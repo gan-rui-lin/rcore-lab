@@ -27,7 +27,7 @@ jobs:
   basic-test:
     runs-on: ubuntu-latest
     outputs:
-      points: ${{ steps.end.outputs.points}}
+      points: ${{ steps.end.outputs.points }}
     container:
       image: alicesama/rcore-ci:2024a
     steps:
@@ -40,13 +40,11 @@ jobs:
           git clone https://github.com/LearningOS/rCore-Tutorial-Checker.git ci-user
           git clone https://github.com/LearningOS/rCore-Tutorial-Test.git ci-user/user
           ID=`git rev-parse --abbrev-ref HEAD | grep -oP 'ch\K[0-9]'`
-          cd ci-user && make test CHAPTER=$ID passwd=${{ secrets.BASE_TEST_TOKEN }} > ../output.txt
-          cat ../output.txt
+          cd ci-user
+          make test CHAPTER=$ID | tee ../output.txt
       - name: end
         id: end
-        run: |
-          cat output.txt | grep -a "Test passed" | grep -oP "\d{1,}/\d{1,}" | xargs -i echo "points={}"
-          cat output.txt | grep -a "Test passed" | grep -oP "\d{1,}/\d{1,}" | xargs -i echo "points={}" >> $GITHUB_OUTPUT
+        run: grep -a "Test passed" output.txt | grep -oP "\d{1,}/\d{1,}" | xargs -i echo "points={}" | tee $GITHUB_OUTPUT
   deploy:
     if: github.repository != 'LearningOS/rCore-Tutorial-Code'
     name: Deploy to pages
@@ -57,7 +55,7 @@ jobs:
       - uses: actions/checkout@v3
         continue-on-error: true
         with:
-          ref: 'gh-pages'
+          ref: gh-pages
       - name: Save Log File
         uses: yfblock/multi-rank-log@main
         with:
@@ -71,3 +69,32 @@ jobs:
           keep_history: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload score
+        run: |
+          cat classroom/latest.json
+          score=$(( $(grep -o 'ch' classroom/latest.json | wc -l) * 100))
+          echo $score
+
+          score_json=$(jq -n \
+            --arg channel github \
+            --argjson courseId ${{ secrets.RCORE_2025_AUTUMN_COURSE_ID }} \
+            --arg name ${{ github.actor }} \
+            --argjson score $score \
+            --argjson totalScore 500 \
+            '{channel: $channel, courseId: $courseId, name: $name, score: $score, totalScore: $totalScore}')
+
+          response=$(curl -X POST ${{ secrets.COURSE_POST_API }} \
+            -H "accept: application/json;charset=utf-8" \
+            -H "Content-Type: application/json" \
+            -H "token: ${{ secrets.RCORE_2025_AUTUMN_TOKEN }}" \
+            -d "$score_json" \
+            -v)
+
+          echo "Response: $response"
+
+          if echo "$response" | grep -q '"result":1'; then
+            echo "Success: The result field contains 1."
+          else
+            echo "Error: The result field does not contain 1."
+            exit 1
+          fi
