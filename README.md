@@ -26,12 +26,17 @@
 
 - [Learning Resource](https://github.com/LearningOS/rust-based-os-comp2025/blob/main/relatedinfo.md)
 
+## Setup
+
+```bash
+$ git clone https://github.com/LearningOS/2025a-rcore-[YOUR_USER_NAME].git
+$ cd 2025a-rcore-[YOUR_USER_NAME]
+```
+
 ## Build & Run
 
 ```bash
 # setup build&run environment first
-$ git clone https://github.com/LearningOS/rCore-Tutorial-Code.git
-$ cd rCore-Tutorial-Code
 $ git clone https://github.com/LearningOS/rCore-Tutorial-Test.git user
 $ git checkout ch$ID
 $ cd os
@@ -64,8 +69,6 @@ Notice: $ID is from [1-9]
 
 ```bash
 # setup build&run environment first
-$ git clone https://github.com/LearningOS/rCore-Tutorial-Code.git
-$ cd rCore-Tutorial-Code
 $ rm -rf ci-user
 $ git clone https://github.com/LearningOS/rCore-Tutorial-Checker.git ci-user
 $ git clone https://github.com/LearningOS/rCore-Tutorial-Test.git ci-user/user
