@@ -1,12 +1,15 @@
 //! File trait & inode(dir, file, pipe, stdin, stdout)
 
+mod pipe;
 mod stdio;
 mod vfs;
 #[cfg(feature = "ext4")]
 mod ext4;
 
 use crate::mm::UserBuffer;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use vfs::VfsInode;
 
 /// trait File for all file types
 pub trait File: Send + Sync {
@@ -22,35 +25,46 @@ pub trait File: Send + Sync {
     fn read_all(&self) -> Vec<u8> {
         Vec::new()
     }
-}
-
-/// The stat of a inode
-#[repr(C)]
-#[derive(Debug)]
-pub struct Stat {
-    /// ID of device containing file
-    pub dev: u64,
-    /// inode number
-    pub ino: u64,
-    /// file type and mode
-    pub mode: StatMode,
-    /// number of hard links
-    pub nlink: u32,
-    /// unused pad
-    pad: [u64; 7],
-}
-
-impl Stat {
-    /// Construct a minimal Stat with mode and link count.
-    pub fn new(mode: StatMode, nlink: u32) -> Self {
-        Self {
-            dev: 0,
-            ino: 0,
-            mode,
-            nlink,
-            pad: [0; 7],
-        }
+    /// Optional: underlying inode, for metadata queries.
+    fn inode(&self) -> Option<Arc<dyn VfsInode>> {
+        None
     }
+    /// Optional: absolute path of this file.
+    fn path(&self) -> Option<&str> {
+        None
+    }
+    /// Optional: get current file offset.
+    fn get_offset(&self) -> Option<usize> {
+        None
+    }
+    /// Optional: set current file offset.
+    fn set_offset(&self, _offset: usize) {}
+}
+
+/// Linux-compatible stat layout (riscv64).
+#[allow(missing_docs)]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct Stat {
+    pub dev: u64,
+    pub ino: u64,
+    pub mode: u32,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u64,
+    pub _pad: u64,
+    pub size: i64,
+    pub blksize: i64,
+    pub _pad2: i32,
+    pub blocks: i64,
+    pub atime_sec: i64,
+    pub atime_nsec: i64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
+    pub ctime_sec: i64,
+    pub ctime_nsec: i64,
+    pub _unused: [i64; 2],
 }
 
 bitflags! {
@@ -69,28 +83,31 @@ bitflags! {
 bitflags! {
     /// The flags argument to the open() system call.
     pub struct OpenFlags: u32 {
-        /// read only
-        const RDONLY = 0;
         /// write only
         const WRONLY = 1 << 0;
         /// read and write
         const RDWR = 1 << 1;
         /// create new file
-        const CREATE = 1 << 9;
+        const CREATE = 1 << 6;
         /// truncate file size to 0
-        const TRUNC = 1 << 10;
+        const TRUNC = 1 << 9;
+        /// append
+        const APPEND = 1 << 10;
+        /// must be a directory
+        const DIRECTORY = 1 << 16;
+        /// close-on-exec
+        const CLOEXEC = 1 << 19;
     }
 }
 
 impl OpenFlags {
     /// Return (readable, writable) tuple.
     pub fn read_write(&self) -> (bool, bool) {
-        if self.is_empty() {
-            (true, false)
-        } else if self.contains(Self::WRONLY) {
-            (false, true)
-        } else {
-            (true, true)
+        match self.bits() & 0b11 {
+            0 => (true, false),
+            1 => (false, true),
+            2 => (true, true),
+            _ => (true, true),
         }
     }
 }
@@ -102,4 +119,5 @@ pub use vfs::mount_ext4;
 /// Auto-detect ext4 and mount it as root if present.
 pub use vfs::mount_ext4_auto;
 pub use vfs::{list_apps, mount_easyfs, open_file, path_is_dir};
+pub use pipe::make_pipe;
 pub use stdio::{Stdin, Stdout};

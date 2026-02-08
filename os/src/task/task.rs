@@ -13,6 +13,8 @@ use alloc::vec::Vec;
 use core::cell::RefMut;
 use riscv::register::sie;
 
+const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
+
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -109,6 +111,18 @@ impl TaskControlBlock {
         let mut inner = self.inner_exclusive_access();
         inner.name = name.to_string();
     }
+
+    /// Get a copy of current working directory.
+    pub fn cwd(&self) -> String {
+        let inner = self.inner_exclusive_access();
+        inner.cwd.clone()
+    }
+
+    /// Set current working directory.
+    pub fn set_cwd(&self, cwd: String) {
+        let mut inner = self.inner_exclusive_access();
+        inner.cwd = cwd;
+    }
 }
 
 pub struct TaskControlBlockInner {
@@ -147,6 +161,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Current working directory
+    pub cwd: String,
+
+    /// Next mmap base
+    pub mmap_base: usize,
 }
 
 impl TaskControlBlockInner {
@@ -215,6 +235,8 @@ impl TaskControlBlock {
                     name: String::from("initproc"),
                     heap_bottom: user_stack_top,
                     program_brk: user_stack_top,
+                    cwd: String::from("/"),
+                    mmap_base: DEFAULT_MMAP_BASE,
                 })
             },
         };
@@ -254,6 +276,7 @@ impl TaskControlBlock {
         inner.base_size = user_stack_top;
         inner.heap_bottom = user_stack_top;
         inner.program_brk = user_stack_top;
+        inner.mmap_base = DEFAULT_MMAP_BASE;
         if let Some(arg0) = args.first() {
             let name = arg0
                 .rsplit('/')
@@ -324,6 +347,8 @@ impl TaskControlBlock {
                     name: parent_inner.name.clone(),
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    cwd: parent_inner.cwd.clone(),
+                    mmap_base: parent_inner.mmap_base,
                 })
             },
         });
@@ -349,11 +374,11 @@ impl TaskControlBlock {
     }
 
     /// change the location of the program break. return None if failed.
-    pub fn change_program_brk(&self, size: i32) -> Option<usize> {
+    pub fn change_program_brk(&self, size: isize) -> Option<usize> {
         let mut inner = self.inner_exclusive_access();
         let heap_bottom = inner.heap_bottom;
         let old_break = inner.program_brk;
-        let new_brk = inner.program_brk as isize + size as isize;
+        let new_brk = inner.program_brk as isize + size;
         if new_brk < heap_bottom as isize {
             return None;
         }

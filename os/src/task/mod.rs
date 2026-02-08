@@ -110,8 +110,8 @@ lazy_static! {
     /// the name "initproc" may be changed to any other app name like "usertests",
     /// but we have user_shell, so we don't need to change it.
     pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
-        let v = open_file("initcode", OpenFlags::RDONLY)
-            .or_else(|| open_file("ch6b_initproc", OpenFlags::RDONLY))
+        let v = open_file("initcode", OpenFlags::empty())
+            .or_else(|| open_file("ch6b_initproc", OpenFlags::empty()))
             .map(|inode| inode.read_all())
             .unwrap_or_else(|| INITPROC_EMBED.to_vec());
         TaskControlBlock::new(v.as_slice())

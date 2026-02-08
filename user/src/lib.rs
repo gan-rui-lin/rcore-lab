@@ -116,35 +116,32 @@ pub enum TraceRequest {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct Stat {
-    /// ID of device containing file
     pub dev: u64,
-    /// inode number
     pub ino: u64,
-    /// file type and mode
-    pub mode: StatMode,
-    /// number of hard links
+    pub mode: u32,
     pub nlink: u32,
-    /// unused pad
-    pad: [u64; 7],
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u64,
+    pub _pad: u64,
+    pub size: i64,
+    pub blksize: i64,
+    pub _pad2: i32,
+    pub blocks: i64,
+    pub atime_sec: i64,
+    pub atime_nsec: i64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
+    pub ctime_sec: i64,
+    pub ctime_nsec: i64,
+    pub _unused: [i64; 2],
 }
 
 impl Stat {
     pub fn new() -> Self {
-        Stat {
-            dev: 0,
-            ino: 0,
-            mode: StatMode::NULL,
-            nlink: 0,
-            pad: [0; 7],
-        }
-    }
-}
-
-impl Default for Stat {
-    fn default() -> Self {
-        Self::new()
+        Stat::default()
     }
 }
 
@@ -403,6 +400,11 @@ pub fn condvar_signal(condvar_id: usize) {
 }
 pub fn condvar_wait(condvar_id: usize, mutex_id: usize) {
     sys_condvar_wait(condvar_id, mutex_id);
+}
+
+pub fn shutdown() -> ! {
+    console::flush();
+    sys_shutdown();
 }
 
 /// Action for a signal

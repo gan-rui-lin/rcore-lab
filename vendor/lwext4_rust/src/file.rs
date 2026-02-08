@@ -48,7 +48,14 @@ impl Ext4File {
     /// |---------------------------------------------------------------|
     /// |   a+ or ab+ or a+b        O_RDWR|O_CREAT|O_APPEND             |
     /// |---------------------------------------------------------------|
-    pub fn file_open(&mut self, path: &str, flags: u32) -> Result<usize, i32> {
+    pub fn file_open(&mut self, path: &str, mut flags: u32) -> Result<usize, i32> {
+        if (flags & O_CREAT) != 0 && (flags & (O_TRUNC | O_APPEND)) == 0 {
+            if self.check_inode_exist(path, self.this_type.clone()) {
+                flags &= !O_CREAT;
+            } else {
+                flags |= O_TRUNC;
+            }
+        }
         let c_path = CString::new(path).expect("CString::new failed");
         if c_path != self.get_path() {
             // debug!(
