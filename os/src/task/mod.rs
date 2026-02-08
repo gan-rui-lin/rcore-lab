@@ -110,11 +110,24 @@ lazy_static! {
     /// the name "initproc" may be changed to any other app name like "usertests",
     /// but we have user_shell, so we don't need to change it.
     pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
-        let inode = open_file("ch6b_initproc", OpenFlags::RDONLY).unwrap();
-        let v = inode.read_all();
+        let v = open_file("initcode", OpenFlags::RDONLY)
+            .or_else(|| open_file("ch6b_initproc", OpenFlags::RDONLY))
+            .map(|inode| inode.read_all())
+            .unwrap_or_else(|| INITPROC_EMBED.to_vec());
         TaskControlBlock::new(v.as_slice())
     });
 }
+
+#[cfg(debug_assertions)]
+const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../user/target/riscv64gc-unknown-none-elf/debug/initcode"
+));
+#[cfg(not(debug_assertions))]
+const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../user/target/riscv64gc-unknown-none-elf/release/initcode"
+));
 
 ///Add init process to the manager
 pub fn add_initproc() {

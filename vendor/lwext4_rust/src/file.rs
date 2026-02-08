@@ -51,11 +51,11 @@ impl Ext4File {
     pub fn file_open(&mut self, path: &str, flags: u32) -> Result<usize, i32> {
         let c_path = CString::new(path).expect("CString::new failed");
         if c_path != self.get_path() {
-            debug!(
-                "Ext4File file_open, cur path={}, new path={}",
-                self.file_path.to_str().unwrap(),
-                path
-            );
+            // debug!(
+            //     "Ext4File file_open, cur path={}, new path={}",
+            //     self.file_path.to_str().unwrap(),
+            //     path
+            // );
         }
         //let to_map = c_path.clone();
         let c_path = c_path.into_raw();
@@ -73,13 +73,13 @@ impl Ext4File {
             return Err(r);
         }
         //self.file_desc_map.insert(to_map, fd); // store c_path
-        debug!("file_open {}, mp={:#x}", path, self.file_desc.mp as usize);
+        // debug!("file_open {}, mp={:#x}", path, self.file_desc.mp as usize);
         Ok(EOK as usize)
     }
 
     pub fn file_close(&mut self) -> Result<usize, i32> {
         if self.file_desc.mp != core::ptr::null_mut() {
-            debug!("file_close {:?}", self.get_path());
+            // debug!("file_close {:?}", self.get_path());
             // self.file_cache_flush()?;
             unsafe {
                 ext4_fclose(&mut self.file_desc);
@@ -101,7 +101,7 @@ impl Ext4File {
                 "r+"
             }
         };
-        debug!("flags_to_cstring: {}", cstr);
+        // debug!("flags_to_cstring: {}", cstr);
         CString::new(cstr).expect("CString::new OpenFlags failed")
     }
 
@@ -119,16 +119,15 @@ impl Ext4File {
     pub fn check_inode_exist(&mut self, path: &str, types: InodeTypes) -> bool {
         let c_path = CString::new(path).expect("CString::new failed");
         let c_path = c_path.into_raw();
-        let mtype = types.clone();
         let r = unsafe { ext4_inode_exist(c_path, types as i32) }; //eg: types: EXT4_DE_REG_FILE
         unsafe {
             drop(CString::from_raw(c_path));
         }
         if r == EOK as i32 {
-            debug!("{:?} {} Exist", mtype, path);
+            // debug!("{:?} {} Exist", types, path);
             true //Exist
         } else {
-            debug!("{:?} {} No Exist. ext4_inode_exist rc = {}", mtype, path, r);
+            // debug!("{:?} {} No Exist. ext4_inode_exist rc = {}", types, path, r);
             false
         }
     }
@@ -153,7 +152,7 @@ impl Ext4File {
 
     /// Remove file by path.
     pub fn file_remove(&mut self, path: &str) -> Result<usize, i32> {
-        debug!("file_remove {}", path);
+        // debug!("file_remove {}", path);
 
         let c_path = CString::new(path).expect("CString::new failed");
         let c_path = c_path.into_raw();
@@ -202,7 +201,7 @@ impl Ext4File {
             return Err(r);
         }
 
-        debug!("file_read {:?}, len={}", self.get_path(), rw_count);
+        // debug!("file_read {:?}, len={}", self.get_path(), rw_count);
 
         Ok(rw_count)
     }
@@ -237,7 +236,7 @@ impl Ext4File {
             error!("ext4_fwrite: rc = {}", r);
             return Err(r);
         }
-        debug!("file_write {:?}, len={}", self.get_path(), rw_count);
+        // debug!("file_write {:?}, len={}", self.get_path(), rw_count);
         Ok(rw_count)
     }
 

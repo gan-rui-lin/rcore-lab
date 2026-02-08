@@ -1,5 +1,6 @@
 use alloc::alloc::{alloc, dealloc, Layout};
 use alloc::slice::from_raw_parts_mut;
+#[cfg(feature = "print")]
 use alloc::string::String;
 use core::cmp::min;
 use core::ffi::{c_char, c_int, c_size_t, c_void};
@@ -7,7 +8,7 @@ use core::ffi::{c_char, c_int, c_size_t, c_void};
 #[cfg(feature = "print")]
 #[linkage = "weak"]
 #[no_mangle]
-unsafe extern "C" fn printf(str: *const c_char, mut args: ...) -> c_int {
+unsafe extern "C" fn printf(str: *const c_char, args: ...) -> c_int {
     // extern "C" { pub fn printf(arg1: *const c_char, ...) -> c_int; }
     use printf_compat::{format, output};
 
@@ -22,7 +23,7 @@ unsafe extern "C" fn printf(str: *const c_char, mut args: ...) -> c_int {
 #[cfg(not(feature = "print"))]
 #[linkage = "weak"]
 #[no_mangle]
-unsafe extern "C" fn printf(str: *const c_char, mut args: ...) -> c_int {
+unsafe extern "C" fn printf(str: *const c_char, _args: ...) -> c_int {
     use core::ffi::CStr;
     let c_str = unsafe { CStr::from_ptr(str) };
     //let arg1 = args.arg::<usize>();

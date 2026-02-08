@@ -120,7 +120,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
     pub extern "C" fn dev_open(bdev: *mut ext4_blockdev) -> ::core::ffi::c_int {
         unsafe {
             let p_user = (*(*bdev).bdif).p_user;
-            debug!("OPEN Ext4 block device p_user={:#x}", p_user as usize);
+            // debug!("OPEN Ext4 block device p_user={:#x}", p_user as usize);
             // DevType: Disk
             if p_user as usize == 0 {
                 error!("Invalid null pointer of p_user");
@@ -154,7 +154,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         blk_cnt: u32,
     ) -> ::core::ffi::c_int {
         unsafe {
-            debug!("READ Ext4 block id: {}, count: {}", blk_id, blk_cnt);
+            // debug!("READ Ext4 block id: {}, count: {}", blk_id, blk_cnt);
             let devt = &mut *((*(*bdev).bdif).p_user as *mut K::DevType);
 
             let seek_off = K::seek(
@@ -190,7 +190,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         blk_cnt: u32,
     ) -> ::core::ffi::c_int {
         unsafe {
-            debug!("WRITE Ext4 block id: {}, count: {}", blk_id, blk_cnt);
+            // debug!("WRITE Ext4 block id: {}, count: {}", blk_id, blk_cnt);
 
             let devt = &mut *((*(*bdev).bdif).p_user as *mut K::DevType);
             //let mut devt = K::DevType::borrow_mut((*(*bdev).bdif).p_user);
@@ -226,11 +226,9 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         }
     }
     pub extern "C" fn dev_close(_bdev: *mut ext4_blockdev) -> ::core::ffi::c_int {
-        unsafe {
-            debug!("CLOSE Ext4 block device");
-            //fclose(dev_file);
-            EOK as _
-        }
+        debug!("CLOSE Ext4 block device");
+        //fclose(dev_file);
+        EOK as _
     }
 
     pub unsafe fn lwext4_mount(&mut self) -> Result<usize, i32> {
