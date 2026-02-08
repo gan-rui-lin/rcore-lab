@@ -253,23 +253,71 @@ impl MemorySet {
     }
     /// Create a new address space by copy code&data from a exited process's address space.
     pub fn from_existed_user(user_space: &Self) -> Self {
+        // debug!("[kernel] clone user space start");
+        trace!("memory_set: clone user space start");
         let mut memory_set = Self::new_bare();
         // map trampoline
+        debug!("[kernel] clone: map_trampoline start");
         memory_set.map_trampoline();
+        debug!("[kernel] clone: map_trampoline done");
+        debug!("[kernel] clone areas len {}", user_space.areas.len());
         // copy data sections/trap_context/user_stack
-        for area in user_space.areas.iter() {
+        for (idx, area) in user_space.areas.iter().enumerate() {
+            debug!("[kernel] clone area {}", idx);
+            trace!(
+                "memory_set: clone area {} start={:?} end={:?}",
+                idx,
+                area.vpn_range.get_start(),
+                area.vpn_range.get_end()
+            );
             let new_area = MapArea::from_another(area);
             memory_set.push(new_area, None);
             // copy data from another space
+            let mut pages_copied: usize = 0;
             for vpn in area.vpn_range {
                 let src_ppn = user_space.translate(vpn).unwrap().ppn();
                 let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
                 dst_ppn
                     .get_bytes_array()
                     .copy_from_slice(src_ppn.get_bytes_array());
+                pages_copied += 1;
+                if (pages_copied & 0x3ff) == 0 {
+                    debug!("[kernel] area {} copied {} pages", idx, pages_copied);
+                    trace!(
+                        "memory_set: area {} copied {} pages",
+                        idx,
+                        pages_copied
+                    );
+                }
             }
+            debug!("[kernel] clone area {} done ({} pages)", idx, pages_copied);
+            trace!(
+                "memory_set: clone area {} done ({} pages)",
+                idx,
+                pages_copied
+            );
         }
+        // debug!("[kernel] clone user space done");
+        trace!("memory_set: clone user space done");
         memory_set
+    }
+
+    /// Debug helper to dump user area ranges.
+    pub fn debug_area_ranges(&self) {
+        debug!("[kernel] user areas: {}", self.areas.len());
+        for (idx, area) in self.areas.iter().enumerate() {
+            let map_type = match area.map_type {
+                MapType::Identical => "Identical",
+                MapType::Framed => "Framed",
+            };
+            debug!(
+                "[kernel] area {} {:?} {:?} {}",
+                idx,
+                area.vpn_range.get_start(),
+                area.vpn_range.get_end(),
+                map_type
+            );
+        }
     }
     /// Change page table by writing satp CSR Register.
     pub fn activate(&self) {

@@ -73,6 +73,14 @@ impl Inode {
             })
         })
     }
+    /// Whether this inode is a directory
+    pub fn is_dir(&self) -> bool {
+        self.read_disk_inode(|disk_inode| disk_inode.is_dir())
+    }
+    /// Whether this inode is a file
+    pub fn is_file(&self) -> bool {
+        self.read_disk_inode(|disk_inode| disk_inode.is_file())
+    }
     /// Increase the size of a disk inode
     fn increase_size(
         &self,

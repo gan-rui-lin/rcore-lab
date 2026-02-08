@@ -1,6 +1,6 @@
 .*/*
 .merge_chain_state
-!.github/*
+.github/*
 !.vscode/settings.json
 .idea
 Cargo.lock
@@ -17,5 +17,9 @@ tools/
 pushall.sh
 *.bak
 ci-user/
-user/
 os/vendor/
+*.img*
+*.code-workspace
+AGENT.*
+kernel-qemu
+sbi-qemu

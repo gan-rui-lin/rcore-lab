@@ -14,6 +14,7 @@ pub struct UPSafeCell<T> {
 }
 
 unsafe impl<T> Sync for UPSafeCell<T> {}
+unsafe impl<T> Send for UPSafeCell<T> {}
 
 impl<T> UPSafeCell<T> {
     /// User is responsible to guarantee that inner struct is only used in
