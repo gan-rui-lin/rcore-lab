@@ -13,6 +13,7 @@ pub const EAGAIN: isize = 11;
 pub const ENOMEM: isize = 12;
 pub const EACCES: isize = 13;
 pub const EFAULT: isize = 14;
+pub const EEXIST: isize = 17;
 pub const ENODEV: isize = 19;
 pub const ENOTDIR: isize = 20;
 pub const EISDIR: isize = 21;
@@ -20,8 +21,11 @@ pub const EINVAL: isize = 22;
 pub const ENFILE: isize = 23;
 pub const EMFILE: isize = 24;
 pub const ENOTTY: isize = 25;
+pub const EPIPE: isize = 32;
+pub const ERANGE: isize = 34;
 pub const ESPIPE: isize = 29;
 pub const ENOSYS: isize = 38;
+pub const ENOTEMPTY: isize = 39;
 pub const ENOTSUP: isize = 95;
 
 #[inline]

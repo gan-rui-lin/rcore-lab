@@ -31,6 +31,9 @@ pub trait VfsInode: Send + Sync {
     fn create(&self, name: &str) -> Option<Arc<dyn VfsInode>>;
     fn truncate(&self);
     fn list(&self) -> Vec<String>;
+    fn size(&self) -> usize {
+        0
+    }
 
     fn is_dir(&self) -> bool {
         self.kind() == VfsNodeKind::Dir
@@ -224,6 +227,7 @@ impl VfsInode for NullInode {
 pub struct VfsFile {
     readable: bool,
     writable: bool,
+    path: String,
     inner: UPSafeCell<VfsFileInner>,
 }
 
@@ -233,10 +237,11 @@ struct VfsFileInner {
 }
 
 impl VfsFile {
-    pub fn new(readable: bool, writable: bool, inode: Arc<dyn VfsInode>) -> Self {
+    pub fn new(readable: bool, writable: bool, inode: Arc<dyn VfsInode>, path: String) -> Self {
         Self {
             readable,
             writable,
+            path,
             inner: unsafe {
                 UPSafeCell::new(VfsFileInner {
                     offset: 0,
@@ -310,6 +315,25 @@ impl File for VfsFile {
     fn read_all(&self) -> Vec<u8> {
         self.read_all()
     }
+
+    fn inode(&self) -> Option<Arc<dyn VfsInode>> {
+        let inner = self.inner.exclusive_access();
+        Some(inner.inode.clone())
+    }
+
+    fn path(&self) -> Option<&str> {
+        Some(self.path.as_str())
+    }
+
+    fn get_offset(&self) -> Option<usize> {
+        let inner = self.inner.exclusive_access();
+        Some(inner.offset)
+    }
+
+    fn set_offset(&self, offset: usize) {
+        let mut inner = self.inner.exclusive_access();
+        inner.offset = offset;
+    }
 }
 
 pub fn list_apps() {
@@ -332,17 +356,17 @@ pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<dyn File>> {
             if flags.contains(OpenFlags::TRUNC) {
                 inode.truncate();
             }
-            return Some(Arc::new(VfsFile::new(readable, writable, inode)));
+            return Some(Arc::new(VfsFile::new(readable, writable, inode, path)));
         }
         let (parent, name) = vfs.resolve_parent(&path)?;
         let inode = parent.create(&name)?;
-        Some(Arc::new(VfsFile::new(readable, writable, inode)))
+        Some(Arc::new(VfsFile::new(readable, writable, inode, path)))
     } else {
         let inode = vfs.resolve(&path)?;
         if flags.contains(OpenFlags::TRUNC) {
             inode.truncate();
         }
-        Some(Arc::new(VfsFile::new(readable, writable, inode)))
+        Some(Arc::new(VfsFile::new(readable, writable, inode, path)))
     }
 }
 

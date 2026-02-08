@@ -21,6 +21,12 @@ impl RecycleAllocator {
             recycled: Vec::new(),
         }
     }
+    pub fn new_with_start(start: usize) -> Self {
+        RecycleAllocator {
+            current: start,
+            recycled: Vec::new(),
+        }
+    }
     pub fn alloc(&mut self) -> usize {
         if let Some(id) = self.recycled.pop() {
             id
@@ -42,7 +48,7 @@ impl RecycleAllocator {
 
 lazy_static! {
     static ref PID_ALLOCATOR: UPSafeCell<RecycleAllocator> =
-        unsafe { UPSafeCell::new(RecycleAllocator::new()) };
+        unsafe { UPSafeCell::new(RecycleAllocator::new_with_start(1)) };
     static ref KSTACK_ALLOCATOR: UPSafeCell<RecycleAllocator> =
         unsafe { UPSafeCell::new(RecycleAllocator::new()) };
 }

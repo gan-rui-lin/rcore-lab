@@ -47,6 +47,7 @@ pub const SYSCALL_SEMAPHORE_DOWN: usize = 470;
 pub const SYSCALL_CONDVAR_CREATE: usize = 471;
 pub const SYSCALL_CONDVAR_SIGNAL: usize = 472;
 pub const SYSCALL_CONDVAR_WAIT: usize = 473;
+pub const SYSCALL_SHUTDOWN: usize = 1001;
 
 pub fn syscall(id: usize, args: [usize; 3]) -> isize {
     let mut ret: isize;
@@ -205,7 +206,12 @@ pub fn sys_sbrk(size: i32) -> isize {
 }
 
 pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
-    syscall(SYSCALL_MMAP, [start, len, prot])
+    const MAP_PRIVATE: usize = 0x02;
+    const MAP_ANON: usize = 0x20;
+    syscall6(
+        SYSCALL_MMAP,
+        [start, len, prot, MAP_PRIVATE | MAP_ANON, usize::MAX, 0],
+    )
 }
 
 pub fn sys_munmap(start: usize, len: usize) -> isize {
@@ -225,7 +231,13 @@ pub fn sys_dup3(oldfd: usize, newfd: usize) -> isize {
 }
 
 pub fn sys_pipe(pipe: &mut [usize]) -> isize {
-    syscall(SYSCALL_PIPE2, [pipe.as_mut_ptr() as usize, 0, 0])
+    let mut fds = [0i32; 2];
+    let ret = syscall(SYSCALL_PIPE2, [fds.as_mut_ptr() as usize, 0, 0]);
+    if ret >= 0 && pipe.len() >= 2 {
+        pipe[0] = fds[0] as usize;
+        pipe[1] = fds[1] as usize;
+    }
+    ret
 }
 
 pub fn sys_chdir(path: &str) -> isize {
@@ -309,4 +321,9 @@ pub fn sys_sigreturn() -> isize {
 
 pub fn sys_kill(pid: usize, signal: i32) -> isize {
     syscall(SYSCALL_KILL, [pid, signal as usize, 0])
+}
+
+pub fn sys_shutdown() -> ! {
+    syscall(SYSCALL_SHUTDOWN, [0, 0, 0]);
+    panic!("sys_shutdown never returns!");
 }

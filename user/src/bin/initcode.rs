@@ -7,9 +7,10 @@ extern crate user_lib;
 extern crate alloc;
 
 use alloc::vec::Vec;
-use user_lib::{chdir, dup, execve, exit, fork, open, wait, OpenFlags};
+use user_lib::{chdir, dup, execve, exit, fork, open, shutdown, wait, OpenFlags};
 
-const ENABLE_BASIC_TEST: bool = true;
+const ENABLE_SINGLE_ELF_SUITE: bool = true;
+const ENABLE_BASIC_TEST: bool = false;
 const ENABLE_BUSYBOX_TEST: bool = false;
 const ENABLE_LUA_TEST: bool = false;
 const ENABLE_LIBC_TEST: bool = false;
@@ -38,9 +39,11 @@ fn main() -> i32 {
     println!("\n=== rCore initcode ===");
 
     if let Some(test_path) = SINGLE_TEST {
-        run_single_binary(test_path);
+        let _ = run_single_binary(test_path);
     } else if ENABLE_ALL_TESTS {
         test_all_tests();
+    } else if ENABLE_SINGLE_ELF_SUITE {
+        run_single_elf_suite();
     } else {
         if ENABLE_BASIC_TEST {
             test_basic();
@@ -60,16 +63,16 @@ fn main() -> i32 {
     }
 
     println!("\n=== All tests completed ===");
-    exit(0);
+    shutdown();
 }
 
-fn run_single_binary(path: &str) {
+fn run_single_binary(path: &str) -> i32 {
     println!("=== Running {} ===", path);
 
     let pid = fork();
     if pid < 0 {
         println!("Fork failed!");
-        return;
+        return -1;
     }
 
     if pid == 0 {
@@ -90,7 +93,79 @@ fn run_single_binary(path: &str) {
         let mut status: i32 = 0;
         let _ = wait(&mut status);
         println!("=== {} completed (status=0x{:x}) ===\n", path, status);
+        status
     }
+}
+
+fn run_single_elf_suite() {
+    let tests = [
+        "/musl/basic/brk",
+        "/musl/basic/chdir",
+        "/musl/basic/clone",
+        "/musl/basic/close",
+        "/musl/basic/dup",
+        "/musl/basic/dup2",
+        "/musl/basic/execve",
+        "/musl/basic/exit",
+        "/musl/basic/fork",
+        "/musl/basic/fstat",
+        "/musl/basic/getcwd",
+        "/musl/basic/getdents",
+        "/musl/basic/getpid",
+        "/musl/basic/getppid",
+        "/musl/basic/gettimeofday",
+        "/musl/basic/mkdir_",
+        "/musl/basic/mmap",
+        "/musl/basic/mount",
+        "/musl/basic/munmap",
+        "/musl/basic/open",
+        "/musl/basic/openat",
+        "/musl/basic/pipe",
+        "/musl/basic/read",
+        "/musl/basic/sleep",
+        "/musl/basic/chdir",
+        // "/musl/basic/test_echo",
+        "/musl/basic/mkdir_",
+        "/musl/basic/times",
+        "/musl/basic/umount",
+        "/musl/basic/uname",
+        "/musl/basic/unlink",
+        "/musl/basic/wait",
+        "/musl/basic/waitpid",
+        "/musl/basic/write",
+        "/musl/basic/yield",
+    ];
+
+    let mut total = 0;
+    let mut passed = 0;
+    let mut failed = 0;
+
+    println!("\n==========================================");
+    println!("   Running Single-ELF Suite (/musl/basic)");
+    println!("==========================================\n");
+
+    for (_idx, path) in tests.iter().enumerate() {
+        total += 1;
+        // println!("\n[{}/{}] Running test: {}", idx + 1, tests.len(), path);
+        println!("------------------------------------------");
+        let status = run_single_binary(path);
+        if status == 0 {
+            passed += 1;
+            // println!("✓ Test PASSED: {}", path);
+        } else {
+            failed += 1;
+            // println!("✗ Test FAILED: {} (status=0x{:x})", path, status);
+        }
+        println!("------------------------------------------");
+    }
+
+    println!("\n==========================================");
+    println!("   Single-ELF Suite Summary");
+    println!("==========================================");
+    println!("Total:  {} tests", total);
+    println!("Passed: {} tests", passed);
+    println!("Failed: {} tests", failed);
+    println!("==========================================\n");
 }
 
 fn run_testcode(script_name: &str) {

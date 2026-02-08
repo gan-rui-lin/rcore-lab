@@ -2,15 +2,12 @@
 #![allow(missing_docs)]
 
 use crate::sync::UPSafeCell;
-use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use easy_fs::BlockDevice;
-use lwext4_rust::bindings::{
-    ext4_dir, ext4_dir_close, ext4_dir_open, EOK, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC,
-};
+use lwext4_rust::bindings::{O_CREAT, O_RDONLY, O_RDWR, O_TRUNC};
 use lwext4_rust::{Ext4BlockWrapper, Ext4File, InodeTypes, KernelDevOp};
 
 use super::vfs::{VfsInode, VfsNodeKind};
@@ -213,45 +210,28 @@ fn ext4_path_join(base: &str, name: &str) -> String {
     }
 }
 
-fn ext4_dir_exists(path: &str) -> bool {
+fn ext4_inode_exists(path: &str, kind: InodeTypes) -> bool {
     let mut try_paths = [path, ""];
     if let Some(stripped) = path.strip_prefix('/') {
         try_paths[1] = stripped;
     }
     for candidate in try_paths.iter().filter(|p| !p.is_empty()) {
-        let c_path = match CString::new(*candidate) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
-        let rc = unsafe { ext4_dir_open(&mut dir, c_path.as_ptr()) };
-        if rc == EOK as i32 {
-            unsafe {
-                ext4_dir_close(&mut dir);
-            }
-            trace!("ext4: dir exists path={}", candidate);
+        let mut file = Ext4File::new(candidate, kind.clone());
+        if file.check_inode_exist(candidate, kind.clone()) {
+            trace!("ext4: inode exists kind={:?} path={}", kind, candidate);
             return true;
         }
-        trace!("ext4: dir_open failed path={} rc={}", candidate, rc);
+        trace!("ext4: inode missing kind={:?} path={}", kind, candidate);
     }
     false
 }
 
+fn ext4_dir_exists(path: &str) -> bool {
+    ext4_inode_exists(path, InodeTypes::EXT4_DE_DIR)
+}
+
 fn ext4_file_exists(path: &str) -> bool {
-    let mut try_paths = [path, ""];
-    if let Some(stripped) = path.strip_prefix('/') {
-        try_paths[1] = stripped;
-    }
-    for candidate in try_paths.iter().filter(|p| !p.is_empty()) {
-        let mut file = Ext4File::new(candidate, InodeTypes::EXT4_DE_REG_FILE);
-        if file.file_open(candidate, O_RDONLY).is_ok() {
-            let _ = file.file_close();
-            trace!("ext4: file exists path={}", candidate);
-            return true;
-        }
-        trace!("ext4: file_open failed path={}", candidate);
-    }
-    false
+    ext4_inode_exists(path, InodeTypes::EXT4_DE_REG_FILE)
 }
 
 impl VfsInode for Ext4Inode {
@@ -293,10 +273,10 @@ impl VfsInode for Ext4Inode {
         }
         trace!("ext4: lookup base={} child={}", self.path, name);
         let child = ext4_path_join(&self.path, name);
-        if ext4_dir_exists(&child) {
-            Some(Arc::new(Ext4Inode::new_dir(child)) as Arc<dyn VfsInode>)
-        } else if ext4_file_exists(&child) {
+        if ext4_file_exists(&child) {
             Some(Arc::new(Ext4Inode::new_file(child)) as Arc<dyn VfsInode>)
+        } else if ext4_dir_exists(&child) {
+            Some(Arc::new(Ext4Inode::new_dir(child)) as Arc<dyn VfsInode>)
         } else {
             None
         }
@@ -342,5 +322,18 @@ impl VfsInode for Ext4Inode {
                 .collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    fn size(&self) -> usize {
+        if self.kind != VfsNodeKind::File {
+            return 0;
+        }
+        let mut file = Ext4File::new(&self.path, InodeTypes::EXT4_DE_REG_FILE);
+        if file.file_open(&self.path, O_RDONLY).is_err() {
+            return 0;
+        }
+        let size = file.file_size() as usize;
+        let _ = file.file_close();
+        size
     }
 }
