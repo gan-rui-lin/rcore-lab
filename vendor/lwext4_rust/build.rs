@@ -3,14 +3,20 @@ use std::process::Command;
 use std::{env, fs};
 
 fn main() {
-    let c_path = PathBuf::from("c/lwext4")
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR missing"));
+    let c_path = manifest_dir
+        .join("c/lwext4")
         .canonicalize()
         .expect("cannot canonicalize path");
 
-    let lwext4_make = Path::new("c/lwext4/toolchain/musl-generic.cmake");
-    let lwext4_patch = Path::new("c/lwext4-make.patch").canonicalize().unwrap();
+    let lwext4_make = manifest_dir.join("c/lwext4/toolchain/musl-generic.cmake");
+    let lwext4_patch = manifest_dir
+        .join("c/lwext4-make.patch")
+        .canonicalize()
+        .unwrap();
 
-    if !Path::new(lwext4_make).exists() {
+    if !lwext4_make.exists() {
         println!("Retrieve lwext4 source code");
         let git_status = Command::new("git")
             .args(&["submodule", "update", "--init", "--recursive"])
@@ -26,16 +32,16 @@ fn main() {
             .expect("failed to execute process: git apply patch");
 
         fs::copy(
-            "c/musl-generic.cmake",
-            "c/lwext4/toolchain/musl-generic.cmake",
+            manifest_dir.join("c/musl-generic.cmake"),
+            manifest_dir.join("c/lwext4/toolchain/musl-generic.cmake"),
         )
         .unwrap();
     }
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let lwext4_lib = &format!("lwext4-{}", arch);
-    let lwext4_lib_path = &format!("c/lwext4/lib{}.a", lwext4_lib);
-    if !Path::new(lwext4_lib_path).exists() {
+    let lwext4_lib_path = manifest_dir.join(format!("c/lwext4/lib{}.a", lwext4_lib));
+    if !lwext4_lib_path.exists() {
         let status = Command::new("make")
             .args(&[
                 "musl-generic",
@@ -47,7 +53,7 @@ fn main() {
             .expect("failed to execute process: make lwext4");
         assert!(status.success());
 
-        if !Path::new("src/bindings.rs").exists() {
+        if !manifest_dir.join("src/bindings.rs").exists() {
             let cc = &format!("{}-linux-musl-gcc", arch);
             let output = Command::new(cc)
                 .args(["-print-sysroot"])
@@ -58,7 +64,7 @@ fn main() {
             let sysroot = sysroot.trim_end();
             let sysroot_inc = &format!("-I{}/include/", sysroot);
 
-            generates_bindings_to_rust(sysroot_inc);
+            generates_bindings_to_rust(&manifest_dir, sysroot_inc);
         }
     }
 
@@ -81,20 +87,40 @@ fn main() {
         "cargo:rustc-link-search=native={}",
         c_path.to_str().unwrap()
     );
-    println!("cargo:rerun-if-changed=c/wrapper.h");
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("c/wrapper.h").to_str().unwrap()
+    );
     println!("cargo:rerun-if-changed={}", c_path.to_str().unwrap());
 }
 
-fn generates_bindings_to_rust(mpath: &str) {
+fn generates_bindings_to_rust(manifest_dir: &Path, mpath: &str) {
     let bindings = bindgen::Builder::default()
         .use_core()
         // The input header we would like to generate bindings for.
-        .header("c/wrapper.h")
+        .header(
+            manifest_dir
+                .join("c/wrapper.h")
+                .to_str()
+                .expect("invalid wrapper.h path"),
+        )
         //.clang_arg("--sysroot=/path/to/sysroot")
         .clang_arg(mpath)
         //.clang_arg("-I../../ulib/axlibc/include")
-        .clang_arg("-I./c/lwext4/include")
-        .clang_arg("-I./c/lwext4/build_musl-generic/include/")
+        .clang_arg(format!(
+            "-I{}",
+            manifest_dir
+                .join("c/lwext4/include")
+                .to_str()
+                .expect("invalid include path")
+        ))
+        .clang_arg(format!(
+            "-I{}",
+            manifest_dir
+                .join("c/lwext4/build_musl-generic/include/")
+                .to_str()
+                .expect("invalid build include path")
+        ))
         .layout_tests(false)
         // Tell cargo to invalidate the built crate whenever any of the included header files changed.
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
@@ -103,7 +129,7 @@ fn generates_bindings_to_rust(mpath: &str) {
         .expect("Unable to generate bindings");
 
     // Write the bindings to the $OUT_DIR/bindings.rs file.
-    let out_path = PathBuf::from("src");
+    let out_path = manifest_dir.join("src");
     bindings
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Couldn't write bindings!");
