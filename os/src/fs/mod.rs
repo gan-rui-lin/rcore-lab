@@ -3,8 +3,6 @@
 mod pipe;
 mod stdio;
 mod vfs;
-#[cfg(feature = "ext4")]
-mod ext4;
 
 use crate::mm::UserBuffer;
 use alloc::sync::Arc;
@@ -118,6 +116,8 @@ pub use vfs::mount_ext4;
 #[cfg(feature = "ext4")]
 /// Auto-detect ext4 and mount it as root if present.
 pub use vfs::mount_ext4_auto;
-pub use vfs::{list_apps, mount_easyfs, open_file, path_is_dir};
+pub use vfs::{
+    create_dir, list_apps, mount_easyfs, mount_fat32, mount_fat32_auto, open_file, path_is_dir,
+};
 pub use pipe::make_pipe;
 pub use stdio::{Stdin, Stdout};
