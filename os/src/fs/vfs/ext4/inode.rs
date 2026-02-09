@@ -139,6 +139,20 @@ impl VfsInode for Ext4Inode {
         Some(Arc::new(Ext4Inode::new_dir(path)))
     }
 
+    fn remove(&self, name: &str, is_dir: bool) -> bool {
+        if self.kind != VfsNodeKind::Dir {
+            return false;
+        }
+        let path = ext4_path_join(self.path.as_str(), name);
+        if is_dir {
+            let mut dir = Ext4File::new(path.as_str(), InodeTypes::EXT4_DE_DIR);
+            dir.dir_rm(path.as_str()).is_ok()
+        } else {
+            let mut file = Ext4File::new(path.as_str(), InodeTypes::EXT4_DE_REG_FILE);
+            file.file_remove(path.as_str()).is_ok()
+        }
+    }
+
     fn truncate(&self) {
         if self.kind != VfsNodeKind::File {
             return;

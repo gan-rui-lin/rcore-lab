@@ -118,6 +118,7 @@ pub use vfs::mount_ext4;
 pub use vfs::mount_ext4_auto;
 pub use vfs::{
     create_dir, list_apps, mount_easyfs, mount_fat32, mount_fat32_auto, open_file, path_is_dir,
+    remove_path,
 };
 pub use pipe::make_pipe;
 pub use stdio::{Stdin, Stdout};

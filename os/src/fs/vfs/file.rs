@@ -177,3 +177,12 @@ pub fn create_dir(path: &str) -> bool {
     };
     parent.create_dir(&name).is_some()
 }
+
+pub fn remove_path(path: &str, is_dir: bool) -> bool {
+    let path = normalize_path(path);
+    let vfs = ROOT_VFS.exclusive_access();
+    let Some((parent, name)) = vfs.resolve_parent(&path) else {
+        return false;
+    };
+    parent.remove(&name, is_dir)
+}

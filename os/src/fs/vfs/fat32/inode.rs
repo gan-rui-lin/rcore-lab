@@ -154,6 +154,18 @@ impl VfsInode for Fat32Inode {
         Some(Arc::new(Fat32Inode::new_dir(path, self.fs.clone())) as Arc<dyn VfsInode>)
     }
 
+    fn remove(&self, name: &str, _is_dir: bool) -> bool {
+        if self.kind != VfsNodeKind::Dir {
+            return false;
+        }
+        let fs = self.fs.exclusive_access();
+        let dir = match fat32_open_dir(&fs, &self.path) {
+            Ok(dir) => dir,
+            Err(_) => return false,
+        };
+        dir.remove(name).is_ok()
+    }
+
     fn truncate(&self) {
         if self.kind != VfsNodeKind::File {
             return;

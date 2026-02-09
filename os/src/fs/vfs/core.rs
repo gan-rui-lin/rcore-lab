@@ -24,6 +24,9 @@ pub trait VfsInode: Send + Sync {
     fn create_dir(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
         None
     }
+    fn remove(&self, _name: &str, _is_dir: bool) -> bool {
+        false
+    }
     fn truncate(&self);
     fn list(&self) -> Vec<String>;
     fn size(&self) -> usize {
