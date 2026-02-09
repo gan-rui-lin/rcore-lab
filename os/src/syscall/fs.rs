@@ -1,5 +1,7 @@
 //! File and filesystem-related syscalls
-use crate::fs::{create_dir, make_pipe, open_file, path_is_dir, OpenFlags, Stat, StatMode};
+use crate::fs::{
+    create_dir, make_pipe, open_file, path_is_dir, remove_path, OpenFlags, Stat, StatMode,
+};
 use crate::mm::{translated_byte_buffer, translated_str, UserBuffer};
 use crate::task::{current_task, current_user_token};
 use super::errno::*;
@@ -11,8 +13,6 @@ use alloc::vec::Vec;
 use alloc::ffi::CString;
 #[cfg(feature = "ext4")]
 use lwext4_rust::bindings::ext4_flink;
-#[cfg(feature = "ext4")]
-use lwext4_rust::{Ext4File, InodeTypes};
 
 const AT_FDCWD: isize = -100;
 const AT_REMOVEDIR: u32 = 0x200;
@@ -416,34 +416,13 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
         if !is_dir {
             return errno(ENOTDIR);
         }
-        #[cfg(feature = "ext4")]
-        {
-            let mut dir = Ext4File::new(&path, InodeTypes::EXT4_DE_DIR);
-            if dir.dir_rm(&path).is_ok() {
-                return 0;
-            }
-            return errno(EIO);
-        }
-        #[cfg(not(feature = "ext4"))]
-        {
-            return errno(ENOTSUP);
-        }
-    }
-    if is_dir {
+    } else if is_dir {
         return errno(EISDIR);
     }
-    #[cfg(feature = "ext4")]
-    {
-        let mut file = Ext4File::new(&path, InodeTypes::EXT4_DE_REG_FILE);
-        if file.file_remove(&path).is_ok() {
-            0
-        } else {
-            errno(EIO)
-        }
-    }
-    #[cfg(not(feature = "ext4"))]
-    {
-        errno(ENOTSUP)
+    if remove_path(&path, is_dir) {
+        0
+    } else {
+        errno(EIO)
     }
 }
 
