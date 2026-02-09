@@ -76,11 +76,17 @@ pub fn rust_main() -> ! {
     #[cfg(feature = "ext4")]
     if fs::mount_ext4_auto() {
         info!("[kernel] ext4 mounted as root");
+    } else if fs::mount_fat32_auto() {
+        info!("[kernel] fat32 mounted as root");
     } else {
         fs::mount_easyfs();
     }
     #[cfg(not(feature = "ext4"))]
-    fs::mount_easyfs();
+    if fs::mount_fat32_auto() {
+        info!("[kernel] fat32 mounted as root");
+    } else {
+        fs::mount_easyfs();
+    }
     fs::list_apps();
     task::add_initproc();
     task::run_tasks();

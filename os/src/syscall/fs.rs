@@ -1,5 +1,5 @@
 //! File and filesystem-related syscalls
-use crate::fs::{make_pipe, open_file, path_is_dir, OpenFlags, Stat, StatMode};
+use crate::fs::{create_dir, make_pipe, open_file, path_is_dir, OpenFlags, Stat, StatMode};
 use crate::mm::{translated_byte_buffer, translated_str, UserBuffer};
 use crate::task::{current_task, current_user_token};
 use super::errno::*;
@@ -208,18 +208,10 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
     if path_is_dir(&full_path) {
         return errno(EEXIST);
     }
-    #[cfg(feature = "ext4")]
-    {
-        let mut dir = Ext4File::new(&full_path, InodeTypes::EXT4_DE_DIR);
-        if dir.dir_mk(&full_path).is_ok() {
-            0
-        } else {
-            errno(EIO)
-        }
-    }
-    #[cfg(not(feature = "ext4"))]
-    {
-        errno(ENOTSUP)
+    if create_dir(&full_path) {
+        0
+    } else {
+        errno(EIO)
     }
 }
 

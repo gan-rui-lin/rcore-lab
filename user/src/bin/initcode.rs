@@ -9,13 +9,14 @@ extern crate alloc;
 use alloc::vec::Vec;
 use user_lib::{chdir, dup, execve, exit, fork, open, shutdown, wait, OpenFlags};
 
-const ENABLE_SINGLE_ELF_SUITE: bool = true;
-const ENABLE_BASIC_TEST: bool = false;
+const ENABLE_SINGLE_ELF_SUITE: bool = false;
+const ENABLE_BASIC_TEST: bool = true;
 const ENABLE_BUSYBOX_TEST: bool = false;
 const ENABLE_LUA_TEST: bool = false;
 const ENABLE_LIBC_TEST: bool = false;
 const ENABLE_LTP_TEST: bool = false;
 const ENABLE_ALL_TESTS: bool = false;
+const ENABLE_FAT32_TESTS: bool = false;
 const SINGLE_TEST: Option<&str> = option_env!("SINGLE_TEST");
 
 const BUSYBOX: &str = "/musl/busybox\0";
@@ -59,6 +60,10 @@ fn main() -> i32 {
         }
         if ENABLE_LTP_TEST {
             test_ltp();
+        }
+
+        if ENABLE_FAT32_TESTS {
+            test_fat32_suite();
         }
     }
 
@@ -273,6 +278,77 @@ fn test_all_tests() {
 
     println!("\n==========================================");
     println!("   Test Suite Summary");
+    println!("==========================================");
+    println!("Total:  {} tests", total);
+    println!("Passed: {} tests", passed);
+    println!("Failed: {} tests", failed);
+    println!("==========================================\n");
+}
+
+fn test_fat32_suite(){
+       let tests = [
+        "brk",
+        "chdir",
+        "clone",
+        "close",
+        "dup",
+        "dup2",
+        "execve",
+        "exit",
+        "fork",
+        "fstat",
+        "getcwd",
+        "getdents",
+        "getpid",
+        "getppid",
+        "gettimeofday",
+        "mkdir_",
+        "mmap",
+        "mount",
+        "munmap",
+        "open",
+        "openat",
+        "pipe",
+        "read",
+        "sleep",
+        "chdir",
+        // "test_echo",
+        "mkdir_",
+        "times",
+        "umount",
+        "uname",
+        "unlink",
+        "wait",
+        "waitpid",
+        "write",
+        "yield",
+    ];
+
+    let mut total = 0;
+    let mut passed = 0;
+    let mut failed = 0;
+
+    println!("\n==========================================");
+    println!("   Running Single-ELF Suite (/musl/basic)");
+    println!("==========================================\n");
+
+    for (_idx, path) in tests.iter().enumerate() {
+        total += 1;
+        // println!("\n[{}/{}] Running test: {}", idx + 1, tests.len(), path);
+        // println!("------------------------------------------");
+        let status = run_single_binary(path);
+        if status == 0 {
+            passed += 1;
+            // println!("✓ Test PASSED: {}", path);
+        } else {
+            failed += 1;
+            // println!("✗ Test FAILED: {} (status=0x{:x})", path, status);
+        }
+        // println!("------------------------------------------");
+    }
+
+    println!("\n==========================================");
+    println!("   Single-ELF Suite Summary");
     println!("==========================================");
     println!("Total:  {} tests", total);
     println!("Passed: {} tests", passed);
