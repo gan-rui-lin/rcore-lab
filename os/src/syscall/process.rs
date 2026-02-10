@@ -12,7 +12,8 @@ use crate::{
     sbi::shutdown,
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
-        suspend_current_and_run_next,
+        find_task_by_pid, suspend_current_and_run_next, SignalAction, SignalFlags, TaskStatus,
+        MAX_SIG,
     },
     timer::{get_time, get_time_us},
 };
@@ -515,6 +516,108 @@ pub fn sys_set_priority(_prio: isize) -> isize {
         current_task().unwrap().pid.0
     );
     errno(ENOSYS)
+}
+
+pub fn sys_kill(pid: usize, signum: i32) -> isize {
+    let pid_now = current_task().unwrap().pid.0;
+    if crate::syscall::should_trace_syscall(pid_now) {
+        trace!("kernel:pid[{}] sys_kill pid={} signum={}", pid_now, pid, signum);
+    }
+    if signum <= 0 || signum > MAX_SIG as i32 {
+        return errno(EINVAL);
+    }
+    let flag = match SignalFlags::from_bits(1u32 << signum) {
+        Some(flag) => flag,
+        None => return errno(EINVAL),
+    };
+    let task = match find_task_by_pid(pid) {
+        Some(task) => task,
+        None => return errno(ESRCH),
+    };
+    let mut inner = task.inner_exclusive_access();
+    inner.signal_pending |= flag;
+    if flag == SignalFlags::SIGCONT {
+        inner.signal_stopped = false;
+        inner.task_status = TaskStatus::Ready;
+    }
+    if flag == SignalFlags::SIGKILL {
+        inner.signal_stopped = false;
+        inner.task_status = TaskStatus::Ready;
+    }
+    if flag == SignalFlags::SIGSTOP {
+        inner.signal_stopped = true;
+        inner.task_status = TaskStatus::Stopped;
+    }
+    0
+}
+
+pub fn sys_sigaction(
+    signum: i32,
+    action: *const SignalAction,
+    old_action: *mut SignalAction,
+) -> isize {
+    let pid = current_task().unwrap().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_sigaction signum={}", pid, signum);
+    }
+    if signum <= 0
+        || signum > MAX_SIG as i32
+        || signum == SignalFlags::SIGKILL.bits().trailing_zeros() as i32
+    {
+        return errno(EINVAL);
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let idx = signum as usize;
+    let token = inner.memory_set.token();
+    if !old_action.is_null() {
+        let old = inner.signal_actions.table[idx];
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&old as *const SignalAction) as *const u8,
+                core::mem::size_of::<SignalAction>(),
+            )
+        };
+        if let Err(err) = copy_to_user(token, old_action as *mut u8, bytes) {
+            return err;
+        }
+    }
+    if !action.is_null() {
+        let new_action = match read_from_user::<SignalAction>(token, action) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+        inner.signal_actions.table[idx] = new_action;
+    }
+    0
+}
+
+pub fn sys_sigprocmask(mask: u32) -> isize {
+    let pid = current_task().unwrap().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_sigprocmask mask=0x{:x}", pid, mask);
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.signal_mask = SignalFlags::from_bits_truncate(mask);
+    0
+}
+
+pub fn sys_sigreturn() -> isize {
+    let pid = current_task().unwrap().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_sigreturn", pid);
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let saved = match inner.signal_trap_cx.take() {
+        Some(cx) => cx,
+        None => return errno(EINVAL),
+    };
+    let saved_a0 = saved.x[10] as isize;
+    *inner.get_trap_cx() = saved;
+    inner.signal_mask = inner.signal_mask_backup;
+    saved_a0
 }
 
 pub fn sys_shutdown() -> ! {

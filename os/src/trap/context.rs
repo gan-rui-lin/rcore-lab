@@ -2,7 +2,7 @@
 use riscv::register::sstatus::{self, Sstatus, SPP};
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 ///trap context structure containing sstatus, sepc and registers
 pub struct TrapContext {
     /// General-Purpose Register x0-31
