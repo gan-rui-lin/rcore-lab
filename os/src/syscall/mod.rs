@@ -48,6 +48,30 @@ const SYSCALL_EXIT: usize = 93;
 const SYSCALL_NANOSLEEP: usize = 101;
 /// yield syscall
 const SYSCALL_YIELD: usize = 124;
+/// thread_create syscall
+const SYSCALL_THREAD_CREATE: usize = 460;
+/// gettid syscall
+const SYSCALL_GETTID: usize = 178;
+/// waittid syscall
+const SYSCALL_WAITTID: usize = 462;
+/// mutex_create syscall
+const SYSCALL_MUTEX_CREATE: usize = 463;
+/// mutex_lock syscall
+const SYSCALL_MUTEX_LOCK: usize = 464;
+/// mutex_unlock syscall
+const SYSCALL_MUTEX_UNLOCK: usize = 466;
+/// semaphore_create syscall
+const SYSCALL_SEMAPHORE_CREATE: usize = 467;
+/// semaphore_up syscall
+const SYSCALL_SEMAPHORE_UP: usize = 468;
+/// semaphore_down syscall
+const SYSCALL_SEMAPHORE_DOWN: usize = 470;
+/// condvar_create syscall
+const SYSCALL_CONDVAR_CREATE: usize = 471;
+/// condvar_signal syscall
+const SYSCALL_CONDVAR_SIGNAL: usize = 472;
+/// condvar_wait syscall
+const SYSCALL_CONDVAR_WAIT: usize = 473;
 /// kill syscall
 const SYSCALL_KILL: usize = 129;
 /// sigaction syscall
@@ -89,14 +113,18 @@ const SYSCALL_SHUTDOWN: usize = 1001;
 mod errno;
 mod fs;
 mod process;
+mod sync;
+mod thread;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use errno::ENOSYS;
 use fs::*;
 use process::*;
+use sync::*;
+use thread::*;
 
 use crate::fs::Stat;
-use crate::task::{current_task, SignalAction};
+use crate::task::{current_process, SignalAction};
 
 const fn parse_trace_pid(value: &str) -> Option<usize> {
     let bytes = value.as_bytes();
@@ -367,8 +395,8 @@ pub fn should_trace_syscall(pid: usize) -> bool {
         }
     }
     if let Some(target) = TRACE_NAME {
-        let task = current_task().unwrap();
-        let name = task.name();
+        let process = current_process();
+        let name = process.inner_exclusive_access().name.clone();
         return name == target;
     }
     true
@@ -376,9 +404,9 @@ pub fn should_trace_syscall(pid: usize) -> bool {
 
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
-    let task = current_task().unwrap();
-    let pid = task.pid.0;
-    let name = task.name();
+    let process = current_process();
+    let pid = process.pid.0;
+    let name = process.inner_exclusive_access().name.clone();
     let trace = should_trace_syscall(pid);
     let mut known = true;
     let ret = match syscall_id {
@@ -426,6 +454,18 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as u32),
         SYSCALL_SIGRETURN => sys_sigreturn(),
+        SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),
+        SYSCALL_GETTID => sys_gettid(),
+        SYSCALL_WAITTID => sys_waittid(args[0]) as isize,
+        SYSCALL_MUTEX_CREATE => sys_mutex_create(args[0] == 1),
+        SYSCALL_MUTEX_LOCK => sys_mutex_lock(args[0]),
+        SYSCALL_MUTEX_UNLOCK => sys_mutex_unlock(args[0]),
+        SYSCALL_SEMAPHORE_CREATE => sys_semaphore_create(args[0]),
+        SYSCALL_SEMAPHORE_UP => sys_semaphore_up(args[0]),
+        SYSCALL_SEMAPHORE_DOWN => sys_semaphore_down(args[0]),
+        SYSCALL_CONDVAR_CREATE => sys_condvar_create(),
+        SYSCALL_CONDVAR_SIGNAL => sys_condvar_signal(args[0]),
+        SYSCALL_CONDVAR_WAIT => sys_condvar_wait(args[0], args[1]),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETPPID => sys_getppid(),
         SYSCALL_FORK => sys_fork(),

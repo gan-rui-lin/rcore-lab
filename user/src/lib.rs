@@ -360,7 +360,7 @@ pub fn gettid() -> isize {
 pub fn waittid(tid: usize) -> isize {
     loop {
         match sys_waittid(tid) {
-            -2 => {
+            code if code == -EAGAIN => {
                 yield_();
             }
             exit_code => return exit_code,

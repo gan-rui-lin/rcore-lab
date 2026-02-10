@@ -11,8 +11,8 @@ use crate::{
     mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission, VirtAddr},
     sbi::shutdown,
     task::{
-        add_task, current_task, current_user_token, exit_current_and_run_next,
-        find_task_by_pid, suspend_current_and_run_next, SignalAction, SignalFlags, TaskStatus,
+        current_process, current_task, current_user_token, exit_current_and_run_next,
+        pid2process, suspend_current_and_run_next, SignalAction, SignalFlags,
         MAX_SIG,
     },
     timer::{get_time, get_time_us},
@@ -106,7 +106,7 @@ fn read_from_user<T: Copy>(token: usize, src: *const T) -> Result<T, isize> {
 }
 
 pub fn sys_exit(exit_code: i32) -> ! {
-    let pid = current_task().unwrap().pid.0;
+    let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_exit", pid);
     }
@@ -121,13 +121,13 @@ pub fn sys_yield() -> isize {
 }
 
 pub fn sys_getpid() -> isize {
-    trace!("kernel: sys_getpid pid:{}", current_task().unwrap().pid.0);
-    current_task().unwrap().pid.0 as isize
+    trace!("kernel: sys_getpid pid:{}", current_process().pid.0);
+    current_process().pid.0 as isize
 }
 
 pub fn sys_getppid() -> isize {
-    let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
     if let Some(parent) = inner.parent.as_ref().and_then(|p| p.upgrade()) {
         parent.pid.0 as isize
     } else {
@@ -136,25 +136,21 @@ pub fn sys_getppid() -> isize {
 }
 
 pub fn sys_fork() -> isize {
-    let pid = current_task().unwrap().pid.0;
+    let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_fork", pid);
     }
-    let current_task = current_task().unwrap();
-    let new_task = current_task.fork();
-    let new_pid = new_task.pid.0;
-    // modify trap context of new_task, because it returns immediately after switching
+    let current_process = current_process();
+    let new_process = current_process.fork();
+    let new_pid = new_process.pid.0;
+    let new_task = new_process.inner_exclusive_access().get_task(0);
     let trap_cx = new_task.inner_exclusive_access().get_trap_cx();
-    // we do not have to move to next instruction since we have done it before
-    // for child process, fork returns 0
     trap_cx.x[10] = 0;
-    // add new task to scheduler
-    add_task(new_task);
     new_pid as isize
 }
 
 pub fn sys_exec(path: *const u8, mut argv: *const usize, mut envp: *const usize) -> isize {
-    let pid = current_task().unwrap().pid.0;
+    let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_exec", pid);
     }
@@ -195,11 +191,11 @@ pub fn sys_exec(path: *const u8, mut argv: *const usize, mut envp: *const usize)
             }
         }
     }
-    let task = current_task().unwrap();
+    let process = current_process();
     let exec_path = if raw_path.starts_with('/') {
         raw_path.clone()
     } else {
-        let cwd = task.cwd();
+        let cwd = process.inner_exclusive_access().cwd.clone();
         if cwd == "/" {
             format!("/{}", raw_path)
         } else {
@@ -208,8 +204,15 @@ pub fn sys_exec(path: *const u8, mut argv: *const usize, mut envp: *const usize)
     };
     if let Some(app_inode) = open_file(exec_path.as_str(), OpenFlags::empty()) {
         let all_data = app_inode.read_all();
-        task.set_name_from_path(exec_path.as_str());
-        task.exec(all_data.as_slice(), args, envs);
+        {
+            let mut inner = process.inner_exclusive_access();
+            let name = exec_path
+                .rsplit('/')
+                .find(|part| !part.is_empty())
+                .unwrap_or(exec_path.as_str());
+            inner.name = String::from(name);
+        }
+        process.exec(all_data.as_slice(), args, envs);
         0
     } else {
         errno(ENOENT)
@@ -220,24 +223,20 @@ pub fn sys_exec(path: *const u8, mut argv: *const usize, mut envp: *const usize)
 /// Else if there is a child process but it is still running, return -EAGAIN.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     loop {
-        let task = current_task().unwrap();
-        let mut inner = task.inner_exclusive_access();
-        if !inner
-            .children
-            .iter()
-            .any(|p| pid == -1 || pid as usize == p.getpid())
-        {
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        if !inner.children.iter().any(|p| pid == -1 || pid as usize == p.getpid()) {
             return errno(ECHILD);
         }
         let pair = inner.children.iter().enumerate().find(|(_, p)| {
-            p.inner_exclusive_access().is_zombie() && (pid == -1 || pid as usize == p.getpid())
+            p.inner_exclusive_access().is_zombie && (pid == -1 || pid as usize == p.getpid())
         });
         if let Some((idx, _)) = pair {
             let child = inner.children.remove(idx);
             if Arc::strong_count(&child) > 1 {
                 trace!(
                     "kernel:pid[{}] waitpid: child pid {} has {} refs",
-                    task.getpid(),
+                    process.getpid(),
                     child.getpid(),
                     Arc::strong_count(&child)
                 );
@@ -258,7 +257,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    let pid = current_task().unwrap().pid.0;
+    let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_get_time", pid);
     }
@@ -284,7 +283,7 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
 }
 
 pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
-    let pid = current_task().unwrap().pid.0;
+    let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_nanosleep", pid);
     }
@@ -315,7 +314,7 @@ pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
 }
 
 pub fn sys_times(tms: *mut Tms) -> isize {
-    let pid = current_task().unwrap().pid.0;
+    let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_times", pid);
     }
@@ -342,7 +341,7 @@ pub fn sys_times(tms: *mut Tms) -> isize {
 }
 
 pub fn sys_uname(uts: *mut UtsName) -> isize {
-    let pid = current_task().unwrap().pid.0;
+    let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_uname", pid);
     }
@@ -383,7 +382,7 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
     const MAP_FIXED: usize = 0x10;
     const MAP_ANON: usize = 0x20;
 
-    let pid = current_task().unwrap().pid.0;
+    let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_mmap", pid);
     }
@@ -404,8 +403,8 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
         map_perm |= MapPermission::X;
     }
     let len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
     let start = if (flags & MAP_FIXED) != 0 && start != 0 {
         start
     } else {
@@ -423,9 +422,8 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
         if offset % PAGE_SIZE != 0 {
             return errno(EINVAL);
         }
-        let task = current_task().unwrap();
         let inode = {
-            let inner = task.inner_exclusive_access();
+            let inner = process.inner_exclusive_access();
             if fd < inner.fd_table.len() {
                 inner.fd_table[fd]
                     .as_ref()
@@ -453,15 +451,15 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
 
 /// YOUR JOB: Implement munmap.
 pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    let pid = current_task().unwrap().pid.0;
+    let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_munmap", pid);
     }
     if _start % PAGE_SIZE != 0 || _len == 0 {
         return errno(EINVAL);
     }
-    let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
     inner
         .memory_set
         .remove_area_with_start_vpn(VirtAddr(_start).floor());
@@ -470,15 +468,14 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
 
 /// change data segment size
 pub fn sys_sbrk(arg: isize) -> isize {
-    let pid = current_task().unwrap().pid.0;
+    let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_sbrk", pid);
     }
-    let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
     let current_brk = inner.program_brk;
     let heap_bottom = inner.heap_bottom;
-    drop(inner);
     if arg == 0 {
         return current_brk as isize;
     }
@@ -488,11 +485,25 @@ pub fn sys_sbrk(arg: isize) -> isize {
     } else {
         arg
     };
-    if let Some(old_brk) = task.change_program_brk(delta) {
+    let new_brk = (current_brk as isize + delta) as usize;
+    if new_brk < heap_bottom {
+        return errno(ENOMEM);
+    }
+    let result = if delta < 0 {
+        inner
+            .memory_set
+            .shrink_to(VirtAddr(heap_bottom), VirtAddr(new_brk))
+    } else {
+        inner
+            .memory_set
+            .append_to(VirtAddr(heap_bottom), VirtAddr(new_brk))
+    };
+    if result {
+        inner.program_brk = new_brk;
         if is_abs {
             current_brk as isize + delta
         } else {
-            old_brk as isize
+            current_brk as isize
         }
     } else {
         errno(ENOMEM)
@@ -504,7 +515,7 @@ pub fn sys_sbrk(arg: isize) -> isize {
 pub fn sys_spawn(_path: *const u8) -> isize {
     trace!(
         "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+        current_process().pid.0
     );
     errno(ENOSYS)
 }
@@ -513,13 +524,13 @@ pub fn sys_spawn(_path: *const u8) -> isize {
 pub fn sys_set_priority(_prio: isize) -> isize {
     trace!(
         "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+        current_process().pid.0
     );
     errno(ENOSYS)
 }
 
 pub fn sys_kill(pid: usize, signum: i32) -> isize {
-    let pid_now = current_task().unwrap().pid.0;
+    let pid_now = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid_now) {
         trace!("kernel:pid[{}] sys_kill pid={} signum={}", pid_now, pid, signum);
     }
@@ -530,24 +541,12 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
         Some(flag) => flag,
         None => return errno(EINVAL),
     };
-    let task = match find_task_by_pid(pid) {
-        Some(task) => task,
+    let process = match pid2process(pid) {
+        Some(process) => process,
         None => return errno(ESRCH),
     };
-    let mut inner = task.inner_exclusive_access();
+    let mut inner = process.inner_exclusive_access();
     inner.signal_pending |= flag;
-    if flag == SignalFlags::SIGCONT {
-        inner.signal_stopped = false;
-        inner.task_status = TaskStatus::Ready;
-    }
-    if flag == SignalFlags::SIGKILL {
-        inner.signal_stopped = false;
-        inner.task_status = TaskStatus::Ready;
-    }
-    if flag == SignalFlags::SIGSTOP {
-        inner.signal_stopped = true;
-        inner.task_status = TaskStatus::Stopped;
-    }
     0
 }
 
@@ -556,7 +555,7 @@ pub fn sys_sigaction(
     action: *const SignalAction,
     old_action: *mut SignalAction,
 ) -> isize {
-    let pid = current_task().unwrap().pid.0;
+    let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_sigaction signum={}", pid, signum);
     }
@@ -566,8 +565,8 @@ pub fn sys_sigaction(
     {
         return errno(EINVAL);
     }
-    let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
     let idx = signum as usize;
     let token = inner.memory_set.token();
     if !old_action.is_null() {
@@ -593,18 +592,18 @@ pub fn sys_sigaction(
 }
 
 pub fn sys_sigprocmask(mask: u32) -> isize {
-    let pid = current_task().unwrap().pid.0;
+    let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_sigprocmask mask=0x{:x}", pid, mask);
     }
-    let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
     inner.signal_mask = SignalFlags::from_bits_truncate(mask);
     0
 }
 
 pub fn sys_sigreturn() -> isize {
-    let pid = current_task().unwrap().pid.0;
+    let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_sigreturn", pid);
     }
@@ -616,13 +615,15 @@ pub fn sys_sigreturn() -> isize {
     };
     let saved_a0 = saved.x[10] as isize;
     *inner.get_trap_cx() = saved;
-    inner.signal_mask = inner.signal_mask_backup;
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    process_inner.signal_mask = inner.signal_mask_backup;
     saved_a0
 }
 
 pub fn sys_shutdown() -> ! {
     trace!(
         "kernel:pid[{}] sys_shutdown",
-        current_task().unwrap().pid.0);
+        current_process().pid.0);
     shutdown();
 }

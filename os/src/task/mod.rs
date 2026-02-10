@@ -1,204 +1,116 @@
-//! Task management implementation
-//!
-//! Everything about task management, like starting and switching tasks is
-//! implemented here.
-//!
-//! A single global instance of [`TaskManager`] called `TASK_MANAGER` controls
-//! all the tasks in the whole operating system.
-//!
-//! A single global instance of [`Processor`] called `PROCESSOR` monitors running
-//! task(s) for each core.
-//!
-//! A single global instance of `PID_ALLOCATOR` allocates pid for user apps.
-//!
-//! Be careful when you see `__switch` ASM function in `switch.S`. Control flow around this function
-//! might not be what you expect.
+#![allow(missing_docs)]
+
+mod action;
 mod context;
 mod id;
 mod manager;
+mod process;
 mod processor;
-mod switch;
-mod action;
 mod signal;
+mod switch;
 #[allow(clippy::module_inception)]
 #[allow(rustdoc::private_intra_doc_links)]
 mod task;
 
 use crate::fs::{open_file, OpenFlags};
+use crate::sbi::shutdown;
+use crate::timer::remove_timer;
 use alloc::sync::Arc;
-pub use context::TaskContext;
 use lazy_static::*;
-pub use manager::{fetch_task, TaskManager};
+
+use manager::fetch_task;
+use process::ProcessControlBlock;
 use switch::__switch;
+
 pub use action::{SignalAction, SignalActions};
-pub use signal::{SignalFlags, MAX_SIG, SigNumber};
+pub use context::TaskContext;
+pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
+pub use manager::{
+    add_task, pid2process, remove_from_pid2process, remove_task, wakeup_task,
+};
+pub use processor::{
+    current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
+    current_user_token, run_tasks, schedule, take_current_task,
+};
+pub use signal::{SignalFlags, SigNumber, MAX_SIG};
 pub use task::{TaskControlBlock, TaskStatus};
 
-pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-pub use manager::add_task;
-pub use processor::{
-    current_task, current_trap_cx, current_user_token, run_tasks, schedule, take_current_task,
-    Processor,
-};
-
-/// Find a task by pid, searching current task first, then the ready queue.
-pub fn find_task_by_pid(pid: usize) -> Option<Arc<TaskControlBlock>> {
-    if let Some(task) = current_task() {
-        if task.getpid() == pid {
-            return Some(task);
-        }
-    }
-    manager::TASK_MANAGER
-        .exclusive_access()
-        .find_by_pid(pid)
-}
-/// Suspend the current 'Running' task and run the next task in task list.
 pub fn suspend_current_and_run_next() {
-    // There must be an application running.
     let task = take_current_task().unwrap();
-
-    // ---- access current TCB exclusively
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-    // Change status to Ready
-    if task_inner.is_stopped() {
-        task_inner.task_status = TaskStatus::Stopped;
-    } else {
-        task_inner.task_status = TaskStatus::Ready;
-    }
+    task_inner.task_status = TaskStatus::Ready;
     drop(task_inner);
-    // ---- release current PCB
-
-    // push back to ready queue.
     add_task(task);
-    // jump to scheduling cycle
     schedule(task_cx_ptr);
 }
 
-/// pid of usertests app in make run TEST=1
-pub const IDLE_PID: usize = 0;
-
-/// Exit the current 'Running' task and run the next task in task list.
-pub fn exit_current_and_run_next(exit_code: i32) {
-    // take from Processor
+pub fn block_current_and_run_next() {
     let task = take_current_task().unwrap();
+    let mut task_inner = task.inner_exclusive_access();
+    let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
+    task_inner.task_status = TaskStatus::Blocked;
+    drop(task_inner);
+    schedule(task_cx_ptr);
+}
 
-    let pid = task.getpid();
-    if pid == IDLE_PID {
-        println!(
-            "[kernel] Idle process exit with exit_code {} ...",
-            exit_code
-        );
-        panic!("All applications completed!");
-    }
-
-    // **** access current TCB exclusively
-    let mut inner = task.inner_exclusive_access();
-    // Change status to Zombie
-    inner.task_status = TaskStatus::Zombie;
-    // Record exit code
-    inner.exit_code = exit_code;
-    // do not move to its parent but under initproc
-
-    // ++++++ access initproc TCB exclusively
-    {
-        let mut initproc_inner = INITPROC.inner_exclusive_access();
-        for child in inner.children.iter() {
-            child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
-            initproc_inner.children.push(child.clone());
+pub fn exit_current_and_run_next(exit_code: i32) {
+    let task = take_current_task().unwrap();
+    let mut task_inner = task.inner_exclusive_access();
+    let process = task.process.upgrade().unwrap();
+    let tid = task_inner.res.as_ref().unwrap().tid;
+    task_inner.exit_code = Some(exit_code);
+    task_inner.res = None;
+    drop(task_inner);
+    drop(task);
+    if tid == 0 {
+        let pid = process.getpid();
+        if pid == IDLE_PID {
+            shutdown();
+        }
+        remove_from_pid2process(pid);
+        let mut process_inner = process.inner_exclusive_access();
+        process_inner.is_zombie = true;
+        process_inner.exit_code = exit_code;
+        {
+            let mut initproc_inner = INITPROC.inner_exclusive_access();
+            for child in process_inner.children.iter() {
+                child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
+                initproc_inner.children.push(child.clone());
+            }
+        }
+        let mut recycle_res = alloc::vec::Vec::new();
+        for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
+            let task = task.as_ref().unwrap();
+            remove_inactive_task(Arc::clone(&task));
+            let mut task_inner = task.inner_exclusive_access();
+            if let Some(res) = task_inner.res.take() {
+                recycle_res.push(res);
+            }
+        }
+        drop(process_inner);
+        recycle_res.clear();
+        let mut process_inner = process.inner_exclusive_access();
+        process_inner.children.clear();
+        process_inner.memory_set.recycle_data_pages();
+        process_inner.fd_table.clear();
+        while process_inner.tasks.len() > 1 {
+            process_inner.tasks.pop();
         }
     }
-    // ++++++ release parent PCB
-
-    inner.children.clear();
-    // deallocate user space
-    inner.memory_set.recycle_data_pages();
-    // drop file descriptors
-    inner.fd_table.clear();
-    drop(inner);
-    // **** release current PCB
-    // drop task manually to maintain rc correctly
-    drop(task);
-    // we do not have to save task context
+    drop(process);
     let mut _unused = TaskContext::zero_init();
     schedule(&mut _unused as *mut _);
 }
 
-/// Check pending signals for current task and deliver one if needed.
-pub fn handle_signals() {
-    let task = match current_task() {
-        Some(task) => task,
-        None => return,
-    };
-    let mut inner = task.inner_exclusive_access();
-    let pending = inner.signal_pending & !inner.signal_mask;
-    if pending.is_empty() {
-        return;
-    }
-    if inner.signal_trap_cx.is_some() && !pending.contains(SignalFlags::SIGKILL) {
-        return;
-    }
-    let (signum, flag) = if pending.contains(SignalFlags::SIGKILL) {
-        let sigkill_num = SignalFlags::SIGKILL.bits().trailing_zeros() as usize;
-        (sigkill_num, SignalFlags::SIGKILL)
-    } else {
-        let signum = pending.bits().trailing_zeros() as usize;
-        let flag = match SignalFlags::from_bits(1u32 << signum) {
-            Some(flag) => flag,
-            None => return,
-        };
-        (signum, flag)
-    };
-    inner.signal_pending.remove(flag);
-
-    if signum == SignalFlags::SIGCONT.bits().trailing_zeros() as usize {
-        inner.signal_stopped = false;
-        inner.task_status = TaskStatus::Ready;
-        return;
-    }
-
-    if signum == SignalFlags::SIGSTOP.bits().trailing_zeros() as usize {
-        inner.signal_stopped = true;
-        inner.task_status = TaskStatus::Stopped;
-        drop(inner);
-        suspend_current_and_run_next();
-        return;
-    }
-
-    if signum == SignalFlags::SIGKILL.bits().trailing_zeros() as usize {
-        drop(inner);
-        exit_current_and_run_next(-(SigNumber::SigKill as i32));
-        return;
-    }
-
-    let action = inner.signal_actions.table[signum];
-    if action.handler == 0 {
-        drop(inner);
-        exit_current_and_run_next(-(signum as i32));
-        return;
-    }
-
-    if inner.signal_trap_cx.is_none() {
-        inner.signal_trap_cx = Some(*inner.get_trap_cx());
-        inner.signal_mask_backup = inner.signal_mask;
-        inner.signal_mask |= action.mask | flag;
-    }
-    let trap_cx = inner.get_trap_cx();
-    trap_cx.sepc = action.handler;
-}
-
 lazy_static! {
-    /// Creation of initial process
-    ///
-    /// the name "initproc" may be changed to any other app name like "usertests",
-    /// but we have user_shell, so we don't need to change it.
-    pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
+    pub static ref INITPROC: Arc<ProcessControlBlock> = {
         let v = open_file("initcode", OpenFlags::empty())
             .or_else(|| open_file("ch6b_initproc", OpenFlags::empty()))
             .map(|inode| inode.read_all())
             .unwrap_or_else(|| INITPROC_EMBED.to_vec());
-        TaskControlBlock::new(v.as_slice())
-    });
+        ProcessControlBlock::new(v.as_slice())
+    };
 }
 
 #[cfg(debug_assertions)]
@@ -212,7 +124,85 @@ const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
     "/../user/target/riscv64gc-unknown-none-elf/release/initcode"
 ));
 
-///Add init process to the manager
 pub fn add_initproc() {
-    add_task(INITPROC.clone());
+    let _initproc = INITPROC.clone();
+}
+
+pub fn current_add_signal(signal: SignalFlags) {
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    process_inner.signal_pending |= signal;
+}
+
+pub fn handle_signals() {
+    let task = match current_task() {
+        Some(task) => task,
+        None => return,
+    };
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    let pending = process_inner.signal_pending & !process_inner.signal_mask;
+    if pending.is_empty() {
+        return;
+    }
+    let mut task_inner = task.inner_exclusive_access();
+    if task_inner.signal_trap_cx.is_some() && !pending.contains(SignalFlags::SIGKILL) {
+        return;
+    }
+    let (signum, flag) = if pending.contains(SignalFlags::SIGKILL) {
+        let sigkill_num = SignalFlags::SIGKILL.bits().trailing_zeros() as usize;
+        (sigkill_num, SignalFlags::SIGKILL)
+    } else {
+        let signum = pending.bits().trailing_zeros() as usize;
+        let flag = match SignalFlags::from_bits(1u32 << signum) {
+            Some(flag) => flag,
+            None => return,
+        };
+        (signum, flag)
+    };
+    process_inner.signal_pending.remove(flag);
+
+    if signum == SignalFlags::SIGSTOP.bits().trailing_zeros() as usize {
+        drop(task_inner);
+        drop(process_inner);
+        block_current_and_run_next();
+        return;
+    }
+
+    if signum == SignalFlags::SIGKILL.bits().trailing_zeros() as usize {
+        drop(task_inner);
+        drop(process_inner);
+        exit_current_and_run_next(-(SigNumber::SigKill as i32));
+        return;
+    }
+
+    let action = process_inner.signal_actions.table[signum];
+    if action.handler == 0 {
+        drop(task_inner);
+        drop(process_inner);
+        exit_current_and_run_next(-(signum as i32));
+        return;
+    }
+
+    if task_inner.signal_trap_cx.is_none() {
+        task_inner.signal_trap_cx = Some(*task_inner.get_trap_cx());
+        task_inner.signal_mask_backup = process_inner.signal_mask;
+        process_inner.signal_mask |= action.mask | flag;
+    }
+    let trap_cx = task_inner.get_trap_cx();
+    trap_cx.sepc = action.handler;
+}
+
+pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
+    remove_task(Arc::clone(&task));
+    remove_timer(Arc::clone(&task));
+}
+
+pub fn block_and_yield() {
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    process_inner.signal_pending.remove(SignalFlags::SIGCONT);
+    drop(process_inner);
+    block_current_and_run_next();
+
 }
