@@ -23,7 +23,25 @@ impl TaskManager {
     }
     /// Take a process out of the ready queue
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        let total = self.ready_queue.len();
+        for _ in 0..total {
+            if let Some(task) = self.ready_queue.pop_front() {
+                if task.inner_exclusive_access().is_stopped() {
+                    self.ready_queue.push_back(task);
+                    continue;
+                }
+                return Some(task);
+            }
+        }
+        None
+    }
+
+    /// Find a task by pid in the ready queue.
+    pub fn find_by_pid(&self, pid: usize) -> Option<Arc<TaskControlBlock>> {
+        self.ready_queue
+            .iter()
+            .find(|task| task.pid.0 == pid)
+            .cloned()
     }
 }
 

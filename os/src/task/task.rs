@@ -1,6 +1,6 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
-use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
+use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle, SignalActions, SignalFlags};
 use crate::config::TRAP_CONTEXT_BASE;
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
@@ -167,6 +167,19 @@ pub struct TaskControlBlockInner {
 
     /// Next mmap base
     pub mmap_base: usize,
+
+    /// Pending signals
+    pub signal_pending: SignalFlags,
+    /// Blocked signal mask
+    pub signal_mask: SignalFlags,
+    /// Signal actions table
+    pub signal_actions: SignalActions,
+    /// Saved trap context for sigreturn
+    pub signal_trap_cx: Option<TrapContext>,
+    /// Saved signal mask for sigreturn
+    pub signal_mask_backup: SignalFlags,
+    /// Current task is stopped by SIGSTOP
+    pub signal_stopped: bool,
 }
 
 impl TaskControlBlockInner {
@@ -181,6 +194,9 @@ impl TaskControlBlockInner {
     }
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
+    }
+    pub fn is_stopped(&self) -> bool {
+        self.signal_stopped
     }
     pub fn alloc_fd(&mut self) -> usize {
         if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
@@ -237,6 +253,12 @@ impl TaskControlBlock {
                     program_brk: user_stack_top,
                     cwd: String::from("/"),
                     mmap_base: DEFAULT_MMAP_BASE,
+                    signal_pending: SignalFlags::empty(),
+                    signal_mask: SignalFlags::empty(),
+                    signal_actions: SignalActions::default(),
+                    signal_trap_cx: None,
+                    signal_mask_backup: SignalFlags::empty(),
+                    signal_stopped: false,
                 })
             },
         };
@@ -349,6 +371,12 @@ impl TaskControlBlock {
                     program_brk: parent_inner.program_brk,
                     cwd: parent_inner.cwd.clone(),
                     mmap_base: parent_inner.mmap_base,
+                    signal_pending: SignalFlags::empty(),
+                    signal_mask: parent_inner.signal_mask,
+                    signal_actions: parent_inner.signal_actions.clone(),
+                    signal_trap_cx: None,
+                    signal_mask_backup: SignalFlags::empty(),
+                    signal_stopped: false,
                 })
             },
         });
@@ -409,6 +437,8 @@ pub enum TaskStatus {
     Ready,
     /// running
     Running,
+    /// stopped by signal
+    Stopped,
     /// exited
     Zombie,
 }

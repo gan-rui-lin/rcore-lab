@@ -48,6 +48,14 @@ const SYSCALL_EXIT: usize = 93;
 const SYSCALL_NANOSLEEP: usize = 101;
 /// yield syscall
 const SYSCALL_YIELD: usize = 124;
+/// kill syscall
+const SYSCALL_KILL: usize = 129;
+/// sigaction syscall
+const SYSCALL_SIGACTION: usize = 134;
+/// sigprocmask syscall
+const SYSCALL_SIGPROCMASK: usize = 135;
+/// sigreturn syscall
+const SYSCALL_SIGRETURN: usize = 139;
 /// setpriority syscall
 const SYSCALL_SET_PRIORITY: usize = 140;
 /// times syscall
@@ -88,7 +96,7 @@ use fs::*;
 use process::*;
 
 use crate::fs::Stat;
-use crate::task::current_task;
+use crate::task::{current_task, SignalAction};
 
 const fn parse_trace_pid(value: &str) -> Option<usize> {
     let bytes = value.as_bytes();
@@ -410,6 +418,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const TimeSpec, args[1] as *mut TimeSpec),
         SYSCALL_YIELD => sys_yield(),
+        SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
+        SYSCALL_SIGACTION => sys_sigaction(
+            args[0] as i32,
+            args[1] as *const SignalAction,
+            args[2] as *mut SignalAction,
+        ),
+        SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as u32),
+        SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETPPID => sys_getppid(),
         SYSCALL_FORK => sys_fork(),
