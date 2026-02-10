@@ -1,64 +1,77 @@
-//!Implementation of [`TaskManager`]
-use super::TaskControlBlock;
+#![allow(missing_docs)]
+
+use super::{ProcessControlBlock, TaskControlBlock, TaskStatus};
 use crate::sync::UPSafeCell;
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use lazy_static::*;
-///A array of `TaskControlBlock` that is thread-safe
+
 pub struct TaskManager {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
-/// A simple FIFO scheduler.
 impl TaskManager {
-    ///Creat an empty TaskManager
     pub fn new() -> Self {
         Self {
             ready_queue: VecDeque::new(),
         }
     }
-    /// Add process back to ready queue
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
         self.ready_queue.push_back(task);
     }
-    /// Take a process out of the ready queue
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        let total = self.ready_queue.len();
-        for _ in 0..total {
-            if let Some(task) = self.ready_queue.pop_front() {
-                if task.inner_exclusive_access().is_stopped() {
-                    self.ready_queue.push_back(task);
-                    continue;
-                }
-                return Some(task);
-            }
-        }
-        None
+        self.ready_queue.pop_front()
     }
-
-    /// Find a task by pid in the ready queue.
-    pub fn find_by_pid(&self, pid: usize) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue
+    pub fn remove(&mut self, task: Arc<TaskControlBlock>) {
+        if let Some((id, _)) = self
+            .ready_queue
             .iter()
-            .find(|task| task.pid.0 == pid)
-            .cloned()
+            .enumerate()
+            .find(|(_, t)| Arc::as_ptr(t) == Arc::as_ptr(&task))
+        {
+            self.ready_queue.remove(id);
+        }
     }
 }
 
 lazy_static! {
-    /// TASK_MANAGER instance through lazy_static!
     pub static ref TASK_MANAGER: UPSafeCell<TaskManager> =
         unsafe { UPSafeCell::new(TaskManager::new()) };
+    pub static ref PID2PCB: UPSafeCell<BTreeMap<usize, Arc<ProcessControlBlock>>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
 }
 
-/// Add process to ready queue
 pub fn add_task(task: Arc<TaskControlBlock>) {
-    //trace!("kernel: TaskManager::add_task");
     TASK_MANAGER.exclusive_access().add(task);
 }
 
-/// Take a process out of the ready queue
+pub fn wakeup_task(task: Arc<TaskControlBlock>) {
+    let mut task_inner = task.inner_exclusive_access();
+    task_inner.task_status = TaskStatus::Ready;
+    drop(task_inner);
+    add_task(task);
+}
+
+pub fn remove_task(task: Arc<TaskControlBlock>) {
+    TASK_MANAGER.exclusive_access().remove(task);
+}
+
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
-    //trace!("kernel: TaskManager::fetch_task");
     TASK_MANAGER.exclusive_access().fetch()
+}
+
+pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
+    let map = PID2PCB.exclusive_access();
+    map.get(&pid).map(Arc::clone)
+}
+
+pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
+    PID2PCB.exclusive_access().insert(pid, process);
+}
+
+pub fn remove_from_pid2process(pid: usize) {
+    let mut map = PID2PCB.exclusive_access();
+    if map.remove(&pid).is_none() {
+        panic!("cannot find pid {} in pid2process!", pid);
+    }
 }

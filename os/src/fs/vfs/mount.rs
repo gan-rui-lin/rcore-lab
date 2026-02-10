@@ -3,6 +3,7 @@
 use super::core::ROOT_VFS;
 use super::easyfs::easyfs_root;
 use super::fat32::fat32_root;
+#[cfg(feature = "ext4")]
 use crate::drivers::BLOCK_DEVICE;
 
 #[cfg(feature = "ext4")]
