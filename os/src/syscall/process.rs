@@ -244,7 +244,8 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
             let found_pid = child.getpid();
             let exit_code = child.inner_exclusive_access().exit_code;
             if !exit_code_ptr.is_null() {
-                *translated_refmut(inner.memory_set.token(), exit_code_ptr) = exit_code;
+                let status = (exit_code & 0xff) << 8;
+                *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
             }
             return found_pid as isize;
         }
