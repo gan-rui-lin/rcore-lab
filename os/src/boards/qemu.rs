@@ -1,79 +1,75 @@
-//ref:: https://github.com/andre-richter/qemu-exit
-use core::arch::asm;
+/// QEMU virt machine clock frequency (Hz).
+pub const CLOCK_FREQ: usize = 12500000;
+/// QEMU virt machine physical memory end.
+pub const MEMORY_END: usize = 0x8800_0000;
 
-const EXIT_SUCCESS: u32 = 0x5555; // Equals `exit(0)`. qemu successful exit
+/// QEMU virt machine MMIO ranges.
+pub const MMIO: &[(usize, usize)] = &[
+    (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine
+    (0x2000000, 0x10000),
+    (0xc000000, 0x210000), // VIRT_PLIC in virt machine
+    (0x10000000, 0x9000),  // VIRT_UART0 with GPU  in virt machine
+];
 
-const EXIT_FAILURE_FLAG: u32 = 0x3333;
-const EXIT_FAILURE: u32 = exit_code_encode(1); // Equals `exit(1)`. qemu failed exit
-const EXIT_RESET: u32 = 0x7777; // qemu reset
+/// Block device implementation on this board.
+pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
+/// UART device implementation on this board.
+pub type CharDeviceImpl = crate::drivers::chardev::NS16550a<VIRT_UART>;
 
-pub trait QEMUExit {
-    /// Exit with specified return code.
-    ///
-    /// Note: For `X86`, code is binary-OR'ed with `0x1` inside QEMU.
-    fn exit(&self, code: u32) -> !;
+/// PLIC base address on QEMU virt machine.
+pub const VIRT_PLIC: usize = 0xC00_0000;
+/// UART base address on QEMU virt machine.
+pub const VIRT_UART: usize = 0x1000_0000;
+/// VirtIO block device base address on QEMU virt machine.
+pub const VIRTIO_BLK: usize = 0x1000_1000;
+/// VirtIO block device IRQ on QEMU virt machine.
+pub const VIRTIO_BLK_IRQ: u32 = 1;
+#[allow(unused)]
+/// VirtIO net device IRQ on QEMU virt machine.
+pub const VIRTIO_NET_IRQ: u32 = 2;
+/// UART IRQ on QEMU virt machine.
+pub const VIRT_UART_IRQ: u32 = 10;
+#[allow(unused)]
+/// Default virtio-gpu horizontal resolution (pixels).
+pub const VIRTGPU_XRES: u32 = 1280;
+#[allow(unused)]
+/// Default virtio-gpu vertical resolution (pixels).
+pub const VIRTGPU_YRES: u32 = 800;
 
-    /// Exit QEMU using `EXIT_SUCCESS`, aka `0`, if possible.
-    ///
-    /// Note: Not possible for `X86`.
-    fn exit_success(&self) -> !;
+use crate::drivers::block::BLOCK_DEVICE;
+use crate::drivers::chardev::{CharDevice, UART};
+use crate::drivers::plic::{IntrTargetPriority, PLIC};
+use crate::drivers::{KEYBOARD_DEVICE, MOUSE_DEVICE};
 
-    /// Exit QEMU using `EXIT_FAILURE`, aka `1`.
-    fn exit_failure(&self) -> !;
-}
-
-/// RISCV64 configuration
-pub struct RISCV64 {
-    /// Address of the sifive_test mapped device.
-    addr: u64,
-}
-
-/// Encode the exit code using EXIT_FAILURE_FLAG.
-const fn exit_code_encode(code: u32) -> u32 {
-    (code << 16) | EXIT_FAILURE_FLAG
-}
-
-impl RISCV64 {
-    /// Create an instance.
-    pub const fn new(addr: u64) -> Self {
-        RISCV64 { addr }
+/// Initialize board-level devices and PLIC routing.
+pub fn device_init() {
+    use riscv::register::sie;
+    let mut plic = unsafe { PLIC::new(VIRT_PLIC) }; // 创建 PLIC 访问器
+    let hart_id: usize = 0; // 单核环境使用 hart 0
+    let supervisor = IntrTargetPriority::Supervisor;
+    let machine = IntrTargetPriority::Machine;
+    plic.set_threshold(hart_id, supervisor, 0); // S 态阈值设为 0，放开所有优先级
+    plic.set_threshold(hart_id, machine, 1); // M 态阈值提高，避免接管这些中断
+    // Enable IRQs for devices that are actually attached.
+    for intr_src_id in [VIRTIO_BLK_IRQ, VIRT_UART_IRQ] {
+        plic.enable(hart_id, supervisor, intr_src_id as usize); // 让该 IRQ 送达 S 态
+        plic.set_priority(intr_src_id as usize, 1); // 设置 IRQ 优先级
+    }
+    unsafe {
+        sie::set_sext(); // 开启 S 态外部中断
     }
 }
 
-impl QEMUExit for RISCV64 {
-    /// Exit qemu with specified exit code.
-    fn exit(&self, code: u32) -> ! {
-        // If code is not a special value, we need to encode it with EXIT_FAILURE_FLAG.
-        let code_new = match code {
-            EXIT_SUCCESS | EXIT_FAILURE | EXIT_RESET => code,
-            _ => exit_code_encode(code),
-        };
-
-        unsafe {
-            asm!(
-                "sw {0}, 0({1})",
-                in(reg)code_new, in(reg)self.addr
-            );
-
-            // For the case that the QEMU exit attempt did not work, transition into an infinite
-            // loop. Calling `panic!()` here is unfeasible, since there is a good chance
-            // this function here is the last expression in the `panic!()` handler
-            // itself. This prevents a possible infinite loop.
-            loop {
-                asm!("wfi", options(nomem, nostack));
-            }
-        }
+/// Dispatch a PLIC interrupt to the corresponding device handler.
+pub fn irq_handler() {
+    let mut plic = unsafe { PLIC::new(VIRT_PLIC) }; // 创建 PLIC 访问器，处理中断
+    let intr_src_id = plic.claim(0, IntrTargetPriority::Supervisor); // 领取 hart 0 的挂起 IRQ
+    match intr_src_id { // 分发到具体设备处理函数
+        5 => KEYBOARD_DEVICE.handle_irq(), // 键盘输入
+        6 => MOUSE_DEVICE.handle_irq(), // 鼠标输入
+        VIRTIO_BLK_IRQ => BLOCK_DEVICE.handle_irq(), // virtio 块设备
+        VIRT_UART_IRQ => UART.handle_irq(), // 串口控制台
+        _ => panic!("unsupported IRQ {}", intr_src_id), // 未知 IRQ
     }
-
-    fn exit_success(&self) -> ! {
-        self.exit(EXIT_SUCCESS);
-    }
-
-    fn exit_failure(&self) -> ! {
-        self.exit(EXIT_FAILURE);
-    }
+    plic.complete(0, IntrTargetPriority::Supervisor, intr_src_id); // 完成中断，重新使能该 IRQ
 }
-
-const VIRT_TEST: u64 = 0x100000;
-
-pub const QEMU_EXIT_HANDLE: RISCV64 = RISCV64::new(VIRT_TEST);

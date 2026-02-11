@@ -420,11 +420,9 @@ impl Ext4File {
                 sss[..len].copy_from_slice(&dentry.name[..len]);
                 sss[len] = 0;
 
-                debug!(
-                    "  {} {}",
-                    dentry.inode_type,
-                    core::str::from_utf8(&sss).unwrap()
-                );
+                let name_str = core::str::from_utf8(&sss[..len])
+                    .unwrap_or("<invalid-utf8>");
+                debug!("  {} {}", dentry.inode_type, name_str);
                 /*   let mut dname: Vec<u8> =
                     Vec::from_raw_parts(&mut dentry.name as *mut u8, len, len + 1);
                 dname.push(0);

@@ -78,6 +78,11 @@ impl ProcessControlBlock {
         self.inner.exclusive_access()
     }
 
+    /// Try to borrow the process inner state; returns None if already borrowed.
+    pub fn try_inner_exclusive_access(&self) -> Option<RefMut<'_, ProcessControlBlockInner>> {
+        self.inner.try_exclusive_access()
+    }
+
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
         let (memory_set, user_stack_top, entry_point) = MemorySet::from_elf(elf_data);
         let ustack_base = user_stack_top.saturating_sub(USER_STACK_SIZE);

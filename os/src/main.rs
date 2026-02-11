@@ -34,7 +34,10 @@ extern crate alloc;
 
 #[macro_use]
 mod console;
+#[path = "boards/qemu.rs"]
+mod board;
 pub mod config;
+/// Device drivers and device manager glue.
 pub mod drivers;
 pub mod fs;
 pub mod lang_items;
@@ -46,6 +49,9 @@ pub mod syscall;
 pub mod task;
 pub mod timer;
 pub mod trap;
+
+use lazy_static::lazy_static;
+use sync::UPIntrFreeCell;
 
 use core::arch::global_asm;
 
@@ -62,6 +68,12 @@ fn clear_bss() {
     }
 }
 
+lazy_static! {
+    /// Switch between polling and interrupt-driven block I/O.
+    pub static ref DEV_NON_BLOCKING_ACCESS: UPIntrFreeCell<bool> =
+        unsafe { UPIntrFreeCell::new(false) };
+}
+
 #[no_mangle]
 /// the rust entry-point of os
 pub fn rust_main() -> ! {
@@ -73,6 +85,7 @@ pub fn rust_main() -> ! {
     trap::init();
     trap::enable_timer_interrupt();
     timer::set_next_trigger();
+    board::device_init();
     #[cfg(feature = "ext4")]
     if fs::mount_ext4_auto() {
         info!("[kernel] ext4 mounted as root");
@@ -89,6 +102,7 @@ pub fn rust_main() -> ! {
     }
     fs::list_apps();
     task::add_initproc();
+    *DEV_NON_BLOCKING_ACCESS.exclusive_access() = true;
     task::run_tasks();
     panic!("Unreachable in rust_main!");
 }

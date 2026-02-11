@@ -14,6 +14,7 @@ SECTIONS
         strampoline = .;
         *(.text.trampoline);
         . = ALIGN(4K);
+        KEEP(*(.text.keep))
         *(.text .text.*)
     }
 

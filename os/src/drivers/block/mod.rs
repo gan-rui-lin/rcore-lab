@@ -1,22 +1,19 @@
-//! virtio_blk device driver
-
 mod virtio_blk;
 
 pub use virtio_blk::VirtIOBlock;
 
+use crate::board::BlockDeviceImpl;
 use alloc::sync::Arc;
 use easy_fs::BlockDevice;
 use lazy_static::*;
 
-type BlockDeviceImpl = virtio_blk::VirtIOBlock;
-
 lazy_static! {
-    /// The global block device driver instance: BLOCK_DEVICE with BlockDevice trait
+    /// Global block device instance.
     pub static ref BLOCK_DEVICE: Arc<dyn BlockDevice> = Arc::new(BlockDeviceImpl::new());
 }
 
+/// Basic read/write test for the block device.
 #[allow(unused)]
-/// Test the block device
 pub fn block_device_test() {
     let block_device = BLOCK_DEVICE.clone();
     let mut write_buffer = [0u8; 512];

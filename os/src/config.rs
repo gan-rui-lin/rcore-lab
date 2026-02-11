@@ -17,9 +17,5 @@ pub const PAGE_SIZE_BITS: usize = 0xc;
 pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
 /// the virtual addr of trap context
 pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;
-/// clock frequency
-pub const CLOCK_FREQ: usize = 12500000;
-/// the physical memory end
-pub const MEMORY_END: usize = 0x88000000;
-/// The base address of control registers in Virtio_Block device
-pub const MMIO: &[(usize, usize)] = &[(0x10001000, 0x1000)];
+/// clock frequency, memory end, and MMIO ranges are board-specific
+pub use crate::board::{CLOCK_FREQ, MEMORY_END, MMIO};
