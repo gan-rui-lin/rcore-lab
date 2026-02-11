@@ -16,6 +16,11 @@ impl TaskControlBlock {
         self.inner.exclusive_access()
     }
 
+    /// Try to borrow the task inner state; returns None if already borrowed.
+    pub fn try_inner_exclusive_access(&self) -> Option<RefMut<'_, TaskControlBlockInner>> {
+        self.inner.try_exclusive_access()
+    }
+
     pub fn get_user_token(&self) -> usize {
         let process = self.process.upgrade().unwrap();
         let inner = process.inner_exclusive_access();

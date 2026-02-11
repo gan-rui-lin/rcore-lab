@@ -1,85 +1,90 @@
 use super::BlockDevice;
-use crate::mm::{
-    frame_alloc, frame_dealloc, kernel_token, FrameTracker, PageTable, PhysAddr, PhysPageNum,
-    StepByOne, VirtAddr,
-};
-use crate::sync::UPSafeCell;
-use alloc::vec::Vec;
-use lazy_static::*;
-use virtio_drivers::{Hal, VirtIOBlk, VirtIOHeader};
+use crate::board::VIRTIO_BLK;
+use crate::DEV_NON_BLOCKING_ACCESS;
+use crate::drivers::bus::virtio::VirtioHal;
+use crate::sync::{Condvar, UPIntrFreeCell};
+use crate::task::schedule;
+use alloc::collections::BTreeMap;
+use virtio_drivers::{BlkResp, RespStatus, VirtIOBlk, VirtIOHeader};
 
-/// The base address of control registers in Virtio_Block device
 #[allow(unused)]
-const VIRTIO0: usize = 0x10001000;
-/// VirtIOBlock device driver strcuture for virtio_blk device
-pub struct VirtIOBlock(UPSafeCell<VirtIOBlk<'static, VirtioHal>>);
+const VIRTIO0: usize = VIRTIO_BLK;
 
-lazy_static! {
-    static ref QUEUE_FRAMES: UPSafeCell<Vec<FrameTracker>> = unsafe { UPSafeCell::new(Vec::new()) };
+/// VirtIO block device wrapper with interrupt-driven I/O support.
+pub struct VirtIOBlock {
+    virtio_blk: UPIntrFreeCell<VirtIOBlk<'static, VirtioHal>>,
+    condvars: BTreeMap<u16, Condvar>,
 }
 
 impl BlockDevice for VirtIOBlock {
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
-        self.0
-            .exclusive_access()
-            .read_block(block_id, buf)
-            .expect("Error when reading VirtIOBlk");
+        let nb = *DEV_NON_BLOCKING_ACCESS.exclusive_access();
+        if nb {
+            let mut resp = BlkResp::default();
+            let task_cx_ptr = self.virtio_blk.exclusive_session(|blk| {
+                let token = unsafe { blk.read_block_nb(block_id, buf, &mut resp).unwrap() };
+                self.condvars.get(&token).unwrap().wait_no_sched()
+            });
+            schedule(task_cx_ptr);
+            assert_eq!(
+                resp.status(),
+                RespStatus::Ok,
+                "Error when reading VirtIOBlk"
+            );
+        } else {
+            self.virtio_blk
+                .exclusive_access()
+                .read_block(block_id, buf)
+                .expect("Error when reading VirtIOBlk");
+        }
     }
     fn write_block(&self, block_id: usize, buf: &[u8]) {
-        self.0
-            .exclusive_access()
-            .write_block(block_id, buf)
-            .expect("Error when writing VirtIOBlk");
+        let nb = *DEV_NON_BLOCKING_ACCESS.exclusive_access();
+        if nb {
+            let mut resp = BlkResp::default();
+            let task_cx_ptr = self.virtio_blk.exclusive_session(|blk| {
+                let token = unsafe { blk.write_block_nb(block_id, buf, &mut resp).unwrap() };
+                self.condvars.get(&token).unwrap().wait_no_sched()
+            });
+            schedule(task_cx_ptr);
+            assert_eq!(
+                resp.status(),
+                RespStatus::Ok,
+                "Error when writing VirtIOBlk"
+            );
+        } else {
+            self.virtio_blk
+                .exclusive_access()
+                .write_block(block_id, buf)
+                .expect("Error when writing VirtIOBlk");
+        }
+    }
+    fn handle_irq(&self) {
+        self.virtio_blk.exclusive_session(|blk| {
+            while let Ok(token) = blk.pop_used() {
+                self.condvars.get(&token).unwrap().signal();
+            }
+        });
     }
 }
 
 impl VirtIOBlock {
-    #[allow(unused)]
-    /// Create a new VirtIOBlock driver with VIRTIO0 base_addr for virtio_blk device
+    /// Create a new VirtIO block device wrapper.
     pub fn new() -> Self {
-        unsafe {
-            Self(UPSafeCell::new(
+        let virtio_blk = unsafe {
+            UPIntrFreeCell::new(
                 VirtIOBlk::<VirtioHal>::new(&mut *(VIRTIO0 as *mut VirtIOHeader)).unwrap(),
-            ))
+            )
+        };
+        let mut condvars = BTreeMap::new();
+        let channels = virtio_blk.exclusive_access().virt_queue_size();
+        for i in 0..channels {
+            let condvar = Condvar::new();
+            condvars.insert(i, condvar);
         }
-    }
-}
-
-pub struct VirtioHal;
-
-impl Hal for VirtioHal {
-    fn dma_alloc(pages: usize) -> usize {
-        let mut ppn_base = PhysPageNum(0);
-        for i in 0..pages {
-            let frame = frame_alloc().unwrap();
-            if i == 0 {
-                ppn_base = frame.ppn;
-            }
-            assert_eq!(frame.ppn.0, ppn_base.0 + i);
-            QUEUE_FRAMES.exclusive_access().push(frame);
+        Self {
+            virtio_blk,
+            condvars,
         }
-        let pa: PhysAddr = ppn_base.into();
-        pa.0
-    }
-
-    fn dma_dealloc(pa: usize, pages: usize) -> i32 {
-        let pa = PhysAddr::from(pa);
-        let mut ppn_base: PhysPageNum = pa.into();
-        for _ in 0..pages {
-            frame_dealloc(ppn_base);
-            ppn_base.step();
-        }
-        0
-    }
-
-    fn phys_to_virt(addr: usize) -> usize {
-        addr
-    }
-
-    fn virt_to_phys(vaddr: usize) -> usize {
-        PageTable::from_token(kernel_token())
-            .translate_va(VirtAddr::from(vaddr))
-            .unwrap()
-            .0
     }
 }

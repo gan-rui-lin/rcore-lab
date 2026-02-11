@@ -19,6 +19,18 @@ pub struct TrapContext {
     pub trap_handler: usize,
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+/// Trap context structure for traps/interrupts from kernel mode
+pub(super) struct KernelTrapContext {
+    /// General-Purpose Register x0-31
+    pub x: [usize; 32],
+    /// Supervisor Status Register
+    pub sstatus: Sstatus,
+    /// Supervisor Exception Program Counter
+    pub sepc: usize,
+}
+
 impl TrapContext {
     /// put the sp(stack pointer) into x\[2\] field of TrapContext
     pub fn set_sp(&mut self, sp: usize) {

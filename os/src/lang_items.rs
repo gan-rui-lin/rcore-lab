@@ -1,5 +1,6 @@
 //! The panic handler
 
+#[allow(unused_imports)]
 use crate::sbi::shutdown;
 use core::panic::PanicInfo;
 

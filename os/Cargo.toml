@@ -17,6 +17,9 @@ virtio-drivers = { path = "../vendor/virtio-drivers-old" }
 easy-fs = { path = "../easy-fs" }
 lwext4_rust = { path = "../vendor/lwext4_rust", default-features = false, optional = true }
 fatfs = { path = "../vendor/rust-fatfs", default-features = false, features = ["alloc", "lfn", "unicode"] }
+volatile = { path = "../vendor/volatile-0.3.0" }
 
+[patch.crates-io]
+volatile = { path = "../vendor/volatile-0.3.0" }
 [features]
 ext4 = ["lwext4_rust"]
