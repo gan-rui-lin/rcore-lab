@@ -1,7 +1,7 @@
 use crate::{
-    mm::kernel_token,
+    mm::{kernel_token, translated_refmut},
     syscall::errno::{errno, EAGAIN, ECHILD},
-    task::{TaskControlBlock, add_task, current_task},
+    task::{TaskControlBlock, add_task, current_task, current_user_token},
     trap::{TrapContext, trap_handler},
 };
 use alloc::sync::Arc;
@@ -44,34 +44,28 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
 }
 
 pub fn sys_gettid() -> isize {
-    let task = current_task().unwrap();
-    let task_inner = task.inner_exclusive_access();
-    let tid = task_inner.res.as_ref().unwrap().tid;
-
-    // In Linux, the main thread's TID equals the PID
-    // Our main thread has TID 0, so return PID for main thread
-    if tid == 0 {
-        let process = task.process.upgrade().unwrap();
-        process.getpid() as isize
-    } else {
-        tid as isize
-    }
+    current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .res
+        .as_ref()
+        .unwrap()
+        .tid as isize
 }
 
-pub fn sys_set_tid_address(tidptr: usize) -> isize {
-    let task = current_task().unwrap();
-    let mut task_inner = task.inner_exclusive_access();
-    task_inner.clear_child_tid = tidptr;
-    let tid = task_inner.res.as_ref().unwrap().tid;
-
-    // In Linux, the main thread's TID equals the PID
-    // Our main thread has TID 0, so return PID for main thread
-    if tid == 0 {
-        let process = task.process.upgrade().unwrap();
-        process.getpid() as isize
-    } else {
-        tid as isize
+pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
+    let tid = current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .res
+        .as_ref()
+        .unwrap()
+        .tid as i32;
+    if !tidptr.is_null() {
+        let token = current_user_token();
+        *translated_refmut(token, tidptr) = tid;
     }
+    tid as isize
 }
 
 /// thread does not exist, return -ECHILD

@@ -453,6 +453,7 @@ impl MemorySet {
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
+    start_va: VirtAddr,
     vpn_range: VPNRange,
     data_frames: BTreeMap<VirtPageNum, FrameTracker>,
     map_type: MapType,
@@ -469,6 +470,7 @@ impl MapArea {
         let start_vpn: VirtPageNum = start_va.floor();
         let end_vpn: VirtPageNum = end_va.ceil();
         Self {
+            start_va,
             vpn_range: VPNRange::new(start_vpn, end_vpn),
             data_frames: BTreeMap::new(),
             map_type,
@@ -477,6 +479,7 @@ impl MapArea {
     }
     pub fn from_another(another: &Self) -> Self {
         Self {
+            start_va: another.start_va,
             vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
             data_frames: BTreeMap::new(),
             map_type: another.map_type,
@@ -532,22 +535,27 @@ impl MapArea {
     /// assume that all frames were cleared before
     pub fn copy_data(&mut self, page_table: &mut PageTable, data: &[u8]) {
         assert_eq!(self.map_type, MapType::Framed);
-        let mut start: usize = 0;
+        let mut data_offset: usize = 0;
         let mut current_vpn = self.vpn_range.get_start();
-        let len = data.len();
-        loop {
-            let src = &data[start..len.min(start + PAGE_SIZE)];
+        let data_len = data.len();
+        let mut first_page = true;
+        while data_offset < data_len {
+            let dst_offset = if first_page {
+                self.start_va.page_offset()
+            } else {
+                0
+            };
+            let copy_len = (PAGE_SIZE - dst_offset).min(data_len - data_offset);
             let dst = &mut page_table
                 .translate(current_vpn)
                 .unwrap()
                 .ppn()
-                .get_bytes_array()[..src.len()];
+                .get_bytes_array()[dst_offset..dst_offset + copy_len];
+            let src = &data[data_offset..data_offset + copy_len];
             dst.copy_from_slice(src);
-            start += PAGE_SIZE;
-            if start >= len {
-                break;
-            }
+            data_offset += copy_len;
             current_vpn.step();
+            first_page = false;
         }
     }
 }
