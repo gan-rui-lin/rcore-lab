@@ -20,6 +20,7 @@ use crate::task::{
     current_add_signal, current_trap_cx, current_trap_cx_user_va, current_user_token,
     handle_signals, suspend_current_and_run_next, SignalFlags,
 };
+use crate::mm::{PageTable, VirtAddr};
 use crate::timer::{check_timer, set_next_trigger};
 use core::arch::{asm, global_asm};
 use riscv::register::{
@@ -160,6 +161,20 @@ pub fn trap_return() -> ! {
     }
 }
 
+/// Debug helper for gdb: translate a user virtual address to physical address.
+/// Returns 0 if unmapped.
+#[no_mangle]
+#[link_section = ".text.keep"]
+#[allow(dead_code)]
+pub extern "C" fn debug_user_va_to_pa(va: usize) -> usize {
+    let token = current_user_token();
+    let page_table = PageTable::from_token(token);
+    match page_table.translate_va(VirtAddr::from(va)) {
+        Some(pa) => pa.into(),
+        None => 0,
+    }
+}
+
 #[no_mangle]
 /// handle trap from kernel
 /// Unimplement: traps/interrupts/exceptions from kernel mode
@@ -172,6 +187,8 @@ fn trap_from_kernel(_trap_cx: &context::KernelTrapContext) {
             crate::board::irq_handler();
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
+            // 内核里可能正持有锁、在临界区或使用内核栈/中断屏蔽状态不一致，此时直接调度切换任务风险很大
+            // 先设置下次触发时间，等到返回用户态后再检查定时器并切换任务
             set_next_trigger();
             check_timer();
         }

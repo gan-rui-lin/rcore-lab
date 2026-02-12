@@ -1,7 +1,7 @@
 use crate::{
-    mm::kernel_token,
+    mm::{kernel_token, translated_refmut},
     syscall::errno::{errno, EAGAIN, ECHILD},
-    task::{TaskControlBlock, add_task, current_task},
+    task::{TaskControlBlock, add_task, current_task, current_user_token},
     trap::{TrapContext, trap_handler},
 };
 use alloc::sync::Arc;
@@ -51,6 +51,21 @@ pub fn sys_gettid() -> isize {
         .as_ref()
         .unwrap()
         .tid as isize
+}
+
+pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
+    let tid = current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .res
+        .as_ref()
+        .unwrap()
+        .tid as i32;
+    if !tidptr.is_null() {
+        let token = current_user_token();
+        *translated_refmut(token, tidptr) = tid;
+    }
+    tid as isize
 }
 
 /// thread does not exist, return -ECHILD
