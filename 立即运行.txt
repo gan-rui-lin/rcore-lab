@@ -1,0 +1,34 @@
+========================================
+  rCore-Lab QEMU 10.x 修复 - 立即运行
+========================================
+
+问题：QEMU 10.2.0 太新，VirtIO 不兼容
+
+解决：使用修复版脚本
+
+立即执行：
+--------
+cd /Users/mac/Desktop/project/rcore-lab
+bash run_fixed.sh
+
+或者：
+--------
+cd /Users/mac/Desktop/project/rcore-lab
+source ~/.zshrc
+bash run.sh
+
+注意：
+--------
+1. 必须在 rcore-lab 目录（不是 os 目录）
+2. 已修复 run.sh 和创建 run_fixed.sh
+3. run_fixed.sh 自动设置 PATH 和兼容参数
+
+退出 QEMU：
+--------
+Ctrl+A 然后 X
+
+如果还是失败：
+--------
+阅读 QEMU修复说明.md 降级到 QEMU 7.2.0
+
+========================================
