@@ -36,6 +36,7 @@ pub struct TaskControlBlockInner {
     pub exit_code: Option<i32>,
     pub signal_trap_cx: Option<TrapContext>,
     pub signal_mask_backup: super::SignalFlags,
+    pub clear_child_tid: usize,
 }
 
 impl TaskControlBlockInner {
@@ -67,6 +68,7 @@ impl TaskControlBlock {
                     exit_code: None,
                     signal_trap_cx: None,
                     signal_mask_backup: super::SignalFlags::empty(),
+                    clear_child_tid: 0,
                 })
             },
         }

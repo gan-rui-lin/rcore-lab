@@ -52,6 +52,8 @@ const SYSCALL_YIELD: usize = 124;
 const SYSCALL_THREAD_CREATE: usize = 460;
 /// gettid syscall
 const SYSCALL_GETTID: usize = 178;
+/// set_tid_address syscall
+const SYSCALL_SET_TID_ADDRESS: usize = 96;
 /// waittid syscall
 const SYSCALL_WAITTID: usize = 462;
 /// mutex_create syscall
@@ -124,7 +126,7 @@ use sync::*;
 use thread::*;
 
 use crate::fs::Stat;
-use crate::task::{current_process, SignalAction};
+use crate::task::{current_process, current_trap_cx, SignalAction};
 
 const fn parse_trace_pid(value: &str) -> Option<usize> {
     let bytes = value.as_bytes();
@@ -456,6 +458,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),
         SYSCALL_GETTID => sys_gettid(),
+        SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0]),
         SYSCALL_WAITTID => sys_waittid(args[0]) as isize,
         SYSCALL_MUTEX_CREATE => sys_mutex_create(args[0] == 1),
         SYSCALL_MUTEX_LOCK => sys_mutex_lock(args[0]),
@@ -496,6 +499,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             -ENOSYS
         },
     };
+    // Extra verbose logging for syscall 96 (set_tid_address)
+    if syscall_id == 96 {
+        info!("[syscall] set_tid_address returned {} to {}, ra={:#x}, sepc={:#x}",
+            ret, name, current_trap_cx().x[1], current_trap_cx().sepc);
+    }
+
     if known && trace && !(syscall_id == SYSCALL_WRITE && args[0] == 1) {
         trace!(
             "[syscall] pid={} name={} num={} args=[0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x}] ret={}",
