@@ -1,6 +1,6 @@
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
-use super::{PidHandle, SignalActions, SignalFlags, TaskControlBlock, add_task, pid_alloc};
+use super::{PidHandle, SignalActions, SignalFlags, TaskControlBlock, TlsArea, add_task, pid_alloc};
 use crate::config::{USER_STACK_SIZE};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{KERNEL_SPACE, MemorySet, translated_refmut};
@@ -40,6 +40,7 @@ pub struct ProcessControlBlockInner {
     pub heap_bottom: usize,
     pub program_brk: usize,
     pub mmap_base: usize,
+    pub tls_area: Option<TlsArea>,
 }
 
 impl ProcessControlBlockInner {
@@ -84,8 +85,13 @@ impl ProcessControlBlock {
     }
 
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
-        let (memory_set, user_stack_top, entry_point) = MemorySet::from_elf(elf_data);
+        let (mut memory_set, user_stack_top, entry_point, tls_info, _auxv_info) = MemorySet::from_elf(elf_data);
         let ustack_base = user_stack_top.saturating_sub(USER_STACK_SIZE);
+
+        // Initialize TLS if PT_TLS segment exists
+        let tls_area = tls_info.map(|info| {
+            TlsArea::new(&info, &mut memory_set, elf_data)
+        });
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
             pid: pid_handle,
@@ -115,6 +121,7 @@ impl ProcessControlBlock {
                     heap_bottom: user_stack_top,
                     program_brk: user_stack_top,
                     mmap_base: DEFAULT_MMAP_BASE,
+                    tls_area: tls_area.clone(),
                 })
             },
         });
@@ -124,13 +131,21 @@ impl ProcessControlBlock {
         let ustack_top = user_stack_top;
         let kstack_top = task.kstack.get_top();
         drop(task_inner);
-        *trap_cx = TrapContext::app_init_context(
+        let mut trap_cx_value = TrapContext::app_init_context(
             entry_point,
             ustack_top,
             KERNEL_SPACE.exclusive_access().token(),
             kstack_top,
             trap_handler as usize,
         );
+
+        // Set tp register if TLS is present
+        if let Some(ref tls) = tls_area {
+            trap_cx_value.x[4] = tls.tp_value;  // tp = x4
+            info!("[kernel] TLS initialized: tp = {:#x}", tls.tp_value);
+        }
+
+        *trap_cx = trap_cx_value;
         let mut process_inner = process.inner_exclusive_access();
         process_inner.tasks.push(Some(Arc::clone(&task)));
         drop(process_inner);
@@ -141,7 +156,13 @@ impl ProcessControlBlock {
 
     pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
-        let (memory_set, user_stack_top, entry_point) = MemorySet::from_elf(elf_data);
+        let (mut memory_set, user_stack_top, entry_point, tls_info, auxv_info) = MemorySet::from_elf(elf_data);
+
+        // Initialize TLS if PT_TLS segment exists
+        let tls_area = tls_info.map(|info| {
+            TlsArea::new(&info, &mut memory_set, elf_data)
+        });
+
         let new_token = memory_set.token();
         let ustack_base = user_stack_top.saturating_sub(USER_STACK_SIZE);
         {
@@ -150,6 +171,7 @@ impl ProcessControlBlock {
             inner.heap_bottom = user_stack_top;
             inner.program_brk = user_stack_top;
             inner.mmap_base = DEFAULT_MMAP_BASE;
+            inner.tls_area = tls_area.clone();
         }
         let task = self.inner_exclusive_access().get_task(0);
         let mut task_inner = task.inner_exclusive_access();
@@ -198,6 +220,34 @@ impl ProcessControlBlock {
             new_token,
             (argv_base + arg_addrs.len() * word_size) as *mut usize,
         ) = 0;
+
+        // Push 16 random bytes for AT_RANDOM
+        user_sp -= 16;
+        user_sp &= !0xf;  // Align to 16 bytes
+        let random_addr = user_sp;
+        // Write some pseudo-random bytes (TODO: use proper RNG)
+        for i in 0..16 {
+            *translated_refmut(new_token, (random_addr + i) as *mut u8) = (i * 17) as u8;
+        }
+
+        // Push auxiliary vectors with proper AT_RANDOM
+        let mut auxv_entries = auxv_info.to_entries(crate::config::PAGE_SIZE);
+        // Update AT_RANDOM to point to our random bytes
+        for entry in &mut auxv_entries {
+            if entry.0 == crate::task::auxv::auxv_type::AT_RANDOM {
+                entry.1 = random_addr;
+            }
+        }
+
+        user_sp -= auxv_entries.len() * 2 * word_size;  // Each entry is 2 words (type, value)
+        let auxv_base = user_sp;
+        for (i, (aux_type, aux_val)) in auxv_entries.iter().enumerate() {
+            *translated_refmut(new_token, (auxv_base + i * 2 * word_size) as *mut usize) = *aux_type;
+            *translated_refmut(new_token, (auxv_base + i * 2 * word_size + word_size) as *mut usize) = *aux_val;
+        }
+        info!("[kernel] exec: Pushed {} auxv entries at {:#x}, AT_RANDOM={:#x}",
+            auxv_entries.len(), auxv_base, random_addr);
+
         let argc = arg_addrs.len();
         user_sp = (user_sp - word_size) & !0xf;
         *translated_refmut(new_token, user_sp as *mut usize) = argc;
@@ -212,13 +262,73 @@ impl ProcessControlBlock {
         trap_cx.x[10] = argc;
         trap_cx.x[11] = argv_base;
         trap_cx.x[12] = envp_base;
+
+        // Set tp register if TLS is present
+        if let Some(ref tls) = tls_area {
+            trap_cx.x[4] = tls.tp_value;  // tp = x4
+            info!("[kernel] exec: TLS initialized: tp = {:#x}", tls.tp_value);
+        } else {
+            // WORKAROUND: Even without PT_TLS, musl expects tp to point to a valid TCB
+            // Allocate a more complete TCB structure based on musl's pthread struct
+            let tcb_addr = 0x7000_1000;  // Use a fixed address
+
+            // Map a page for TCB
+            let mut inner = self.inner_exclusive_access();
+            inner.memory_set.insert_framed_area(
+                tcb_addr.into(),
+                (tcb_addr + 0x1000).into(),
+                crate::mm::MapPermission::R | crate::mm::MapPermission::W | crate::mm::MapPermission::U,
+            );
+
+            // Initialize TCB with musl pthread structure layout
+            // Based on musl's src/internal/pthread_impl.h:
+            // struct pthread {
+            //   struct pthread *self;           // offset 0
+            //   void **dtv;                     // offset 8
+            //   struct pthread *prev, *next;    // offset 16, 24
+            //   uintptr_t sysinfo;             // offset 32
+            //   uintptr_t canary, canary2;     // offset 40, 48
+            //   pid_t tid;                      // offset 56
+            //   int errno_val;                  // offset 60
+            //   // ... more fields
+            // }
+            let token = inner.memory_set.token();
+            let pid = self.getpid();
+
+            // Zero out entire TCB region first
+            for i in 0..256 {  // Clear first 256 bytes
+                *crate::mm::translated_refmut(token, (tcb_addr + i) as *mut u8) = 0;
+            }
+
+            // Set key fields
+            *crate::mm::translated_refmut(token, (tcb_addr + 0) as *mut usize) = tcb_addr;  // self
+            *crate::mm::translated_refmut(token, (tcb_addr + 8) as *mut usize) = 0;  // dtv = NULL
+            *crate::mm::translated_refmut(token, (tcb_addr + 16) as *mut usize) = 0;  // prev = NULL
+            *crate::mm::translated_refmut(token, (tcb_addr + 24) as *mut usize) = 0;  // next = NULL
+            *crate::mm::translated_refmut(token, (tcb_addr + 32) as *mut usize) = 0;  // sysinfo
+            *crate::mm::translated_refmut(token, (tcb_addr + 40) as *mut usize) = 0;  // canary
+            *crate::mm::translated_refmut(token, (tcb_addr + 48) as *mut usize) = 0;  // canary2
+            *crate::mm::translated_refmut(token, (tcb_addr + 56) as *mut i32) = pid as i32;  // tid
+
+            drop(inner);
+
+            trap_cx.x[4] = tcb_addr;  // tp points to TCB
+            info!("[kernel] exec: Extended TCB allocated at {:#x} (no PT_TLS), tid={}", tcb_addr, pid);
+        }
+
         *task_inner.get_trap_cx() = trap_cx;
     }
 
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
-        let memory_set = MemorySet::from_existed_user(&parent.memory_set);
+        let mut memory_set = MemorySet::from_existed_user(&parent.memory_set);
+
+        // Copy TLS from parent if it exists
+        let tls_area = parent.tls_area.as_ref().map(|parent_tls| {
+            TlsArea::new_from_parent(parent_tls, &parent.memory_set, &mut memory_set)
+        });
+
         let pid = pid_alloc();
         let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
         for fd in parent.fd_table.iter() {
@@ -252,6 +362,7 @@ impl ProcessControlBlock {
                     heap_bottom: parent.heap_bottom,
                     program_brk: parent.program_brk,
                     mmap_base: parent.mmap_base,
+                    tls_area,
                 })
             },
         });

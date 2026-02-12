@@ -174,8 +174,8 @@ impl MemorySet {
         memory_set
     }
     /// Include sections in elf and trampoline and TrapContext and user stack,
-    /// also returns user_sp_base and entry point.
-    pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize) {
+    /// also returns user_sp_base, entry point, TLS info (if present), and auxv info.
+    pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize, Option<crate::task::TlsInfo>, crate::task::AuxvInfo) {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
@@ -210,6 +210,88 @@ impl MemorySet {
                 );
             }
         }
+
+        // Parse PT_TLS segment (Thread Local Storage) and check for PT_INTERP
+        let mut tls_info = None;
+        let mut has_interp = false;
+        info!("[ELF] Scanning {} program headers for PT_TLS and PT_INTERP", ph_count);
+        for i in 0..ph_count {
+            let ph = elf.program_header(i).unwrap();
+            let ph_type = ph.get_type().unwrap();
+            trace!("[ELF] PH {}: type={:?}, vaddr={:#x}, filesz={:#x}, memsz={:#x}",
+                i, ph_type, ph.virtual_addr(), ph.file_size(), ph.mem_size());
+
+            if ph_type == xmas_elf::program::Type::Tls {
+                tls_info = Some(crate::task::TlsInfo {
+                    vaddr: ph.virtual_addr() as usize,
+                    filesz: ph.file_size() as usize,
+                    memsz: ph.mem_size() as usize,
+                    align: ph.align() as usize,
+                });
+                info!("[ELF] Found PT_TLS: vaddr={:#x}, filesz={:#x}, memsz={:#x}, align={:#x}",
+                    ph.virtual_addr(), ph.file_size(), ph.mem_size(), ph.align());
+            } else if ph_type == xmas_elf::program::Type::Interp {
+                has_interp = true;
+                // Extract interpreter path
+                let interp_start = ph.offset() as usize;
+                let interp_end = interp_start + ph.file_size() as usize;
+                if interp_end < elf_data.len() {
+                    let interp_bytes = &elf_data[interp_start..interp_end];
+                    if let Ok(interp_str) = core::str::from_utf8(interp_bytes) {
+                        info!("[ELF] Found PT_INTERP: {}", interp_str.trim_end_matches('\0'));
+                    }
+                }
+            }
+        }
+        if tls_info.is_none() {
+            info!("[ELF] No PT_TLS segment found");
+        }
+        if !has_interp {
+            info!("[ELF] No PT_INTERP (statically linked)");
+        }
+
+        // Calculate auxiliary vector information
+        // AT_PHDR: program headers location in memory
+        // For most ELF files, program headers are at e_phoff from the start of the file
+        // and are loaded as part of the first PT_LOAD segment
+        let phdr_addr = if ph_count > 0 {
+            let first_ph = elf.program_header(0).unwrap();
+            if first_ph.get_type().unwrap() == xmas_elf::program::Type::Load {
+                // Calculate where program headers are in memory
+                // They're at file_offset ph_offset, which maps to vaddr + (ph_offset - file_offset)
+                let file_offset = first_ph.offset() as usize;
+                let ph_offset = elf_header.pt2.ph_offset() as usize;
+                if ph_offset >= file_offset && ph_offset < (file_offset + first_ph.file_size() as usize) {
+                    // Program headers are within first PT_LOAD segment
+                    first_ph.virtual_addr() as usize + (ph_offset - file_offset)
+                } else {
+                    // Fallback: assume PT_PHDR not available
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        let auxv_info = crate::task::AuxvInfo {
+            phdr_addr,
+            phent_size: elf_header.pt2.ph_entry_size() as usize,
+            phnum: ph_count as usize,
+            entry: elf.header.pt2.entry_point() as usize,
+        };
+
+        if phdr_addr == 0 {
+            info!("[ELF] Warning: AT_PHDR set to 0 (program headers not accessible)");
+        }
+        info!("[ELF] Auxv: phdr={:#x}, phent={}, phnum={}, entry={:#x}",
+            auxv_info.phdr_addr, auxv_info.phent_size, auxv_info.phnum, auxv_info.entry);
+        info!("[ELF] First PT_LOAD: vaddr={:#x}, offset={:#x}, filesz={:#x}",
+            elf.program_header(0).unwrap().virtual_addr(),
+            elf.program_header(0).unwrap().offset(),
+            elf.program_header(0).unwrap().file_size());
+
         // map user stack with U flags
         let max_end_va: VirtAddr = max_end_vpn.into();
         let mut user_stack_bottom: usize = max_end_va.into();
@@ -249,6 +331,8 @@ impl MemorySet {
             memory_set,
             user_stack_top,
             elf.header.pt2.entry_point() as usize,
+            tls_info,
+            auxv_info,
         )
     }
     /// Create a new address space by copy code&data from a exited process's address space.
