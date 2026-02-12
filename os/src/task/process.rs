@@ -1,7 +1,7 @@
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
 use super::{PidHandle, SignalActions, SignalFlags, TaskControlBlock, TlsArea, add_task, pid_alloc};
-use crate::config::{USER_STACK_SIZE};
+use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{KERNEL_SPACE, MemorySet, translated_refmut};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
@@ -11,6 +11,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
+use xmas_elf::program::Type;
 
 const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
 
@@ -163,6 +164,29 @@ impl ProcessControlBlock {
             TlsArea::new(&info, &mut memory_set, elf_data)
         });
 
+        let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
+        let ph_num = elf.header.pt2.ph_count() as usize;
+        let ph_ent = elf.header.pt2.ph_entry_size() as usize;
+        let ph_off = elf.header.pt2.ph_offset() as usize;
+        let mut ph_addr = 0usize;
+        for ph in elf.program_iter() {
+            if let Ok(Type::Phdr) = ph.get_type() {
+                ph_addr = ph.virtual_addr() as usize;
+                break;
+            }
+        }
+        if ph_addr == 0 {
+            for ph in elf.program_iter() {
+                if let Ok(Type::Load) = ph.get_type() {
+                    let p_off = ph.offset() as usize;
+                    let p_filesz = ph.file_size() as usize;
+                    if ph_off >= p_off && ph_off < p_off + p_filesz {
+                        ph_addr = ph.virtual_addr() as usize + (ph_off - p_off);
+                        break;
+                    }
+                }
+            }
+        }
         let new_token = memory_set.token();
         let ustack_base = user_stack_top.saturating_sub(USER_STACK_SIZE);
         {
@@ -180,6 +204,9 @@ impl ProcessControlBlock {
         }
         task_inner.trap_cx_ppn = task_inner.res.as_ref().unwrap().trap_cx_ppn();
         let mut user_sp = user_stack_top;
+        // End marker (NULL) at the top of stack region.
+        user_sp -= 1;
+        *translated_refmut(new_token, user_sp as *mut u8) = 0;
         let mut env_addrs: Vec<usize> = Vec::new();
         for env in envs.iter() {
             user_sp -= env.len() + 1;
@@ -202,6 +229,25 @@ impl ProcessControlBlock {
         }
         user_sp &= !0xf;
         let word_size = core::mem::size_of::<usize>();
+        const AT_NULL: usize = 0;
+        const AT_PHDR: usize = 3;
+        const AT_PHENT: usize = 4;
+        const AT_PHNUM: usize = 5;
+        const AT_PAGESZ: usize = 6;
+        const AT_ENTRY: usize = 9;
+        let auxv_entries = [
+            (AT_ENTRY, entry_point),
+            (AT_PHDR, ph_addr),
+            (AT_PHENT, ph_ent),
+            (AT_PHNUM, ph_num),
+            (AT_PAGESZ, PAGE_SIZE),
+            (AT_NULL, 0),
+        ];
+        for (key, val) in auxv_entries.iter().rev() {
+            user_sp -= 2 * word_size;
+            *translated_refmut(new_token, user_sp as *mut usize) = *key;
+            *translated_refmut(new_token, (user_sp + word_size) as *mut usize) = *val;
+        }
         user_sp -= (env_addrs.len() + 1) * word_size;
         let envp_base = user_sp;
         for (i, addr) in env_addrs.iter().enumerate() {
