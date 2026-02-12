@@ -181,72 +181,72 @@ impl ProcessControlBlock {
             res.ustack_base = ustack_base;
         }
         task_inner.trap_cx_ppn = task_inner.res.as_ref().unwrap().trap_cx_ppn();
-        let mut user_sp = user_stack_top;
+        let mut user_sp = user_stack_top; // 从用户栈顶（高地址）开始向下构建
         // End marker (NULL) at the top of stack region.
-        user_sp -= 1;
-        *translated_refmut(new_token, user_sp as *mut u8) = 0;
-        let mut env_addrs: Vec<usize> = Vec::new();
+        user_sp -= 1; // 预留 1 字节作为“字符串区结束标记”
+        *translated_refmut(new_token, user_sp as *mut u8) = 0; // 写入 0 作为 end marker
+        let mut env_addrs: Vec<usize> = Vec::new(); // 记录每个 env 字符串的首地址
         for env in envs.iter() {
-            user_sp -= env.len() + 1;
-            let addr = user_sp;
+            user_sp -= env.len() + 1; // 为 "KEY=VAL\0" 预留空间
+            let addr = user_sp; // 当前 env 字符串首地址
             for (i, b) in env.as_bytes().iter().enumerate() {
-                *translated_refmut(new_token, (addr + i) as *mut u8) = *b;
+                *translated_refmut(new_token, (addr + i) as *mut u8) = *b; // 拷贝 env 内容
             }
-            *translated_refmut(new_token, (addr + env.len()) as *mut u8) = 0;
-            env_addrs.push(addr);
+            *translated_refmut(new_token, (addr + env.len()) as *mut u8) = 0; // 结尾补 '\0'
+            env_addrs.push(addr); // 保存 env 起始地址
         }
-        let mut arg_addrs: Vec<usize> = Vec::new();
+        let mut arg_addrs: Vec<usize> = Vec::new(); // 记录每个 argv 字符串的首地址
         for arg in args.iter() {
-            user_sp -= arg.len() + 1;
-            let addr = user_sp;
+            user_sp -= arg.len() + 1; // 为 "arg\0" 预留空间
+            let addr = user_sp; // 当前 argv 字符串首地址
             for (i, b) in arg.as_bytes().iter().enumerate() {
-                *translated_refmut(new_token, (addr + i) as *mut u8) = *b;
+                *translated_refmut(new_token, (addr + i) as *mut u8) = *b; // 拷贝 arg 内容
             }
-            *translated_refmut(new_token, (addr + arg.len()) as *mut u8) = 0;
-            arg_addrs.push(addr);
+            *translated_refmut(new_token, (addr + arg.len()) as *mut u8) = 0; // 结尾补 '\0'
+            arg_addrs.push(addr); // 保存 argv 起始地址
         }
-        user_sp &= !0xf;
-        let word_size = core::mem::size_of::<usize>();
-        const AT_NULL: usize = 0;
-        const AT_PHDR: usize = 3;
-        const AT_PHENT: usize = 4;
-        const AT_PHNUM: usize = 5;
-        const AT_PAGESZ: usize = 6;
-        const AT_ENTRY: usize = 9;
+        user_sp &= !0xf; // 16 字节对齐（ABI 约定）
+        let word_size = core::mem::size_of::<usize>(); // 指针宽度（64 位下为 8）
+        const AT_NULL: usize = 0; // auxv 结束标记
+        const AT_PHDR: usize = 3; // 程序头表地址
+        const AT_PHENT: usize = 4; // 程序头表项大小
+        const AT_PHNUM: usize = 5; // 程序头表项个数
+        const AT_PAGESZ: usize = 6; // 页大小
+        const AT_ENTRY: usize = 9; // 入口地址
         let auxv_entries = [
-            (AT_ENTRY, entry_point),
-            (AT_PHDR, ph_addr),
-            (AT_PHENT, ph_ent),
-            (AT_PHNUM, ph_num),
-            (AT_PAGESZ, PAGE_SIZE),
-            (AT_NULL, 0),
+            (AT_ENTRY, entry_point), // ELF 入口地址
+            (AT_PHDR, ph_addr), // 程序头表虚拟地址
+            (AT_PHENT, ph_ent), // 每项大小
+            (AT_PHNUM, ph_num), // 项数
+            (AT_PAGESZ, PAGE_SIZE), // 页大小
+            (AT_NULL, 0), // 结束
         ];
         for (key, val) in auxv_entries.iter().rev() {
-            user_sp -= 2 * word_size;
-            *translated_refmut(new_token, user_sp as *mut usize) = *key;
-            *translated_refmut(new_token, (user_sp + word_size) as *mut usize) = *val;
+            user_sp -= 2 * word_size; // 为 (key, val) 预留两个 word
+            *translated_refmut(new_token, user_sp as *mut usize) = *key; // 写 key
+            *translated_refmut(new_token, (user_sp + word_size) as *mut usize) = *val; // 写 val
         }
-        user_sp -= (env_addrs.len() + 1) * word_size;
-        let envp_base = user_sp;
+        user_sp -= (env_addrs.len() + 1) * word_size; // 为 envp 指针数组 + NULL 预留
+        let envp_base = user_sp; // envp 起始地址
         for (i, addr) in env_addrs.iter().enumerate() {
-            *translated_refmut(new_token, (envp_base + i * word_size) as *mut usize) = *addr;
+            *translated_refmut(new_token, (envp_base + i * word_size) as *mut usize) = *addr; // envp[i] 指向 env 字符串
         }
         *translated_refmut(
             new_token,
             (envp_base + env_addrs.len() * word_size) as *mut usize,
-        ) = 0;
-        user_sp -= (arg_addrs.len() + 1) * word_size;
-        let argv_base = user_sp;
+        ) = 0; // envp 末尾 NULL
+        user_sp -= (arg_addrs.len() + 1) * word_size; // 为 argv 指针数组 + NULL 预留
+        let argv_base = user_sp; // argv 起始地址
         for (i, addr) in arg_addrs.iter().enumerate() {
-            *translated_refmut(new_token, (argv_base + i * word_size) as *mut usize) = *addr;
+            *translated_refmut(new_token, (argv_base + i * word_size) as *mut usize) = *addr; // argv[i] 指向 arg 字符串
         }
         *translated_refmut(
             new_token,
             (argv_base + arg_addrs.len() * word_size) as *mut usize,
-        ) = 0;
-        let argc = arg_addrs.len();
-        user_sp = (user_sp - word_size) & !0xf;
-        *translated_refmut(new_token, user_sp as *mut usize) = argc;
+        ) = 0; // argv 末尾 NULL
+        let argc = arg_addrs.len(); // 参数个数
+        user_sp = (user_sp - word_size) & !0xf; // 为 argc 预留并对齐
+        *translated_refmut(new_token, user_sp as *mut usize) = argc; // 写入 argc
 
         let mut trap_cx = TrapContext::app_init_context(
             entry_point,
