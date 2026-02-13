@@ -205,6 +205,62 @@ impl ProcessControlBlock {
         }
         user_sp &= !0xf;
         let word_size = core::mem::size_of::<usize>();
+
+        // Push auxiliary vectors FIRST (before envp/argv)
+        // Use simple auxv for programs without PT_TLS (like busybox)
+        // Use complete auxv for programs with PT_TLS
+        if tls_area.is_some() {
+            // Push 16 random bytes for AT_RANDOM
+            user_sp -= 16;
+            user_sp &= !0xf;  // Align to 16 bytes
+            let random_addr = user_sp;
+            // Write some pseudo-random bytes (TODO: use proper RNG)
+            for i in 0..16 {
+                *translated_refmut(new_token, (random_addr + i) as *mut u8) = (i * 17) as u8;
+            }
+
+            // Push complete auxiliary vectors with proper AT_RANDOM
+            let mut auxv_entries = auxv_info.to_entries(crate::config::PAGE_SIZE);
+            // Update AT_RANDOM to point to our random bytes
+            for entry in &mut auxv_entries {
+                if entry.0 == crate::task::auxv::auxv_type::AT_RANDOM {
+                    entry.1 = random_addr;
+                }
+            }
+
+            user_sp -= auxv_entries.len() * 2 * word_size;  // Each entry is 2 words (type, value)
+            let auxv_base = user_sp;
+            for (i, (aux_type, aux_val)) in auxv_entries.iter().enumerate() {
+                *translated_refmut(new_token, (auxv_base + i * 2 * word_size) as *mut usize) = *aux_type;
+                *translated_refmut(new_token, (auxv_base + i * 2 * word_size + word_size) as *mut usize) = *aux_val;
+            }
+            info!("[kernel] exec: Pushed {} auxv entries at {:#x}, AT_RANDOM={:#x}",
+                auxv_entries.len(), auxv_base, random_addr);
+        } else {
+            // Simple auxv for programs without PT_TLS (master branch style)
+            const AT_NULL: usize = 0;
+            const AT_PHDR: usize = 3;
+            const AT_PHENT: usize = 4;
+            const AT_PHNUM: usize = 5;
+            const AT_PAGESZ: usize = 6;
+            const AT_ENTRY: usize = 9;
+            let simple_auxv = [
+                (AT_ENTRY, auxv_info.entry),
+                (AT_PHDR, auxv_info.phdr_addr),
+                (AT_PHENT, auxv_info.phent_size),
+                (AT_PHNUM, auxv_info.phnum),
+                (AT_PAGESZ, crate::config::PAGE_SIZE),
+                (AT_NULL, 0),
+            ];
+            for (key, val) in simple_auxv.iter().rev() {
+                user_sp -= 2 * word_size;
+                *translated_refmut(new_token, user_sp as *mut usize) = *key;
+                *translated_refmut(new_token, (user_sp + word_size) as *mut usize) = *val;
+            }
+            info!("[kernel] exec: Pushed {} simple auxv entries (no PT_TLS)", simple_auxv.len());
+        }
+
+        // Now push envp and argv arrays
         user_sp -= (env_addrs.len() + 1) * word_size;
         let envp_base = user_sp;
         for (i, addr) in env_addrs.iter().enumerate() {
@@ -223,33 +279,6 @@ impl ProcessControlBlock {
             new_token,
             (argv_base + arg_addrs.len() * word_size) as *mut usize,
         ) = 0;
-
-        // Push 16 random bytes for AT_RANDOM
-        user_sp -= 16;
-        user_sp &= !0xf;  // Align to 16 bytes
-        let random_addr = user_sp;
-        // Write some pseudo-random bytes (TODO: use proper RNG)
-        for i in 0..16 {
-            *translated_refmut(new_token, (random_addr + i) as *mut u8) = (i * 17) as u8;
-        }
-
-        // Push auxiliary vectors with proper AT_RANDOM
-        let mut auxv_entries = auxv_info.to_entries(crate::config::PAGE_SIZE);
-        // Update AT_RANDOM to point to our random bytes
-        for entry in &mut auxv_entries {
-            if entry.0 == crate::task::auxv::auxv_type::AT_RANDOM {
-                entry.1 = random_addr;
-            }
-        }
-
-        user_sp -= auxv_entries.len() * 2 * word_size;  // Each entry is 2 words (type, value)
-        let auxv_base = user_sp;
-        for (i, (aux_type, aux_val)) in auxv_entries.iter().enumerate() {
-            *translated_refmut(new_token, (auxv_base + i * 2 * word_size) as *mut usize) = *aux_type;
-            *translated_refmut(new_token, (auxv_base + i * 2 * word_size + word_size) as *mut usize) = *aux_val;
-        }
-        info!("[kernel] exec: Pushed {} auxv entries at {:#x}, AT_RANDOM={:#x}",
-            auxv_entries.len(), auxv_base, random_addr);
 
         let argc = arg_addrs.len();
         user_sp = (user_sp - word_size) & !0xf;
