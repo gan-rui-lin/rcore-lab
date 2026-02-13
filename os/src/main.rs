@@ -102,7 +102,7 @@ pub fn rust_main() -> ! {
     }
     fs::list_apps();
     task::add_initproc();
-    *DEV_NON_BLOCKING_ACCESS.exclusive_access() = true;
+    *DEV_NON_BLOCKING_ACCESS.exclusive_access() = false;  // Disable non-blocking I/O to avoid Unsupported error
     task::run_tasks();
     panic!("Unreachable in rust_main!");
 }

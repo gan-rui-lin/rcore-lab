@@ -101,12 +101,23 @@ pub fn trap_handler() -> ! {
         | Trap::Exception(Exception::InstructionPageFault)
         | Trap::Exception(Exception::LoadFault)
         | Trap::Exception(Exception::LoadPageFault) => {
-            println!(
-                "[kernel] trap_handler:  {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                scause.cause(),
-                stval,
-                current_trap_cx().sepc,
-            );
+            let trap_cx = current_trap_cx();
+            println!("[kernel] trap_handler: {:?} in application", scause.cause());
+            println!("  bad addr (stval) = {:#x}", stval);
+            println!("  bad instruction (sepc) = {:#x}", trap_cx.sepc);
+            println!("  Registers:");
+            println!("    ra (x1) = {:#x}", trap_cx.x[1]);
+            println!("    sp (x2) = {:#x}", trap_cx.x[2]);
+            println!("    gp (x3) = {:#x}", trap_cx.x[3]);
+            println!("    tp (x4) = {:#x}", trap_cx.x[4]);
+            println!("    t0 (x5) = {:#x}", trap_cx.x[5]);
+            println!("    t1 (x6) = {:#x}", trap_cx.x[6]);
+            println!("    a0 (x10) = {:#x}", trap_cx.x[10]);
+            println!("    a1 (x11) = {:#x}", trap_cx.x[11]);
+            println!("    a2 (x12) = {:#x}", trap_cx.x[12]);
+            println!("    a3 (x13) = {:#x}", trap_cx.x[13]);
+            println!("    a4 (x14) = {:#x}", trap_cx.x[14]);
+            println!("    a5 (x15) = {:#x}", trap_cx.x[15]);
             current_add_signal(SignalFlags::SIGSEGV);
         }
         Trap::Exception(Exception::IllegalInstruction) => {

@@ -1,6 +1,7 @@
 #![allow(missing_docs)]
 
 mod action;
+mod auxv;
 mod context;
 mod id;
 mod manager;
@@ -11,6 +12,7 @@ mod switch;
 #[allow(clippy::module_inception)]
 #[allow(rustdoc::private_intra_doc_links)]
 mod task;
+mod tls;
 
 use crate::fs::{open_file, OpenFlags};
 use crate::sbi::shutdown;
@@ -24,6 +26,7 @@ use process::ProcessControlBlock;
 use switch::__switch;
 
 pub use action::{SignalAction, SignalActions};
+pub use auxv::AuxvInfo;
 pub use context::TaskContext;
 pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
 pub use manager::{
@@ -35,6 +38,7 @@ pub use processor::{
 };
 pub use signal::{SignalFlags, SigNumber, MAX_SIG};
 pub use task::{TaskControlBlock, TaskStatus};
+pub use tls::{TlsArea, TlsInfo};
 
 pub fn suspend_current_and_run_next() {
     let task = take_current_task().unwrap();

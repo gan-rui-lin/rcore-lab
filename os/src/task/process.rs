@@ -1,7 +1,7 @@
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
-use super::{PidHandle, SignalActions, SignalFlags, TaskControlBlock, add_task, pid_alloc};
-use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
+use super::{PidHandle, SignalActions, SignalFlags, TaskControlBlock, TlsArea, add_task, pid_alloc};
+use crate::config::{USER_STACK_SIZE};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{KERNEL_SPACE, MemorySet, translated_refmut};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
@@ -11,7 +11,6 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
-use xmas_elf::program::Type;
 
 const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
 
@@ -41,6 +40,7 @@ pub struct ProcessControlBlockInner {
     pub heap_bottom: usize,
     pub program_brk: usize,
     pub mmap_base: usize,
+    pub tls_area: Option<TlsArea>,
 }
 
 impl ProcessControlBlockInner {
@@ -85,8 +85,13 @@ impl ProcessControlBlock {
     }
 
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
-        let (memory_set, user_stack_top, entry_point) = MemorySet::from_elf(elf_data);
+        let (mut memory_set, user_stack_top, entry_point, tls_info, _auxv_info) = MemorySet::from_elf(elf_data);
         let ustack_base = user_stack_top.saturating_sub(USER_STACK_SIZE);
+
+        // Initialize TLS if PT_TLS segment exists
+        let tls_area = tls_info.map(|info| {
+            TlsArea::new(&info, &mut memory_set, elf_data)
+        });
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
             pid: pid_handle,
@@ -116,6 +121,7 @@ impl ProcessControlBlock {
                     heap_bottom: user_stack_top,
                     program_brk: user_stack_top,
                     mmap_base: DEFAULT_MMAP_BASE,
+                    tls_area: tls_area.clone(),
                 })
             },
         });
@@ -125,13 +131,21 @@ impl ProcessControlBlock {
         let ustack_top = user_stack_top;
         let kstack_top = task.kstack.get_top();
         drop(task_inner);
-        *trap_cx = TrapContext::app_init_context(
+        let mut trap_cx_value = TrapContext::app_init_context(
             entry_point,
             ustack_top,
             KERNEL_SPACE.exclusive_access().token(),
             kstack_top,
             trap_handler as usize,
         );
+
+        // Set tp register if TLS is present
+        if let Some(ref tls) = tls_area {
+            trap_cx_value.x[4] = tls.tp_value;  // tp = x4
+            info!("[kernel] TLS initialized: tp = {:#x}", tls.tp_value);
+        }
+
+        *trap_cx = trap_cx_value;
         let mut process_inner = process.inner_exclusive_access();
         process_inner.tasks.push(Some(Arc::clone(&task)));
         drop(process_inner);
@@ -142,30 +156,13 @@ impl ProcessControlBlock {
 
     pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
-        let (memory_set, user_stack_top, entry_point) = MemorySet::from_elf(elf_data);
-        let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
-        let ph_num = elf.header.pt2.ph_count() as usize;
-        let ph_ent = elf.header.pt2.ph_entry_size() as usize;
-        let ph_off = elf.header.pt2.ph_offset() as usize;
-        let mut ph_addr = 0usize;
-        for ph in elf.program_iter() {
-            if let Ok(Type::Phdr) = ph.get_type() {
-                ph_addr = ph.virtual_addr() as usize;
-                break;
-            }
-        }
-        if ph_addr == 0 {
-            for ph in elf.program_iter() {
-                if let Ok(Type::Load) = ph.get_type() {
-                    let p_off = ph.offset() as usize;
-                    let p_filesz = ph.file_size() as usize;
-                    if ph_off >= p_off && ph_off < p_off + p_filesz {
-                        ph_addr = ph.virtual_addr() as usize + (ph_off - p_off);
-                        break;
-                    }
-                }
-            }
-        }
+        let (mut memory_set, user_stack_top, entry_point, tls_info, auxv_info) = MemorySet::from_elf(elf_data);
+
+        // Initialize TLS if PT_TLS segment exists
+        let tls_area = tls_info.map(|info| {
+            TlsArea::new(&info, &mut memory_set, elf_data)
+        });
+
         let new_token = memory_set.token();
         let ustack_base = user_stack_top.saturating_sub(USER_STACK_SIZE);
         {
@@ -174,6 +171,7 @@ impl ProcessControlBlock {
             inner.heap_bottom = user_stack_top;
             inner.program_brk = user_stack_top;
             inner.mmap_base = DEFAULT_MMAP_BASE;
+            inner.tls_area = tls_area.clone();
         }
         let task = self.inner_exclusive_access().get_task(0);
         let mut task_inner = task.inner_exclusive_access();
@@ -181,72 +179,110 @@ impl ProcessControlBlock {
             res.ustack_base = ustack_base;
         }
         task_inner.trap_cx_ppn = task_inner.res.as_ref().unwrap().trap_cx_ppn();
-        let mut user_sp = user_stack_top; // 从用户栈顶（高地址）开始向下构建
+        let mut user_sp = user_stack_top;
         // End marker (NULL) at the top of stack region.
-        user_sp -= 1; // 预留 1 字节作为“字符串区结束标记”
-        *translated_refmut(new_token, user_sp as *mut u8) = 0; // 写入 0 作为 end marker
-        let mut env_addrs: Vec<usize> = Vec::new(); // 记录每个 env 字符串的首地址
+        user_sp -= 1;
+        *translated_refmut(new_token, user_sp as *mut u8) = 0;
+        let mut env_addrs: Vec<usize> = Vec::new();
         for env in envs.iter() {
-            user_sp -= env.len() + 1; // 为 "KEY=VAL\0" 预留空间
-            let addr = user_sp; // 当前 env 字符串首地址
+            user_sp -= env.len() + 1;
+            let addr = user_sp;
             for (i, b) in env.as_bytes().iter().enumerate() {
-                *translated_refmut(new_token, (addr + i) as *mut u8) = *b; // 拷贝 env 内容
+                *translated_refmut(new_token, (addr + i) as *mut u8) = *b;
             }
-            *translated_refmut(new_token, (addr + env.len()) as *mut u8) = 0; // 结尾补 '\0'
-            env_addrs.push(addr); // 保存 env 起始地址
+            *translated_refmut(new_token, (addr + env.len()) as *mut u8) = 0;
+            env_addrs.push(addr);
         }
-        let mut arg_addrs: Vec<usize> = Vec::new(); // 记录每个 argv 字符串的首地址
+        let mut arg_addrs: Vec<usize> = Vec::new();
         for arg in args.iter() {
-            user_sp -= arg.len() + 1; // 为 "arg\0" 预留空间
-            let addr = user_sp; // 当前 argv 字符串首地址
+            user_sp -= arg.len() + 1;
+            let addr = user_sp;
             for (i, b) in arg.as_bytes().iter().enumerate() {
-                *translated_refmut(new_token, (addr + i) as *mut u8) = *b; // 拷贝 arg 内容
+                *translated_refmut(new_token, (addr + i) as *mut u8) = *b;
             }
-            *translated_refmut(new_token, (addr + arg.len()) as *mut u8) = 0; // 结尾补 '\0'
-            arg_addrs.push(addr); // 保存 argv 起始地址
+            *translated_refmut(new_token, (addr + arg.len()) as *mut u8) = 0;
+            arg_addrs.push(addr);
         }
-        user_sp &= !0xf; // 16 字节对齐（ABI 约定）
-        let word_size = core::mem::size_of::<usize>(); // 指针宽度（64 位下为 8）
-        const AT_NULL: usize = 0; // auxv 结束标记
-        const AT_PHDR: usize = 3; // 程序头表地址
-        const AT_PHENT: usize = 4; // 程序头表项大小
-        const AT_PHNUM: usize = 5; // 程序头表项个数
-        const AT_PAGESZ: usize = 6; // 页大小
-        const AT_ENTRY: usize = 9; // 入口地址
-        let auxv_entries = [
-            (AT_ENTRY, entry_point), // ELF 入口地址
-            (AT_PHDR, ph_addr), // 程序头表虚拟地址
-            (AT_PHENT, ph_ent), // 每项大小
-            (AT_PHNUM, ph_num), // 项数
-            (AT_PAGESZ, PAGE_SIZE), // 页大小
-            (AT_NULL, 0), // 结束
-        ];
-        for (key, val) in auxv_entries.iter().rev() {
-            user_sp -= 2 * word_size; // 为 (key, val) 预留两个 word
-            *translated_refmut(new_token, user_sp as *mut usize) = *key; // 写 key
-            *translated_refmut(new_token, (user_sp + word_size) as *mut usize) = *val; // 写 val
+        user_sp &= !0xf;
+        let word_size = core::mem::size_of::<usize>();
+
+        // Push auxiliary vectors FIRST (before envp/argv)
+        // Use simple auxv for programs without PT_TLS (like busybox)
+        // Use complete auxv for programs with PT_TLS
+        if tls_area.is_some() {
+            // Push 16 random bytes for AT_RANDOM
+            user_sp -= 16;
+            user_sp &= !0xf;  // Align to 16 bytes
+            let random_addr = user_sp;
+            // Write some pseudo-random bytes (TODO: use proper RNG)
+            for i in 0..16 {
+                *translated_refmut(new_token, (random_addr + i) as *mut u8) = (i * 17) as u8;
+            }
+
+            // Push complete auxiliary vectors with proper AT_RANDOM
+            let mut auxv_entries = auxv_info.to_entries(crate::config::PAGE_SIZE);
+            // Update AT_RANDOM to point to our random bytes
+            for entry in &mut auxv_entries {
+                if entry.0 == crate::task::auxv::auxv_type::AT_RANDOM {
+                    entry.1 = random_addr;
+                }
+            }
+
+            user_sp -= auxv_entries.len() * 2 * word_size;  // Each entry is 2 words (type, value)
+            let auxv_base = user_sp;
+            for (i, (aux_type, aux_val)) in auxv_entries.iter().enumerate() {
+                *translated_refmut(new_token, (auxv_base + i * 2 * word_size) as *mut usize) = *aux_type;
+                *translated_refmut(new_token, (auxv_base + i * 2 * word_size + word_size) as *mut usize) = *aux_val;
+            }
+            info!("[kernel] exec: Pushed {} auxv entries at {:#x}, AT_RANDOM={:#x}",
+                auxv_entries.len(), auxv_base, random_addr);
+        } else {
+            // Simple auxv for programs without PT_TLS (master branch style)
+            const AT_NULL: usize = 0;
+            const AT_PHDR: usize = 3;
+            const AT_PHENT: usize = 4;
+            const AT_PHNUM: usize = 5;
+            const AT_PAGESZ: usize = 6;
+            const AT_ENTRY: usize = 9;
+            let simple_auxv = [
+                (AT_ENTRY, auxv_info.entry),
+                (AT_PHDR, auxv_info.phdr_addr),
+                (AT_PHENT, auxv_info.phent_size),
+                (AT_PHNUM, auxv_info.phnum),
+                (AT_PAGESZ, crate::config::PAGE_SIZE),
+                (AT_NULL, 0),
+            ];
+            for (key, val) in simple_auxv.iter().rev() {
+                user_sp -= 2 * word_size;
+                *translated_refmut(new_token, user_sp as *mut usize) = *key;
+                *translated_refmut(new_token, (user_sp + word_size) as *mut usize) = *val;
+            }
+            info!("[kernel] exec: Pushed {} simple auxv entries (no PT_TLS)", simple_auxv.len());
         }
-        user_sp -= (env_addrs.len() + 1) * word_size; // 为 envp 指针数组 + NULL 预留
-        let envp_base = user_sp; // envp 起始地址
+
+        // Now push envp and argv arrays
+        user_sp -= (env_addrs.len() + 1) * word_size;
+        let envp_base = user_sp;
         for (i, addr) in env_addrs.iter().enumerate() {
-            *translated_refmut(new_token, (envp_base + i * word_size) as *mut usize) = *addr; // envp[i] 指向 env 字符串
+            *translated_refmut(new_token, (envp_base + i * word_size) as *mut usize) = *addr;
         }
         *translated_refmut(
             new_token,
             (envp_base + env_addrs.len() * word_size) as *mut usize,
-        ) = 0; // envp 末尾 NULL
-        user_sp -= (arg_addrs.len() + 1) * word_size; // 为 argv 指针数组 + NULL 预留
-        let argv_base = user_sp; // argv 起始地址
+        ) = 0;
+        user_sp -= (arg_addrs.len() + 1) * word_size;
+        let argv_base = user_sp;
         for (i, addr) in arg_addrs.iter().enumerate() {
-            *translated_refmut(new_token, (argv_base + i * word_size) as *mut usize) = *addr; // argv[i] 指向 arg 字符串
+            *translated_refmut(new_token, (argv_base + i * word_size) as *mut usize) = *addr;
         }
         *translated_refmut(
             new_token,
             (argv_base + arg_addrs.len() * word_size) as *mut usize,
-        ) = 0; // argv 末尾 NULL
-        let argc = arg_addrs.len(); // 参数个数
-        user_sp = (user_sp - word_size) & !0xf; // 为 argc 预留并对齐
-        *translated_refmut(new_token, user_sp as *mut usize) = argc; // 写入 argc
+        ) = 0;
+
+        let argc = arg_addrs.len();
+        user_sp = (user_sp - word_size) & !0xf;
+        *translated_refmut(new_token, user_sp as *mut usize) = argc;
 
         let mut trap_cx = TrapContext::app_init_context(
             entry_point,
@@ -258,13 +294,27 @@ impl ProcessControlBlock {
         trap_cx.x[10] = argc;
         trap_cx.x[11] = argv_base;
         trap_cx.x[12] = envp_base;
+
+        // Set tp register only if TLS segment is present
+        if let Some(ref tls) = tls_area {
+            trap_cx.x[4] = tls.tp_value;  // tp = x4
+            info!("[kernel] exec: TLS initialized: tp = {:#x}", tls.tp_value);
+        }
+        // Note: If no PT_TLS, we don't set tp - let userspace libc initialize it
+
         *task_inner.get_trap_cx() = trap_cx;
     }
 
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
-        let memory_set = MemorySet::from_existed_user(&parent.memory_set);
+        let mut memory_set = MemorySet::from_existed_user(&parent.memory_set);
+
+        // Copy TLS from parent if it exists
+        let tls_area = parent.tls_area.as_ref().map(|parent_tls| {
+            TlsArea::new_from_parent(parent_tls, &parent.memory_set, &mut memory_set)
+        });
+
         let pid = pid_alloc();
         let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
         for fd in parent.fd_table.iter() {
@@ -298,6 +348,7 @@ impl ProcessControlBlock {
                     heap_bottom: parent.heap_bottom,
                     program_brk: parent.program_brk,
                     mmap_base: parent.mmap_base,
+                    tls_area,
                 })
             },
         });
