@@ -54,8 +54,6 @@ const SYSCALL_YIELD: usize = 124;
 const SYSCALL_THREAD_CREATE: usize = 460;
 /// gettid syscall
 const SYSCALL_GETTID: usize = 178;
-/// set_tid_address syscall
-const SYSCALL_SET_TID_ADDRESS: usize = 96;
 /// waittid syscall
 const SYSCALL_WAITTID: usize = 462;
 /// mutex_create syscall
@@ -461,7 +459,6 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),
         SYSCALL_GETTID => sys_gettid(),
-        SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
         SYSCALL_WAITTID => sys_waittid(args[0]) as isize,
         SYSCALL_MUTEX_CREATE => sys_mutex_create(args[0] == 1),
         SYSCALL_MUTEX_LOCK => sys_mutex_lock(args[0]),
