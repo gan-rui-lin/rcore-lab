@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Set PATH to prioritize rustup nightly-2024-05-02 toolchain
+export PATH="$HOME/.rustup/toolchains/nightly-2024-05-02-aarch64-apple-darwin/bin:$HOME/.rustup/toolchains/nightly-2024-05-02-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin:$PATH"
+
 # 默认配置
 BUILD_TYPE="debug"
 IMAGE_FILE="sdcard-final.img"

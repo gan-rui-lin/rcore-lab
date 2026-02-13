@@ -23,3 +23,5 @@ os/vendor/
 AGENT.*
 kernel-qemu
 sbi-qemu
+tmp/*
+os/tmp/*
