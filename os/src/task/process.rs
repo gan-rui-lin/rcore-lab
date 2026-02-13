@@ -1,7 +1,7 @@
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
 use super::{PidHandle, SignalActions, SignalFlags, TaskControlBlock, TlsArea, add_task, pid_alloc};
-use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
+use crate::config::{USER_STACK_SIZE};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{KERNEL_SPACE, MemorySet, translated_refmut};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
@@ -11,7 +11,6 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
-use xmas_elf::program::Type;
 
 const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
 
@@ -164,29 +163,6 @@ impl ProcessControlBlock {
             TlsArea::new(&info, &mut memory_set, elf_data)
         });
 
-        let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
-        let ph_num = elf.header.pt2.ph_count() as usize;
-        let ph_ent = elf.header.pt2.ph_entry_size() as usize;
-        let ph_off = elf.header.pt2.ph_offset() as usize;
-        let mut ph_addr = 0usize;
-        for ph in elf.program_iter() {
-            if let Ok(Type::Phdr) = ph.get_type() {
-                ph_addr = ph.virtual_addr() as usize;
-                break;
-            }
-        }
-        if ph_addr == 0 {
-            for ph in elf.program_iter() {
-                if let Ok(Type::Load) = ph.get_type() {
-                    let p_off = ph.offset() as usize;
-                    let p_filesz = ph.file_size() as usize;
-                    if ph_off >= p_off && ph_off < p_off + p_filesz {
-                        ph_addr = ph.virtual_addr() as usize + (ph_off - p_off);
-                        break;
-                    }
-                }
-            }
-        }
         let new_token = memory_set.token();
         let ustack_base = user_stack_top.saturating_sub(USER_STACK_SIZE);
         {
@@ -229,25 +205,6 @@ impl ProcessControlBlock {
         }
         user_sp &= !0xf;
         let word_size = core::mem::size_of::<usize>();
-        const AT_NULL: usize = 0;
-        const AT_PHDR: usize = 3;
-        const AT_PHENT: usize = 4;
-        const AT_PHNUM: usize = 5;
-        const AT_PAGESZ: usize = 6;
-        const AT_ENTRY: usize = 9;
-        let auxv_entries = [
-            (AT_ENTRY, entry_point),
-            (AT_PHDR, ph_addr),
-            (AT_PHENT, ph_ent),
-            (AT_PHNUM, ph_num),
-            (AT_PAGESZ, PAGE_SIZE),
-            (AT_NULL, 0),
-        ];
-        for (key, val) in auxv_entries.iter().rev() {
-            user_sp -= 2 * word_size;
-            *translated_refmut(new_token, user_sp as *mut usize) = *key;
-            *translated_refmut(new_token, (user_sp + word_size) as *mut usize) = *val;
-        }
         user_sp -= (env_addrs.len() + 1) * word_size;
         let envp_base = user_sp;
         for (i, addr) in env_addrs.iter().enumerate() {
@@ -309,58 +266,12 @@ impl ProcessControlBlock {
         trap_cx.x[11] = argv_base;
         trap_cx.x[12] = envp_base;
 
-        // Set tp register if TLS is present
+        // Set tp register only if TLS segment is present
         if let Some(ref tls) = tls_area {
             trap_cx.x[4] = tls.tp_value;  // tp = x4
             info!("[kernel] exec: TLS initialized: tp = {:#x}", tls.tp_value);
-        } else {
-            // WORKAROUND: Even without PT_TLS, musl expects tp to point to a valid TCB
-            // Allocate a more complete TCB structure based on musl's pthread struct
-            let tcb_addr = 0x7000_1000;  // Use a fixed address
-
-            // Map a page for TCB
-            let mut inner = self.inner_exclusive_access();
-            inner.memory_set.insert_framed_area(
-                tcb_addr.into(),
-                (tcb_addr + 0x1000).into(),
-                crate::mm::MapPermission::R | crate::mm::MapPermission::W | crate::mm::MapPermission::U,
-            );
-
-            // Initialize TCB with musl pthread structure layout
-            // Based on musl's src/internal/pthread_impl.h:
-            // struct pthread {
-            //   struct pthread *self;           // offset 0
-            //   void **dtv;                     // offset 8
-            //   struct pthread *prev, *next;    // offset 16, 24
-            //   uintptr_t sysinfo;             // offset 32
-            //   uintptr_t canary, canary2;     // offset 40, 48
-            //   pid_t tid;                      // offset 56
-            //   int errno_val;                  // offset 60
-            //   // ... more fields
-            // }
-            let token = inner.memory_set.token();
-            let pid = self.getpid();
-
-            // Zero out entire TCB region first
-            for i in 0..256 {  // Clear first 256 bytes
-                *crate::mm::translated_refmut(token, (tcb_addr + i) as *mut u8) = 0;
-            }
-
-            // Set key fields
-            *crate::mm::translated_refmut(token, (tcb_addr + 0) as *mut usize) = tcb_addr;  // self
-            *crate::mm::translated_refmut(token, (tcb_addr + 8) as *mut usize) = 0;  // dtv = NULL
-            *crate::mm::translated_refmut(token, (tcb_addr + 16) as *mut usize) = 0;  // prev = NULL
-            *crate::mm::translated_refmut(token, (tcb_addr + 24) as *mut usize) = 0;  // next = NULL
-            *crate::mm::translated_refmut(token, (tcb_addr + 32) as *mut usize) = 0;  // sysinfo
-            *crate::mm::translated_refmut(token, (tcb_addr + 40) as *mut usize) = 0;  // canary
-            *crate::mm::translated_refmut(token, (tcb_addr + 48) as *mut usize) = 0;  // canary2
-            *crate::mm::translated_refmut(token, (tcb_addr + 56) as *mut i32) = pid as i32;  // tid
-
-            drop(inner);
-
-            trap_cx.x[4] = tcb_addr;  // tp points to TCB
-            info!("[kernel] exec: Extended TCB allocated at {:#x} (no PT_TLS), tid={}", tcb_addr, pid);
         }
+        // Note: If no PT_TLS, we don't set tp - let userspace libc initialize it
 
         *task_inner.get_trap_cx() = trap_cx;
     }
