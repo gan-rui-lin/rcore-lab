@@ -271,6 +271,24 @@ impl ProcessControlBlock {
             info!("[kernel] exec: Pushed {} simple auxv entries (no PT_TLS)", simple_auxv.len());
         }
 
+        // Allocate TCB before argc/argv/envp if no PT_TLS
+        let tp_value = if tls_area.is_none() {
+            let tcb_size = 16usize;
+            user_sp = (user_sp - tcb_size) & !0xf;
+            let tcb_addr = user_sp;
+
+            // Initialize minimal TCB
+            // TCB[0] = dtv pointer (set to 0)
+            *translated_refmut(new_token, tcb_addr as *mut usize) = 0;
+            // TCB[1] = self pointer (points to TCB itself)
+            *translated_refmut(new_token, (tcb_addr + 8) as *mut usize) = tcb_addr;
+
+            info!("[kernel] exec: Minimal TCB allocated at {:#x} (before argc)", tcb_addr);
+            Some(tcb_addr)
+        } else {
+            None
+        };
+
         // Now push envp and argv arrays
         user_sp -= (env_addrs.len() + 1) * word_size;
         let envp_base = user_sp;
@@ -310,22 +328,10 @@ impl ProcessControlBlock {
         if let Some(ref tls) = tls_area {
             trap_cx.x[4] = tls.tp_value;  // tp = x4
             info!("[kernel] exec: TLS initialized: tp = {:#x}", tls.tp_value);
-        } else {
-            // Even without PT_TLS, busybox needs tp to point to a valid TCB
-            // Allocate a minimal TLS area (16 bytes for TCB) at the top of user stack
-            let tcb_size = 16usize;
-            user_sp = (user_sp - tcb_size) & !0xf;  // Align to 16 bytes
-            let tp_value = user_sp;
-
-            // Initialize minimal TCB
-            // TCB[0] = dtv pointer (set to 0)
-            *translated_refmut(new_token, tp_value as *mut usize) = 0;
-            // TCB[1] = self pointer (points to TCB itself)
-            *translated_refmut(new_token, (tp_value + 8) as *mut usize) = tp_value;
-
-            trap_cx.x[4] = tp_value;  // tp = x4
-            info!("[kernel] exec: Minimal TCB initialized (no PT_TLS): tp = {:#x}", tp_value);
-            // Note: Don't create TlsArea for minimal TCB on stack - it's copied with stack during fork
+        } else if let Some(tcb_addr) = tp_value {
+            // Use the TCB we allocated earlier (before argc)
+            trap_cx.x[4] = tcb_addr;  // tp = x4
+            info!("[kernel] exec: Minimal TCB initialized (no PT_TLS): tp = {:#x}", tcb_addr);
         }
 
         *task_inner.get_trap_cx() = trap_cx;
