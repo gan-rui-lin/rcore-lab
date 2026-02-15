@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed (2026-02-16)
+
+#### Linux ABI栈布局错误 [ac9fc68]
+- **argv[0]=NULL的根本原因**: 完全修正exec()中的Linux ABI栈布局实现
+  - **现象**: busybox在0x10ef4处LoadPageFault，argv[0]=NULL
+  - **根因**: 对Linux ABI的根本性误解 - 错误地创建了单独的argv/envp数组
+  - **错误实现**: `*(sp) = argc, *(sp+8) = argv数组地址` ← 多了一层间接
+  - **正确ABI**: `*(sp) = argc, *(sp+8) = argv[0], *(sp+16) = argv[1], ...` ← argv指针直接在栈上
+  - **修复**: 移除argv/envp数组分配，直接在argc后写入argv/envp指针
+  - **测试**: ✅ 无LoadPageFault，busybox成功运行，退出码0x0
+
 ### Fixed (2026-02-15)
 
 #### Busybox OOM问题 [04ee655]
@@ -16,7 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - **根因**: 强制TCB初始化干扰了musl libc的malloc初始化逻辑
   - **修复**: 移除强制TCB，让userspace libc自行初始化tp寄存器
   - **同时改进**: 添加完整auxv支持(12项)，包括AT_RANDOM, AT_UID等
-  - **测试**: busybox成功运行，退出码0x0
+  - **注**: 此修复暴露了后续的栈布局错误(ac9fc68)
 
 #### LoadPageFault Bug [3e53f6a]
 - **TCB覆盖argc问题**: 修复exec()中TCB初始化时机错误导致的内存覆盖
@@ -24,7 +35,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - **根因**: TCB分配在argc写入之后，覆盖了argc/argv/envp数据
   - **修复**: 将TCB分配移到argc写入之前，确保正确的栈布局
   - **文档**: `docs/LoadPageFault-Debug-Report.md` 完整调试过程
-  - **注**: 此修复后续被04ee655替代，最终采用不强制TCB的方案
+  - **注**: 此修复被04ee655和ac9fc68替代
 
 ### Added (2026-02-15)
 
