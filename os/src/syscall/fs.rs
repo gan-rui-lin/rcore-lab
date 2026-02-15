@@ -819,3 +819,261 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
         _ => errno(EINVAL),
     }
 }
+
+/// ioctl system call - Device I/O control
+///
+/// # Arguments
+/// - fd: file descriptor
+/// - request: I/O control request code
+/// - arg: request-specific argument
+///
+/// # Returns
+/// - Success: 0 or request-specific value
+/// - Failure: -errno
+pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
+    use super::errno::*;
+    use crate::mm::translated_refmut;
+
+    // Common ioctl request codes
+    const TCGETS: usize = 0x5401;      // Get terminal attributes
+    const TCSETS: usize = 0x5402;      // Set terminal attributes
+    const TIOCGPGRP: usize = 0x540F;   // Get process group
+    const TIOCSPGRP: usize = 0x5410;   // Set process group
+    const TIOCGWINSZ: usize = 0x5413;  // Get window size
+    const TIOCSWINSZ: usize = 0x5414;  // Set window size
+    const FIONREAD: usize = 0x541B;    // Get number of bytes available
+    const FIONBIO: usize = 0x5421;     // Set/clear non-blocking I/O
+
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+
+    // Handle common ioctl requests
+    match request {
+        TCGETS => {
+            // Get terminal attributes
+            // For simplicity, return success without actual implementation
+            // Real implementation would fill termios structure
+            if arg == 0 {
+                return errno(EFAULT);
+            }
+            0
+        }
+        TCSETS => {
+            // Set terminal attributes
+            // For simplicity, accept but don't actually change anything
+            if arg == 0 {
+                return errno(EFAULT);
+            }
+            0
+        }
+        TIOCGWINSZ => {
+            // Get window size
+            // Return default terminal size: 24 rows x 80 columns
+            if arg == 0 {
+                return errno(EFAULT);
+            }
+            let token = current_user_token();
+            let winsize = translated_refmut(token, arg as *mut [u16; 4]);
+            winsize[0] = 24;  // ws_row
+            winsize[1] = 80;  // ws_col
+            winsize[2] = 0;   // ws_xpixel
+            winsize[3] = 0;   // ws_ypixel
+            0
+        }
+        TIOCSWINSZ => {
+            // Set window size
+            // Accept but ignore
+            if arg == 0 {
+                return errno(EFAULT);
+            }
+            0
+        }
+        TIOCGPGRP | TIOCSPGRP => {
+            // Process group operations
+            // Not fully implemented, return success
+            if arg == 0 {
+                return errno(EFAULT);
+            }
+            0
+        }
+        FIONREAD => {
+            // Get number of bytes available to read
+            // For regular files, return remaining bytes
+            // For pipes/sockets, would need actual buffer check
+            if arg == 0 {
+                return errno(EFAULT);
+            }
+            let available = if let Some(inode) = file.inode() {
+                let size = inode.size();
+                let offset = file.get_offset().unwrap_or(0);
+                if size > offset {
+                    size - offset
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let token = current_user_token();
+            let out_ptr = translated_refmut(token, arg as *mut usize);
+            *out_ptr = available;
+            0
+        }
+        FIONBIO => {
+            // Set/clear non-blocking mode
+            // Accept but don't implement (would need File trait changes)
+            if arg == 0 {
+                return errno(EFAULT);
+            }
+            0
+        }
+        _ => {
+            // Unknown ioctl request
+            // Return ENOTTY (inappropriate ioctl for device)
+            errno(ENOTTY)
+        }
+    }
+}
+
+/// ftruncate system call - Truncate file to specified length
+///
+/// # Arguments
+/// - fd: file descriptor
+/// - length: new file size in bytes
+///
+/// # Returns
+/// - Success: 0
+/// - Failure: -errno
+pub fn sys_ftruncate(fd: usize, length: isize) -> isize {
+    use super::errno::*;
+
+    if length < 0 {
+        return errno(EINVAL);
+    }
+
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+
+    // Check if file is writable
+    if !file.writable() {
+        return errno(EINVAL);
+    }
+
+    // For now, we'll accept the call but won't actually truncate
+    // Full implementation would require:
+    // 1. OSInode to support truncate operation
+    // 2. File system layer to handle block allocation/deallocation
+    // 3. Handling of growing files (filling with zeros)
+    // 4. Handling of shrinking files (freeing blocks)
+
+    // Get current file size
+    if let Some(inode) = file.inode() {
+        let current_size = inode.size();
+        let new_size = length as usize;
+
+        if new_size > current_size {
+            // Growing file - would need to allocate blocks and zero-fill
+            // For simplicity, we'll just accept it
+            debug!(
+                "[sys_ftruncate] fd={} grow from {} to {} (not fully implemented)",
+                fd, current_size, new_size
+            );
+        } else if new_size < current_size {
+            // Shrinking file - would need to free blocks
+            debug!(
+                "[sys_ftruncate] fd={} shrink from {} to {} (not fully implemented)",
+                fd, current_size, new_size
+            );
+        }
+        // If new_size == current_size, nothing to do
+
+        0
+    } else {
+        // File has no size (pipe, socket, etc.)
+        errno(EINVAL)
+    }
+}
+
+/// sendfile system call - Transfer data between file descriptors
+///
+/// # Arguments
+/// - out_fd: destination file descriptor
+/// - in_fd: source file descriptor
+/// - offset: pointer to offset (if non-null, read starts from this offset)
+/// - count: number of bytes to transfer
+///
+/// # Returns
+/// - Success: number of bytes transferred
+/// - Failure: -errno
+///
+/// Note: This is a simplified implementation that accepts the parameters
+/// but returns ENOSYS (not implemented) as it requires kernel buffer management.
+/// A full implementation would need:
+/// 1. Kernel-space buffer pool for zero-copy transfers
+/// 2. Proper handling of file offset updates
+/// 3. Support for splice/pipe operations
+pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut isize, count: usize) -> isize {
+    use super::errno::*;
+
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+
+    // Validate file descriptors
+    if in_fd >= inner.fd_table.len() || out_fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+
+    let Some(in_file) = &inner.fd_table[in_fd] else {
+        return errno(EBADF);
+    };
+
+    let Some(out_file) = &inner.fd_table[out_fd] else {
+        return errno(EBADF);
+    };
+
+    // Check permissions
+    if !in_file.readable() {
+        return errno(EBADF);
+    }
+    if !out_file.writable() {
+        return errno(EBADF);
+    }
+
+    // Validate offset parameter if provided
+    if !offset.is_null() {
+        use crate::mm::translated_refmut;
+        let token = current_user_token();
+        let offset_ref = translated_refmut(token, offset);
+        if *offset_ref < 0 {
+            return errno(EINVAL);
+        }
+    }
+
+    // For now, return ENOSYS (not fully implemented)
+    // A complete implementation would require kernel buffer management
+    // to efficiently transfer data without going through user space
+    debug!(
+        "[sys_sendfile] in_fd={} out_fd={} count={} (not fully implemented)",
+        in_fd, out_fd, count
+    );
+
+    // Return 0 to indicate no bytes transferred (but not an error)
+    // Applications can fall back to read/write loops
+    errno(ENOSYS)
+}
