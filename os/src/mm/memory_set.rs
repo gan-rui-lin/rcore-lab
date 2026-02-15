@@ -450,6 +450,61 @@ impl MemorySet {
             false
         }
     }
+
+    /// Change memory protection for a region
+    /// Returns true on success, false if region not found or invalid
+    pub fn change_protection(
+        &mut self,
+        start: VirtAddr,
+        end: VirtAddr,
+        new_perm: MapPermission,
+    ) -> bool {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+
+        // Find overlapping areas and change their permissions
+        let mut success = false;
+        for area in self.areas.iter_mut() {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+
+            // Check if this area overlaps with the requested range
+            if area_start < end_vpn && area_end > start_vpn {
+                // Calculate the actual range to modify within this area
+                let modify_start = area_start.max(start_vpn);
+                let modify_end = area_end.min(end_vpn);
+
+                // Convert MapPermission to PTEFlags
+                let mut flags = PTEFlags::V;
+                if new_perm.contains(MapPermission::R) {
+                    flags |= PTEFlags::R;
+                }
+                if new_perm.contains(MapPermission::W) {
+                    flags |= PTEFlags::W;
+                }
+                if new_perm.contains(MapPermission::X) {
+                    flags |= PTEFlags::X;
+                }
+                if new_perm.contains(MapPermission::U) {
+                    flags |= PTEFlags::U;
+                }
+
+                // Update page table entries for this range
+                for vpn in VPNRange::new(modify_start, modify_end) {
+                    self.page_table.change_pte_flags(vpn, flags);
+                }
+
+                // If the entire area is being modified, update the area's permission
+                if modify_start == area_start && modify_end == area_end {
+                    area.map_perm = new_perm;
+                }
+
+                success = true;
+            }
+        }
+
+        success
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {

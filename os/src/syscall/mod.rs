@@ -16,6 +16,8 @@ const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_DUP: usize = 23;
 /// dup3 syscall
 const SYSCALL_DUP3: usize = 24;
+/// fcntl syscall
+const SYSCALL_FCNTL: usize = 25;
 /// unlinkat syscall
 const SYSCALL_UNLINKAT: usize = 35;
 /// mkdirat syscall
@@ -36,10 +38,14 @@ const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_PIPE2: usize = 59;
 /// getdents64 syscall
 const SYSCALL_GETDENTS64: usize = 61;
+/// lseek syscall
+const SYSCALL_LSEEK: usize = 62;
 /// read syscall
 const SYSCALL_READ: usize = 63;
 /// write syscall
 const SYSCALL_WRITE: usize = 64;
+/// writev syscall
+const SYSCALL_WRITEV: usize = 66;
 /// fstat syscall
 const SYSCALL_FSTAT: usize = 80;
 /// exit syscall
@@ -114,6 +120,8 @@ const SYSCALL_FORK: usize = 220;
 const SYSCALL_EXEC: usize = 221;
 /// mmap syscall
 const SYSCALL_MMAP: usize = 222;
+/// mprotect syscall
+const SYSCALL_MPROTECT: usize = 226;
 /// waitpid syscall
 const SYSCALL_WAITPID: usize = 260;
 /// spawn syscall
@@ -425,6 +433,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_DUP3 => sys_dup3(args[0], args[1]),
+        SYSCALL_FCNTL => sys_fcntl(args[0], args[1] as i32, args[2]),
         SYSCALL_OPENAT => sys_openat(
             args[0] as isize,
             args[1] as *const u8,
@@ -452,8 +461,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
+        SYSCALL_LSEEK => sys_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
+        SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const usize, args[2]),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut Stat),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
@@ -498,6 +509,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GET_TIME => sys_get_time(args[0] as *mut TimeVal, args[1]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
+        SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_SBRK => sys_sbrk(args[0] as isize),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),

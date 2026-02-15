@@ -667,3 +667,68 @@ pub fn sys_shutdown() -> ! {
         current_process().pid.0);
     shutdown();
 }
+
+/// mprotect - change memory region protection
+///
+/// # Arguments
+/// * `addr` - starting address of memory region (must be page-aligned)
+/// * `len` - length of memory region
+/// * `prot` - new protection flags (PROT_READ | PROT_WRITE | PROT_EXEC)
+///
+/// # Returns
+/// * On success: 0
+/// * On error: -errno
+pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_mprotect addr=0x{:x} len=0x{:x} prot=0x{:x}",
+               pid, addr, len, prot);
+    }
+
+    const PROT_READ: usize = 0x1;
+    const PROT_WRITE: usize = 0x2;
+    const PROT_EXEC: usize = 0x4;
+
+    use crate::config::PAGE_SIZE;
+
+    // Check alignment
+    if addr % PAGE_SIZE != 0 {
+        return errno(EINVAL);
+    }
+
+    if len == 0 {
+        return 0;
+    }
+
+    // Convert prot flags to MapPermission
+    let mut map_perm = MapPermission::U;
+    if (prot & PROT_READ) != 0 {
+        map_perm |= MapPermission::R;
+    }
+    if (prot & PROT_WRITE) != 0 {
+        map_perm |= MapPermission::W;
+    }
+    if (prot & PROT_EXEC) != 0 {
+        map_perm |= MapPermission::X;
+    }
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+
+    // Round up length to page boundary
+    let page_count = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    let end_addr = addr + page_count * PAGE_SIZE;
+
+    // Change protection for the memory region
+    let result = inner.memory_set.change_protection(
+        VirtAddr(addr),
+        VirtAddr(end_addr),
+        map_perm,
+    );
+
+    if result {
+        0
+    } else {
+        errno(EINVAL)
+    }
+}

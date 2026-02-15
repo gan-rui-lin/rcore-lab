@@ -585,3 +585,237 @@ pub fn sys_umount2(_target: *const u8, _flags: u32) -> isize {
     }
     0
 }
+
+/// lseek - reposition read/write file offset
+///
+/// # Arguments
+/// * `fd` - file descriptor
+/// * `offset` - offset value
+/// * `whence` - SEEK_SET (0), SEEK_CUR (1), SEEK_END (2)
+///
+/// # Returns
+/// * On success: the resulting offset location
+/// * On error: -errno
+pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_lseek fd={} offset={} whence={}", pid, fd, offset, whence);
+    }
+
+    const SEEK_SET: usize = 0;
+    const SEEK_CUR: usize = 1;
+    const SEEK_END: usize = 2;
+
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+
+    // Check if this is a pipe or other non-seekable file
+    if file.inode().is_none() {
+        return errno(ESPIPE);
+    }
+
+    let file = file.clone();
+    drop(inner);
+
+    let current_offset = file.get_offset().unwrap_or(0) as isize;
+    let file_size = if let Some(inode) = file.inode() {
+        inode.size() as isize
+    } else {
+        return errno(ESPIPE);
+    };
+
+    let new_offset = match whence {
+        SEEK_SET => offset,
+        SEEK_CUR => current_offset + offset,
+        SEEK_END => file_size + offset,
+        _ => return errno(EINVAL),
+    };
+
+    if new_offset < 0 {
+        return errno(EINVAL);
+    }
+
+    file.set_offset(new_offset as usize);
+    new_offset
+}
+
+/// writev - write data from multiple buffers
+///
+/// # Arguments
+/// * `fd` - file descriptor
+/// * `iov` - pointer to iovec array
+/// * `iovcnt` - number of iovec elements
+///
+/// # Returns
+/// * On success: number of bytes written
+/// * On error: -errno
+pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) && fd != 1 {
+        trace!("kernel:pid[{}] sys_writev fd={} iovcnt={}", pid, fd, iovcnt);
+    }
+
+    if iov.is_null() {
+        return errno(EFAULT);
+    }
+
+    if iovcnt == 0 {
+        return 0;
+    }
+
+    let token = current_user_token();
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+
+    if !file.writable() {
+        return errno(EBADF);
+    }
+
+    let file = file.clone();
+    drop(inner);
+
+    let mut total_written = 0isize;
+
+    // Read iovec structures from user space
+    for i in 0..iovcnt {
+        let iov_ptr = unsafe { iov.add(i * 2) };
+        let iov_buffers = translated_byte_buffer(token, iov_ptr as *const u8, 16);
+
+        let mut iov_data = [0u8; 16];
+        let mut offset = 0;
+        for slice in iov_buffers {
+            let len = slice.len().min(16 - offset);
+            iov_data[offset..offset + len].copy_from_slice(&slice[..len]);
+            offset += len;
+            if offset >= 16 {
+                break;
+            }
+        }
+
+        let base = usize::from_le_bytes([
+            iov_data[0], iov_data[1], iov_data[2], iov_data[3],
+            iov_data[4], iov_data[5], iov_data[6], iov_data[7],
+        ]);
+        let len = usize::from_le_bytes([
+            iov_data[8], iov_data[9], iov_data[10], iov_data[11],
+            iov_data[12], iov_data[13], iov_data[14], iov_data[15],
+        ]);
+
+        if base == 0 || len == 0 {
+            continue;
+        }
+
+        let buffers = translated_byte_buffer(token, base as *const u8, len);
+        let written = file.write(UserBuffer::new(buffers));
+        total_written += written as isize;
+    }
+
+    total_written
+}
+
+/// fcntl - manipulate file descriptor
+///
+/// # Arguments
+/// * `fd` - file descriptor
+/// * `cmd` - command (F_GETFL, F_SETFL, F_GETFD, F_SETFD, F_DUPFD)
+/// * `arg` - command-specific argument
+///
+/// # Returns
+/// * On success: depends on command
+/// * On error: -errno
+pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_fcntl fd={} cmd={} arg={}", pid, fd, cmd, arg);
+    }
+
+    const F_DUPFD: i32 = 0;
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+
+    let Some(_file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+
+    match cmd {
+        F_DUPFD => {
+            // Duplicate fd to the lowest numbered available fd >= arg
+            let new_fd = if arg < inner.fd_table.len() {
+                let mut found = None;
+                for i in arg..inner.fd_table.len() {
+                    if inner.fd_table[i].is_none() {
+                        found = Some(i);
+                        break;
+                    }
+                }
+                if let Some(i) = found {
+                    i
+                } else {
+                    inner.fd_table.len()
+                }
+            } else {
+                inner.fd_table.len()
+            };
+
+            if new_fd >= inner.fd_table.len() {
+                inner.fd_table.resize_with(new_fd + 1, || None);
+            }
+            inner.fd_table[new_fd] = inner.fd_table[fd].clone();
+            new_fd as isize
+        }
+        F_GETFD => {
+            // Get file descriptor flags (currently only FD_CLOEXEC is supported)
+            // For simplicity, return 0 (no flags set)
+            0
+        }
+        F_SETFD => {
+            // Set file descriptor flags
+            // For simplicity, accept but ignore
+            0
+        }
+        F_GETFL => {
+            // Get file status flags
+            // Return basic flags based on file properties
+            let file = &inner.fd_table[fd].as_ref().unwrap();
+            let mut flags = 0u32;
+            if file.readable() && file.writable() {
+                flags |= 0b10; // O_RDWR
+            } else if file.writable() {
+                flags |= 0b01; // O_WRONLY
+            }
+            // O_RDONLY is 0
+            flags as isize
+        }
+        F_SETFL => {
+            // Set file status flags
+            // For simplicity, accept but ignore (would need to modify File trait)
+            0
+        }
+        _ => errno(EINVAL),
+    }
+}
