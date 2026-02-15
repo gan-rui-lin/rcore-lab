@@ -856,3 +856,57 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
         errno(EINVAL)
     }
 }
+
+/// rt_sigtimedwait - Wait for signal
+///
+/// # Arguments
+/// - set: pointer to signal set to wait for
+/// - info: pointer to siginfo_t structure (output)
+/// - timeout: pointer to timespec structure (timeout)
+/// - sigsetsize: size of signal set
+///
+/// # Returns
+/// - Success: signal number
+/// - Failure: -errno
+///
+/// Note: This is a simplified implementation that doesn't actually block.
+/// A full implementation would need to:
+/// 1. Block the current task until a signal arrives
+/// 2. Handle timeout properly
+/// 3. Fill in the siginfo structure with signal details
+pub fn sys_rt_sigtimedwait(
+    set: *const usize,
+    info: *mut usize,
+    timeout: *const TimeSpec,
+    _sigsetsize: usize,
+) -> isize {
+    // Validate pointers
+    if set.is_null() {
+        return errno(EFAULT);
+    }
+
+    // For now, return EAGAIN to indicate no signal is pending
+    // A full implementation would:
+    // 1. Check if any signals in the set are pending
+    // 2. If yes, dequeue the signal and return its number
+    // 3. If no, block until a signal arrives or timeout occurs
+
+    // Read the signal set from user space (for validation)
+    let token = current_user_token();
+    let _sigset = translated_ref(token, set);
+
+    // Read timeout if provided
+    if !timeout.is_null() {
+        let _ts = translated_ref(token, timeout);
+        // Would use timeout to set up a timer
+    }
+
+    // Check if info pointer is provided
+    if !info.is_null() {
+        // Would fill in siginfo structure here
+        let _info_ref = translated_refmut(token, info);
+    }
+
+    // For simplicity, return EAGAIN (no signal available)
+    errno(EAGAIN)
+}
