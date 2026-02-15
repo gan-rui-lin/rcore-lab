@@ -139,10 +139,21 @@ impl ProcessControlBlock {
             trap_handler as usize,
         );
 
-        // Set tp register if TLS is present
+        // Set tp register
         if let Some(ref tls) = tls_area {
             trap_cx_value.x[4] = tls.tp_value;  // tp = x4
             info!("[kernel] TLS initialized: tp = {:#x}", tls.tp_value);
+        } else {
+            // Even without PT_TLS, allocate a minimal TCB near top of user stack
+            let tcb_addr = ustack_top - 16;  // 16 bytes TCB
+            let token = process.inner_exclusive_access().memory_set.token();
+
+            // Initialize minimal TCB
+            *translated_refmut(token, tcb_addr as *mut usize) = 0;
+            *translated_refmut(token, (tcb_addr + 8) as *mut usize) = tcb_addr;
+
+            trap_cx_value.x[4] = tcb_addr;  // tp = x4
+            info!("[kernel] Minimal TCB initialized (no PT_TLS): tp = {:#x}", tcb_addr);
         }
 
         *trap_cx = trap_cx_value;
@@ -295,12 +306,27 @@ impl ProcessControlBlock {
         trap_cx.x[11] = argv_base;
         trap_cx.x[12] = envp_base;
 
-        // Set tp register only if TLS segment is present
+        // Set tp register
         if let Some(ref tls) = tls_area {
             trap_cx.x[4] = tls.tp_value;  // tp = x4
             info!("[kernel] exec: TLS initialized: tp = {:#x}", tls.tp_value);
+        } else {
+            // Even without PT_TLS, busybox needs tp to point to a valid TCB
+            // Allocate a minimal TLS area (16 bytes for TCB) at the top of user stack
+            let tcb_size = 16usize;
+            user_sp = (user_sp - tcb_size) & !0xf;  // Align to 16 bytes
+            let tp_value = user_sp;
+
+            // Initialize minimal TCB
+            // TCB[0] = dtv pointer (set to 0)
+            *translated_refmut(new_token, tp_value as *mut usize) = 0;
+            // TCB[1] = self pointer (points to TCB itself)
+            *translated_refmut(new_token, (tp_value + 8) as *mut usize) = tp_value;
+
+            trap_cx.x[4] = tp_value;  // tp = x4
+            info!("[kernel] exec: Minimal TCB initialized (no PT_TLS): tp = {:#x}", tp_value);
+            // Note: Don't create TlsArea for minimal TCB on stack - it's copied with stack during fork
         }
-        // Note: If no PT_TLS, we don't set tp - let userspace libc initialize it
 
         *task_inner.get_trap_cx() = trap_cx;
     }
