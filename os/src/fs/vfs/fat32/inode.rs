@@ -1,6 +1,6 @@
 use super::disk::Fat32IoError;
 use super::fs::Fat32Fs;
-use crate::sync::UPSafeCell;
+use crate::sync::UPIntrFreeCell;
 use super::super::core::{VfsInode, VfsNodeKind};
 use alloc::format;
 use alloc::string::String;
@@ -12,19 +12,19 @@ use fatfs::{DefaultTimeProvider, Read, Seek, Write};
 pub struct Fat32Inode {
     path: String,
     kind: VfsNodeKind,
-    fs: Arc<UPSafeCell<Fat32Fs>>,
+    fs: Arc<UPIntrFreeCell<Fat32Fs>>,
 }
 
 impl Fat32Inode {
-    pub(super) fn new(path: String, kind: VfsNodeKind, fs: Arc<UPSafeCell<Fat32Fs>>) -> Self {
+    pub(super) fn new(path: String, kind: VfsNodeKind, fs: Arc<UPIntrFreeCell<Fat32Fs>>) -> Self {
         Self { path, kind, fs }
     }
 
-    pub(super) fn new_dir(path: String, fs: Arc<UPSafeCell<Fat32Fs>>) -> Self {
+    pub(super) fn new_dir(path: String, fs: Arc<UPIntrFreeCell<Fat32Fs>>) -> Self {
         Self::new(path, VfsNodeKind::Dir, fs)
     }
 
-    pub(super) fn new_file(path: String, fs: Arc<UPSafeCell<Fat32Fs>>) -> Self {
+    pub(super) fn new_file(path: String, fs: Arc<UPIntrFreeCell<Fat32Fs>>) -> Self {
         Self::new(path, VfsNodeKind::File, fs)
     }
 }
