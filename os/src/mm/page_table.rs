@@ -139,6 +139,18 @@ impl PageTable {
         assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
         *pte = PageTableEntry::empty();
     }
+    /// change the flags of a page table entry
+    #[allow(unused)]
+    pub fn change_pte_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
+        if let Some(pte) = self.find_pte(vpn) {
+            if pte.is_valid() {
+                let ppn = pte.ppn();
+                *pte = PageTableEntry::new(ppn, flags);
+                return true;
+            }
+        }
+        false
+    }
     /// get the page table entry from the virtual page number
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn).map(|pte| *pte)
