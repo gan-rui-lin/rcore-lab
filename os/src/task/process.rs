@@ -249,18 +249,41 @@ impl ProcessControlBlock {
                 auxv_entries.len(), auxv_base, random_addr);
         } else {
             // Simple auxv for programs without PT_TLS (master branch style)
+            // IMPORTANT: Must include AT_RANDOM for musl malloc to work correctly
+
+            // Push 16 random bytes for AT_RANDOM (needed by musl malloc)
+            user_sp -= 16;
+            user_sp &= !0xf;  // Align to 16 bytes
+            let random_addr = user_sp;
+            // Write some pseudo-random bytes (TODO: use proper RNG)
+            for i in 0..16 {
+                *translated_refmut(new_token, (random_addr + i) as *mut u8) = (i * 17) as u8;
+            }
+
             const AT_NULL: usize = 0;
             const AT_PHDR: usize = 3;
             const AT_PHENT: usize = 4;
             const AT_PHNUM: usize = 5;
             const AT_PAGESZ: usize = 6;
             const AT_ENTRY: usize = 9;
+            const AT_UID: usize = 11;
+            const AT_EUID: usize = 12;
+            const AT_GID: usize = 13;
+            const AT_EGID: usize = 14;
+            const AT_SECURE: usize = 23;
+            const AT_RANDOM: usize = 25;
             let simple_auxv = [
                 (AT_ENTRY, auxv_info.entry),
                 (AT_PHDR, auxv_info.phdr_addr),
                 (AT_PHENT, auxv_info.phent_size),
                 (AT_PHNUM, auxv_info.phnum),
                 (AT_PAGESZ, crate::config::PAGE_SIZE),
+                (AT_UID, 0),        // Root user
+                (AT_EUID, 0),       // Root effective user
+                (AT_GID, 0),        // Root group
+                (AT_EGID, 0),       // Root effective group
+                (AT_SECURE, 0),     // Not in secure mode
+                (AT_RANDOM, random_addr),
                 (AT_NULL, 0),
             ];
             for (key, val) in simple_auxv.iter().rev() {
@@ -268,26 +291,13 @@ impl ProcessControlBlock {
                 *translated_refmut(new_token, user_sp as *mut usize) = *key;
                 *translated_refmut(new_token, (user_sp + word_size) as *mut usize) = *val;
             }
-            info!("[kernel] exec: Pushed {} simple auxv entries (no PT_TLS)", simple_auxv.len());
+            info!("[kernel] exec: Pushed {} simple auxv entries (no PT_TLS), AT_RANDOM={:#x}",
+                simple_auxv.len(), random_addr);
         }
 
-        // Allocate TCB before argc/argv/envp if no PT_TLS
-        let tp_value = if tls_area.is_none() {
-            let tcb_size = 16usize;
-            user_sp = (user_sp - tcb_size) & !0xf;
-            let tcb_addr = user_sp;
-
-            // Initialize minimal TCB
-            // TCB[0] = dtv pointer (set to 0)
-            *translated_refmut(new_token, tcb_addr as *mut usize) = 0;
-            // TCB[1] = self pointer (points to TCB itself)
-            *translated_refmut(new_token, (tcb_addr + 8) as *mut usize) = tcb_addr;
-
-            info!("[kernel] exec: Minimal TCB allocated at {:#x} (before argc)", tcb_addr);
-            Some(tcb_addr)
-        } else {
-            None
-        };
+        // Do NOT allocate TCB for programs without PT_TLS
+        // Let userspace libc initialize tp if needed
+        let tp_value = None;
 
         // Now push envp and argv arrays
         user_sp -= (env_addrs.len() + 1) * word_size;
