@@ -10,12 +10,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed (2026-02-15)
 
+#### Busybox OOM问题 [04ee655]
+- **强制TCB导致OOM**: 移除对无PT_TLS程序的强制TCB分配
+  - **现象**: busybox调用mmap(0, 0, ...)失败，打印"sh: out of memory"
+  - **根因**: 强制TCB初始化干扰了musl libc的malloc初始化逻辑
+  - **修复**: 移除强制TCB，让userspace libc自行初始化tp寄存器
+  - **同时改进**: 添加完整auxv支持(12项)，包括AT_RANDOM, AT_UID等
+  - **测试**: busybox成功运行，退出码0x0
+
 #### LoadPageFault Bug [3e53f6a]
 - **TCB覆盖argc问题**: 修复exec()中TCB初始化时机错误导致的内存覆盖
   - **现象**: busybox在0x10ef4处发生LoadPageFault，argv[0]为NULL
   - **根因**: TCB分配在argc写入之后，覆盖了argc/argv/envp数据
   - **修复**: 将TCB分配移到argc写入之前，确保正确的栈布局
   - **文档**: `docs/LoadPageFault-Debug-Report.md` 完整调试过程
+  - **注**: 此修复后续被04ee655替代，最终采用不强制TCB的方案
 
 ### Added (2026-02-15)
 
@@ -35,11 +44,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed (2026-02-15)
 
-#### TLS支持 [e47e5c3]
+#### TLS支持 [e47e5c3] - 已弃用
 - **最小TCB初始化**: 为没有PT_TLS段的程序（如busybox）初始化最小线程控制块
   - 在用户栈顶分配16字节TCB
   - 正确设置tp寄存器指向TCB
-  - 兼容静态链接的musl程序
+  - ~~兼容静态链接的musl程序~~
+  - **注**: 此方案导致busybox OOM，已被04ee655替代
 
 ---
 
