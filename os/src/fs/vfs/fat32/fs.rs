@@ -1,7 +1,7 @@
 use super::disk::{Fat32Disk, Fat32IoError};
 use super::inode::Fat32Inode;
 use crate::drivers::BLOCK_DEVICE;
-use crate::sync::UPSafeCell;
+use crate::sync::UPIntrFreeCell;
 use alloc::string::String;
 use alloc::sync::Arc;
 use easy_fs::BlockDevice;
@@ -18,7 +18,7 @@ pub(in crate::fs::vfs) fn fat32_root() -> Result<Arc<dyn VfsInode>, Error<Fat32I
     if fs.fat_type() != FatType::Fat32 {
         return Err(Error::CorruptedFileSystem);
     }
-    let fs = Arc::new(unsafe { UPSafeCell::new(fs) });
+    let fs = Arc::new(unsafe { UPIntrFreeCell::new(fs) });
     Ok(Arc::new(Fat32Inode::new_dir(String::from("/"), fs)))
 }
 
