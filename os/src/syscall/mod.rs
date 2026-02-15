@@ -94,6 +94,8 @@ const SYSCALL_KILL: usize = 129;
 const SYSCALL_SIGACTION: usize = 134;
 /// sigprocmask syscall
 const SYSCALL_SIGPROCMASK: usize = 135;
+/// rt_sigtimedwait syscall
+const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
 /// sigreturn syscall
 const SYSCALL_SIGRETURN: usize = 139;
 /// setpriority syscall
@@ -116,6 +118,22 @@ const SYSCALL_GETEUID: usize = 175;
 const SYSCALL_GETGID: usize = 176;
 /// getegid syscall
 const SYSCALL_GETEGID: usize = 177;
+/// msgget syscall
+const SYSCALL_MSGGET: usize = 186;
+/// msgsnd syscall
+const SYSCALL_MSGSND: usize = 187;
+/// msgrcv syscall
+const SYSCALL_MSGRCV: usize = 188;
+/// msgctl syscall
+const SYSCALL_MSGCTL: usize = 189;
+/// shmget syscall
+const SYSCALL_SHMGET: usize = 194;
+/// shmctl syscall
+const SYSCALL_SHMCTL: usize = 195;
+/// shmat syscall
+const SYSCALL_SHMAT: usize = 196;
+/// shmdt syscall
+const SYSCALL_SHMDT: usize = 197;
 /// sbrk syscall
 const SYSCALL_SBRK: usize = 214;
 /// munmap syscall
@@ -138,6 +156,7 @@ const SYSCALL_SHUTDOWN: usize = 1001;
 
 mod errno;
 mod fs;
+mod ipc;
 mod process;
 mod sync;
 mod thread;
@@ -145,6 +164,7 @@ mod thread;
 use core::sync::atomic::{AtomicBool, Ordering};
 use errno::ENOSYS;
 use fs::*;
+use ipc::*;
 use process::*;
 use sync::*;
 use thread::*;
@@ -481,6 +501,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const TimeSpec, args[1] as *mut TimeSpec),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
+        SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
+            args[0] as *const usize,
+            args[1] as *mut usize,
+            args[2] as *const TimeSpec,
+            args[3],
+        ),
         SYSCALL_SIGACTION => sys_sigaction(
             args[0] as i32,
             args[1] as *const SignalAction,
@@ -506,6 +532,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
+        SYSCALL_MSGGET => sys_msgget(args[0] as i32, args[1] as i32),
+        SYSCALL_MSGSND => sys_msgsnd(args[0] as i32, args[1], args[2], args[3] as i32),
+        SYSCALL_MSGRCV => sys_msgrcv(args[0] as i32, args[1], args[2], args[3] as isize, args[4] as i32),
+        SYSCALL_MSGCTL => sys_msgctl(args[0] as i32, args[1] as i32, args[2]),
+        SYSCALL_SHMGET => sys_shmget(args[0] as i32, args[1], args[2] as i32),
+        SYSCALL_SHMAT => sys_shmat(args[0] as i32, args[1], args[2] as i32),
+        SYSCALL_SHMDT => sys_shmdt(args[0]),
+        SYSCALL_SHMCTL => sys_shmctl(args[0] as i32, args[1] as i32, args[2]),
         SYSCALL_FORK => sys_fork(),
         SYSCALL_EXEC => sys_exec(
             args[0] as *const u8,
