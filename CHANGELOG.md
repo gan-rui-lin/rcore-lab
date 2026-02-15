@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed (2026-02-15)
+
+#### LoadPageFault Bug [3e53f6a]
+- **TCB覆盖argc问题**: 修复exec()中TCB初始化时机错误导致的内存覆盖
+  - **现象**: busybox在0x10ef4处发生LoadPageFault，argv[0]为NULL
+  - **根因**: TCB分配在argc写入之后，覆盖了argc/argv/envp数据
+  - **修复**: 将TCB分配移到argc写入之前，确保正确的栈布局
+  - **文档**: `docs/LoadPageFault-Debug-Report.md` 完整调试过程
+
 ### Added (2026-02-15)
 
 #### 中断安全基础设施 [5f3b8ee]
