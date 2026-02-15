@@ -1,6 +1,6 @@
 //! batch subsystem
 
-use crate::sync::UPSafeCell;
+use crate::sync::UPIntrFreeCell;
 use crate::trap::TrapContext;
 use core::arch::asm;
 use lazy_static::*;
@@ -100,8 +100,8 @@ impl AppManager {
 }
 
 lazy_static! {
-    static ref APP_MANAGER: UPSafeCell<AppManager> = unsafe {
-        UPSafeCell::new({
+    static ref APP_MANAGER: UPIntrFreeCell<AppManager> = unsafe {
+        UPIntrFreeCell::new({
             extern "C" {
                 fn _num_app();
             }
