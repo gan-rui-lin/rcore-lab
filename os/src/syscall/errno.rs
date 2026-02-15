@@ -24,6 +24,7 @@ pub const ENOTTY: isize = 25;
 pub const EPIPE: isize = 32;
 pub const ERANGE: isize = 34;
 pub const ESPIPE: isize = 29;
+pub const ELOOP: isize = 40;
 pub const ENOSYS: isize = 38;
 pub const ENOTEMPTY: isize = 39;
 pub const ENOTSUP: isize = 95;

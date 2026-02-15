@@ -149,11 +149,57 @@ pub fn sys_fork() -> isize {
     new_pid as isize
 }
 
-pub fn sys_exec(path: *const u8, mut argv: *const usize, mut envp: *const usize) -> isize {
+/// Maximum depth for shebang recursion to prevent infinite loops
+const MAX_SHEBANG_DEPTH: usize = 4;
+
+/// Parse shebang line and return (interpreter_path, optional_arg)
+fn parse_shebang(data: &[u8]) -> Option<(String, Option<String>)> {
+    // Check for shebang marker
+    if data.len() < 2 || data[0] != b'#' || data[1] != b'!' {
+        return None;
+    }
+
+    // Find the end of first line
+    let line_end = data.iter().position(|&b| b == b'\n' || b == b'\r').unwrap_or(data.len());
+    if line_end <= 2 {
+        return None;
+    }
+
+    // Extract the shebang line (skip #!)
+    let shebang_line = &data[2..line_end];
+
+    // Convert to string and trim whitespace
+    let shebang_str = core::str::from_utf8(shebang_line).ok()?.trim();
+    if shebang_str.is_empty() {
+        return None;
+    }
+
+    // Split by whitespace to get interpreter and optional argument
+    let mut parts = shebang_str.split_whitespace();
+    let interpreter = String::from(parts.next()?);
+    let arg = parts.next().map(|s| String::from(s));
+
+    Some((interpreter, arg))
+}
+
+/// Internal exec implementation with shebang recursion depth tracking
+fn sys_exec_internal(
+    path: *const u8,
+    mut argv: *const usize,
+    mut envp: *const usize,
+    depth: usize,
+) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_exec", pid);
+        trace!("kernel:pid[{}] sys_exec (depth={})", pid, depth);
     }
+
+    // Prevent infinite shebang recursion
+    if depth > MAX_SHEBANG_DEPTH {
+        error!("kernel:pid[{}] sys_exec: shebang recursion too deep", pid);
+        return errno(ELOOP);
+    }
+
     if path.is_null() {
         return errno(EFAULT);
     }
@@ -162,6 +208,7 @@ pub fn sys_exec(path: *const u8, mut argv: *const usize, mut envp: *const usize)
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_exec path={}", pid, raw_path);
     }
+
     let mut args: Vec<String> = Vec::new();
     if !argv.is_null() {
         loop {
@@ -178,6 +225,7 @@ pub fn sys_exec(path: *const u8, mut argv: *const usize, mut envp: *const usize)
     if args.is_empty() {
         args.push(raw_path.clone());
     }
+
     let mut envs: Vec<String> = Vec::new();
     if !envp.is_null() {
         loop {
@@ -191,6 +239,7 @@ pub fn sys_exec(path: *const u8, mut argv: *const usize, mut envp: *const usize)
             }
         }
     }
+
     let process = current_process();
     let exec_path = if raw_path.starts_with('/') {
         raw_path.clone()
@@ -202,8 +251,79 @@ pub fn sys_exec(path: *const u8, mut argv: *const usize, mut envp: *const usize)
             format!("{}/{}", cwd.trim_end_matches('/'), raw_path)
         }
     };
+
     if let Some(app_inode) = open_file(exec_path.as_str(), OpenFlags::empty()) {
         let all_data = app_inode.read_all();
+
+        // Check for shebang
+        if let Some((interpreter, interp_arg)) = parse_shebang(&all_data) {
+            if crate::syscall::should_trace_syscall(pid) {
+                trace!(
+                    "kernel:pid[{}] sys_exec: detected shebang, interpreter={}, arg={:?}",
+                    pid,
+                    interpreter,
+                    interp_arg
+                );
+            }
+
+            // Construct new argv for interpreter
+            // Format: [interpreter, optional_arg, script_path, original_args...]
+            let mut new_args = Vec::new();
+            new_args.push(interpreter.clone());
+            if let Some(arg) = interp_arg {
+                new_args.push(arg);
+            }
+            new_args.push(exec_path.clone());
+            // Add original arguments (skip argv[0] which was the script name)
+            for i in 1..args.len() {
+                new_args.push(args[i].clone());
+            }
+
+            // Try to open and execute the interpreter
+            let interp_path = if interpreter.starts_with('/') {
+                interpreter.clone()
+            } else {
+                let cwd = process.inner_exclusive_access().cwd.clone();
+                if cwd == "/" {
+                    format!("/{}", interpreter)
+                } else {
+                    format!("{}/{}", cwd.trim_end_matches('/'), interpreter)
+                }
+            };
+
+            if let Some(interp_inode) = open_file(interp_path.as_str(), OpenFlags::empty()) {
+                let interp_data = interp_inode.read_all();
+
+                // Check if interpreter itself has a shebang (recursive)
+                if interp_data.len() >= 2 && interp_data[0] == b'#' && interp_data[1] == b'!' {
+                    // Recursively handle nested shebang
+                    error!(
+                        "kernel:pid[{}] sys_exec: interpreter {} has shebang, not supported",
+                        pid, interp_path
+                    );
+                    return errno(ENOEXEC);
+                }
+
+                // Update process name to interpreter
+                {
+                    let mut inner = process.inner_exclusive_access();
+                    let name = interp_path
+                        .rsplit('/')
+                        .find(|part| !part.is_empty())
+                        .unwrap_or(interp_path.as_str());
+                    inner.name = String::from(name);
+                }
+
+                // Execute the interpreter with the script as argument
+                process.exec(interp_data.as_slice(), new_args, envs);
+                return 0;
+            } else {
+                error!("kernel:pid[{}] sys_exec: interpreter not found: {}", pid, interp_path);
+                return errno(ENOENT);
+            }
+        }
+
+        // Not a script, execute as regular ELF binary
         {
             let mut inner = process.inner_exclusive_access();
             let name = exec_path
@@ -217,6 +337,10 @@ pub fn sys_exec(path: *const u8, mut argv: *const usize, mut envp: *const usize)
     } else {
         errno(ENOENT)
     }
+}
+
+pub fn sys_exec(path: *const u8, argv: *const usize, envp: *const usize) -> isize {
+    sys_exec_internal(path, argv, envp, 0)
 }
 
 /// If there is not a child process whose pid is same as given, return -ECHILD.
