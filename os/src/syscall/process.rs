@@ -622,6 +622,45 @@ pub fn sys_sigreturn() -> isize {
     saved_a0
 }
 
+/// Get user ID
+/// rcore-lab is a single-user system, always returns 0
+pub fn sys_getuid() -> isize {
+    trace!("kernel:pid[{}] sys_getuid", current_process().pid.0);
+    0
+}
+
+/// Get effective user ID
+/// rcore-lab is a single-user system, always returns 0
+pub fn sys_geteuid() -> isize {
+    trace!("kernel:pid[{}] sys_geteuid", current_process().pid.0);
+    0
+}
+
+/// Get group ID
+/// rcore-lab is a single-user system, always returns 0
+pub fn sys_getgid() -> isize {
+    trace!("kernel:pid[{}] sys_getgid", current_process().pid.0);
+    0
+}
+
+/// Get effective group ID
+/// rcore-lab is a single-user system, always returns 0
+pub fn sys_getegid() -> isize {
+    trace!("kernel:pid[{}] sys_getegid", current_process().pid.0);
+    0
+}
+
+/// Exit all threads in the process
+/// In rcore-lab, exit_group behaves the same as exit since we terminate the entire process
+pub fn sys_exit_group(exit_code: i32) -> ! {
+    trace!(
+        "kernel:pid[{}] sys_exit_group (exit_code={})",
+        current_process().pid.0,
+        exit_code
+    );
+    sys_exit(exit_code)
+}
+
 pub fn sys_shutdown() -> ! {
     trace!(
         "kernel:pid[{}] sys_shutdown",
