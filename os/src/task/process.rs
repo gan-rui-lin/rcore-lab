@@ -299,33 +299,50 @@ impl ProcessControlBlock {
         // Let userspace libc initialize tp if needed
         let tp_value = None;
 
-        // Now push envp and argv arrays
-        user_sp -= (env_addrs.len() + 1) * word_size;
-        let envp_base = user_sp;
-        for (i, addr) in env_addrs.iter().enumerate() {
-            *translated_refmut(new_token, (envp_base + i * word_size) as *mut usize) = *addr;
-        }
-        *translated_refmut(
-            new_token,
-            (envp_base + env_addrs.len() * word_size) as *mut usize,
-        ) = 0;
-        user_sp -= (arg_addrs.len() + 1) * word_size;
-        let argv_base = user_sp;
-        for (i, addr) in arg_addrs.iter().enumerate() {
-            *translated_refmut(new_token, (argv_base + i * word_size) as *mut usize) = *addr;
-        }
-        *translated_refmut(
-            new_token,
-            (argv_base + arg_addrs.len() * word_size) as *mut usize,
-        ) = 0;
+        // Linux ABI stack layout (from low address/high stack):
+        // [argc][argv[0]][argv[1]]...[NULL][envp[0]]...[NULL][auxv]...
+        // sp points to argc, sp+8 points to argv[0] (NOT to an argv array!)
 
+        // First, calculate required space and align
         let argc = arg_addrs.len();
-        user_sp = (user_sp - word_size) & !0xf;
-        *translated_refmut(new_token, user_sp as *mut usize) = argc;
+        user_sp -= word_size;  // space for argc
+        user_sp -= (argc + 1) * word_size;  // space for argv pointers + NULL
+        user_sp -= (env_addrs.len() + 1) * word_size;  // space for envp pointers + NULL
+        user_sp &= !0xf;  // Align to 16 bytes
+
+        // Now write from low address to high
+        let mut current_sp = user_sp;
+
+        // Write argc
+        *translated_refmut(new_token, current_sp as *mut usize) = argc;
+        current_sp += word_size;
+
+        // Write argv pointers
+        let argv_base = current_sp;
+        for addr in arg_addrs.iter() {
+            *translated_refmut(new_token, current_sp as *mut usize) = *addr;
+            current_sp += word_size;
+        }
+        *translated_refmut(new_token, current_sp as *mut usize) = 0;  // argv NULL terminator
+        current_sp += word_size;
+
+        // Write envp pointers
+        let envp_base = current_sp;
+        for addr in env_addrs.iter() {
+            *translated_refmut(new_token, current_sp as *mut usize) = *addr;
+            current_sp += word_size;
+        }
+        *translated_refmut(new_token, current_sp as *mut usize) = 0;  // envp NULL terminator
+
+        info!("[kernel] exec: sp={:#x}, argc={}, argv_base={:#x}, envp_base={:#x}",
+            user_sp, argc, argv_base, envp_base);
+        info!("[kernel] exec: argv[0]={:#x}, argv[1]={:#x}",
+            if argc > 0 { arg_addrs[0] } else { 0 },
+            if argc > 1 { arg_addrs[1] } else { 0 });
 
         let mut trap_cx = TrapContext::app_init_context(
             entry_point,
-            user_sp,
+            user_sp,  // sp should point to argc
             KERNEL_SPACE.exclusive_access().token(),
             task.kstack.get_top(),
             trap_handler as usize,
