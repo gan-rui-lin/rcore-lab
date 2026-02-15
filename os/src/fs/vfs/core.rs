@@ -1,4 +1,4 @@
-use crate::sync::UPSafeCell;
+use crate::sync::UPIntrFreeCell;
 use lazy_static::lazy_static;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -188,7 +188,7 @@ impl Vfs {
 }
 
 lazy_static! {
-    pub(crate) static ref ROOT_VFS: UPSafeCell<Vfs> = unsafe { UPSafeCell::new(Vfs::new()) };
+    pub(crate) static ref ROOT_VFS: UPIntrFreeCell<Vfs> = unsafe { UPIntrFreeCell::new(Vfs::new()) };
 }
 
 struct NullInode;

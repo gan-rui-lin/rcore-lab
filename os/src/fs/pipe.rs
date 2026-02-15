@@ -1,7 +1,7 @@
 //! Simple in-memory pipe implementation.
 use super::File;
 use crate::mm::UserBuffer;
-use crate::sync::UPSafeCell;
+use crate::sync::UPIntrFreeCell;
 use crate::task::suspend_current_and_run_next;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -70,11 +70,11 @@ impl Pipe {
 pub struct PipeEnd {
     readable: bool,
     writable: bool,
-    pipe: Arc<UPSafeCell<Pipe>>,
+    pipe: Arc<UPIntrFreeCell<Pipe>>,
 }
 
 impl PipeEnd {
-    fn new(pipe: Arc<UPSafeCell<Pipe>>, readable: bool, writable: bool) -> Self {
+    fn new(pipe: Arc<UPIntrFreeCell<Pipe>>, readable: bool, writable: bool) -> Self {
         Self {
             readable,
             writable,
@@ -158,7 +158,7 @@ impl File for PipeEnd {
 
 /// Create a pipe and return (read_end, write_end).
 pub fn make_pipe(capacity: usize) -> (Arc<dyn File + Send + Sync>, Arc<dyn File + Send + Sync>) {
-    let pipe = Arc::new(unsafe { UPSafeCell::new(Pipe::new(capacity.max(DEFAULT_PIPE_CAPACITY))) });
+    let pipe = Arc::new(unsafe { UPIntrFreeCell::new(Pipe::new(capacity.max(DEFAULT_PIPE_CAPACITY))) });
     let read_end = Arc::new(PipeEnd::new(pipe.clone(), true, false));
     let write_end = Arc::new(PipeEnd::new(pipe, false, true));
     (read_end, write_end)

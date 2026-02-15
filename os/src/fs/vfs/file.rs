@@ -3,7 +3,7 @@
 use super::core::{normalize_path, VfsInode, VfsNodeKind, ROOT_VFS};
 use super::super::{File, OpenFlags};
 use crate::mm::UserBuffer;
-use crate::sync::UPSafeCell;
+use crate::sync::UPIntrFreeCell;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -12,7 +12,7 @@ pub struct VfsFile {
     readable: bool,
     writable: bool,
     path: String,
-    inner: UPSafeCell<VfsFileInner>,
+    inner: UPIntrFreeCell<VfsFileInner>,
 }
 
 struct VfsFileInner {
@@ -27,7 +27,7 @@ impl VfsFile {
             writable,
             path,
             inner: unsafe {
-                UPSafeCell::new(VfsFileInner {
+                UPIntrFreeCell::new(VfsFileInner {
                     offset: 0,
                     inode,
                 })

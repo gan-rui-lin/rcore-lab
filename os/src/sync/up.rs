@@ -101,7 +101,9 @@ pub struct UPIntrFreeCell<T> {
 }
 
 unsafe impl<T> Sync for UPIntrFreeCell<T> {}
+unsafe impl<T> Send for UPIntrFreeCell<T> {}
 
+/// RAII guard that automatically unmasks interrupts when dropped.
 pub struct UPIntrRefMut<'a, T>(Option<RefMut<'a, T>>);
 
 impl<T> UPIntrFreeCell<T> {
@@ -116,6 +118,18 @@ impl<T> UPIntrFreeCell<T> {
     pub fn exclusive_access(&self) -> UPIntrRefMut<'_, T> {
         INTR_MASKING_INFO.get_mut().enter();
         UPIntrRefMut(Some(self.inner.borrow_mut()))
+    }
+
+    /// Try to borrow the inner value while masking interrupts; returns None if already borrowed.
+    pub fn try_exclusive_access(&self) -> Option<UPIntrRefMut<'_, T>> {
+        INTR_MASKING_INFO.get_mut().enter();
+        match self.inner.try_borrow_mut() {
+            Ok(refmut) => Some(UPIntrRefMut(Some(refmut))),
+            Err(_) => {
+                INTR_MASKING_INFO.get_mut().exit();
+                None
+            }
+        }
     }
 
     /// Run a closure with exclusive access while masking interrupts.

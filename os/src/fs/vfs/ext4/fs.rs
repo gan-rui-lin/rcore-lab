@@ -1,6 +1,6 @@
 use super::disk::Ext4Disk;
 use super::inode::Ext4Inode;
-use crate::sync::UPSafeCell;
+use crate::sync::UPIntrFreeCell;
 use alloc::string::String;
 use alloc::sync::Arc;
 use easy_fs::BlockDevice;
@@ -9,7 +9,7 @@ use lwext4_rust::Ext4BlockWrapper;
 use super::super::core::VfsInode;
 
 pub(crate) struct Ext4Fs {
-    _inner: UPSafeCell<Ext4BlockWrapper<Ext4Disk>>,
+    _inner: UPIntrFreeCell<Ext4BlockWrapper<Ext4Disk>>,
 }
 
 impl Ext4Fs {
@@ -20,7 +20,7 @@ impl Ext4Fs {
             "ext4_fs0",
         )?;
         Ok(Self {
-            _inner: unsafe { UPSafeCell::new(wrapper) },
+            _inner: unsafe { UPIntrFreeCell::new(wrapper) },
         })
     }
 
