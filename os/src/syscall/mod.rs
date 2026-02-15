@@ -44,6 +44,8 @@ const SYSCALL_WRITE: usize = 64;
 const SYSCALL_FSTAT: usize = 80;
 /// exit syscall
 const SYSCALL_EXIT: usize = 93;
+/// exit_group syscall
+const SYSCALL_EXIT_GROUP: usize = 94;
 /// set_tid_address syscall
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
 /// nanosleep syscall
@@ -94,6 +96,14 @@ const SYSCALL_GET_TIME: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 /// getppid syscall
 const SYSCALL_GETPPID: usize = 173;
+/// getuid syscall
+const SYSCALL_GETUID: usize = 174;
+/// geteuid syscall
+const SYSCALL_GETEUID: usize = 175;
+/// getgid syscall
+const SYSCALL_GETGID: usize = 176;
+/// getegid syscall
+const SYSCALL_GETEGID: usize = 177;
 /// sbrk syscall
 const SYSCALL_SBRK: usize = 214;
 /// munmap syscall
@@ -446,6 +456,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut Stat),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
+        SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const TimeSpec, args[1] as *mut TimeSpec),
         SYSCALL_YIELD => sys_yield(),
@@ -471,6 +482,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CONDVAR_WAIT => sys_condvar_wait(args[0], args[1]),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETPPID => sys_getppid(),
+        SYSCALL_GETUID => sys_getuid(),
+        SYSCALL_GETEUID => sys_geteuid(),
+        SYSCALL_GETGID => sys_getgid(),
+        SYSCALL_GETEGID => sys_getegid(),
         SYSCALL_FORK => sys_fork(),
         SYSCALL_EXEC => sys_exec(
             args[0] as *const u8,
