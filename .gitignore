@@ -25,3 +25,4 @@ kernel-qemu
 sbi-qemu
 tmp/*
 os/tmp/*
+*.log

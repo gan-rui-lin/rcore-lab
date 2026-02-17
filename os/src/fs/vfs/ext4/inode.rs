@@ -59,16 +59,37 @@ fn ext4_file_exists(path: &str) -> bool {
     ext4_inode_exists(path, InodeTypes::EXT4_DE_REG_FILE)
 }
 
+fn ext4_open_file(path: &str, kind: InodeTypes, flags: u32) -> Option<Ext4File> {
+    let mut file = Ext4File::new(path, kind.clone());
+    if file.file_open(path, flags).is_ok() {
+        return Some(file);
+    }
+    if let Some(stripped) = path.strip_prefix('/') {
+        let mut file = Ext4File::new(stripped, kind);
+        if file.file_open(stripped, flags).is_ok() {
+            return Some(file);
+        }
+    }
+    None
+}
+
 impl VfsInode for Ext4Inode {
     fn kind(&self) -> VfsNodeKind {
         self.kind
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
-        let mut file = Ext4File::new(self.path.as_str(), InodeTypes::EXT4_DE_REG_FILE);
-        if file.file_open(self.path.as_str(), O_RDONLY).is_err() {
-            return 0;
-        }
+        let mut file = match ext4_open_file(
+            self.path.as_str(),
+            InodeTypes::EXT4_DE_REG_FILE,
+            O_RDONLY,
+        ) {
+            Some(file) => file,
+            None => {
+                trace!("ext4: open failed path={} (read)", self.path);
+                return 0;
+            }
+        };
         let ret = file.file_seek(offset as i64, SEEK_SET);
         if ret.is_err() {
             let _ = file.file_close();
@@ -80,10 +101,17 @@ impl VfsInode for Ext4Inode {
     }
 
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
-        let mut file = Ext4File::new(self.path.as_str(), InodeTypes::EXT4_DE_REG_FILE);
-        if file.file_open(self.path.as_str(), O_RDWR | O_CREAT).is_err() {
-            return 0;
-        }
+        let mut file = match ext4_open_file(
+            self.path.as_str(),
+            InodeTypes::EXT4_DE_REG_FILE,
+            O_RDWR | O_CREAT,
+        ) {
+            Some(file) => file,
+            None => {
+                trace!("ext4: open failed path={} (write)", self.path);
+                return 0;
+            }
+        };
         let ret = file.file_seek(offset as i64, SEEK_SET);
         if ret.is_err() {
             let _ = file.file_close();
@@ -157,10 +185,17 @@ impl VfsInode for Ext4Inode {
         if self.kind != VfsNodeKind::File {
             return;
         }
-        let mut file = Ext4File::new(self.path.as_str(), InodeTypes::EXT4_DE_REG_FILE);
-        if file.file_open(self.path.as_str(), O_RDWR | O_TRUNC).is_err() {
-            return;
-        }
+        let mut file = match ext4_open_file(
+            self.path.as_str(),
+            InodeTypes::EXT4_DE_REG_FILE,
+            O_RDWR | O_TRUNC,
+        ) {
+            Some(file) => file,
+            None => {
+                trace!("ext4: open failed path={} (truncate)", self.path);
+                return;
+            }
+        };
         let _ = file.file_close();
     }
 
@@ -186,10 +221,17 @@ impl VfsInode for Ext4Inode {
         if self.kind != VfsNodeKind::File {
             return 0;
         }
-        let mut file = Ext4File::new(self.path.as_str(), InodeTypes::EXT4_DE_REG_FILE);
-        if file.file_open(self.path.as_str(), O_RDONLY).is_err() {
-            return 0;
-        }
+        let mut file = match ext4_open_file(
+            self.path.as_str(),
+            InodeTypes::EXT4_DE_REG_FILE,
+            O_RDONLY,
+        ) {
+            Some(file) => file,
+            None => {
+                trace!("ext4: open failed path={} (size)", self.path);
+                return 0;
+            }
+        };
         let size = file.file_size() as usize;
         let _ = file.file_close();
         size

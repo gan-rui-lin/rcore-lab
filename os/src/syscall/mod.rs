@@ -52,6 +52,8 @@ const SYSCALL_WRITE: usize = 64;
 const SYSCALL_WRITEV: usize = 66;
 /// sendfile syscall
 const SYSCALL_SENDFILE: usize = 71;
+/// fstatat syscall
+const SYSCALL_FSTATAT: usize = 79;
 /// fstat syscall
 const SYSCALL_FSTAT: usize = 80;
 /// exit syscall
@@ -453,6 +455,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     let process = current_process();
     let pid = process.pid.0;
     let name = process.inner_exclusive_access().name.clone();
+    if pid == 4 && syscall_id == 221 {
+        let cwd = process.inner_exclusive_access().cwd.clone();
+        trace!("[syscall] pid=4 entry name={} cwd={}", name, cwd);
+    }
     let trace = should_trace_syscall(pid);
     let mut known = true;
     let ret = match syscall_id {
@@ -494,6 +500,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const usize, args[2]),
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut isize, args[3]),
+        SYSCALL_FSTATAT => sys_fstatat(args[0] as isize, args[1] as *const u8, args[2] as *mut Stat, args[3] as u32),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut Stat),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
@@ -569,6 +576,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             -ENOSYS
         },
     };
+    if pid == 4 && syscall_id == SYSCALL_EXEC {
+        trace!("[syscall] pid=4 exec ret={}", ret);
+    }
     // Extra verbose logging for syscall 96 (set_tid_address)
     if syscall_id == 96 {
         info!("[syscall] set_tid_address returned {} to {}, ra={:#x}, sepc={:#x}",

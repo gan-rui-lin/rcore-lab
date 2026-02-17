@@ -3,7 +3,7 @@ use super::manager::insert_into_pid2process;
 use super::{PidHandle, SignalActions, SignalFlags, TaskControlBlock, TlsArea, add_task, pid_alloc};
 use crate::config::{USER_STACK_SIZE};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{KERNEL_SPACE, MemorySet, translated_refmut};
+use crate::mm::{KERNEL_SPACE, MemorySet, translated_byte_buffer, translated_ref, translated_refmut, translated_str};
 use crate::sync::{Condvar, Mutex, Semaphore, UPIntrFreeCell};
 use crate::trap::{TrapContext, trap_handler};
 use alloc::string::String;
@@ -85,7 +85,8 @@ impl ProcessControlBlock {
     }
 
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
-        let (mut memory_set, user_stack_top, entry_point, tls_info, _auxv_info) = MemorySet::from_elf(elf_data);
+        let (mut memory_set, heap_bottom, user_stack_top, entry_point, tls_info, _auxv_info) =
+            MemorySet::from_elf(elf_data);
         let ustack_base = user_stack_top.saturating_sub(USER_STACK_SIZE);
 
         // Initialize TLS if PT_TLS segment exists
@@ -118,8 +119,8 @@ impl ProcessControlBlock {
                     condvar_list: Vec::new(),
                     name: String::from("initproc"),
                     cwd: String::from("/"),
-                    heap_bottom: user_stack_top,
-                    program_brk: user_stack_top,
+                    heap_bottom,
+                    program_brk: heap_bottom,
                     mmap_base: DEFAULT_MMAP_BASE,
                     tls_area: tls_area.clone(),
                 })
@@ -139,7 +140,6 @@ impl ProcessControlBlock {
             trap_handler as usize,
         );
 
-        // Set tp register
         if let Some(ref tls) = tls_area {
             trap_cx_value.x[4] = tls.tp_value;  // tp = x4
             info!("[kernel] TLS initialized: tp = {:#x}", tls.tp_value);
@@ -167,7 +167,18 @@ impl ProcessControlBlock {
 
     pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
-        let (mut memory_set, user_stack_top, entry_point, tls_info, auxv_info) = MemorySet::from_elf(elf_data);
+        let exec_name = self.inner_exclusive_access().name.clone();
+        debug!("[kernel] exec: process name={} argc={}", exec_name, args.len());
+        let (mut memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info) =
+            MemorySet::from_elf(elf_data);
+        debug!(
+            "[kernel] exec: entry={:#x} heap_bottom={:#x} user_stack_top={:#x} auxv_phdr={:#x} auxv_entry={:#x}",
+            entry_point,
+            heap_bottom,
+            user_stack_top,
+            auxv_info.phdr_addr,
+            auxv_info.entry
+        );
 
         // Initialize TLS if PT_TLS segment exists
         let tls_area = tls_info.map(|info| {
@@ -175,13 +186,32 @@ impl ProcessControlBlock {
         });
 
         let new_token = memory_set.token();
+        if exec_name == "sh" || exec_name == "busybox" {
+            let mut bytes = [0u8; 8];
+            let mut offset = 0usize;
+            for slice in translated_byte_buffer(new_token, entry_point as *const u8, bytes.len()) {
+                let len = slice.len().min(bytes.len() - offset);
+                bytes[offset..offset + len].copy_from_slice(&slice[..len]);
+                offset += len;
+                if offset >= bytes.len() {
+                    break;
+                }
+            }
+            debug!("[kernel] exec: entry mem bytes={:02x?}", bytes);
+        }
         let ustack_base = user_stack_top.saturating_sub(USER_STACK_SIZE);
+        debug!(
+            "[kernel] exec: token={:#x} ustack_base={:#x} tls={}",
+            new_token,
+            ustack_base,
+            tls_area.is_some()
+        );
         {
             let mut inner = self.inner_exclusive_access();
             inner.memory_set = memory_set;
-            inner.heap_bottom = user_stack_top;
-            inner.program_brk = user_stack_top;
-            inner.mmap_base = DEFAULT_MMAP_BASE;
+            inner.heap_bottom = heap_bottom;
+            inner.program_brk = heap_bottom;
+            inner.mmap_base = core::cmp::max(DEFAULT_MMAP_BASE, user_stack_top);
             inner.tls_area = tls_area.clone();
         }
         let task = self.inner_exclusive_access().get_task(0);
@@ -214,101 +244,71 @@ impl ProcessControlBlock {
             *translated_refmut(new_token, (addr + arg.len()) as *mut u8) = 0;
             arg_addrs.push(addr);
         }
+        for (idx, addr) in arg_addrs.iter().take(4).enumerate() {
+            debug!("[kernel] exec: argv[{}] ptr={:#x}", idx, addr);
+        }
+        for (idx, addr) in env_addrs.iter().take(4).enumerate() {
+            debug!("[kernel] exec: envp[{}] ptr={:#x}", idx, addr);
+        }
         user_sp &= !0xf;
         let word_size = core::mem::size_of::<usize>();
 
-        // Push auxiliary vectors FIRST (before envp/argv)
-        // Use simple auxv for programs without PT_TLS (like busybox)
-        // Use complete auxv for programs with PT_TLS
-        if tls_area.is_some() {
-            // Push 16 random bytes for AT_RANDOM
-            user_sp -= 16;
-            user_sp &= !0xf;  // Align to 16 bytes
-            let random_addr = user_sp;
-            // Write some pseudo-random bytes (TODO: use proper RNG)
-            for i in 0..16 {
-                *translated_refmut(new_token, (random_addr + i) as *mut u8) = (i * 17) as u8;
-            }
+        // Reserve 16 random bytes for AT_RANDOM (needed by musl malloc).
+        user_sp = user_sp.saturating_sub(16);
+        user_sp &= !0xf;
+        let random_addr = user_sp;
+        for i in 0..16 {
+            *translated_refmut(new_token, (random_addr + i) as *mut u8) = (i * 17) as u8;
+        }
 
-            // Push complete auxiliary vectors with proper AT_RANDOM
-            let mut auxv_entries = auxv_info.to_entries(crate::config::PAGE_SIZE);
-            // Update AT_RANDOM to point to our random bytes
-            for entry in &mut auxv_entries {
-                if entry.0 == crate::task::auxv::auxv_type::AT_RANDOM {
-                    entry.1 = random_addr;
-                }
-            }
-
-            user_sp -= auxv_entries.len() * 2 * word_size;  // Each entry is 2 words (type, value)
-            let auxv_base = user_sp;
-            for (i, (aux_type, aux_val)) in auxv_entries.iter().enumerate() {
-                *translated_refmut(new_token, (auxv_base + i * 2 * word_size) as *mut usize) = *aux_type;
-                *translated_refmut(new_token, (auxv_base + i * 2 * word_size + word_size) as *mut usize) = *aux_val;
-            }
-            info!("[kernel] exec: Pushed {} auxv entries at {:#x}, AT_RANDOM={:#x}",
-                auxv_entries.len(), auxv_base, random_addr);
+        // Allocate a minimal TCB for programs without PT_TLS so tp is valid.
+        let tp_value = if tls_area.is_none() {
+            user_sp = user_sp.saturating_sub(16);
+            user_sp &= !0xf;
+            let tcb_addr = user_sp;
+            *translated_refmut(new_token, tcb_addr as *mut usize) = 0;
+            *translated_refmut(new_token, (tcb_addr + 8) as *mut usize) = tcb_addr;
+            Some(tcb_addr)
         } else {
-            // Simple auxv for programs without PT_TLS (master branch style)
-            // IMPORTANT: Must include AT_RANDOM for musl malloc to work correctly
+            None
+        };
 
-            // Push 16 random bytes for AT_RANDOM (needed by musl malloc)
-            user_sp -= 16;
-            user_sp &= !0xf;  // Align to 16 bytes
-            let random_addr = user_sp;
-            // Write some pseudo-random bytes (TODO: use proper RNG)
-            for i in 0..16 {
-                *translated_refmut(new_token, (random_addr + i) as *mut u8) = (i * 17) as u8;
-            }
-
-            const AT_NULL: usize = 0;
-            const AT_PHDR: usize = 3;
-            const AT_PHENT: usize = 4;
-            const AT_PHNUM: usize = 5;
-            const AT_PAGESZ: usize = 6;
-            const AT_ENTRY: usize = 9;
-            const AT_UID: usize = 11;
-            const AT_EUID: usize = 12;
-            const AT_GID: usize = 13;
-            const AT_EGID: usize = 14;
-            const AT_SECURE: usize = 23;
-            const AT_RANDOM: usize = 25;
-            let simple_auxv = [
+        // Prepare auxiliary vectors to be placed right after envp.
+        let mut auxv_entries = if tls_area.is_some() {
+            auxv_info.to_entries(crate::config::PAGE_SIZE)
+        } else {
+            use crate::task::auxv::auxv_type::*;
+            vec![
                 (AT_ENTRY, auxv_info.entry),
                 (AT_PHDR, auxv_info.phdr_addr),
                 (AT_PHENT, auxv_info.phent_size),
                 (AT_PHNUM, auxv_info.phnum),
                 (AT_PAGESZ, crate::config::PAGE_SIZE),
-                (AT_UID, 0),        // Root user
-                (AT_EUID, 0),       // Root effective user
-                (AT_GID, 0),        // Root group
-                (AT_EGID, 0),       // Root effective group
-                (AT_SECURE, 0),     // Not in secure mode
-                (AT_RANDOM, random_addr),
+                (AT_UID, 0),
+                (AT_EUID, 0),
+                (AT_GID, 0),
+                (AT_EGID, 0),
+                (AT_SECURE, 0),
+                (AT_RANDOM, 0),
                 (AT_NULL, 0),
-            ];
-            for (key, val) in simple_auxv.iter().rev() {
-                user_sp -= 2 * word_size;
-                *translated_refmut(new_token, user_sp as *mut usize) = *key;
-                *translated_refmut(new_token, (user_sp + word_size) as *mut usize) = *val;
+            ]
+        };
+        for entry in &mut auxv_entries {
+            if entry.0 == crate::task::auxv::auxv_type::AT_RANDOM {
+                entry.1 = random_addr;
             }
-            info!("[kernel] exec: Pushed {} simple auxv entries (no PT_TLS), AT_RANDOM={:#x}",
-                simple_auxv.len(), random_addr);
         }
 
-        // Do NOT allocate TCB for programs without PT_TLS
-        // Let userspace libc initialize tp if needed
-        let tp_value = None;
-
         // Linux ABI stack layout (from low address/high stack):
-        // [argc][argv[0]][argv[1]]...[NULL][envp[0]]...[NULL][auxv]...
-        // sp points to argc, sp+8 points to argv[0] (NOT to an argv array!)
-
-        // First, calculate required space and align
+        // [argc][argv...][NULL][envp...][NULL][auxv...]
+        // sp points to argc.
         let argc = arg_addrs.len();
-        user_sp -= word_size;  // space for argc
-        user_sp -= (argc + 1) * word_size;  // space for argv pointers + NULL
-        user_sp -= (env_addrs.len() + 1) * word_size;  // space for envp pointers + NULL
-        user_sp &= !0xf;  // Align to 16 bytes
+        let argv_size = (argc + 1) * word_size;
+        let envp_size = (env_addrs.len() + 1) * word_size;
+        let auxv_size = auxv_entries.len() * 2 * word_size;
+        let total_size = word_size + argv_size + envp_size + auxv_size;
+        user_sp = user_sp.saturating_sub(total_size);
+        user_sp &= !0xf;
 
         // Now write from low address to high
         let mut current_sp = user_sp;
@@ -333,9 +333,47 @@ impl ProcessControlBlock {
             current_sp += word_size;
         }
         *translated_refmut(new_token, current_sp as *mut usize) = 0;  // envp NULL terminator
+        current_sp += word_size;
 
-        info!("[kernel] exec: sp={:#x}, argc={}, argv_base={:#x}, envp_base={:#x}",
-            user_sp, argc, argv_base, envp_base);
+        // Write auxv entries immediately after envp NULL terminator.
+        let auxv_base = current_sp;
+        for (i, (aux_type, aux_val)) in auxv_entries.iter().enumerate() {
+            *translated_refmut(new_token, (auxv_base + i * 2 * word_size) as *mut usize) = *aux_type;
+            *translated_refmut(new_token, (auxv_base + i * 2 * word_size + word_size) as *mut usize) = *aux_val;
+        }
+
+        let argc_mem = *translated_ref(new_token, user_sp as *const usize);
+        let argv0_mem = *translated_ref(new_token, argv_base as *const usize);
+        let envp0_mem = *translated_ref(new_token, envp_base as *const usize);
+        if args.get(0).map(|s| s.as_str()) == Some("sh") {
+            let argv1_mem = *translated_ref(new_token, (argv_base + word_size) as *const usize);
+            let argv0_str = translated_str(new_token, argv0_mem as *const u8);
+            let argv1_str = if argv1_mem == 0 {
+                String::from("<null>")
+            } else {
+                translated_str(new_token, argv1_mem as *const u8)
+            };
+            debug!(
+                "[kernel] exec: argv0_str={} argv1_str={} argc={}",
+                argv0_str,
+                argv1_str,
+                argc
+            );
+        }
+        info!(
+            "[kernel] exec: sp={:#x}, argc={}, argv_base={:#x}, envp_base={:#x}",
+            user_sp,
+            argc,
+            argv_base,
+            envp_base
+        );
+        info!("[kernel] exec: auxv_base={:#x}, auxv_entries={}", auxv_base, auxv_entries.len());
+        info!(
+            "[kernel] exec: argc@sp={} argv0@argv_base={:#x} envp0@envp_base={:#x}",
+            argc_mem,
+            argv0_mem,
+            envp0_mem
+        );
         info!("[kernel] exec: argv[0]={:#x}, argv[1]={:#x}",
             if argc > 0 { arg_addrs[0] } else { 0 },
             if argc > 1 { arg_addrs[1] } else { 0 });

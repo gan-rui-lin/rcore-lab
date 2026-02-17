@@ -5,8 +5,12 @@ mod stdio;
 mod vfs;
 
 use crate::mm::UserBuffer;
+#[cfg(feature = "ext4")]
+use alloc::ffi::CString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+#[cfg(feature = "ext4")]
+use lwext4_rust::bindings::ext4_flink;
 use vfs::VfsInode;
 
 /// trait File for all file types
@@ -122,3 +126,60 @@ pub use vfs::{
 };
 pub use pipe::make_pipe;
 pub use stdio::{Stdin, Stdout};
+
+#[cfg(feature = "ext4")]
+fn ensure_hardlink(linkpath: &str, target: &str) {
+    if open_file(linkpath, OpenFlags::empty()).is_some() {
+        return;
+    }
+    let link_c = match CString::new(linkpath) {
+        Ok(v) => v,
+        Err(_) => {
+            warn!("ext4: invalid link path {}", linkpath);
+            return;
+        }
+    };
+    let target_c = match CString::new(target) {
+        Ok(v) => v,
+        Err(_) => {
+            warn!("ext4: invalid target path {}", target);
+            return;
+        }
+    };
+    let rc = unsafe { ext4_flink(target_c.as_ptr(), link_c.as_ptr()) };
+    if rc == 0 {
+        info!("ext4: created hardlink {} -> {}", linkpath, target);
+    } else {
+        warn!("ext4: hardlink create failed {} -> {} rc={}", linkpath, target, rc);
+    }
+}
+
+#[cfg(feature = "ext4")]
+/// Create common BusyBox hardlinks on ext4 (e.g. /bin/sh) to keep scripts working.
+pub fn ensure_busybox_links() {
+    const BUSYBOX_PATH: &str = "/musl/busybox";
+    if open_file(BUSYBOX_PATH, OpenFlags::empty()).is_none() {
+        error!("[ext4] busybox not found at {}", BUSYBOX_PATH);
+        return;
+    }
+    debug!("[ext4] ensure busybox links from {}", BUSYBOX_PATH);
+    create_dir("/bin");
+    create_dir("/usr");
+    create_dir("/usr/bin");
+    create_dir("/lib");
+    ensure_hardlink("/bin/sh", BUSYBOX_PATH);
+    ensure_hardlink("/bin/basename", BUSYBOX_PATH);
+    ensure_hardlink("/usr/bin/basename", BUSYBOX_PATH);
+    ensure_hardlink("/musl/basename", BUSYBOX_PATH);
+    const MUSL_LOADER_FALLBACK: &str = "/musl/lib/libc.so";
+    if open_file(MUSL_LOADER_FALLBACK, OpenFlags::empty()).is_some() {
+        ensure_hardlink("/lib/ld-linux-riscv64-lp64d.so.1", MUSL_LOADER_FALLBACK);
+    } else {
+        error!("[ext4] missing musl loader fallback at {}", MUSL_LOADER_FALLBACK);
+    }
+    if open_file("/bin/sh", OpenFlags::empty()).is_some() {
+        debug!("[ext4] /bin/sh ready");
+    } else {
+        error!("[ext4] /bin/sh missing after link attempt");
+    }
+}

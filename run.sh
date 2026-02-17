@@ -8,6 +8,7 @@ BUILD_TYPE="debug"
 IMAGE_FILE="sdcard-final.img"
 GDB_DEBUG="0"
 GDB_FLAGS=""
+LOG="${LOG-}"
 NET_FORWARD="0"
 NET_DUMP_FILE=""
 NET_DUMP_OBJ=""
@@ -91,6 +92,15 @@ if [[ "$BUILD_TYPE" != "debug" && "$BUILD_TYPE" != "all" ]]; then
     exit 1
 fi
 
+# 默认日志级别：debug 显示全部日志，all 关闭日志
+if [[ -z "$LOG" ]]; then
+    if [[ "$BUILD_TYPE" == "debug" ]]; then
+        LOG="TRACE"
+    else
+        LOG="OFF"
+    fi
+fi
+
 # 验证镜像文件存在，或者尝试解压 .xz 文件
 if [[ ! -f "$IMAGE_FILE" ]]; then
     # 检查是否存在对应的 .xz 文件
@@ -149,24 +159,19 @@ fi
 
 # 执行构建[1](@ref)
 if [[ "$BUILD_TYPE" == "debug" ]]; then
-    if [[ -n "$LOG" ]]; then
-        if LOG="$LOG" make debug; then
-            echo "构建成功!"
-        else
-            echo "错误: 构建失败"
-            exit 1
-        fi
-    elif LOG=TRACE make debug; then
+    if LOG="$LOG" make debug; then
         echo "构建成功!"
     else
         echo "错误: 构建失败"
         exit 1
     fi
-elif make "$BUILD_TYPE"; then
-    echo "构建成功!"
 else
-    echo "错误: 构建失败"
-    exit 1
+    if LOG="$LOG" make "$BUILD_TYPE"; then
+        echo "构建成功!"
+    else
+        echo "错误: 构建失败"
+        exit 1
+    fi
 fi
 
 # 运行QEMU

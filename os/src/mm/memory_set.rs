@@ -174,8 +174,17 @@ impl MemorySet {
         memory_set
     }
     /// Include sections in elf and trampoline and TrapContext and user stack,
-    /// also returns user_sp_base, entry point, TLS info (if present), and auxv info.
-    pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize, Option<crate::task::TlsInfo>, crate::task::AuxvInfo) {
+    /// also returns heap_bottom, user_sp_base, entry point, TLS info (if present), and auxv info.
+    pub fn from_elf(
+        elf_data: &[u8]
+    ) -> (
+        Self,
+        usize,
+        usize,
+        usize,
+        Option<crate::task::TlsInfo>,
+        crate::task::AuxvInfo,
+    ) {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
@@ -185,12 +194,39 @@ impl MemorySet {
         let magic = elf_header.pt1.magic;
         assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
         let ph_count = elf_header.pt2.ph_count();
+        let elf_type = elf_header.pt2.type_().as_type();
+        let mut has_interp = false;
+        let mut min_load_vaddr = usize::MAX;
+        for i in 0..ph_count {
+            let ph = elf.program_header(i).unwrap();
+            let ph_type = ph.get_type().unwrap();
+            if ph_type == xmas_elf::program::Type::Interp {
+                has_interp = true;
+            } else if ph_type == xmas_elf::program::Type::Load {
+                let vaddr = ph.virtual_addr() as usize;
+                if vaddr < min_load_vaddr {
+                    min_load_vaddr = vaddr;
+                }
+            }
+        }
+        let load_base = if elf_type == xmas_elf::header::Type::SharedObject && !has_interp {
+            0x4000_0000usize
+        } else {
+            0
+        };
+        info!(
+            "[ELF] type={:?} has_interp={} min_load_vaddr={:#x} load_base={:#x}",
+            elf_type,
+            has_interp,
+            min_load_vaddr,
+            load_base
+        );
         let mut max_end_vpn = VirtPageNum(0);
         for i in 0..ph_count {
             let ph = elf.program_header(i).unwrap();
             if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
-                let start_va: VirtAddr = (ph.virtual_addr() as usize).into();
-                let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize).into();
+                let start_va: VirtAddr = (load_base + ph.virtual_addr() as usize).into();
+                let end_va: VirtAddr = (load_base + (ph.virtual_addr() + ph.mem_size()) as usize).into();
                 let mut map_perm = MapPermission::U;
                 let ph_flags = ph.flags();
                 if ph_flags.is_read() {
@@ -208,12 +244,35 @@ impl MemorySet {
                     map_area,
                     Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
                 );
+                if i == 0 {
+                    let file_off = ph.offset() as usize;
+                    let file_len = ph.file_size() as usize;
+                    let check_len = core::cmp::min(8, file_len);
+                    if check_len > 0 {
+                        let vaddr = load_base + ph.virtual_addr() as usize;
+                        let file_bytes = &elf.input[file_off..file_off + check_len];
+                        let mut mem_bytes: Vec<u8> = Vec::with_capacity(check_len);
+                        for idx in 0..check_len {
+                            let va = VirtAddr::from(vaddr + idx);
+                            if let Some(pte) = memory_set.page_table.translate(va.floor()) {
+                                let offset = va.page_offset();
+                                mem_bytes.push(pte.ppn().get_bytes_array()[offset]);
+                            } else {
+                                mem_bytes.push(0);
+                            }
+                        }
+                        info!(
+                            "[ELF] PT_LOAD[0] file bytes={:02x?} mem bytes={:02x?}",
+                            file_bytes,
+                            mem_bytes
+                        );
+                    }
+                }
             }
         }
 
         // Parse PT_TLS segment (Thread Local Storage) and check for PT_INTERP
         let mut tls_info = None;
-        let mut has_interp = false;
         info!("[ELF] Scanning {} program headers for PT_TLS and PT_INTERP", ph_count);
         for i in 0..ph_count {
             let ph = elf.program_header(i).unwrap();
@@ -223,7 +282,7 @@ impl MemorySet {
 
             if ph_type == xmas_elf::program::Type::Tls {
                 tls_info = Some(crate::task::TlsInfo {
-                    vaddr: ph.virtual_addr() as usize,
+                    vaddr: load_base + ph.virtual_addr() as usize,
                     filesz: ph.file_size() as usize,
                     memsz: ph.mem_size() as usize,
                     align: ph.align() as usize,
@@ -263,7 +322,7 @@ impl MemorySet {
                 let ph_offset = elf_header.pt2.ph_offset() as usize;
                 if ph_offset >= file_offset && ph_offset < (file_offset + first_ph.file_size() as usize) {
                     // Program headers are within first PT_LOAD segment
-                    first_ph.virtual_addr() as usize + (ph_offset - file_offset)
+                    load_base + first_ph.virtual_addr() as usize + (ph_offset - file_offset)
                 } else {
                     // Fallback: assume PT_PHDR not available
                     0
@@ -279,7 +338,7 @@ impl MemorySet {
             phdr_addr,
             phent_size: elf_header.pt2.ph_entry_size() as usize,
             phnum: ph_count as usize,
-            entry: elf.header.pt2.entry_point() as usize,
+            entry: load_base + elf.header.pt2.entry_point() as usize,
         };
 
         if phdr_addr == 0 {
@@ -294,7 +353,8 @@ impl MemorySet {
 
         // map user stack with U flags
         let max_end_va: VirtAddr = max_end_vpn.into();
-        let mut user_stack_bottom: usize = max_end_va.into();
+        let heap_bottom: usize = max_end_va.into();
+        let mut user_stack_bottom: usize = heap_bottom;
         // guard page
         user_stack_bottom += PAGE_SIZE;
         let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
@@ -310,8 +370,8 @@ impl MemorySet {
         // used in sbrk
         memory_set.push(
             MapArea::new(
-                user_stack_top.into(),
-                user_stack_top.into(),
+                heap_bottom.into(),
+                heap_bottom.into(),
                 MapType::Framed,
                 MapPermission::R | MapPermission::W | MapPermission::U,
             ),
@@ -327,10 +387,12 @@ impl MemorySet {
             ),
             None,
         );
+        let entry_point = load_base + elf.header.pt2.entry_point() as usize;
         (
             memory_set,
+            heap_bottom,
             user_stack_top,
-            elf.header.pt2.entry_point() as usize,
+            entry_point,
             tls_info,
             auxv_info,
         )
@@ -414,6 +476,38 @@ impl MemorySet {
     /// Translate a virtual page number to a page table entry
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
+    }
+
+    /// Count mapped areas that overlap with [start, end).
+    pub fn overlap_count(&self, start: VirtAddr, end: VirtAddr) -> usize {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        self.areas
+            .iter()
+            .filter(|area| {
+                let area_start = area.vpn_range.get_start();
+                let area_end = area.vpn_range.get_end();
+                area_start < end_vpn && area_end > start_vpn
+            })
+            .count()
+    }
+
+    /// Get overlapping area ranges for [start, end).
+    pub fn overlap_ranges(&self, start: VirtAddr, end: VirtAddr) -> Vec<(VirtAddr, VirtAddr)> {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        self.areas
+            .iter()
+            .filter_map(|area| {
+                let area_start = area.vpn_range.get_start();
+                let area_end = area.vpn_range.get_end();
+                if area_start < end_vpn && area_end > start_vpn {
+                    Some((area_start.into(), area_end.into()))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     ///Remove all `MapArea`
