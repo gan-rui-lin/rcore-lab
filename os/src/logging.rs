@@ -34,16 +34,19 @@ impl Log for SimpleLogger {
 pub fn init() {
     static LOGGER: SimpleLogger = SimpleLogger;
     log::set_logger(&LOGGER).unwrap();
-    if !cfg!(debug_assertions) {
-        log::set_max_level(LevelFilter::Off);
+    let level = match option_env!("LOG") {
+        Some("OFF") => Some(LevelFilter::Off),
+        Some("NONE") => Some(LevelFilter::Off),
+        Some("ERROR") => Some(LevelFilter::Error),
+        Some("WARN") => Some(LevelFilter::Warn),
+        Some("INFO") => Some(LevelFilter::Info),
+        Some("DEBUG") => Some(LevelFilter::Debug),
+        Some("TRACE") => Some(LevelFilter::Trace),
+        Some(_) => Some(LevelFilter::Info),
+        None => Some(LevelFilter::Off),
+    };
+    if let Some(level) = level {
+        log::set_max_level(level);
         return;
     }
-    log::set_max_level(match option_env!("LOG") {
-        Some("ERROR") => LevelFilter::Error,
-        Some("WARN") => LevelFilter::Warn,
-        Some("INFO") => LevelFilter::Info,
-        Some("DEBUG") => LevelFilter::Debug,
-        Some("TRACE") => LevelFilter::Trace,
-        _ => LevelFilter::Info,
-    });
 }

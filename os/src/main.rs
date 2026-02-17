@@ -89,6 +89,7 @@ pub fn rust_main() -> ! {
     #[cfg(feature = "ext4")]
     if fs::mount_ext4_auto() {
         info!("[kernel] ext4 mounted as root");
+        fs::ensure_busybox_links();
     } else if fs::mount_fat32_auto() {
         info!("[kernel] fat32 mounted as root");
     } else {

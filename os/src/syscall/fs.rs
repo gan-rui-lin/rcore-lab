@@ -3,6 +3,8 @@ use crate::fs::{
     create_dir, make_pipe, open_file, path_is_dir, remove_path, OpenFlags, Stat, StatMode,
 };
 use crate::mm::{translated_byte_buffer, translated_str, UserBuffer};
+#[allow(unused_imports)] // for debug
+use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::task::{current_process, current_user_token};
 use super::errno::*;
 use alloc::format;
@@ -16,6 +18,9 @@ use lwext4_rust::bindings::ext4_flink;
 
 const AT_FDCWD: isize = -100;
 const AT_REMOVEDIR: u32 = 0x200;
+
+// static WRITE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+// static WRITEV_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
@@ -115,7 +120,26 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
         let file = file.clone();
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
-        file.write(UserBuffer::new(translated_byte_buffer(token, buf, len))) as isize
+        let written = file.write(UserBuffer::new(translated_byte_buffer(token, buf, len))) as isize;
+        // let name = process.inner_exclusive_access().name.clone();
+        // if (name == "busybox" || name == "sh") && fd <= 2 && len > 0 {
+        //     if written == 0 {
+        //         trace!("[sys_write] pid={} name={} fd={} len={} -> 0", pid, name, fd, len);
+        //     } else {
+        //         let count = WRITE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        //         if count < 10 {
+        //             trace!(
+        //                 "[sys_write] pid={} name={} fd={} len={} -> {}",
+        //                 pid,
+        //                 name,
+        //                 fd,
+        //                 len,
+        //                 written
+        //             );
+        //         }
+        //     }
+        // }
+        written
     } else {
         errno(EBADF)
     }
@@ -169,6 +193,18 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         };
         resolve_path(&base, &raw_path)
     };
+    // let proc_name = process.inner_exclusive_access().name.clone();
+    // if (proc_name == "busybox" || proc_name == "sh")
+    //     && (raw_path.starts_with("./") || raw_path.contains("/basic/"))
+    // {
+    //     println!(
+    //         "[sys_openat] pid={} name={} raw={} full={}",
+    //         pid,
+    //         proc_name,
+    //         raw_path,
+    //         full_path
+    //     );
+    // }
     let flags = OpenFlags::from_bits_truncate(flags);
     if flags.contains(OpenFlags::DIRECTORY) && !path_is_dir(&full_path) {
         return errno(ENOTDIR);
@@ -222,6 +258,9 @@ pub fn sys_close(fd: usize) -> isize {
     }
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
+    // if (inner.name == "busybox" || inner.name == "sh") && fd <= 2 {
+    //     trace!("[sys_close] pid={} name={} fd={}", pid, inner.name, fd);
+    // }
     if fd >= inner.fd_table.len() {
         return errno(EBADF);
     }
@@ -230,6 +269,79 @@ pub fn sys_close(fd: usize) -> isize {
     }
     inner.fd_table[fd].take();
     0
+}
+
+/// fstatat: stat by path, relative to dirfd.
+/// ! 暂时未使用 flags 参数
+pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, _flags: u32) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_fstatat", pid);
+    }
+    if path.is_null() {
+        return errno(EFAULT);
+    }
+    let token = current_user_token();
+    let raw_path = translated_str(token, path);
+    if raw_path.is_empty() {
+        return errno(EINVAL);
+    }
+    let base = if raw_path.starts_with('/') {
+        String::new()
+    } else {
+        match dirfd_base(dirfd) {
+            Ok(base) => base,
+            Err(err) => return err,
+        }
+    };
+    let full_path = if raw_path.starts_with('/') {
+        normalize_path(&raw_path)
+    } else {
+        resolve_path(&base, &raw_path)
+    };
+    // trace!(
+    //     "[sys_fstatat] pid={} dirfd={} flags={:#x} path={} full={}",
+    //     pid,
+    //     dirfd,
+    //     flags,
+    //     raw_path,
+    //     full_path
+    // );
+
+    let open_flags = if path_is_dir(&full_path) {
+        OpenFlags::DIRECTORY
+    } else {
+        OpenFlags::empty()
+    };
+    let Some(file) = open_file(full_path.as_str(), open_flags) else {
+        return errno(ENOENT);
+    };
+    let mut stat = Stat::default();
+    let (mode_bits, size) = if let Some(inode) = file.inode() {
+        let mode = if inode.is_dir() {
+            StatMode::DIR
+        } else {
+            StatMode::FILE
+        };
+        (mode.bits() | 0o777, inode.size())
+    } else {
+        (StatMode::FILE.bits() | 0o666, 0)
+    };
+    stat.mode = mode_bits;
+    stat.nlink = 1;
+    stat.size = size as i64;
+    stat.blksize = 512;
+    stat.blocks = ((size + 511) / 512) as i64;
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&stat as *const Stat) as *const u8,
+            core::mem::size_of::<Stat>(),
+        )
+    };
+    match copy_to_user(token, st as *mut u8, bytes) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
 }
 
 /// YOUR JOB: Implement fstat.
@@ -404,11 +516,7 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
         resolve_path(&base, &raw)
     };
     let is_dir = path_is_dir(&path);
-    let exists = if is_dir {
-        true
-    } else {
-        open_file(path.as_str(), OpenFlags::from_bits_truncate(0)).is_some()
-    };
+    let exists = open_file(path.as_str(), OpenFlags::from_bits_truncate(0)).is_some();
     if !exists {
         return errno(ENOENT);
     }
@@ -464,6 +572,7 @@ pub fn sys_chdir(_path: *const u8) -> isize {
         return errno(EINVAL);
     }
     let process = current_process();
+    // let proc_name = process.inner_exclusive_access().name.clone();
     let base = if raw.starts_with('/') {
         String::from("/")
     } else {
@@ -474,7 +583,18 @@ pub fn sys_chdir(_path: *const u8) -> isize {
     } else {
         resolve_path(&base, &raw)
     };
-    if path_is_dir(&path) {
+    let is_dir = path_is_dir(&path);
+    // if proc_name == "busybox" && (raw == "basic" || raw.contains("run-all.sh") || raw.contains("basic")) {
+    //     println!(
+    //         "[sys_chdir] pid={} name={} raw={} resolved={} is_dir={}",
+    //         pid,
+    //         proc_name,
+    //         raw,
+    //         path,
+    //         is_dir
+    //     );
+    // }
+    if is_dir {
         let mut inner = process.inner_exclusive_access();
         inner.cwd = path;
         0
@@ -726,6 +846,24 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
         total_written += written as isize;
     }
 
+    // let name = current_process().inner_exclusive_access().name.clone();
+    // if (name == "busybox" || name == "sh") && fd <= 2 && iovcnt > 0 {
+    //     if total_written == 0 {
+    //         trace!("[sys_writev] pid={} name={} fd={} iovcnt={} -> 0", pid, name, fd, iovcnt);
+    //     } else {
+    //         let count = WRITEV_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    //         if count < 10 {
+    //             trace!(
+    //                 "[sys_writev] pid={} name={} fd={} iovcnt={} -> {}",
+    //                 pid,
+    //                 name,
+    //                 fd,
+    //                 iovcnt,
+    //                 total_written
+    //             );
+    //         }
+    //     }
+    // }
     total_written
 }
 
@@ -762,6 +900,16 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
         return errno(EBADF);
     };
 
+    // if inner.name == "busybox" && (cmd == F_GETFD || cmd == F_SETFD) {
+    //     trace!(
+    //         "[sys_fcntl] pid={} name={} fd={} cmd={} arg={}",
+    //         pid,
+    //         inner.name,
+    //         fd,
+    //         cmd,
+    //         arg
+    //     );
+    // }
     match cmd {
         F_DUPFD => {
             // Duplicate fd to the lowest numbered available fd >= arg
