@@ -17,10 +17,13 @@ mod context;
 use crate::config::TRAMPOLINE;
 use crate::syscall::syscall;
 use crate::task::{
-    current_add_signal, current_trap_cx, current_trap_cx_user_va, current_user_token,
-    handle_signals, suspend_current_and_run_next, SignalFlags,
+    current_add_signal, current_process, current_trap_cx, current_trap_cx_user_va,
+    current_user_token, handle_signals, suspend_current_and_run_next, SignalFlags,
 };
 use crate::mm::{PageTable, VirtAddr};
+use crate::config::PAGE_SIZE;
+use crate::fs::{open_file, OpenFlags};
+use xmas_elf::ElfFile;
 use crate::timer::{check_timer, set_next_trigger};
 use core::arch::{asm, global_asm};
 use riscv::register::{
@@ -102,9 +105,53 @@ pub fn trap_handler() -> ! {
         | Trap::Exception(Exception::LoadFault)
         | Trap::Exception(Exception::LoadPageFault) => {
             let trap_cx = current_trap_cx();
+            let proc = current_process();
+            let proc_inner = proc.inner_exclusive_access();
+            let pid = proc.pid.0;
+            let name = proc_inner.name.clone();
+            drop(proc_inner);
             println!("[kernel] trap_handler: {:?} in application", scause.cause());
+            println!("  pid={} name={}", pid, name);
             println!("  bad addr (stval) = {:#x}", stval);
             println!("  bad instruction (sepc) = {:#x}", trap_cx.sepc);
+            let token = current_user_token();
+            let page_table = PageTable::from_token(token);
+            let stval_va = VirtAddr::from(stval as usize);
+            if let Some(pte) = page_table.translate(stval_va.floor()) {
+                if pte.is_valid() {
+                    let offset = stval_va.page_offset();
+                    let end = core::cmp::min(offset + 8, PAGE_SIZE);
+                    let bytes = &pte.ppn().get_bytes_array()[offset..end];
+                    println!(
+                        "  stval pte: ppn={:#x} flags={:?} bytes={:02x?}",
+                        pte.ppn().0,
+                        pte.flags(),
+                        bytes
+                    );
+                } else {
+                    println!("  stval pte: invalid flags={:?}", pte.flags());
+                }
+            } else {
+                println!("  stval pte: unmapped");
+            }
+            let sepc_va = VirtAddr::from(trap_cx.sepc);
+            if let Some(pte) = page_table.translate(sepc_va.floor()) {
+                if pte.is_valid() {
+                    let offset = sepc_va.page_offset();
+                    let end = core::cmp::min(offset + 8, PAGE_SIZE);
+                    let bytes = &pte.ppn().get_bytes_array()[offset..end];
+                    println!(
+                        "  sepc pte: ppn={:#x} flags={:?} bytes={:02x?}",
+                        pte.ppn().0,
+                        pte.flags(),
+                        bytes
+                    );
+                } else {
+                    println!("  sepc pte: invalid flags={:?}", pte.flags());
+                }
+            } else {
+                println!("  sepc pte: unmapped");
+            }
             println!("  Registers:");
             println!("    ra (x1) = {:#x}", trap_cx.x[1]);
             println!("    sp (x2) = {:#x}", trap_cx.x[2]);
@@ -118,9 +165,70 @@ pub fn trap_handler() -> ! {
             println!("    a3 (x13) = {:#x}", trap_cx.x[13]);
             println!("    a4 (x14) = {:#x}", trap_cx.x[14]);
             println!("    a5 (x15) = {:#x}", trap_cx.x[15]);
+            if name == "busybox" || name == "ld-linux-riscv64-lp64d.so.1" {
+                let path = if name == "busybox" {
+                    "/musl/busybox"
+                } else {
+                    "/lib/ld-linux-riscv64-lp64d.so.1"
+                };
+                if let Some(file) = open_file(path, OpenFlags::empty()) {
+                    let data = file.read_all();
+                    if let Ok(elf) = ElfFile::new(data.as_slice()) {
+                        let elf_type = elf.header.pt2.type_().as_type();
+                        let mut has_interp = false;
+                        let ph_count = elf.header.pt2.ph_count();
+                        for i in 0..ph_count {
+                            let ph = elf.program_header(i).unwrap();
+                            if ph.get_type().unwrap() == xmas_elf::program::Type::Interp {
+                                has_interp = true;
+                                break;
+                            }
+                        }
+                        let load_base = if elf_type == xmas_elf::header::Type::SharedObject && !has_interp {
+                            0x4000_0000usize
+                        } else {
+                            0
+                        };
+                        let mut found = false;
+                        for i in 0..ph_count {
+                            let ph = elf.program_header(i).unwrap();
+                            if ph.get_type().unwrap() != xmas_elf::program::Type::Load {
+                                continue;
+                            }
+                            let vaddr = load_base + ph.virtual_addr() as usize;
+                            let memsz = ph.mem_size() as usize;
+                            if trap_cx.sepc < vaddr || trap_cx.sepc >= vaddr.saturating_add(memsz) {
+                                continue;
+                            }
+                            let filesz = ph.file_size() as usize;
+                            let file_off = ph.offset() as usize + trap_cx.sepc.saturating_sub(vaddr);
+                            let end = (file_off + 8).min(data.len());
+                            if file_off < end && file_off < ph.offset() as usize + filesz {
+                                println!("  file bytes @sepc={:02x?}", &data[file_off..end]);
+                                println!("  file off @sepc={:#x}", file_off);
+                            } else {
+                                println!("  file bytes @sepc: out of file range");
+                            }
+                            found = true;
+                            break;
+                        }
+                        if !found {
+                            println!("  file bytes @sepc: sepc not in PT_LOAD");
+                        }
+                    } else {
+                        println!("  file bytes @sepc: invalid ELF");
+                    }
+                } else {
+                    println!("  file bytes @sepc: {} not found", path);
+                }
+            }
             current_add_signal(SignalFlags::SIGSEGV);
         }
         Trap::Exception(Exception::IllegalInstruction) => {
+            let trap_cx = current_trap_cx();
+            println!("[kernel] trap_handler: IllegalInstruction in application");
+            println!("  bad addr (stval) = {:#x}", stval);
+            println!("  bad instruction (sepc) = {:#x}", trap_cx.sepc);
             current_add_signal(SignalFlags::SIGILL);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {

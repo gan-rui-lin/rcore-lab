@@ -11,7 +11,7 @@ fmt:
 	cd easy-fs; cargo fmt; cd ../easy-fs-fuse cargo fmt; cd ../os ; cargo fmt; cd ../user; cargo fmt; cd ..
 
 all:
-	@make -C os all
+	@make -C os LOG=$(LOG) all
 	@cp os/kernel-qemu kernel-qemu
 	@cp os/sbi-qemu sbi-qemu
 

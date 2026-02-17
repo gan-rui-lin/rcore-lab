@@ -3,7 +3,7 @@
 #[allow(unused)]
 
 /// user app's stack size
-pub const USER_STACK_SIZE: usize = 4096 * 2;
+pub const USER_STACK_SIZE: usize = 4096 * 5;
 /// kernel stack size
 pub const KERNEL_STACK_SIZE: usize = 4096 * 20;
 /// kernel heap size

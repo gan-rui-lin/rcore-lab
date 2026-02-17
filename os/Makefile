@@ -2,7 +2,7 @@
 TARGET := riscv64gc-unknown-none-elf
 MODE := release
 FEATURES ?= ext4
-LOG ?= OFF
+LOG ?= TRACE
 KERNEL_ELF := target/$(TARGET)/$(MODE)/os
 KERNEL_BIN := $(KERNEL_ELF).bin
 KERNEL_QEMU := kernel-qemu
