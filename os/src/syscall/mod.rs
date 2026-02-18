@@ -172,6 +172,7 @@ use sync::*;
 use thread::*;
 
 use crate::fs::Stat;
+#[allow(unused_imports)] // debug: for current_trap_cx in syscall() 
 use crate::task::{current_process, current_trap_cx, SignalAction};
 
 const fn parse_trace_pid(value: &str) -> Option<usize> {
@@ -576,14 +577,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             -ENOSYS
         },
     };
-    if pid == 4 && syscall_id == SYSCALL_EXEC {
-        trace!("[syscall] pid=4 exec ret={}", ret);
-    }
-    // Extra verbose logging for syscall 96 (set_tid_address)
-    if syscall_id == 96 {
-        info!("[syscall] set_tid_address returned {} to {}, ra={:#x}, sepc={:#x}",
-            ret, name, current_trap_cx().x[1], current_trap_cx().sepc);
-    }
+    // if pid == 4 && syscall_id == SYSCALL_EXEC {
+    //     trace!("[syscall] pid=4 exec ret={}", ret);
+    // }
+    // // Extra verbose logging for syscall 96 (set_tid_address)
+    // if syscall_id == 96 {
+    //     info!("[syscall] set_tid_address returned {} to {}, ra={:#x}, sepc={:#x}",
+    //         ret, name, current_trap_cx().x[1], current_trap_cx().sepc);
+    // }
 
     if known && trace && !(syscall_id == SYSCALL_WRITE && args[0] == 1) {
         trace!(

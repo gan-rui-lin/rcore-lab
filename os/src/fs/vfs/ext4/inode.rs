@@ -86,7 +86,7 @@ impl VfsInode for Ext4Inode {
         ) {
             Some(file) => file,
             None => {
-                trace!("ext4: open failed path={} (read)", self.path);
+                error!("ext4: open failed path={} (read)", self.path);
                 return 0;
             }
         };
@@ -108,7 +108,7 @@ impl VfsInode for Ext4Inode {
         ) {
             Some(file) => file,
             None => {
-                trace!("ext4: open failed path={} (write)", self.path);
+                error!("ext4: open failed path={} (write)", self.path);
                 return 0;
             }
         };
@@ -162,6 +162,7 @@ impl VfsInode for Ext4Inode {
         }
         let mut dir = Ext4File::new(path.as_str(), InodeTypes::EXT4_DE_DIR);
         if dir.dir_mk(path.as_str()).is_err() {
+            error!("ext4: dir_mk failed path={}", path);
             return None;
         }
         Some(Arc::new(Ext4Inode::new_dir(path)))
@@ -192,7 +193,7 @@ impl VfsInode for Ext4Inode {
         ) {
             Some(file) => file,
             None => {
-                trace!("ext4: open failed path={} (truncate)", self.path);
+                error!("ext4: open failed path={} (truncate)", self.path);
                 return;
             }
         };
@@ -228,7 +229,7 @@ impl VfsInode for Ext4Inode {
         ) {
             Some(file) => file,
             None => {
-                trace!("ext4: open failed path={} (size)", self.path);
+                error!("ext4: open failed path={} (size)", self.path);
                 return 0;
             }
         };

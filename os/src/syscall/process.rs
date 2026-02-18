@@ -7,7 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::{
-    fs::{open_file, OpenFlags},
+    fs::{open_file, File, OpenFlags},
     mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission, VirtAddr},
     sbi::shutdown,
     task::{
@@ -208,13 +208,16 @@ fn resolve_relative_path(path: &str) -> String {
 }
 
 fn build_exec_candidates(exec_path: &str, envs: &[String]) -> Vec<String> {
+    // 绝对路径直接返回
     if exec_path.starts_with('/') {
         return vec![String::from(exec_path)];
     }
+    // 相对路径需要基于当前工作目录拼接
     if exec_path.contains('/') {
         return vec![resolve_relative_path(exec_path)];
     }
     let mut candidates = Vec::new();
+    // 根据 PATH 环境变量拼接候选路径，PATH 以冒号分隔多个目录，空目录表示当前目录
     if let Some(path_env) = envs.iter().find(|env| env.starts_with("PATH=")) {
         let path_value = &path_env[5..];
         for dir in path_value.split(':') {
@@ -233,6 +236,97 @@ fn build_exec_candidates(exec_path: &str, envs: &[String]) -> Vec<String> {
         candidates.push(resolve_relative_path(exec_path));
     }
     candidates
+}
+
+fn trace_exec_resolution(
+    name: &str,
+    exec_path: &str,
+    exec_path_resolved: &str,
+    args: &[String],
+) {
+    if name == "busybox"
+        && (exec_path.contains("run-all.sh")
+            || exec_path.contains("/basic/")
+            || exec_path.starts_with("./"))
+    {
+        let argv0 = args.get(0).cloned().unwrap_or_default();
+        let argv1 = args.get(1).cloned().unwrap_or_default();
+        trace!(
+            "[sys_exec] pid={} name={} raw={} resolved={} argv0={} argv1={}",
+            current_process().pid.0,
+            name,
+            exec_path,
+            exec_path_resolved,
+            argv0,
+            argv1
+        );
+    }
+}
+
+fn trace_entry_bytes(exec_path_resolved: &str, all_data: &[u8], app: &Arc<dyn File>) {
+    if exec_path_resolved != "/bin/sh" && exec_path_resolved != "/musl/busybox" {
+        return;
+    }
+    if let Ok(elf) = xmas_elf::ElfFile::new(all_data) {
+        let entry = elf.header.pt2.entry_point() as usize;
+        let ph_count = elf.header.pt2.ph_count() as usize;
+        for idx in 0..ph_count {
+            if let Ok(ph) = elf.program_header(idx as u16) {
+                if ph.get_type().ok() != Some(xmas_elf::program::Type::Load) {
+                    continue;
+                }
+                let vaddr = ph.virtual_addr() as usize;
+                let filesz = ph.file_size() as usize;
+                if entry < vaddr || entry >= vaddr.saturating_add(filesz) {
+                    continue;
+                }
+                let offset = ph.offset() as usize;
+                let file_off = offset + (entry - vaddr);
+                let end = (file_off + 8).min(all_data.len());
+                if end > file_off {
+                    let label = if exec_path_resolved == "/bin/sh" {
+                        "/bin/sh"
+                    } else {
+                        "/musl/busybox"
+                    };
+                    let entry_bytes = &all_data[file_off..end];
+                    trace!("[sys_exec] {} entry bytes={:02x?}", label, entry_bytes);
+                    if exec_path_resolved == "/musl/busybox"
+                        && entry_bytes.iter().all(|b| *b == 0)
+                    {
+                        let head_len = all_data.len().min(16);
+                        trace!(
+                            "[sys_exec] busybox read_all len={} head={:02x?}",
+                            all_data.len(),
+                            &all_data[..head_len]
+                        );
+                        if let Some(inode) = app.inode() {
+                            let mut buf = [0u8; 8];
+                            let n = inode.read_at(file_off, &mut buf);
+                            trace!(
+                                "[sys_exec] busybox inode.read_at off={:#x} n={} bytes={:02x?}",
+                                file_off,
+                                n,
+                                &buf[..n]
+                            );
+                            trace!("[sys_exec] busybox inode.size={}", inode.size());
+                        } else {
+                            trace!("[sys_exec] busybox inode missing");
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+
+fn trace_run_all_head(name: &str, exec_path: &str, all_data: &[u8]) {
+    if name == "busybox" && exec_path.contains("run-all.sh") {
+        let head_len = all_data.len().min(16);
+        let head = &all_data[..head_len];
+        trace!("[sys_exec] run-all.sh head={:02x?} len={}", head, all_data.len());
+    }
 }
 
 fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, depth: usize) -> isize {
@@ -276,17 +370,23 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
     let mut depth = depth;
     loop {
         if exec_path == "/bin/sh" {
-            if open_file("/musl/busybox", OpenFlags::empty()).is_some() {
-                exec_path = String::from("/musl/busybox");
-                if let Some(first) = args.get_mut(0) {
-                    if first == "/bin/sh" {
-                        *first = String::from("sh");
-                    }
+            // 应该已经提前做了硬链接
+            if open_file("/bin/sh", OpenFlags::empty()).is_none() {
+                if open_file("/musl/busybox", OpenFlags::empty()).is_some() {
+                    info!("[sys_exec] pid={} exec /bin/sh fallback to /musl/busybox", current_process().pid.0);
+                    exec_path = String::from("/musl/busybox");
+                } else {
+                    error!("[sys_exec] pid={} exec /bin/sh fallback busybox also not found", current_process().pid.0);
+                    return errno(ENOENT);
                 }
+            } else {
+                trace!("[sys_exec] /bin/sh ready");
             }
+
         }
         let mut resolved_path = None;
         let mut app = None;
+        // 根据 exec_path 和 PATH 环境变量构建候选路径列表，并尝试打开找到第一个存在的文件
         for candidate in build_exec_candidates(exec_path.as_str(), &envs) {
             if let Some(found) = open_file(candidate.as_str(), OpenFlags::empty()) {
                 resolved_path = Some(candidate);
@@ -294,6 +394,7 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
                 break;
             }
         }
+        // 如果没有找到任何候选文件，返回 ENOENT
         let Some(app) = app else {
             let name = current_process().inner_exclusive_access().name.clone();
             if name == "busybox" && exec_path.starts_with("./") {
@@ -306,96 +407,15 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
             }
             return errno(ENOENT);
         };
+        // 如果找到的候选文件路径和原始 exec_path 不同，说明是通过 PATH 环境变量解析得到的，打印解析信息
         let exec_path_resolved = resolved_path.unwrap_or_else(|| exec_path.clone());
         let name = current_process().inner_exclusive_access().name.clone();
-        if name == "busybox"
-            && (exec_path.contains("run-all.sh")
-                || exec_path.contains("/basic/")
-                || exec_path.starts_with("./"))
-        {
-            let argv0 = args.get(0).cloned().unwrap_or_default();
-            let argv1 = args.get(1).cloned().unwrap_or_default();
-            trace!(
-                "[sys_exec] pid={} name={} raw={} resolved={} argv0={} argv1={}",
-                current_process().pid.0,
-                name,
-                exec_path,
-                exec_path_resolved,
-                argv0,
-                argv1
-            );
-        }
+        trace_exec_resolution(&name, &exec_path, &exec_path_resolved, &args);
         let all_data = app.read_all();
-        if exec_path_resolved == "/bin/sh" || exec_path_resolved == "/musl/busybox" {
-            if let Ok(elf) = xmas_elf::ElfFile::new(all_data.as_slice()) {
-                let entry = elf.header.pt2.entry_point() as usize;
-                let ph_count = elf.header.pt2.ph_count() as usize;
-                for idx in 0..ph_count {
-                    if let Ok(ph) = elf.program_header(idx as u16) {
-                        if ph.get_type().ok() != Some(xmas_elf::program::Type::Load) {
-                            continue;
-                        }
-                        let vaddr = ph.virtual_addr() as usize;
-                        let filesz = ph.file_size() as usize;
-                        if entry < vaddr || entry >= vaddr.saturating_add(filesz) {
-                            continue;
-                        }
-                        let offset = ph.offset() as usize;
-                        let file_off = offset + (entry - vaddr);
-                        let end = (file_off + 8).min(all_data.len());
-                        if end > file_off {
-                            let label = if exec_path_resolved == "/bin/sh" {
-                                "/bin/sh"
-                            } else {
-                                "/musl/busybox"
-                            };
-                            let entry_bytes = &all_data[file_off..end];
-                            trace!(
-                                "[sys_exec] {} entry bytes={:02x?}",
-                                label,
-                                entry_bytes
-                            );
-                            if exec_path_resolved == "/musl/busybox"
-                                && entry_bytes.iter().all(|b| *b == 0)
-                            {
-                                let head_len = all_data.len().min(16);
-                                trace!(
-                                    "[sys_exec] busybox read_all len={} head={:02x?}",
-                                    all_data.len(),
-                                    &all_data[..head_len]
-                                );
-                                if let Some(inode) = app.inode() {
-                                    let mut buf = [0u8; 8];
-                                    let n = inode.read_at(file_off, &mut buf);
-                                    trace!(
-                                        "[sys_exec] busybox inode.read_at off={:#x} n={} bytes={:02x?}",
-                                        file_off,
-                                        n,
-                                        &buf[..n]
-                                    );
-                                    trace!(
-                                        "[sys_exec] busybox inode.size={}",
-                                        inode.size()
-                                    );
-                                } else {
-                                    trace!("[sys_exec] busybox inode missing");
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        if name == "busybox" && exec_path.contains("run-all.sh") {
-            let head_len = all_data.len().min(16);
-            let head = &all_data[..head_len];
-            trace!(
-                "[sys_exec] run-all.sh head={:02x?} len={}",
-                head,
-                all_data.len()
-            );
-        }
+        trace_entry_bytes(&exec_path_resolved, &all_data, &app);
+        trace_run_all_head(&name, &exec_path, &all_data);
+        // 检查文件内容，如果是脚本则解析 shebang 进行递归 exec
+        // 如果是 ELF 则正常执行，注意动态链接的 ELF 需要先加载解释器再由解释器加载主程序
         if let Some((interpreter, opt_arg)) = parse_shebang(&all_data) {
             trace!(
                 "[sys_exec] shebang interp={} opt_arg={:?} script={}",
@@ -407,45 +427,6 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
                 return errno(ELOOP);
             }
             depth += 1;
-            if open_file(interpreter.as_str(), OpenFlags::empty()).is_none() {
-                let pid = current_process().pid.0;
-                warn!(
-                    "kernel:pid[{}] sys_exec: interpreter {} not found, trying busybox",
-                    pid, interpreter
-                );
-                const BUSYBOX_PATH: &str = "/musl/busybox";
-                if let Some(busybox_inode) = open_file(BUSYBOX_PATH, OpenFlags::empty()) {
-                    let process = current_process();
-                    let busybox_data = busybox_inode.read_all();
-                    let mut busybox_args = Vec::new();
-                    // argv[0] should be "sh" so busybox runs the sh applet with the script.
-                    busybox_args.push(String::from("sh"));
-                    busybox_args.push(exec_path_resolved.clone());
-                    for arg in args.iter().skip(1) {
-                        busybox_args.push(arg.clone());
-                    }
-                    trace!(
-                        "[sys_exec] pid={} name={} fallback=busybox argv0={} argv1={} argv2={}",
-                        pid,
-                        name,
-                        busybox_args.get(0).cloned().unwrap_or_default(),
-                        busybox_args.get(1).cloned().unwrap_or_default(),
-                        busybox_args.get(2).cloned().unwrap_or_default()
-                    );
-                    {
-                        let mut inner = process.inner_exclusive_access();
-                        inner.name = String::from("busybox");
-                    }
-                    process.exec(busybox_data.as_slice(), busybox_args, envs);
-                    return 0;
-                } else {
-                    error!(
-                        "kernel:pid[{}] sys_exec: interpreter {} not found, busybox also not found",
-                        pid, interpreter
-                    );
-                    return errno(ENOENT);
-                }
-            }
             trace!("[sys_exec] shebang interpreter ready: {}", interpreter);
             let interp_basename = interpreter
                 .rsplit('/')
@@ -471,6 +452,7 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
         if all_data.len() < 4 || &all_data[..4] != b"\x7fELF" {
             return errno(ENOEXEC);
         }
+        let mut interp_data: Option<Vec<u8>> = None;
         if let Ok(elf) = xmas_elf::ElfFile::new(all_data.as_slice()) {
             let mut interp: Option<String> = None;
             for i in 0..elf.header.pt2.ph_count() {
@@ -487,15 +469,17 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
                 }
             }
             if let Some(mut interp_path) = interp {
-                if depth >= MAX_SHEBANG_DEPTH {
-                    return errno(ELOOP);
-                }
-                depth += 1;
                 if open_file(interp_path.as_str(), OpenFlags::empty()).is_none() {
-                    if interp_path.starts_with("/lib/") {
-                        let fallback = "/musl/lib/libc.so";
-                        if open_file(fallback, OpenFlags::empty()).is_some() {
-                            interp_path = String::from(fallback);
+                    // ! 实际已经先 ensure_flink 了
+                    if interp_path == "/lib/ld-linux-riscv64-lp64d.so.1" {
+                        let musl_loader = "/musl/lib/libc.so";
+                        let glibc_loader = "/glibc/lib/ld-linux-riscv64-lp64d.so.1";
+                        if open_file(musl_loader, OpenFlags::empty()).is_some() {
+                            interp_path = String::from(musl_loader);
+                            info!("[sys_exec] prefer musl loader: {}", interp_path);
+                        } else if open_file(glibc_loader, OpenFlags::empty()).is_some() {
+                            interp_path = String::from(glibc_loader);
+                            info!("[sys_exec] fallback glibc loader: {}", interp_path);
                         }
                     }
                 }
@@ -503,15 +487,12 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
                     trace!("[sys_exec] interp not found: {}", interp_path);
                     return errno(ENOENT);
                 }
-                let mut new_args: Vec<String> = Vec::new();
-                new_args.push(interp_path.clone());
-                new_args.push(exec_path_resolved.clone());
-                if args.len() > 1 {
-                    new_args.extend(args.into_iter().skip(1));
+                if let Some(interp_file) = open_file(interp_path.as_str(), OpenFlags::empty()) {
+                    interp_data = Some(interp_file.read_all());
+                } else {
+                    error!("[sys_exec] interp open failed: {}", interp_path);
+                    return errno(ENOENT);
                 }
-                args = new_args;
-                exec_path = interp_path;
-                continue;
             }
         }
         let process = current_process();
@@ -528,12 +509,12 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
                 exec_path
             );
         }
-        if exec_path == "/bin/sh" {
-            let argv0 = args.get(0).cloned().unwrap_or_default();
-            let argv1 = args.get(1).cloned().unwrap_or_default();
-            trace!("[sys_exec] /bin/sh argv0={} argv1={}", argv0, argv1);
-        }
-        process.exec(all_data.as_slice(), args, envs);
+        // if exec_path == "/bin/sh" {
+        //     let argv0 = args.get(0).cloned().unwrap_or_default();
+        //     let argv1 = args.get(1).cloned().unwrap_or_default();
+        //     trace!("[sys_exec] /bin/sh argv0={} argv1={}", argv0, argv1);
+        // }
+        process.exec_with_interp(all_data.as_slice(), interp_data.as_deref(), args, envs);
         let after_name = current_process().inner_exclusive_access().name.clone();
         trace!("[sys_exec] after exec name={}", after_name);
         return 0;
@@ -716,68 +697,77 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
 
     let mut len = len;
     if len == 0 {
-        let cx = current_trap_cx();
-        let sepc = cx.sepc;
-        let ra = cx.x[1];
-        let gp = cx.x[3];
-        let process = current_process();
-        let inner = process.inner_exclusive_access();
-        let name = inner.name.clone();
-        let heap_bottom = inner.heap_bottom;
-        let program_brk = inner.program_brk;
-        let mmap_base = inner.mmap_base;
-        drop(inner);
-        let token = current_user_token();
-        let heap_struct = gp.wrapping_add(0x688);
-        let heap_align = *translated_ref(token, (heap_struct + 0x38) as *const usize);
-        let heap_min = *translated_ref(token, (heap_struct + 0x10) as *const usize);
-        let malloc_shift = *translated_ref(token, (gp + 0x140) as *const u32);
+        warn!(
+            "kernel:pid[{}] sys_mmap with zero length, treating as 1 page",
+            pid
+        );
+        //// 针对 musl busybox 的问题排查代码
+        // let cx = current_trap_cx();
+        // let sepc = cx.sepc;
+        // let ra = cx.x[1];
+        // let gp = cx.x[3];
+        // let process = current_process();
+        // let inner = process.inner_exclusive_access();
+        // let name = inner.name.clone();
+        // let heap_bottom = inner.heap_bottom;
+        // let program_brk = inner.program_brk;
+        // let mmap_base = inner.mmap_base;
+        // drop(inner);
+        // let token = current_user_token();
+        // let heap_struct = gp.wrapping_add(0x688);
+        // let heap_align = *translated_ref(token, (heap_struct + 0x38) as *const usize);
+        // let heap_min = *translated_ref(token, (heap_struct + 0x10) as *const usize);
+        // let malloc_shift = *translated_ref(token, (gp + 0x140) as *const u32);
         if (flags & MAP_ANON) != 0 && (flags & MAP_PRIVATE) != 0 {
-            trace!(
-                "[sys_mmap] pid={} name={} sepc={:#x} ra={:#x} gp={:#x} req={:#x} len=0 prot={:#x} flags={:#x} fd={} off={:#x} hb={:#x} brk={:#x} mmap_base={:#x} heap_align={:#x} heap_min={:#x} malloc_shift={} -> compat map 1 page",
-                pid,
-                name,
-                sepc,
-                ra,
-                gp,
-                start,
-                prot,
-                flags,
-                fd,
-                offset,
-                heap_bottom,
-                program_brk,
-                mmap_base,
-                heap_align,
-                heap_min,
-                malloc_shift
-            );
+            // trace!(
+            //     "[sys_mmap] pid={} name={} sepc={:#x} ra={:#x} gp={:#x} req={:#x} len=0 prot={:#x} flags={:#x} fd={} off={:#x} hb={:#x} brk={:#x} mmap_base={:#x} heap_align={:#x} heap_min={:#x} malloc_shift={} -> compat map 1 page",
+            //     pid,
+            //     name,
+            //     sepc,
+            //     ra,
+            //     gp,
+            //     start,
+            //     prot,
+            //     flags,
+            //     fd,
+            //     offset,
+            //     heap_bottom,
+            //     program_brk,
+            //     mmap_base,
+            //     heap_align,
+            //     heap_min,
+            //     malloc_shift
+            // );
             len = PAGE_SIZE;
         } else {
-            trace!(
-                "[sys_mmap] pid={} name={} sepc={:#x} ra={:#x} gp={:#x} req={:#x} len=0 prot={:#x} flags={:#x} fd={} off={:#x} hb={:#x} brk={:#x} mmap_base={:#x} heap_align={:#x} heap_min={:#x} malloc_shift={} -> EINVAL",
-                pid,
-                name,
-                sepc,
-                ra,
-                gp,
-                start,
-                prot,
-                flags,
-                fd,
-                offset,
-                heap_bottom,
-                program_brk,
-                mmap_base,
-                heap_align,
-                heap_min,
-                malloc_shift
-            );
+            // trace!(
+            //     "[sys_mmap] pid={} name={} sepc={:#x} ra={:#x} gp={:#x} req={:#x} len=0 prot={:#x} flags={:#x} fd={} off={:#x} hb={:#x} brk={:#x} mmap_base={:#x} heap_align={:#x} heap_min={:#x} malloc_shift={} -> EINVAL",
+            //     pid,
+            //     name,
+            //     sepc,
+            //     ra,
+            //     gp,
+            //     start,
+            //     prot,
+            //     flags,
+            //     fd,
+            //     offset,
+            //     heap_bottom,
+            //     program_brk,
+            //     mmap_base,
+            //     heap_align,
+            //     heap_min,
+            //     malloc_shift
+            // );
             return errno(EINVAL);
         }
     }
 
     if start % PAGE_SIZE != 0 && (flags & MAP_FIXED) != 0 {
+        error!(
+            "start addr should be page aligned when MAP_FIXED is set, but got {:#x} in pid {}",
+            pid, start
+        );
         return errno(EINVAL);
     }
     let mut map_perm = MapPermission::U;
@@ -790,8 +780,10 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
     if (prot & PROT_EXEC) != 0 {
         map_perm |= MapPermission::X;
     }
+    // 获取页对齐的长度，如果 len 已经是页大小的整数倍，则保持不变；否则向上调整到下一个页边界。
     let len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
+    // 获取 mmap 的起始地址，如果是固定映射且提供了非零的起始地址，则使用该地址；否则根据当前进程的 mmap_base 来分配一个合适的地址，并更新 mmap_base。
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let req_start = start;
@@ -847,12 +839,17 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
         flags,
         start
     );
+
+    // 在进程的内存空间里插入一个新的映射区域，起始地址为 start，长度为 len，权限为 map_perm。
     inner
         .memory_set
         .insert_framed_area(VirtAddr(start), VirtAddr(start + len), map_perm);
     drop(inner);
 
+    // 文件映射填充部分，在“不是匿名映射、而且有有效 fd”的情况下，把文件内容读进映射的页里。
+    // TODO: 懒分配/写时复制等优化
     if (flags & MAP_ANON) == 0 && fd != usize::MAX {
+        // offset 参数必须是页大小的整数倍，否则返回 -EINVAL。
         if offset % PAGE_SIZE != 0 {
             return errno(EINVAL);
         }
@@ -884,59 +881,59 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
 }
 
 /// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+pub fn sys_munmap(start: usize, len: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_munmap", pid);
     }
-    if _start % PAGE_SIZE != 0 || _len == 0 {
+    if start % PAGE_SIZE != 0 || len == 0 {
         return errno(EINVAL);
     }
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
-        let before = inner
-            .memory_set
-            .overlap_count(VirtAddr(_start), VirtAddr(_start + _len));
-        trace!(
-            "[sys_munmap] pid={} name={} start={:#x} len={:#x} overlap_before={}",
-            pid,
-            inner.name,
-            _start,
-            _len,
-            before
-        );
-        if before > 0 {
-            let ranges = inner
-                .memory_set
-                .overlap_ranges(VirtAddr(_start), VirtAddr(_start + _len));
-            for (idx, (r_start, r_end)) in ranges.into_iter().enumerate() {
-                trace!(
-                    "[sys_munmap] pid={} overlap[{}]=[{:#x},{:#x})",
-                    pid,
-                    idx,
-                    r_start.0,
-                    r_end.0
-                );
-            }
-        }
-    }
+    // if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
+    //     let before = inner
+    //         .memory_set
+    //         .overlap_count(VirtAddr(start), VirtAddr(start + len));
+    //     trace!(
+    //         "[sys_munmap] pid={} name={} start={:#x} len={:#x} overlap_before={}",
+    //         pid,
+    //         inner.name,
+    //         start,
+    //         len,
+    //         before
+    //     );
+    //     if before > 0 {
+    //         let ranges = inner
+    //             .memory_set
+    //             .overlap_ranges(VirtAddr(start), VirtAddr(start + len));
+    //         for (idx, (r_start, r_end)) in ranges.into_iter().enumerate() {
+    //             trace!(
+    //                 "[sys_munmap] pid={} overlap[{}]=[{:#x},{:#x})",
+    //                 pid,
+    //                 idx,
+    //                 r_start.0,
+    //                 r_end.0
+    //             );
+    //         }
+    //     }
+    // }
     inner
         .memory_set
-        .remove_area_with_start_vpn(VirtAddr(_start).floor());
-    if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
-        let after = inner
-            .memory_set
-            .overlap_count(VirtAddr(_start), VirtAddr(_start + _len));
-        trace!(
-            "[sys_munmap] pid={} name={} start={:#x} len={:#x} overlap_after={}",
-            pid,
-            inner.name,
-            _start,
-            _len,
-            after
-        );
-    }
+        .remove_area_with_start_vpn(VirtAddr(start).floor());
+    // if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
+    //     let after = inner
+    //         .memory_set
+    //         .overlap_count(VirtAddr(start), VirtAddr(start + len));
+    //     trace!(
+    //         "[sys_munmap] pid={} name={} start={:#x} len={:#x} overlap_after={}",
+    //         pid,
+    //         inner.name,
+    //         start,
+    //         len,
+    //         after
+    //     );
+    // }
     0
 }
 
@@ -953,27 +950,29 @@ pub fn sys_sbrk(arg: isize) -> isize {
     let current_brk = inner.program_brk;
     let heap_bottom = inner.heap_bottom;
     if arg == 0 {
-        if name == "busybox" {
-            trace!(
-                "[sys_sbrk] pid={} name={} sepc={:#x} arg=0 cur={:#x} heap_bottom={:#x}",
-                pid,
-                name,
-                sepc,
-                current_brk,
-                heap_bottom
-            );
-        }
+        // if name == "busybox" {
+        //     trace!(
+        //         "[sys_sbrk] pid={} name={} sepc={:#x} arg=0 cur={:#x} heap_bottom={:#x}",
+        //         pid,
+        //         name,
+        //         sepc,
+        //         current_brk,
+        //         heap_bottom
+        //     );
+        // }
         return current_brk as isize;
     }
     let is_abs = (arg as usize) >= heap_bottom;
     let delta = if is_abs {
         arg - current_brk as isize
     } else {
+        // sbrk(delta) is equivalent to brk(current_brk + delta)
         arg
     };
     let new_brk = (current_brk as isize + delta) as usize;
     if new_brk < heap_bottom {
-        trace!(
+        // new_brk is below the heap bottom, which is invalid
+        error!(
             "[sys_sbrk] pid={} name={} sepc={:#x} arg={} cur={:#x} heap_bottom={:#x} new={:#x} -> ENOMEM",
             pid,
             name,
@@ -1012,7 +1011,7 @@ pub fn sys_sbrk(arg: isize) -> isize {
             current_brk as isize
         }
     } else {
-        trace!(
+        error!(
             "[sys_sbrk] pid={} name={} sepc={:#x} arg={} cur={:#x} heap_bottom={:#x} new={:#x} -> ENOMEM",
             pid,
             name,

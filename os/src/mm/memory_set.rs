@@ -173,8 +173,212 @@ impl MemorySet {
         }
         memory_set
     }
+
+    fn scan_elf_meta(elf: &xmas_elf::ElfFile, elf_data: &[u8]) -> (bool, usize) {
+        let ph_count = elf.header.pt2.ph_count();
+        let mut has_interp = false;
+        let mut min_load_vaddr = usize::MAX;
+        for i in 0..ph_count {
+            let ph = elf.program_header(i).unwrap();
+            let ph_type = ph.get_type().unwrap();
+            if ph_type == xmas_elf::program::Type::Interp {
+                has_interp = true;
+                let interp_start = ph.offset() as usize;
+                let interp_end = interp_start + ph.file_size() as usize;
+                if interp_end < elf_data.len() {
+                    let interp_bytes = &elf_data[interp_start..interp_end];
+                    if let Ok(interp_str) = core::str::from_utf8(interp_bytes) {
+                        info!("[ELF] Found PT_INTERP: {}", interp_str.trim_end_matches('\0'));
+                    }
+                }
+            } else if ph_type == xmas_elf::program::Type::Load {
+                let vaddr = ph.virtual_addr() as usize;
+                if vaddr < min_load_vaddr {
+                    min_load_vaddr = vaddr;
+                }
+            }
+        }
+        (has_interp, min_load_vaddr)
+    }
+
+    fn map_load_segments(
+        memory_set: &mut MemorySet,
+        elf: &xmas_elf::ElfFile,
+        load_base: usize,
+    ) -> VirtPageNum {
+        let ph_count = elf.header.pt2.ph_count();
+        let mut max_end_vpn = VirtPageNum(0);
+        for i in 0..ph_count {
+            let ph = elf.program_header(i).unwrap();
+            if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
+                let start_va = VirtAddr::from(load_base + ph.virtual_addr() as usize);
+                let end_va =
+                    VirtAddr::from(load_base + (ph.virtual_addr() + ph.mem_size()) as usize);
+                let mut map_perm = MapPermission::U;
+                let ph_flags = ph.flags();
+                if ph_flags.is_read() {
+                    map_perm |= MapPermission::R;
+                }
+                if ph_flags.is_write() {
+                    map_perm |= MapPermission::W;
+                }
+                if ph_flags.is_execute() {
+                    map_perm |= MapPermission::X;
+                }
+                let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
+                max_end_vpn = map_area.vpn_range.get_end();
+                memory_set.push(
+                    map_area,
+                    Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
+                );
+            }
+        }
+        max_end_vpn
+    }
+
+    fn scan_tls_info(
+        elf: &xmas_elf::ElfFile,
+        load_base: usize,
+    ) -> Option<crate::task::TlsInfo> {
+        let ph_count = elf.header.pt2.ph_count();
+        let mut tls_info = None;
+        info!("[ELF] Scanning {} program headers for PT_TLS", ph_count);
+        for i in 0..ph_count {
+            let ph = elf.program_header(i).unwrap();
+            let ph_type = ph.get_type().unwrap();
+            trace!(
+                "[ELF] PH {}: type={:?}, vaddr={:#x}, filesz={:#x}, memsz={:#x}",
+                i,
+                ph_type,
+                ph.virtual_addr(),
+                ph.file_size(),
+                ph.mem_size()
+            );
+
+            if ph_type == xmas_elf::program::Type::Tls {
+                tls_info = Some(crate::task::TlsInfo {
+                    vaddr: load_base + ph.virtual_addr() as usize,
+                    filesz: ph.file_size() as usize,
+                    memsz: ph.mem_size() as usize,
+                    align: ph.align() as usize,
+                });
+                info!(
+                    "[ELF] Found PT_TLS: vaddr={:#x}, filesz={:#x}, memsz={:#x}, align={:#x}",
+                    ph.virtual_addr(),
+                    ph.file_size(),
+                    ph.mem_size(),
+                    ph.align()
+                );
+            }
+        }
+        tls_info
+    }
+
+    fn prepare_auxv_info(
+        elf: &xmas_elf::ElfFile,
+        load_base: usize,
+    ) -> crate::task::AuxvInfo {
+        let elf_header = elf.header;
+        let ph_count = elf_header.pt2.ph_count();
+        let phdr_addr = if ph_count > 0 {
+            let ph_offset = elf_header.pt2.ph_offset() as usize;
+            let mut found = None;
+            for i in 0..ph_count {
+                let ph = elf.program_header(i).unwrap();
+                if ph.get_type().unwrap() != xmas_elf::program::Type::Load {
+                    continue;
+                }
+                let file_offset = ph.offset() as usize;
+                let file_end = file_offset + ph.file_size() as usize;
+                if ph_offset >= file_offset && ph_offset < file_end {
+                    let vaddr = ph.virtual_addr() as usize;
+                    found = Some(load_base + vaddr + (ph_offset - file_offset));
+                    break;
+                }
+            }
+            found.unwrap_or(0)
+        } else {
+            0
+        };
+
+        let auxv_info = crate::task::AuxvInfo {
+            phdr_addr,
+            phent_size: elf_header.pt2.ph_entry_size() as usize,
+            phnum: ph_count as usize,
+            entry: load_base + elf.header.pt2.entry_point() as usize,
+        };
+
+        if phdr_addr == 0 {
+            info!("[ELF] Warning: AT_PHDR set to 0 (program headers not accessible)");
+        }
+        info!(
+            "[ELF] Auxv: phdr={:#x}, phent={}, phnum={}, entry={:#x}",
+            auxv_info.phdr_addr,
+            auxv_info.phent_size,
+            auxv_info.phnum,
+            auxv_info.entry
+        );
+        if let Some(first_load) = (0..ph_count)
+            .filter_map(|i| elf.program_header(i).ok())
+            .find(|ph| ph.get_type().ok() == Some(xmas_elf::program::Type::Load))
+        {
+            info!(
+                "[ELF] First PT_LOAD: vaddr={:#x}, offset={:#x}, filesz={:#x}",
+                first_load.virtual_addr(),
+                first_load.offset(),
+                first_load.file_size()
+            );
+        }
+
+        auxv_info
+    }
+
+    fn map_user_stack_and_trap(
+        memory_set: &mut MemorySet,
+        max_end_vpn: VirtPageNum,
+    ) -> (usize, usize) {
+        let max_end_va: VirtAddr = max_end_vpn.into();
+        let heap_bottom: usize = max_end_va.into();
+        let mut user_stack_bottom: usize = heap_bottom;
+        user_stack_bottom += PAGE_SIZE;
+        let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
+        memory_set.push(
+            MapArea::new(
+                user_stack_bottom.into(),
+                user_stack_top.into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            ),
+            None,
+        );
+        memory_set.push(
+            MapArea::new(
+                heap_bottom.into(),
+                heap_bottom.into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            ),
+            None,
+        );
+        memory_set.push(
+            MapArea::new(
+                TRAP_CONTEXT_BASE.into(),
+                TRAMPOLINE.into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::W,
+            ),
+            None,
+        );
+        (heap_bottom, user_stack_top)
+    }
+
+    fn align_up(value: usize, align: usize) -> usize {
+        (value + align - 1) & !(align - 1)
+    }
+
     /// Include sections in elf and trampoline and TrapContext and user stack,
     /// also returns heap_bottom, user_sp_base, entry point, TLS info (if present), and auxv info.
+    /// 不处理解释器，只加载主程序 ELF
     pub fn from_elf(
         elf_data: &[u8]
     ) -> (
@@ -193,21 +397,13 @@ impl MemorySet {
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
         assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
-        let ph_count = elf_header.pt2.ph_count();
+        let _ph_count = elf_header.pt2.ph_count();
         let elf_type = elf_header.pt2.type_().as_type();
-        let mut has_interp = false;
-        let mut min_load_vaddr = usize::MAX;
-        for i in 0..ph_count {
-            let ph = elf.program_header(i).unwrap();
-            let ph_type = ph.get_type().unwrap();
-            if ph_type == xmas_elf::program::Type::Interp {
-                has_interp = true;
-            } else if ph_type == xmas_elf::program::Type::Load {
-                let vaddr = ph.virtual_addr() as usize;
-                if vaddr < min_load_vaddr {
-                    min_load_vaddr = vaddr;
-                }
-            }
+        let (has_interp, min_load_vaddr) = Self::scan_elf_meta(&elf, elf_data);
+        if has_interp {
+            warn!(
+                "called from_elf but with interpreter, you should call from_elf_with_interp instead"
+            );
         }
         let load_base = if elf_type == xmas_elf::header::Type::SharedObject && !has_interp {
             0x4000_0000usize
@@ -221,87 +417,9 @@ impl MemorySet {
             min_load_vaddr,
             load_base
         );
-        let mut max_end_vpn = VirtPageNum(0);
-        for i in 0..ph_count {
-            let ph = elf.program_header(i).unwrap();
-            if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
-                let start_va: VirtAddr = (load_base + ph.virtual_addr() as usize).into();
-                let end_va: VirtAddr = (load_base + (ph.virtual_addr() + ph.mem_size()) as usize).into();
-                let mut map_perm = MapPermission::U;
-                let ph_flags = ph.flags();
-                if ph_flags.is_read() {
-                    map_perm |= MapPermission::R;
-                }
-                if ph_flags.is_write() {
-                    map_perm |= MapPermission::W;
-                }
-                if ph_flags.is_execute() {
-                    map_perm |= MapPermission::X;
-                }
-                let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
-                max_end_vpn = map_area.vpn_range.get_end();
-                memory_set.push(
-                    map_area,
-                    Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
-                );
-                if i == 0 {
-                    let file_off = ph.offset() as usize;
-                    let file_len = ph.file_size() as usize;
-                    let check_len = core::cmp::min(8, file_len);
-                    if check_len > 0 {
-                        let vaddr = load_base + ph.virtual_addr() as usize;
-                        let file_bytes = &elf.input[file_off..file_off + check_len];
-                        let mut mem_bytes: Vec<u8> = Vec::with_capacity(check_len);
-                        for idx in 0..check_len {
-                            let va = VirtAddr::from(vaddr + idx);
-                            if let Some(pte) = memory_set.page_table.translate(va.floor()) {
-                                let offset = va.page_offset();
-                                mem_bytes.push(pte.ppn().get_bytes_array()[offset]);
-                            } else {
-                                mem_bytes.push(0);
-                            }
-                        }
-                        info!(
-                            "[ELF] PT_LOAD[0] file bytes={:02x?} mem bytes={:02x?}",
-                            file_bytes,
-                            mem_bytes
-                        );
-                    }
-                }
-            }
-        }
+        let max_end_vpn = Self::map_load_segments(&mut memory_set, &elf, load_base);
 
-        // Parse PT_TLS segment (Thread Local Storage) and check for PT_INTERP
-        let mut tls_info = None;
-        info!("[ELF] Scanning {} program headers for PT_TLS and PT_INTERP", ph_count);
-        for i in 0..ph_count {
-            let ph = elf.program_header(i).unwrap();
-            let ph_type = ph.get_type().unwrap();
-            trace!("[ELF] PH {}: type={:?}, vaddr={:#x}, filesz={:#x}, memsz={:#x}",
-                i, ph_type, ph.virtual_addr(), ph.file_size(), ph.mem_size());
-
-            if ph_type == xmas_elf::program::Type::Tls {
-                tls_info = Some(crate::task::TlsInfo {
-                    vaddr: load_base + ph.virtual_addr() as usize,
-                    filesz: ph.file_size() as usize,
-                    memsz: ph.mem_size() as usize,
-                    align: ph.align() as usize,
-                });
-                info!("[ELF] Found PT_TLS: vaddr={:#x}, filesz={:#x}, memsz={:#x}, align={:#x}",
-                    ph.virtual_addr(), ph.file_size(), ph.mem_size(), ph.align());
-            } else if ph_type == xmas_elf::program::Type::Interp {
-                has_interp = true;
-                // Extract interpreter path
-                let interp_start = ph.offset() as usize;
-                let interp_end = interp_start + ph.file_size() as usize;
-                if interp_end < elf_data.len() {
-                    let interp_bytes = &elf_data[interp_start..interp_end];
-                    if let Ok(interp_str) = core::str::from_utf8(interp_bytes) {
-                        info!("[ELF] Found PT_INTERP: {}", interp_str.trim_end_matches('\0'));
-                    }
-                }
-            }
-        }
+        let tls_info = Self::scan_tls_info(&elf, load_base);
         if tls_info.is_none() {
             info!("[ELF] No PT_TLS segment found");
         }
@@ -309,84 +427,10 @@ impl MemorySet {
             info!("[ELF] No PT_INTERP (statically linked)");
         }
 
-        // Calculate auxiliary vector information
-        // AT_PHDR: program headers location in memory
-        // For most ELF files, program headers are at e_phoff from the start of the file
-        // and are loaded as part of the first PT_LOAD segment
-        let phdr_addr = if ph_count > 0 {
-            let first_ph = elf.program_header(0).unwrap();
-            if first_ph.get_type().unwrap() == xmas_elf::program::Type::Load {
-                // Calculate where program headers are in memory
-                // They're at file_offset ph_offset, which maps to vaddr + (ph_offset - file_offset)
-                let file_offset = first_ph.offset() as usize;
-                let ph_offset = elf_header.pt2.ph_offset() as usize;
-                if ph_offset >= file_offset && ph_offset < (file_offset + first_ph.file_size() as usize) {
-                    // Program headers are within first PT_LOAD segment
-                    load_base + first_ph.virtual_addr() as usize + (ph_offset - file_offset)
-                } else {
-                    // Fallback: assume PT_PHDR not available
-                    0
-                }
-            } else {
-                0
-            }
-        } else {
-            0
-        };
+        let auxv_info = Self::prepare_auxv_info(&elf, load_base);
 
-        let auxv_info = crate::task::AuxvInfo {
-            phdr_addr,
-            phent_size: elf_header.pt2.ph_entry_size() as usize,
-            phnum: ph_count as usize,
-            entry: load_base + elf.header.pt2.entry_point() as usize,
-        };
-
-        if phdr_addr == 0 {
-            info!("[ELF] Warning: AT_PHDR set to 0 (program headers not accessible)");
-        }
-        info!("[ELF] Auxv: phdr={:#x}, phent={}, phnum={}, entry={:#x}",
-            auxv_info.phdr_addr, auxv_info.phent_size, auxv_info.phnum, auxv_info.entry);
-        info!("[ELF] First PT_LOAD: vaddr={:#x}, offset={:#x}, filesz={:#x}",
-            elf.program_header(0).unwrap().virtual_addr(),
-            elf.program_header(0).unwrap().offset(),
-            elf.program_header(0).unwrap().file_size());
-
-        // map user stack with U flags
-        let max_end_va: VirtAddr = max_end_vpn.into();
-        let heap_bottom: usize = max_end_va.into();
-        let mut user_stack_bottom: usize = heap_bottom;
-        // guard page
-        user_stack_bottom += PAGE_SIZE;
-        let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
-        memory_set.push(
-            MapArea::new(
-                user_stack_bottom.into(),
-                user_stack_top.into(),
-                MapType::Framed,
-                MapPermission::R | MapPermission::W | MapPermission::U,
-            ),
-            None,
-        );
-        // used in sbrk
-        memory_set.push(
-            MapArea::new(
-                heap_bottom.into(),
-                heap_bottom.into(),
-                MapType::Framed,
-                MapPermission::R | MapPermission::W | MapPermission::U,
-            ),
-            None,
-        );
-        // map TrapContext
-        memory_set.push(
-            MapArea::new(
-                TRAP_CONTEXT_BASE.into(),
-                TRAMPOLINE.into(),
-                MapType::Framed,
-                MapPermission::R | MapPermission::W,
-            ),
-            None,
-        );
+        let (heap_bottom, user_stack_top) =
+            Self::map_user_stack_and_trap(&mut memory_set, max_end_vpn);
         let entry_point = load_base + elf.header.pt2.entry_point() as usize;
         (
             memory_set,
@@ -395,6 +439,85 @@ impl MemorySet {
             entry_point,
             tls_info,
             auxv_info,
+        )
+    }
+
+    /// Load main ELF plus interpreter ELF (PT_INTERP) into one address space.
+    /// Returns main entry/auxv info and interpreter base/entry for initial jump.
+    pub fn from_elf_with_interp(
+        elf_data: &[u8],
+        interp_data: &[u8],
+    ) -> (
+        Self,
+        usize,
+        usize,
+        usize,
+        Option<crate::task::TlsInfo>,
+        crate::task::AuxvInfo,
+        usize,
+        usize,
+    ) {
+        let mut memory_set = Self::new_bare();
+        memory_set.map_trampoline();
+
+        let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
+        let elf_header = elf.header;
+        let magic = elf_header.pt1.magic;
+        assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
+        let _ph_count = elf_header.pt2.ph_count();
+        let elf_type = elf_header.pt2.type_().as_type();
+        let (has_interp, min_load_vaddr) = Self::scan_elf_meta(&elf, elf_data);
+        let load_base = if elf_type == xmas_elf::header::Type::SharedObject && !has_interp {
+            0x4000_0000usize
+        } else {
+            0
+        };
+        info!(
+            "[ELF] type={:?} has_interp={} min_load_vaddr={:#x} load_base={:#x}",
+            elf_type,
+            has_interp,
+            min_load_vaddr,
+            load_base
+        );
+
+        let mut max_end_vpn = Self::map_load_segments(&mut memory_set, &elf, load_base);
+
+        let tls_info = Self::scan_tls_info(&elf, load_base);
+        if tls_info.is_none() {
+            info!("[ELF] No PT_TLS segment found");
+        }
+        if !has_interp {
+            info!("[ELF] No PT_INTERP (statically linked)");
+        }
+
+        let auxv_info = Self::prepare_auxv_info(&elf, load_base);
+
+        let max_end_va: VirtAddr = max_end_vpn.into();
+        let mut interp_base = max_end_va.into();
+        interp_base = Self::align_up(interp_base, PAGE_SIZE);
+
+        // 映射 解释器 ELF，注意解释器 ELF 也可能有 PT_TLS 和 PT_INTERP，但我们不处理解释器的解释器（递归加载），只加载第一层解释器
+        let interp_elf = xmas_elf::ElfFile::new(interp_data).unwrap();
+        let interp_max_end_vpn = Self::map_load_segments(&mut memory_set, &interp_elf, interp_base);
+        if interp_max_end_vpn > max_end_vpn {
+            max_end_vpn = interp_max_end_vpn;
+        }
+
+        let (heap_bottom, user_stack_top) =
+            Self::map_user_stack_and_trap(&mut memory_set, max_end_vpn);
+
+        // 静态链接的 ELF 入口点是主程序的 entry point，动态链接的 ELF 入口点是解释器的 entry point，loader 先跳转到解释器入口，由解释器负责加载主程序并跳转到主程序入口
+        let entry_point = load_base + elf.header.pt2.entry_point() as usize;
+        let interp_entry = interp_base + interp_elf.header.pt2.entry_point() as usize;
+        (
+            memory_set,
+            heap_bottom,
+            user_stack_top,
+            entry_point,
+            tls_info,
+            auxv_info,
+            interp_base,
+            interp_entry,
         )
     }
     /// Create a new address space by copy code&data from a exited process's address space.
@@ -516,7 +639,6 @@ impl MemorySet {
     }
 
     /// shrink the area to new_end
-    #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
         if let Some(area) = self
             .areas
@@ -531,7 +653,6 @@ impl MemorySet {
     }
 
     /// append the area to new_end
-    #[allow(unused)]
     pub fn append_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
         if let Some(area) = self
             .areas

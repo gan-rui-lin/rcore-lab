@@ -181,7 +181,7 @@ pub fn handle_signals() {
     if signum == SignalFlags::SIGKILL.bits().trailing_zeros() as usize {
         let pid = process.pid.0;
         let name = process_inner.name.clone();
-        println!("[signal] pid={} name={} killed by SIGKILL", pid, name);
+        warn!("[signal] pid={} name={} killed by SIGKILL", pid, name);
         drop(task_inner);
         drop(process_inner);
         exit_current_and_run_next(-(SigNumber::SigKill as i32));
@@ -192,7 +192,7 @@ pub fn handle_signals() {
     if action.handler == 0 {
         let pid = process.pid.0;
         let name = process_inner.name.clone();
-        println!(
+        warn!(
             "[signal] pid={} name={} default handler for signum {}",
             pid,
             name,

@@ -6,6 +6,9 @@ use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{KERNEL_SPACE, MemorySet, translated_byte_buffer, translated_ref, translated_refmut, translated_str};
 use crate::sync::{Condvar, Mutex, Semaphore, UPIntrFreeCell};
 use crate::trap::{TrapContext, trap_handler};
+use xmas_elf::ElfFile;
+use xmas_elf::sections::{SectionData, ShType};
+use xmas_elf::symbol_table::Entry;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -13,6 +16,36 @@ use alloc::vec::Vec;
 use crate::sync::UPIntrRefMut;
 
 const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
+
+fn find_global_pointer(elf_data: &[u8]) -> Option<usize> {
+    let elf = ElfFile::new(elf_data).ok()?;
+    for section in elf.section_iter() {
+        let Ok(section_type) = section.get_type() else {
+            continue;
+        };
+        if section_type != ShType::SymTab && section_type != ShType::DynSym {
+            continue;
+        }
+        if let Ok(SectionData::SymbolTable64(entries)) = section.get_data(&elf) {
+            for entry in entries {
+                if let Ok(name) = entry.get_name(&elf) {
+                    if name == "__global_pointer$" {
+                        return Some(entry.value() as usize);
+                    }
+                }
+            }
+        } else if let Ok(SectionData::DynSymbolTable64(entries)) = section.get_data(&elf) {
+            for entry in entries {
+                if let Ok(name) = entry.get_name(&elf) {
+                    if name == "__global_pointer$" {
+                        return Some(entry.value() as usize);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
 
 pub struct ProcessControlBlock {
     pub pid: PidHandle,
@@ -88,6 +121,12 @@ impl ProcessControlBlock {
         let (mut memory_set, heap_bottom, user_stack_top, entry_point, tls_info, _auxv_info) =
             MemorySet::from_elf(elf_data);
         let ustack_base = user_stack_top.saturating_sub(USER_STACK_SIZE);
+        let load_base = if let Ok(elf) = ElfFile::new(elf_data) {
+            entry_point.saturating_sub(elf.header.pt2.entry_point() as usize)
+        } else {
+            0
+        };
+        let gp = find_global_pointer(elf_data).map(|v| v + load_base).unwrap_or(0);
 
         // Initialize TLS if PT_TLS segment exists
         let tls_area = tls_info.map(|info| {
@@ -140,6 +179,10 @@ impl ProcessControlBlock {
             trap_handler as usize,
         );
 
+        if gp != 0 {
+            trap_cx_value.x[3] = gp;  // gp = x3
+            info!("[kernel] GP initialized: gp = {:#x}", gp);
+        }
         if let Some(ref tls) = tls_area {
             trap_cx_value.x[4] = tls.tp_value;  // tp = x4
             info!("[kernel] TLS initialized: tp = {:#x}", tls.tp_value);
@@ -166,14 +209,50 @@ impl ProcessControlBlock {
     }
 
     pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
+        self.exec_with_interp(elf_data, None, args, envs);
+    }
+
+    pub fn exec_with_interp(
+        self: &Arc<Self>,
+        elf_data: &[u8],
+        interp_data: Option<&[u8]>,
+        args: Vec<String>,
+        envs: Vec<String>,
+    ) {
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
         let exec_name = self.inner_exclusive_access().name.clone();
         debug!("[kernel] exec: process name={} argc={}", exec_name, args.len());
-        let (mut memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info) =
-            MemorySet::from_elf(elf_data);
+        let (mut memory_set, heap_bottom, user_stack_top, main_entry, tls_info, auxv_info, interp_base, interp_entry) =
+            if let Some(interp_data) = interp_data {
+                let (memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info, interp_base, interp_entry) =
+                    MemorySet::from_elf_with_interp(elf_data, interp_data);
+                (memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info, Some(interp_base), Some(interp_entry))
+            } else {
+                let (memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info) =
+                    MemorySet::from_elf(elf_data);
+                (memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info, None, None)
+            };
+        let entry_point = interp_entry.unwrap_or(main_entry);
+        let load_base = if let Ok(elf) = ElfFile::new(elf_data) {
+            main_entry.saturating_sub(elf.header.pt2.entry_point() as usize)
+        } else {
+            0
+        };
+        let gp = if let Some(interp_data) = interp_data {
+            if let Ok(_interp_elf) = ElfFile::new(interp_data) {
+                let interp_load_base = interp_base.unwrap_or(0);
+                find_global_pointer(interp_data)
+                    .map(|v| v + interp_load_base)
+                    .unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            find_global_pointer(elf_data).map(|v| v + load_base).unwrap_or(0)
+        };
         debug!(
             "[kernel] exec: entry={:#x} heap_bottom={:#x} user_stack_top={:#x} auxv_phdr={:#x} auxv_entry={:#x}",
-            entry_point,
+            main_entry,
             heap_bottom,
             user_stack_top,
             auxv_info.phdr_addr,
@@ -189,7 +268,8 @@ impl ProcessControlBlock {
         if exec_name == "sh" || exec_name == "busybox" {
             let mut bytes = [0u8; 8];
             let mut offset = 0usize;
-            for slice in translated_byte_buffer(new_token, entry_point as *const u8, bytes.len()) {
+            let debug_entry = main_entry;
+            for slice in translated_byte_buffer(new_token, debug_entry as *const u8, bytes.len()) {
                 let len = slice.len().min(bytes.len() - offset);
                 bytes[offset..offset + len].copy_from_slice(&slice[..len]);
                 offset += len;
@@ -293,6 +373,14 @@ impl ProcessControlBlock {
                 (AT_NULL, 0),
             ]
         };
+        if let Some(base) = interp_base {
+            let at_base = crate::task::auxv::auxv_type::AT_BASE;
+            if let Some(pos) = auxv_entries.iter().position(|(k, _)| *k == crate::task::auxv::auxv_type::AT_NULL) {
+                auxv_entries.insert(pos, (at_base, base));
+            } else {
+                auxv_entries.push((at_base, base));
+            }
+        }
         for entry in &mut auxv_entries {
             if entry.0 == crate::task::auxv::auxv_type::AT_RANDOM {
                 entry.1 = random_addr;
@@ -389,6 +477,10 @@ impl ProcessControlBlock {
         trap_cx.x[11] = argv_base;
         trap_cx.x[12] = envp_base;
 
+        if gp != 0 {
+            trap_cx.x[3] = gp;  // gp = x3
+            info!("[kernel] exec: GP initialized: gp = {:#x}", gp);
+        }
         // Set tp register
         if let Some(ref tls) = tls_area {
             trap_cx.x[4] = tls.tp_value;  // tp = x4
