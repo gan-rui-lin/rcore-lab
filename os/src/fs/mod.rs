@@ -171,11 +171,14 @@ pub fn ensure_busybox_links() {
     ensure_hardlink("/bin/basename", BUSYBOX_PATH);
     ensure_hardlink("/usr/bin/basename", BUSYBOX_PATH);
     ensure_hardlink("/musl/basename", BUSYBOX_PATH);
-    const MUSL_LOADER_FALLBACK: &str = "/musl/lib/libc.so";
-    if open_file(MUSL_LOADER_FALLBACK, OpenFlags::empty()).is_some() {
-        ensure_hardlink("/lib/ld-linux-riscv64-lp64d.so.1", MUSL_LOADER_FALLBACK);
+    const GLIBC_LOADER: &str = "/glibc/lib/ld-linux-riscv64-lp64d.so.1";
+    const MUSL_LOADER: &str = "/musl/lib/libc.so";
+    if open_file(MUSL_LOADER, OpenFlags::empty()).is_some() {
+        ensure_hardlink("/lib/ld-linux-riscv64-lp64d.so.1", MUSL_LOADER);
+    } else if open_file(GLIBC_LOADER, OpenFlags::empty()).is_some() {
+        ensure_hardlink("/lib/ld-linux-riscv64-lp64d.so.1", GLIBC_LOADER);
     } else {
-        error!("[ext4] missing musl loader fallback at {}", MUSL_LOADER_FALLBACK);
+        error!("[ext4] missing loader at {} and {}", MUSL_LOADER, GLIBC_LOADER);
     }
     if open_file("/bin/sh", OpenFlags::empty()).is_some() {
         debug!("[ext4] /bin/sh ready");
