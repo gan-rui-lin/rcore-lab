@@ -110,10 +110,10 @@ pub fn trap_handler() -> ! {
             let pid = proc.pid.0;
             let name = proc_inner.name.clone();
             drop(proc_inner);
-            println!("[kernel] trap_handler: {:?} in application", scause.cause());
-            println!("  pid={} name={}", pid, name);
-            println!("  bad addr (stval) = {:#x}", stval);
-            println!("  bad instruction (sepc) = {:#x}", trap_cx.sepc);
+            error!("[kernel] trap_handler: {:?} in application", scause.cause());
+            error!("  pid={} name={}", pid, name);
+            error!("  bad addr (stval) = {:#x}", stval);
+            error!("  bad instruction (sepc) = {:#x}", trap_cx.sepc);
             let token = current_user_token();
             let page_table = PageTable::from_token(token);
             let stval_va = VirtAddr::from(stval as usize);
@@ -122,17 +122,17 @@ pub fn trap_handler() -> ! {
                     let offset = stval_va.page_offset();
                     let end = core::cmp::min(offset + 8, PAGE_SIZE);
                     let bytes = &pte.ppn().get_bytes_array()[offset..end];
-                    println!(
+                    error!(
                         "  stval pte: ppn={:#x} flags={:?} bytes={:02x?}",
                         pte.ppn().0,
                         pte.flags(),
                         bytes
                     );
                 } else {
-                    println!("  stval pte: invalid flags={:?}", pte.flags());
+                    error!("  stval pte: invalid flags={:?}", pte.flags());
                 }
             } else {
-                println!("  stval pte: unmapped");
+                error!("  stval pte: unmapped");
             }
             let sepc_va = VirtAddr::from(trap_cx.sepc);
             if let Some(pte) = page_table.translate(sepc_va.floor()) {
@@ -140,31 +140,31 @@ pub fn trap_handler() -> ! {
                     let offset = sepc_va.page_offset();
                     let end = core::cmp::min(offset + 8, PAGE_SIZE);
                     let bytes = &pte.ppn().get_bytes_array()[offset..end];
-                    println!(
+                    error!(
                         "  sepc pte: ppn={:#x} flags={:?} bytes={:02x?}",
                         pte.ppn().0,
                         pte.flags(),
                         bytes
                     );
                 } else {
-                    println!("  sepc pte: invalid flags={:?}", pte.flags());
+                    error!("  sepc pte: invalid flags={:?}", pte.flags());
                 }
             } else {
-                println!("  sepc pte: unmapped");
+                error!("  sepc pte: unmapped");
             }
-            println!("  Registers:");
-            println!("    ra (x1) = {:#x}", trap_cx.x[1]);
-            println!("    sp (x2) = {:#x}", trap_cx.x[2]);
-            println!("    gp (x3) = {:#x}", trap_cx.x[3]);
-            println!("    tp (x4) = {:#x}", trap_cx.x[4]);
-            println!("    t0 (x5) = {:#x}", trap_cx.x[5]);
-            println!("    t1 (x6) = {:#x}", trap_cx.x[6]);
-            println!("    a0 (x10) = {:#x}", trap_cx.x[10]);
-            println!("    a1 (x11) = {:#x}", trap_cx.x[11]);
-            println!("    a2 (x12) = {:#x}", trap_cx.x[12]);
-            println!("    a3 (x13) = {:#x}", trap_cx.x[13]);
-            println!("    a4 (x14) = {:#x}", trap_cx.x[14]);
-            println!("    a5 (x15) = {:#x}", trap_cx.x[15]);
+            error!("  Registers:");
+            error!("    ra (x1) = {:#x}", trap_cx.x[1]);
+            error!("    sp (x2) = {:#x}", trap_cx.x[2]);
+            error!("    gp (x3) = {:#x}", trap_cx.x[3]);
+            error!("    tp (x4) = {:#x}", trap_cx.x[4]);
+            error!("    t0 (x5) = {:#x}", trap_cx.x[5]);
+            error!("    t1 (x6) = {:#x}", trap_cx.x[6]);
+            error!("    a0 (x10) = {:#x}", trap_cx.x[10]);
+            error!("    a1 (x11) = {:#x}", trap_cx.x[11]);
+            error!("    a2 (x12) = {:#x}", trap_cx.x[12]);
+            error!("    a3 (x13) = {:#x}", trap_cx.x[13]);
+            error!("    a4 (x14) = {:#x}", trap_cx.x[14]);
+            error!("    a5 (x15) = {:#x}", trap_cx.x[15]);
             if name == "busybox" || name == "ld-linux-riscv64-lp64d.so.1" {
                 let path = if name == "busybox" {
                     "/musl/busybox"
@@ -204,31 +204,51 @@ pub fn trap_handler() -> ! {
                             let file_off = ph.offset() as usize + trap_cx.sepc.saturating_sub(vaddr);
                             let end = (file_off + 8).min(data.len());
                             if file_off < end && file_off < ph.offset() as usize + filesz {
-                                println!("  file bytes @sepc={:02x?}", &data[file_off..end]);
-                                println!("  file off @sepc={:#x}", file_off);
+                                error!("  file bytes @sepc={:02x?}", &data[file_off..end]);
+                                error!("  file off @sepc={:#x}", file_off);
                             } else {
-                                println!("  file bytes @sepc: out of file range");
+                                error!("  file bytes @sepc: out of file range");
                             }
                             found = true;
                             break;
                         }
                         if !found {
-                            println!("  file bytes @sepc: sepc not in PT_LOAD");
+                            error!("  file bytes @sepc: sepc not in PT_LOAD");
                         }
                     } else {
-                        println!("  file bytes @sepc: invalid ELF");
+                        error!("  file bytes @sepc: invalid ELF");
                     }
                 } else {
-                    println!("  file bytes @sepc: {} not found", path);
+                    error!("  file bytes @sepc: {} not found", path);
                 }
             }
             current_add_signal(SignalFlags::SIGSEGV);
         }
         Trap::Exception(Exception::IllegalInstruction) => {
             let trap_cx = current_trap_cx();
-            println!("[kernel] trap_handler: IllegalInstruction in application");
-            println!("  bad addr (stval) = {:#x}", stval);
-            println!("  bad instruction (sepc) = {:#x}", trap_cx.sepc);
+            error!("[kernel] trap_handler: IllegalInstruction in application");
+            error!("  bad addr (stval) = {:#x}", stval);
+            error!("  bad instruction (sepc) = {:#x}", trap_cx.sepc);
+            let token = current_user_token();
+            let page_table = PageTable::from_token(token);
+            let sepc_va = VirtAddr::from(trap_cx.sepc);
+            if let Some(pte) = page_table.translate(sepc_va.floor()) {
+                if pte.is_valid() {
+                    let offset = sepc_va.page_offset();
+                    let end = core::cmp::min(offset + 8, PAGE_SIZE);
+                    let bytes = &pte.ppn().get_bytes_array()[offset..end];
+                    error!(
+                        "  sepc pte: ppn={:#x} flags={:?} bytes={:02x?}",
+                        pte.ppn().0,
+                        pte.flags(),
+                        bytes
+                    );
+                } else {
+                    error!("  sepc pte: invalid flags={:?}", pte.flags());
+                }
+            } else {
+                error!("  sepc pte: unmapped");
+            }
             current_add_signal(SignalFlags::SIGILL);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
