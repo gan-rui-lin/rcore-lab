@@ -589,6 +589,37 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
     }
 }
 
+pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_clock_gettime", pid);
+    }
+    if ts.is_null() {
+        return errno(EFAULT);
+    }
+    match clock_id {
+        0 | 1 => {
+            let us = get_time_us();
+            let spec = TimeSpec {
+                tv_sec: us / 1_000_000,
+                tv_nsec: (us % 1_000_000) * 1_000,
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&spec as *const TimeSpec) as *const u8,
+                    core::mem::size_of::<TimeSpec>(),
+                )
+            };
+            let token = current_user_token();
+            match copy_to_user(token, ts as *mut u8, bytes) {
+                Ok(_) => 0,
+                Err(err) => err,
+            }
+        }
+        _ => errno(EINVAL),
+    }
+}
+
 pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {

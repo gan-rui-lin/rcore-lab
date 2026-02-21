@@ -1,5 +1,5 @@
 //! Simple in-memory pipe implementation.
-use super::File;
+use super::{File, PollEvents};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use crate::task::suspend_current_and_run_next;
@@ -153,6 +153,18 @@ impl File for PipeEnd {
             }
         }
         total
+    }
+
+    fn poll(&self, events: PollEvents) -> PollEvents {
+        let pipe = self.pipe.exclusive_access();
+        let mut revents = PollEvents::empty();
+        if events.contains(PollEvents::POLLIN) && self.readable && (pipe.len > 0 || !pipe.write_open) {
+            revents |= PollEvents::POLLIN;
+        }
+        if events.contains(PollEvents::POLLOUT) && self.writable && (pipe.len < pipe.capacity() || !pipe.read_open) {
+            revents |= PollEvents::POLLOUT;
+        }
+        revents
     }
 }
 

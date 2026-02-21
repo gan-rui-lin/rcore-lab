@@ -1,4 +1,5 @@
 //!Stdin & Stdout
+use super::PollEvents;
 use super::File;
 use crate::mm::UserBuffer;
 use crate::sbi::console_getchar;
@@ -39,6 +40,24 @@ impl File for Stdin {
     fn write(&self, _user_buf: UserBuffer) -> usize {
         panic!("Cannot write to stdin!");
     }
+
+    fn poll(&self, events: PollEvents) -> PollEvents {
+        if !events.contains(PollEvents::POLLIN) {
+            return PollEvents::empty();
+        }
+        loop {
+            if console_getchar() == usize::MAX {
+                // no char available, suspend and run next task
+                suspend_current_and_run_next();
+            }
+            else {
+                // char available, put it back to console buffer and return POLLIN
+                // since we have no way to put back the char to console buffer, we just return POLLIN and let the caller read it again.
+                break;
+            }
+        }
+        return PollEvents::POLLIN;
+    }
 }
 
 impl File for Stdout {
@@ -56,5 +75,12 @@ impl File for Stdout {
             print!("{}", core::str::from_utf8(*buffer).unwrap());
         }
         user_buf.len()
+    }
+
+    fn poll(&self, events: PollEvents) -> PollEvents {
+        if events.contains(PollEvents::POLLOUT) {
+            return PollEvents::POLLOUT;
+        }
+        return PollEvents::empty();
     }
 }
