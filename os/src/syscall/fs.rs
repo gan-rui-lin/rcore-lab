@@ -1,11 +1,13 @@
 //! File and filesystem-related syscalls
 use crate::fs::{
-    create_dir, make_pipe, open_file, path_is_dir, remove_path, OpenFlags, Stat, StatMode,
+    create_dir, make_pipe, open_file, path_is_dir, remove_path, OpenFlags, Stat, StatMode,PollEvents
 };
-use crate::mm::{translated_byte_buffer, translated_str, UserBuffer};
+use crate::mm::{translated_byte_buffer, translated_str, translated_refmut, UserBuffer};
 #[allow(unused_imports)] // for debug
 use core::sync::atomic::{AtomicUsize, Ordering};
-use crate::task::{current_process, current_user_token};
+#[allow(unused_imports)] // for debug
+use crate::task::{current_process, current_task, current_user_token, suspend_current_and_run_next};
+use crate::timer::get_time_ms;
 use super::errno::*;
 use alloc::format;
 use alloc::string::String;
@@ -993,14 +995,15 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
     const FIONBIO: usize = 0x5421;     // Set/clear non-blocking I/O
 
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-
-    let Some(file) = &inner.fd_table[fd] else {
-        return errno(EBADF);
+    let file = {
+        let inner = process.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return errno(EBADF);
+        }
+        let Some(file) = &inner.fd_table[fd] else {
+            return errno(EBADF);
+        };
+        file.clone()
     };
 
     // Handle common ioctl requests
@@ -1180,28 +1183,31 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut isize, count: usiz
     use super::errno::*;
 
     let process = current_process();
-    let inner = process.inner_exclusive_access();
+    let (_in_file, _out_file) = {
+        let inner = process.inner_exclusive_access();
+        // Validate file descriptors
+        if in_fd >= inner.fd_table.len() || out_fd >= inner.fd_table.len() {
+            return errno(EBADF);
+        }
 
-    // Validate file descriptors
-    if in_fd >= inner.fd_table.len() || out_fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
+        let Some(in_file) = &inner.fd_table[in_fd] else {
+            return errno(EBADF);
+        };
 
-    let Some(in_file) = &inner.fd_table[in_fd] else {
-        return errno(EBADF);
+        let Some(out_file) = &inner.fd_table[out_fd] else {
+            return errno(EBADF);
+        };
+
+        // Check permissions
+        if !in_file.readable() {
+            return errno(EBADF);
+        }
+        if !out_file.writable() {
+            return errno(EBADF);
+        }
+
+        (in_file.clone(), out_file.clone())
     };
-
-    let Some(out_file) = &inner.fd_table[out_fd] else {
-        return errno(EBADF);
-    };
-
-    // Check permissions
-    if !in_file.readable() {
-        return errno(EBADF);
-    }
-    if !out_file.writable() {
-        return errno(EBADF);
-    }
 
     // Validate offset parameter if provided
     if !offset.is_null() {
@@ -1225,3 +1231,78 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut isize, count: usiz
     // Applications can fall back to read/write loops
     errno(ENOSYS)
 }
+
+
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct PollFd {
+    /// file descriptor
+    fd: i32,
+    /// requested events    
+    events: PollEvents,
+    /// returned events
+    revents: PollEvents,
+}
+
+pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: i32) -> isize {
+    if fds.is_null() {
+        return errno(EFAULT);
+    }
+
+    let token = current_user_token();
+
+    let mut poll_fds: Vec<&mut PollFd> = Vec::new();
+    let deadline = if timeout > 0 {
+        Some(get_time_ms().saturating_add(timeout as usize))
+    } else {
+        None
+    };
+
+    for i in 0..nfds {
+        let poll_fd = translated_refmut(token, unsafe { fds.add(i) });
+        poll_fds.push(poll_fd);
+    }
+
+    loop {
+        let mut ret = 0;
+        for fd in poll_fds.iter_mut() {
+            fd.revents = PollEvents::empty(); // reset revents before checking
+            if fd.fd < 0 {
+                // Ignore negative fds per poll/ppoll semantics.
+                continue;
+            }
+
+            let file = {
+                let process = current_process();
+                let inner = process.inner_exclusive_access();
+                if (fd.fd as usize) >= inner.fd_table.len() {
+                    fd.revents |= PollEvents::POLLINVAL;
+                    ret += 1;
+                    continue;
+                };
+                let Some(file) = &inner.fd_table[fd.fd as usize] else {
+                    fd.revents |= PollEvents::POLLINVAL;
+                    ret += 1;
+                    continue;
+                };
+                file.clone()
+            };
+            let request = fd.events | PollEvents::POLLERR | PollEvents::POLLHUP;
+            let ready = file.poll(request);
+            if !ready.is_empty() {
+                fd.revents |= ready;
+                ret += 1;
+            }
+        }
+        if ret != 0 || timeout == 0 {
+            return ret;
+        }
+        if let Some(deadline) = deadline {
+            if get_time_ms() >= deadline {
+                return 0;
+            }
+        }
+        suspend_current_and_run_next();
+    }
+}
+

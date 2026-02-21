@@ -27,6 +27,12 @@ pub trait File: Send + Sync {
     fn read_all(&self) -> Vec<u8> {
         Vec::new()
     }
+    /// poll the file for events, return the events bitflags
+    /// default implementation returns POLLIN | POLLOUT, which means always readable and writable.
+    /// ! for files that are not always ready, e.g. pipes, this should be overridden to return the actual events. 
+    fn poll(&self, _events: PollEvents) -> PollEvents {
+        PollEvents::POLLIN | PollEvents::POLLOUT
+    }
     /// Optional: underlying inode, for metadata queries.
     fn inode(&self) -> Option<Arc<dyn VfsInode>> {
         None
@@ -41,6 +47,7 @@ pub trait File: Send + Sync {
     }
     /// Optional: set current file offset.
     fn set_offset(&self, _offset: usize) {}
+
 }
 
 /// Linux-compatible stat layout (riscv64).
@@ -111,6 +118,25 @@ impl OpenFlags {
             2 => (true, true),
             _ => (true, true),
         }
+    }
+}
+
+
+bitflags::bitflags! {
+    /// Poll events for file polling.
+    pub struct PollEvents: i16 {
+        /// There is data to read.
+        const POLLIN = 0x001;
+        /// There is urgent data to read.
+        const POLLPRI = 0x002;
+        ///  Writing now will not block.
+        const POLLOUT = 0x004;
+        /// Error condition.
+        const POLLERR = 0x008;
+        /// Hang up.
+        const POLLHUP = 0x010;
+        /// Invalid poll request.
+        const POLLINVAL = 0x020;
     }
 }
 

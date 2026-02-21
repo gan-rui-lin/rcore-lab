@@ -52,6 +52,8 @@ const SYSCALL_WRITE: usize = 64;
 const SYSCALL_WRITEV: usize = 66;
 /// sendfile syscall
 const SYSCALL_SENDFILE: usize = 71;
+/// ppoll syscall
+const SYSCALL_POLL: usize = 73;
 /// fstatat syscall
 const SYSCALL_FSTATAT: usize = 79;
 /// fstat syscall
@@ -106,6 +108,8 @@ const SYSCALL_SET_PRIORITY: usize = 140;
 const SYSCALL_TIMES: usize = 153;
 /// uname syscall
 const SYSCALL_UNAME: usize = 160;
+/// clock_gettime syscall
+const SYSCALL_CLOCK_GETTIME: usize = 113;
 /// gettime syscall
 const SYSCALL_GET_TIME: usize = 169;
 /// getpid syscall
@@ -557,6 +561,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
+        SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),
         SYSCALL_GET_TIME => sys_get_time(args[0] as *mut TimeVal, args[1]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
@@ -564,6 +569,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SBRK => sys_sbrk(args[0] as isize),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
+        SYSCALL_POLL => sys_ppoll(args[0] as *mut PollFd, args[1], args[2] as i32),
         SYSCALL_SHUTDOWN => sys_shutdown(),
         _ => {
             known = false;
