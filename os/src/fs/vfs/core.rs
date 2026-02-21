@@ -158,7 +158,7 @@ impl Vfs {
             match current.lookup(comp) {
                 Some(next) => current = next,
                 None => {
-                    trace!("vfs: resolve failed at {} for {}", comp, path);
+                    error!("vfs: resolve failed at {} for {}", comp, path);
                     return None;
                 }
             }

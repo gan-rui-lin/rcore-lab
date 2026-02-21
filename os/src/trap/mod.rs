@@ -249,6 +249,65 @@ pub fn trap_handler() -> ! {
             } else {
                 error!("  sepc pte: unmapped");
             }
+            // for debug
+            let name = current_process().inner_exclusive_access().name.clone();
+            if name == "busybox" || name == "ld-linux-riscv64-lp64d.so.1" {
+                let path = if name == "busybox" {
+                    "/musl/busybox"
+                } else {
+                    "/lib/ld-linux-riscv64-lp64d.so.1"
+                };
+                if let Some(file) = open_file(path, OpenFlags::empty()) {
+                    let data = file.read_all();
+                    if let Ok(elf) = ElfFile::new(data.as_slice()) {
+                        let elf_type = elf.header.pt2.type_().as_type();
+                        let mut has_interp = false;
+                        let ph_count = elf.header.pt2.ph_count();
+                        for i in 0..ph_count {
+                            let ph = elf.program_header(i).unwrap();
+                            if ph.get_type().unwrap() == xmas_elf::program::Type::Interp {
+                                has_interp = true;
+                                break;
+                            }
+                        }
+                        let load_base = if elf_type == xmas_elf::header::Type::SharedObject && !has_interp {
+                            0x4000_0000usize
+                        } else {
+                            0
+                        };
+                        let mut found = false;
+                        for i in 0..ph_count {
+                            let ph = elf.program_header(i).unwrap();
+                            if ph.get_type().unwrap() != xmas_elf::program::Type::Load {
+                                continue;
+                            }
+                            let vaddr = load_base + ph.virtual_addr() as usize;
+                            let memsz = ph.mem_size() as usize;
+                            if trap_cx.sepc < vaddr || trap_cx.sepc >= vaddr.saturating_add(memsz) {
+                                continue;
+                            }
+                            let filesz = ph.file_size() as usize;
+                            let file_off = ph.offset() as usize + trap_cx.sepc.saturating_sub(vaddr);
+                            let end = (file_off + 8).min(data.len());
+                            if file_off < end && file_off < ph.offset() as usize + filesz {
+                                error!("  file bytes @sepc={:02x?}", &data[file_off..end]);
+                                error!("  file off @sepc={:#x}", file_off);
+                            } else {
+                                error!("  file bytes @sepc: out of file range");
+                            }
+                            found = true;
+                            break;
+                        }
+                        if !found {
+                            error!("  file bytes @sepc: sepc not in PT_LOAD");
+                        }
+                    } else {
+                        error!("  file bytes @sepc: invalid ELF");
+                    }
+                } else {
+                    error!("  file bytes @sepc: {} not found", path);
+                }
+            }
             current_add_signal(SignalFlags::SIGILL);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
