@@ -352,6 +352,14 @@ impl MemorySet {
             ),
             None,
         );
+        if let Some(pte) = memory_set.page_table.translate(VirtAddr::from(user_stack_bottom).floor()) {
+            trace!(
+                "[stack_map] bottom={:#x} top={:#x} pte_bits={:#x}",
+                user_stack_bottom,
+                user_stack_top,
+                pte.bits
+            );
+        }
         memory_set.push(
             MapArea::new(
                 heap_bottom.into(),
@@ -542,14 +550,39 @@ impl MemorySet {
             );
             let new_area = MapArea::from_another(area);
             memory_set.push(new_area, None);
+            if area.map_perm.contains(MapPermission::U)
+                && area.map_perm.contains(MapPermission::R)
+                && area.map_perm.contains(MapPermission::W)
+            {
+                let start_vpn = area.vpn_range.get_start();
+                let end_vpn = area.vpn_range.get_end();
+                let start_addr: usize = VirtAddr::from(start_vpn).into();
+                let end_addr: usize = VirtAddr::from(end_vpn).into();
+                if let Some(pte) = memory_set
+                    .page_table
+                    .translate(VirtAddr::from(start_addr).floor())
+                {
+                    trace!(
+                        "[clone_area] idx={} start={:#x} end={:#x} pte_bits={:#x}",
+                        idx,
+                        start_addr,
+                        end_addr,
+                        pte.bits
+                    );
+                }
+            }
             // copy data from another space
             let mut pages_copied: usize = 0;
             for vpn in area.vpn_range {
-                let src_ppn = user_space.translate(vpn).unwrap().ppn();
+                let src_pte = user_space.translate(vpn).unwrap();
+                let src_ppn = src_pte.ppn();
                 let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
                 dst_ppn
                     .get_bytes_array()
                     .copy_from_slice(src_ppn.get_bytes_array());
+                memory_set
+                    .page_table
+                    .change_pte_flags(vpn, src_pte.flags());
                 pages_copied += 1;
                 if (pages_copied & 0x3ff) == 0 {
                     debug!("[kernel] area {} copied {} pages", idx, pages_copied);
@@ -689,6 +722,10 @@ impl MemorySet {
                 // Calculate the actual range to modify within this area
                 let modify_start = area_start.max(start_vpn);
                 let modify_end = area_end.min(end_vpn);
+                let area_start_addr: usize = VirtAddr::from(area_start).into();
+                let area_end_addr: usize = VirtAddr::from(area_end).into();
+                let modify_start_addr: usize = VirtAddr::from(modify_start).into();
+                let modify_end_addr: usize = VirtAddr::from(modify_end).into();
 
                 // Convert MapPermission to PTEFlags
                 let mut flags = PTEFlags::V;
@@ -708,6 +745,18 @@ impl MemorySet {
                 // Update page table entries for this range
                 for vpn in VPNRange::new(modify_start, modify_end) {
                     self.page_table.change_pte_flags(vpn, flags);
+                }
+
+                if let Some(pte) = self.page_table.translate(modify_start) {
+                    trace!(
+                        "[mprotect] area={:#x}-{:#x} modify={:#x}-{:#x} perm_bits={:#x} pte_bits={:#x}",
+                        area_start_addr,
+                        area_end_addr,
+                        modify_start_addr,
+                        modify_end_addr,
+                        new_perm.bits,
+                        pte.bits
+                    );
                 }
 
                 // If the entire area is being modified, update the area's permission
