@@ -5,18 +5,20 @@ use alloc::sync::Arc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use bitflags::bitflags;
 
 use crate::{
     fs::{open_file, File, OpenFlags},
-    mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission, VirtAddr},
+    mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission, PageTable, VirtAddr},
     sbi::shutdown,
     task::{
         current_process, current_task, current_trap_cx, current_user_token, exit_current_and_run_next,
-        pid2process, suspend_current_and_run_next, RLimit, RLIMIT_NLIMITS, SigNumber, SignalAction,
-        SignalFlags,
+        futex_requeue, futex_remove_waiter, futex_wait, futex_wait_bitset, futex_wake,
+        futex_wake_bitset, pid2process, suspend_current_and_run_next, FutexKey, RLimit,
+        RLIMIT_NLIMITS, SigNumber, SignalAction, SignalFlags,
         MAX_SIG,
     },
-    timer::{get_time, get_time_us},
+    timer::{add_timer, get_time, get_time_ms, get_time_us, remove_timer},
 };
 
 use super::errno::*;
@@ -74,6 +76,23 @@ pub struct UtsName {
     pub domainname: [u8; 65],
 }
 
+bitflags! {
+    struct FutexCmd: u32 {
+        const FUTEX_WAIT = 0;
+        const FUTEX_WAKE = 1;
+        const FUTEX_REQUEUE = 3;
+        const FUTEX_WAIT_BITSET = 9;
+        const FUTEX_WAKE_BITSET = 10;
+    }
+}
+
+bitflags! {
+    struct FutexOpt: u32 {
+        const FUTEX_PRIVATE_FLAG = 0x80;
+        const FUTEX_CLOCK_REALTIME = 0x100;
+    }
+}
+
 impl Default for UtsName {
     fn default() -> Self {
         Self {
@@ -122,6 +141,119 @@ fn read_from_user<T: Copy>(token: usize, src: *const T) -> Result<T, isize> {
     }
     let value = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const T) };
     Ok(value)
+}
+
+pub fn sys_futex(
+    uaddr1: *mut i32,
+    futex_op: u32,
+    val: i32,
+    timeout: *const TimeSpec,
+    uaddr2: *mut i32,
+    val3: i32,
+) -> isize {
+    if uaddr1.is_null() || (uaddr1 as usize) % core::mem::size_of::<i32>() != 0 {
+        return errno(EINVAL);
+    }
+    let cmd = FutexCmd::from_bits_truncate(futex_op & 0x7f);
+    let opt = FutexOpt::from_bits_truncate(futex_op);
+    let token = current_user_token();
+    let page_table = PageTable::from_token(token);
+    let pa = match page_table.translate_va(VirtAddr::from(uaddr1 as usize)) {
+        Some(pa) => pa,
+        None => return errno(EFAULT),
+    };
+    let private = opt.contains(FutexOpt::FUTEX_PRIVATE_FLAG);
+    let pid = if private { current_process().pid.0 } else { 0 };
+    let key = FutexKey::new(pa, pid);
+
+    match cmd {
+        FutexCmd::FUTEX_WAIT => {
+            let futex_word = translated_ref(token, uaddr1);
+            if *futex_word != val {
+                return errno(EAGAIN);
+            }
+            let has_timeout = !timeout.is_null();
+            if has_timeout {
+                let spec = match read_from_user(token, timeout) {
+                    Ok(value) => value,
+                    Err(err) => return err,
+                };
+                if spec.tv_nsec >= 1_000_000_000 {
+                    return errno(EINVAL);
+                }
+                let add_ms = spec
+                    .tv_sec
+                    .saturating_mul(1000)
+                    .saturating_add(spec.tv_nsec / 1_000_000);
+                let expire_ms = get_time_ms().saturating_add(add_ms);
+                add_timer(expire_ms, current_task().unwrap());
+            }
+            futex_wait(key.clone());
+            if has_timeout {
+                let task = current_task().unwrap();
+                let timed_out = futex_remove_waiter(&key, &task);
+                remove_timer(task);
+                if timed_out {
+                    return errno(ETIMEDOUT);
+                }
+            }
+            0
+        }
+        FutexCmd::FUTEX_WAKE => futex_wake(key, val as usize) as isize,
+        FutexCmd::FUTEX_REQUEUE => {
+            if uaddr2.is_null() {
+                return errno(EINVAL);
+            }
+            let pa2 = match page_table.translate_va(VirtAddr::from(uaddr2 as usize)) {
+                Some(pa) => pa,
+                None => return errno(EFAULT),
+            };
+            let new_key = FutexKey::new(pa2, pid);
+            futex_requeue(key, val, new_key, val3) as isize
+        }
+        FutexCmd::FUTEX_WAIT_BITSET => {
+            if val3 == 0 {
+                return errno(EINVAL);
+            }
+            let futex_word = translated_ref(token, uaddr1);
+            if *futex_word != val {
+                return errno(EAGAIN);
+            }
+            let has_timeout = !timeout.is_null();
+            if has_timeout {
+                let spec = match read_from_user(token, timeout) {
+                    Ok(value) => value,
+                    Err(err) => return err,
+                };
+                if spec.tv_nsec >= 1_000_000_000 {
+                    return errno(EINVAL);
+                }
+                let add_ms = spec
+                    .tv_sec
+                    .saturating_mul(1000)
+                    .saturating_add(spec.tv_nsec / 1_000_000);
+                let expire_ms = get_time_ms().saturating_add(add_ms);
+                add_timer(expire_ms, current_task().unwrap());
+            }
+            futex_wait_bitset(key.clone(), val3);
+            if has_timeout {
+                let task = current_task().unwrap();
+                let timed_out = futex_remove_waiter(&key, &task);
+                remove_timer(task);
+                if timed_out {
+                    return errno(ETIMEDOUT);
+                }
+            }
+            0
+        }
+        FutexCmd::FUTEX_WAKE_BITSET => {
+            if val3 == 0 {
+                return errno(EINVAL);
+            }
+            futex_wake_bitset(key, val as usize, val3) as isize
+        }
+        _ => errno(ENOSYS),
+    }
 }
 
 pub fn sys_exit(exit_code: i32) -> ! {
