@@ -72,6 +72,8 @@ const SYSCALL_EXIT: usize = 93;
 const SYSCALL_EXIT_GROUP: usize = 94;
 /// set_tid_address syscall
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
+/// futex syscall
+const SYSCALL_FUTEX: usize = 98;
 /// nanosleep syscall
 const SYSCALL_NANOSLEEP: usize = 101;
 /// yield syscall
@@ -553,6 +555,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
+        SYSCALL_FUTEX => sys_futex(
+            args[0] as *mut i32,
+            args[1] as u32,
+            args[2] as i32,
+            args[3] as *const TimeSpec,
+            args[4] as *mut i32,
+            args[5] as i32,
+        ),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const TimeSpec, args[1] as *mut TimeSpec),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
