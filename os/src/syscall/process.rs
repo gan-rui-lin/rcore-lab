@@ -12,7 +12,8 @@ use crate::{
     sbi::shutdown,
     task::{
         current_process, current_task, current_trap_cx, current_user_token, exit_current_and_run_next,
-        pid2process, suspend_current_and_run_next, SignalAction, SignalFlags,
+        pid2process, suspend_current_and_run_next, RLimit, RLIMIT_NLIMITS, SigNumber, SignalAction,
+        SignalFlags,
         MAX_SIG,
     },
     timer::{get_time, get_time_us},
@@ -432,43 +433,61 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
         let all_data = app.read_all();
         trace_entry_bytes(&exec_path_resolved, &all_data, &app);
         trace_run_all_head(&name, &exec_path, &all_data);
-        // 检查文件内容，如果是脚本则解析 shebang 进行递归 exec
-        // 如果是 ELF 则正常执行，注意动态链接的 ELF 需要先加载解释器再由解释器加载主程序
-        if let Some((interpreter, opt_arg)) = parse_shebang(&all_data) {
-            trace!(
-                "[sys_exec] shebang interp={} opt_arg={:?} script={}",
-                interpreter,
-                opt_arg,
-                exec_path_resolved
-            );
+        // Prefer ELF execution; only try shebang (or /bin/sh fallback) for non-ELF.
+        let is_elf = all_data.len() >= 4 && &all_data[..4] == b"\x7fELF";
+        if !is_elf {
+            // Check for shebang scripts first.
+            if let Some((interpreter, opt_arg)) = parse_shebang(&all_data) {
+                trace!(
+                    "[sys_exec] shebang interp={} opt_arg={:?} script={}",
+                    interpreter,
+                    opt_arg,
+                    exec_path_resolved
+                );
+                if depth >= MAX_SHEBANG_DEPTH {
+                    return errno(ELOOP);
+                }
+                depth += 1;
+                trace!("[sys_exec] shebang interpreter ready: {}", interpreter);
+                let interp_basename = interpreter
+                    .rsplit('/')
+                    .find(|part| !part.is_empty())
+                    .unwrap_or(interpreter.as_str());
+                let mut new_args: Vec<String> = Vec::new();
+                if interp_basename == "sh" {
+                    new_args.push(String::from("sh"));
+                } else {
+                    new_args.push(interpreter.clone());
+                }
+                if let Some(arg) = opt_arg {
+                    new_args.push(arg);
+                }
+                new_args.push(exec_path_resolved.clone());
+                if args.len() > 1 {
+                    new_args.extend(args.into_iter().skip(1));
+                }
+                args = new_args;
+                exec_path = interpreter;
+                continue;
+            }
+            // Non-ELF without shebang: fall back to /bin/sh (execlp-like behavior).
             if depth >= MAX_SHEBANG_DEPTH {
                 return errno(ELOOP);
             }
             depth += 1;
-            trace!("[sys_exec] shebang interpreter ready: {}", interpreter);
-            let interp_basename = interpreter
-                .rsplit('/')
-                .find(|part| !part.is_empty())
-                .unwrap_or(interpreter.as_str());
             let mut new_args: Vec<String> = Vec::new();
-            if interp_basename == "sh" {
-                new_args.push(String::from("sh"));
-            } else {
-                new_args.push(interpreter.clone());
-            }
-            if let Some(arg) = opt_arg {
-                new_args.push(arg);
-            }
+            new_args.push(String::from("sh"));
             new_args.push(exec_path_resolved.clone());
             if args.len() > 1 {
                 new_args.extend(args.into_iter().skip(1));
             }
             args = new_args;
-            exec_path = interpreter;
+            exec_path = String::from("/bin/sh");
+            warn!(
+                "[sys_exec] non-ELF without shebang, fallback to /bin/sh for {} with args {:?}. BE CAREFUL OF IT.for run-static.sh/run-dynamic.sh, it's fine",
+                exec_path_resolved, args
+            );
             continue;
-        }
-        if all_data.len() < 4 || &all_data[..4] != b"\x7fELF" {
-            return errno(ENOEXEC);
         }
         let mut interp_data: Option<Vec<u8>> = None;
         if let Ok(elf) = xmas_elf::ElfFile::new(all_data.as_slice()) {
@@ -1211,14 +1230,75 @@ pub fn sys_sigaction(
     0
 }
 
-pub fn sys_sigprocmask(mask: u32) -> isize {
+pub fn sys_sigprocmask(
+    how: usize,
+    set: *const usize,
+    oldset: *mut usize,
+    sigsetsize: usize,
+) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_sigprocmask mask=0x{:x}", pid, mask);
+        trace!(
+            "kernel:pid[{}] sys_sigprocmask how=0x{:x} set={:?} oldset={:?} size={}",
+            pid,
+            how,
+            set,
+            oldset,
+            sigsetsize
+        );
     }
+    if sigsetsize != core::mem::size_of::<usize>() {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    inner.signal_mask = SignalFlags::from_bits_truncate(mask);
+
+    if !oldset.is_null() {
+        let mut user_mask: usize = 0;
+        for signum in 1..=MAX_SIG {
+            let flag = match SignalFlags::from_bits(1u32 << signum) {
+                Some(f) => f,
+                None => continue,
+            };
+            if inner.signal_mask.contains(flag) {
+                user_mask |= 1usize << (signum - 1);
+            }
+        }
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&user_mask as *const usize) as *const u8,
+                core::mem::size_of::<usize>(),
+            )
+        };
+        if let Err(err) = copy_to_user(token, oldset as *mut u8, bytes) {
+            return err;
+        }
+    }
+
+    if !set.is_null() {
+        let user_mask = match read_from_user::<usize>(token, set) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+        let mut new_flags = SignalFlags::empty();
+        for signum in 1..=MAX_SIG {
+            if (user_mask & (1usize << (signum - 1))) == 0 {
+                continue;
+            }
+            let flag = match SignalFlags::from_bits(1u32 << signum) {
+                Some(f) => f,
+                None => continue,
+            };
+            new_flags |= flag;
+        }
+        match how {
+            0 => inner.signal_mask |= new_flags,    // SIG_BLOCK
+            1 => inner.signal_mask &= !new_flags,   // SIG_UNBLOCK
+            2 => inner.signal_mask = new_flags,     // SIG_SETMASK
+            _ => return errno(EINVAL),
+        }
+    }
     0
 }
 
@@ -1266,6 +1346,80 @@ pub fn sys_getgid() -> isize {
 /// rcore-lab is a single-user system, always returns 0
 pub fn sys_getegid() -> isize {
     trace!("kernel:pid[{}] sys_getegid", current_process().pid.0);
+    0
+}
+
+pub fn sys_getrlimit(resource: usize, rlim: *mut RLimit) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_getrlimit resource={}", pid, resource);
+    }
+    if rlim.is_null() {
+        return errno(EFAULT);
+    }
+    if resource >= RLIMIT_NLIMITS {
+        return errno(EINVAL);
+    }
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let limit = inner.rlimits[resource];
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&limit as *const RLimit) as *const u8,
+            core::mem::size_of::<RLimit>(),
+        )
+    };
+    let token = current_user_token();
+    match copy_to_user(token, rlim as *mut u8, bytes) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
+}
+
+pub fn sys_prlimit64(
+    pid: usize,
+    resource: usize,
+    new_limit: *const RLimit,
+    old_limit: *mut RLimit,
+) -> isize {
+    let current_pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(current_pid) {
+        trace!(
+            "kernel:pid[{}] sys_prlimit64 pid={} resource={}",
+            current_pid,
+            pid,
+            resource
+        );
+    }
+    if resource >= RLIMIT_NLIMITS {
+        return errno(EINVAL);
+    }
+    if pid != 0 && pid != current_pid {
+        return errno(ESRCH);
+    }
+
+    let token = current_user_token();
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let old = inner.rlimits[resource];
+    if !old_limit.is_null() {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&old as *const RLimit) as *const u8,
+                core::mem::size_of::<RLimit>(),
+            )
+        };
+        if let Err(err) = copy_to_user(token, old_limit as *mut u8, bytes) {
+            return err;
+        }
+    }
+    if !new_limit.is_null() {
+        let new_val = read_from_user::<RLimit>(token, new_limit).unwrap();
+        if new_val.rlim_cur > new_val.rlim_max {
+            return errno(EINVAL);
+        }
+        inner.rlimits[resource] = new_val;
+    }
     0
 }
 
@@ -1374,12 +1528,6 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 /// # Returns
 /// - Success: signal number
 /// - Failure: -errno
-///
-/// Note: This is a simplified implementation that doesn't actually block.
-/// A full implementation would need to:
-/// 1. Block the current task until a signal arrives
-/// 2. Handle timeout properly
-/// 3. Fill in the siginfo structure with signal details
 pub fn sys_rt_sigtimedwait(
     set: *const usize,
     info: *mut usize,
@@ -1391,28 +1539,67 @@ pub fn sys_rt_sigtimedwait(
         return errno(EFAULT);
     }
 
-    // For now, return EAGAIN to indicate no signal is pending
-    // A full implementation would:
-    // 1. Check if any signals in the set are pending
-    // 2. If yes, dequeue the signal and return its number
-    // 3. If no, block until a signal arrives or timeout occurs
-
-    // Read the signal set from user space (for validation)
+    // Read the signal set from user space
     let token = current_user_token();
-    let _sigset = translated_ref(token, set);
+    let sigset = *translated_ref(token, set);
+    if sigset == 0 {
+        return errno(EINVAL);
+    }
 
     // Read timeout if provided
-    if !timeout.is_null() {
-        let _ts = translated_ref(token, timeout);
-        // Would use timeout to set up a timer
-    }
+    let timeout_us = if !timeout.is_null() {
+        let ts = read_from_user::<TimeSpec>(token, timeout).unwrap();
+        if ts.tv_nsec >= 1_000_000_000 {
+            return errno(EINVAL);
+        }
+        Some(
+            ts.tv_sec
+                .saturating_mul(1_000_000)
+                .saturating_add(ts.tv_nsec / 1_000),
+        )
+    } else {
+        None
+    };
 
-    // Check if info pointer is provided
-    if !info.is_null() {
-        // Would fill in siginfo structure here
-        let _info_ref = translated_refmut(token, info);
-    }
+    let start = get_time_us();
+    let deadline = timeout_us.map(|delta| start.saturating_add(delta));
 
-    // For simplicity, return EAGAIN (no signal available)
-    errno(EAGAIN)
+    loop {
+        let mut found = None;
+        {
+            let process = current_process();
+            let mut inner = process.inner_exclusive_access();
+            for signum in 1..=MAX_SIG {
+                if signum == SigNumber::SigKill as usize || signum == SigNumber::SigStop as usize {
+                    continue;
+                }
+                if (sigset & (1usize << (signum - 1))) == 0 {
+                    continue;
+                }
+                let flag = match SignalFlags::from_bits(1u32 << signum) {
+                    Some(f) => f,
+                    None => continue,
+                };
+                if inner.signal_pending.contains(flag) {
+                    inner.signal_pending.remove(flag);
+                    found = Some(signum as isize);
+                    break;
+                }
+            }
+        }
+
+        if let Some(signum) = found {
+            if !info.is_null() {
+                let _info_ref = translated_refmut(token, info);
+            }
+            return signum;
+        }
+
+        if let Some(dl) = deadline {
+            if get_time_us() >= dl {
+                return errno(EAGAIN);
+            }
+        }
+        suspend_current_and_run_next();
+    }
 }
