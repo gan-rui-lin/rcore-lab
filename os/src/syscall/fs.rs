@@ -22,6 +22,23 @@ use lwext4_rust::bindings::ext4_flink;
 const AT_FDCWD: isize = -100;
 const AT_REMOVEDIR: u32 = 0x200;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StatFs {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
+    pub f_spare: [i64; 4],
+}
+
 // static WRITE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 // static WRITEV_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -103,6 +120,23 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
         }
     }
     Ok(())
+}
+
+fn build_statfs() -> StatFs {
+    StatFs {
+        f_type: 0xEF53, // ext4 magic; used as a generic placeholder
+        f_bsize: 1024,
+        f_blocks: 1024 * 1024,
+        f_bfree: 512 * 1024,
+        f_bavail: 512 * 1024,
+        f_files: 0,
+        f_ffree: 0,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: 1024,
+        f_flags: 0,
+        f_spare: [0; 4],
+    }
 }
 
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
@@ -604,6 +638,116 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
     } else {
         errno(EIO)
     }
+}
+
+pub fn sys_renameat2(
+    old_dirfd: isize,
+    old_name: *const u8,
+    new_dirfd: isize,
+    new_name: *const u8,
+    flags: u32,
+) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_renameat2", pid);
+    }
+    if flags != 0 {
+        return errno(EINVAL);
+    }
+    if old_name.is_null() || new_name.is_null() {
+        return errno(EFAULT);
+    }
+    let token = current_user_token();
+    let old_raw = translated_str(token, old_name);
+    let new_raw = translated_str(token, new_name);
+    if old_raw.is_empty() || new_raw.is_empty() {
+        return errno(EINVAL);
+    }
+    let old_base = match dirfd_base(old_dirfd) {
+        Ok(base) => base,
+        Err(err) => return err,
+    };
+    let new_base = match dirfd_base(new_dirfd) {
+        Ok(base) => base,
+        Err(err) => return err,
+    };
+    let old_path = if old_raw.starts_with('/') {
+        normalize_path(&old_raw)
+    } else {
+        resolve_path(&old_base, &old_raw)
+    };
+    let new_path = if new_raw.starts_with('/') {
+        normalize_path(&new_raw)
+    } else {
+        resolve_path(&new_base, &new_raw)
+    };
+    if old_path == new_path {
+        return 0;
+    }
+
+    let old_is_dir = path_is_dir(&old_path);
+    if old_is_dir {
+        if open_file(new_path.as_str(), OpenFlags::empty()).is_some() {
+            return errno(EEXIST);
+        }
+        if !create_dir(&new_path) {
+            return errno(EIO);
+        }
+        if !remove_path(&old_path, true) {
+            return errno(EIO);
+        }
+        return 0;
+    }
+
+    let old_file = match open_file(old_path.as_str(), OpenFlags::empty()) {
+        Some(file) => file,
+        None => return errno(ENOENT),
+    };
+    let old_inode = match old_file.inode() {
+        Some(inode) => inode,
+        None => return errno(EIO),
+    };
+
+    if open_file(new_path.as_str(), OpenFlags::empty()).is_some() {
+        if path_is_dir(&new_path) {
+            return errno(EISDIR);
+        }
+        if !remove_path(&new_path, false) {
+            return errno(EIO);
+        }
+    }
+
+    let new_file = match open_file(new_path.as_str(), OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY) {
+        Some(file) => file,
+        None => return errno(ENOENT),
+    };
+    let new_inode = match new_file.inode() {
+        Some(inode) => inode,
+        None => return errno(EIO),
+    };
+
+    let mut offset = 0usize;
+    let mut buf = [0u8; 512];
+    loop {
+        let n = old_inode.read_at(offset, &mut buf);
+        if n == 0 {
+            break;
+        }
+        let mut written = 0usize;
+        while written < n {
+            let w = new_inode.write_at(offset + written, &buf[written..n]);
+            if w == 0 {
+                return errno(EIO);
+            }
+            written += w;
+        }
+        offset += n;
+    }
+
+    if !remove_path(&old_path, false) {
+        return errno(EIO);
+    }
+    0
 }
 
 pub fn sys_getcwd(buf: *mut u8, len: usize) -> isize {
@@ -1312,6 +1456,69 @@ pub fn sys_ftruncate(fd: usize, length: isize) -> isize {
     } else {
         // File has no size (pipe, socket, etc.)
         errno(EINVAL)
+    }
+}
+
+pub fn sys_statfs(path: *const u8, buf: *mut StatFs) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_statfs", pid);
+    }
+    if path.is_null() || buf.is_null() {
+        return errno(EFAULT);
+    }
+    let token = current_user_token();
+    let raw = translated_str(token, path);
+    if raw.is_empty() {
+        return errno(EINVAL);
+    }
+    let cwd = current_process().inner_exclusive_access().cwd.clone();
+    let full_path = if raw.starts_with('/') {
+        normalize_path(&raw)
+    } else {
+        resolve_path(&cwd, &raw)
+    };
+    if open_file(full_path.as_str(), OpenFlags::empty()).is_none() {
+        return errno(ENOENT);
+    }
+    let statfs = build_statfs();
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&statfs as *const StatFs) as *const u8,
+            core::mem::size_of::<StatFs>(),
+        )
+    };
+    match copy_to_user(token, buf as *mut u8, bytes) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
+}
+
+pub fn sys_fstatfs(fd: usize, buf: *mut StatFs) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_fstatfs", pid);
+    }
+    if buf.is_null() {
+        return errno(EFAULT);
+    }
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+        return errno(EBADF);
+    }
+    drop(inner);
+    let statfs = build_statfs();
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&statfs as *const StatFs) as *const u8,
+            core::mem::size_of::<StatFs>(),
+        )
+    };
+    let token = current_user_token();
+    match copy_to_user(token, buf as *mut u8, bytes) {
+        Ok(_) => 0,
+        Err(err) => err,
     }
 }
 
