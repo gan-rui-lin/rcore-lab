@@ -36,6 +36,7 @@ pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
     current_user_token, run_tasks, schedule, take_current_task,
 };
+pub use process::{RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY};
 pub use signal::{SignalFlags, SigNumber, MAX_SIG};
 pub use task::{TaskControlBlock, TaskStatus};
 pub use tls::{TlsArea, TlsInfo};
@@ -81,6 +82,14 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         let mut process_inner = process.inner_exclusive_access();
         process_inner.is_zombie = true;
         process_inner.exit_code = exit_code;
+        let parent = process_inner.parent.as_ref().and_then(|p| p.upgrade());
+
+        drop(process_inner);
+        if let Some(parent) = parent {
+            let mut parent_inner = parent.inner_exclusive_access();
+            parent_inner.signal_pending |= SignalFlags::SIGCHLD;
+        }
+        let process_inner = process.inner_exclusive_access();
         {
             let mut initproc_inner = INITPROC.inner_exclusive_access();
             for child in process_inner.children.iter() {

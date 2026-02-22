@@ -17,6 +17,38 @@ use crate::sync::UPIntrRefMut;
 
 const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
 
+pub const RLIMIT_NLIMITS: usize = 16;
+pub const RLIMIT_STACK: usize = 3;
+pub const RLIMIT_NOFILE: usize = 7;
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RLimit {
+    pub rlim_cur: u64,
+    pub rlim_max: u64,
+}
+
+fn default_rlimits() -> [RLimit; RLIMIT_NLIMITS] {
+    let mut limits = [
+        RLimit {
+            rlim_cur: RLIM_INFINITY,
+            rlim_max: RLIM_INFINITY,
+        };
+        RLIMIT_NLIMITS
+    ];
+    let stack = USER_STACK_SIZE as u64;
+    limits[RLIMIT_STACK] = RLimit {
+        rlim_cur: stack,
+        rlim_max: stack,
+    };
+    limits[RLIMIT_NOFILE] = RLimit {
+        rlim_cur: 1024,
+        rlim_max: 1024,
+    };
+    limits
+}
+
 fn find_global_pointer(elf_data: &[u8]) -> Option<usize> {
     let elf = ElfFile::new(elf_data).ok()?;
     for section in elf.section_iter() {
@@ -74,6 +106,7 @@ pub struct ProcessControlBlockInner {
     pub program_brk: usize,
     pub mmap_base: usize,
     pub tls_area: Option<TlsArea>,
+    pub rlimits: [RLimit; RLIMIT_NLIMITS],
 }
 
 impl ProcessControlBlockInner {
@@ -162,6 +195,7 @@ impl ProcessControlBlock {
                     program_brk: heap_bottom,
                     mmap_base: DEFAULT_MMAP_BASE,
                     tls_area: tls_area.clone(),
+                    rlimits: default_rlimits(),
                 })
             },
         });
@@ -497,12 +531,10 @@ impl ProcessControlBlock {
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
-        let mut memory_set = MemorySet::from_existed_user(&parent.memory_set);
+        let memory_set = MemorySet::from_existed_user(&parent.memory_set);
 
-        // Copy TLS from parent if it exists
-        let tls_area = parent.tls_area.as_ref().map(|parent_tls| {
-            TlsArea::new_from_parent(parent_tls, &parent.memory_set, &mut memory_set)
-        });
+        // TLS pages are already cloned via MemorySet::from_existed_user.
+        let tls_area = parent.tls_area.clone();
 
         let pid = pid_alloc();
         let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
@@ -538,6 +570,7 @@ impl ProcessControlBlock {
                     program_brk: parent.program_brk,
                     mmap_base: parent.mmap_base,
                     tls_area,
+                    rlimits: parent.rlimits,
                 })
             },
         });
