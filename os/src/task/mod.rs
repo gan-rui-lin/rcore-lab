@@ -12,6 +12,7 @@ mod switch;
 #[allow(clippy::module_inception)]
 #[allow(rustdoc::private_intra_doc_links)]
 mod task;
+mod futex;
 mod tls;
 
 use crate::fs::{open_file, OpenFlags};
@@ -39,6 +40,10 @@ pub use processor::{
 pub use process::{RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY};
 pub use signal::{SignalFlags, SigNumber, MAX_SIG};
 pub use task::{TaskControlBlock, TaskStatus};
+pub use futex::{
+    FutexKey, futex_requeue, futex_remove_waiter, futex_wait, futex_wait_bitset, futex_wake,
+    futex_wake_bitset,
+};
 pub use tls::{TlsArea, TlsInfo};
 
 pub fn suspend_current_and_run_next() {
