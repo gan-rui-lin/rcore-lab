@@ -160,6 +160,18 @@ impl TaskUserRes {
             ustack_top.into(),
             MapPermission::R | MapPermission::W | MapPermission::U,
         );
+        if let Some(pte) = process_inner
+            .memory_set
+            .translate(VirtAddr::from(ustack_bottom).floor())
+        {
+            trace!(
+                "[ustack_alloc] tid={} bottom={:#x} top={:#x} pte_bits={:#x}",
+                self.tid,
+                ustack_bottom,
+                ustack_top,
+                pte.bits
+            );
+        }
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
         process_inner.memory_set.insert_framed_area(
