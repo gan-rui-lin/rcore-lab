@@ -56,13 +56,14 @@ pub fn device_init() {
         plic.enable(hart_id, supervisor, intr_src_id as usize); // 让该 IRQ 送达 S 态
         plic.set_priority(intr_src_id as usize, 1); // 设置 IRQ 优先级
     }
-    // unsafe {
-    //     sie::set_sext(); // 开启 S 态外部中断
-    // }
+    unsafe {
+        sie::set_sext(); // 开启 S 态外部中断
+    }
 }
 
 /// Dispatch a PLIC interrupt to the corresponding device handler.
 pub fn irq_handler() {
+    // warn!("PLIC interrupt received");
     let mut plic = unsafe { PLIC::new(VIRT_PLIC) }; // 创建 PLIC 访问器，处理中断
     let intr_src_id = plic.claim(0, IntrTargetPriority::Supervisor); // 领取 hart 0 的挂起 IRQ
     match intr_src_id { // 分发到具体设备处理函数
@@ -73,4 +74,6 @@ pub fn irq_handler() {
         _ => panic!("unsupported IRQ {}", intr_src_id), // 未知 IRQ
     }
     plic.complete(0, IntrTargetPriority::Supervisor, intr_src_id); // 完成中断，重新使能该 IRQ
+
+    // warn!("PLIC interrupt handled");
 }
