@@ -101,6 +101,8 @@ pub fn rust_main() -> ! {
     } else {
         fs::mount_easyfs();
     }
+    fs::mount_procfs();
+    fs::ensure_basic_paths();
     fs::list_apps();
     task::add_initproc();
     *DEV_NON_BLOCKING_ACCESS.exclusive_access() = false;  // Disable non-blocking I/O to avoid Unsupported error
