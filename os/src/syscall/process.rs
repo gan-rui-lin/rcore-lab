@@ -45,6 +45,24 @@ pub struct Tms {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SysInfo {
+    pub uptime: i64,
+    pub loads: [u64; 3],
+    pub totalram: u64,
+    pub freeram: u64,
+    pub sharedram: u64,
+    pub bufferram: u64,
+    pub totalswap: u64,
+    pub freeswap: u64,
+    pub procs: u16,
+    pub pad: u16,
+    pub totalhigh: u64,
+    pub freehigh: u64,
+    pub mem_unit: u32,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct UtsName {
     pub sysname: [u8; 65],
@@ -707,6 +725,62 @@ pub fn sys_uname(uts: *mut UtsName) -> isize {
     };
     let token = current_user_token();
     match copy_to_user(token, uts as *mut u8, bytes) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
+}
+
+pub fn sys_syslog(_log_type: usize, buf: *mut u8, len: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_syslog", pid);
+    }
+    if len == 0 {
+        return 0;
+    }
+    if buf.is_null() {
+        return errno(EFAULT);
+    }
+    let token = current_user_token();
+    let out = [0u8; 1];
+    match copy_to_user(token, buf, &out) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
+}
+
+pub fn sys_sysinfo(info: *mut SysInfo) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_sysinfo", pid);
+    }
+    if info.is_null() {
+        return errno(EFAULT);
+    }
+    let us = get_time_us();
+    let data = SysInfo {
+        uptime: (us / 1_000_000) as i64,
+        loads: [0, 0, 0],
+        totalram: 0,
+        freeram: 0,
+        sharedram: 0,
+        bufferram: 0,
+        totalswap: 0,
+        freeswap: 0,
+        procs: 1,
+        pad: 0,
+        totalhigh: 0,
+        freehigh: 0,
+        mem_unit: 1,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&data as *const SysInfo) as *const u8,
+            core::mem::size_of::<SysInfo>(),
+        )
+    };
+    let token = current_user_token();
+    match copy_to_user(token, info as *mut u8, bytes) {
         Ok(_) => 0,
         Err(err) => err,
     }

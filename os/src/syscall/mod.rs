@@ -32,6 +32,8 @@ const SYSCALL_UMOUNT2: usize = 39;
 const SYSCALL_MOUNT: usize = 40;
 /// ftruncate syscall
 const SYSCALL_FTRUNCATE: usize = 46;
+/// faccessat syscall
+const SYSCALL_FACCESSAT: usize = 48;
 /// chdir syscall
 const SYSCALL_CHDIR: usize = 49;
 /// openat syscall
@@ -48,6 +50,8 @@ const SYSCALL_LSEEK: usize = 62;
 const SYSCALL_READ: usize = 63;
 /// write syscall
 const SYSCALL_WRITE: usize = 64;
+/// readv syscall
+const SYSCALL_READV: usize = 65;
 /// writev syscall
 const SYSCALL_WRITEV: usize = 66;
 /// sendfile syscall
@@ -58,6 +62,8 @@ const SYSCALL_POLL: usize = 73;
 const SYSCALL_FSTATAT: usize = 79;
 /// fstat syscall
 const SYSCALL_FSTAT: usize = 80;
+/// utimensat syscall
+const SYSCALL_UTIMENSAT: usize = 88;
 /// exit syscall
 const SYSCALL_EXIT: usize = 93;
 /// exit_group syscall
@@ -110,6 +116,8 @@ const SYSCALL_TIMES: usize = 153;
 const SYSCALL_UNAME: usize = 160;
 /// clock_gettime syscall
 const SYSCALL_CLOCK_GETTIME: usize = 113;
+/// syslog syscall
+const SYSCALL_SYSLOG: usize = 116;
 /// gettime syscall
 const SYSCALL_GET_TIME: usize = 169;
 /// getpid syscall
@@ -124,6 +132,8 @@ const SYSCALL_GETEUID: usize = 175;
 const SYSCALL_GETGID: usize = 176;
 /// getegid syscall
 const SYSCALL_GETEGID: usize = 177;
+/// sysinfo syscall
+const SYSCALL_SYSINFO: usize = 179;
 /// msgget syscall
 const SYSCALL_MSGGET: usize = 186;
 /// msgsnd syscall
@@ -473,6 +483,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1] as i32, args[2]),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as isize),
+        SYSCALL_FACCESSAT => sys_faccessat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as u32,
+            args[3] as u32,
+        ),
         SYSCALL_OPENAT => sys_openat(
             args[0] as isize,
             args[1] as *const u8,
@@ -503,10 +519,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
+        SYSCALL_READV => sys_readv(args[0], args[1] as *const usize, args[2]),
         SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const usize, args[2]),
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut isize, args[3]),
         SYSCALL_FSTATAT => sys_fstatat(args[0] as isize, args[1] as *const u8, args[2] as *mut Stat, args[3] as u32),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut Stat),
+        SYSCALL_UTIMENSAT => sys_utimensat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *const process::TimeSpec,
+            args[3] as u32,
+        ),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
@@ -544,6 +567,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
+        SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut process::SysInfo),
         SYSCALL_MSGGET => sys_msgget(args[0] as i32, args[1] as i32),
         SYSCALL_MSGSND => sys_msgsnd(args[0] as i32, args[1], args[2], args[3] as i32),
         SYSCALL_MSGRCV => sys_msgrcv(args[0] as i32, args[1], args[2], args[3] as isize, args[4] as i32),
@@ -562,6 +586,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),
+        SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_GET_TIME => sys_get_time(args[0] as *mut TimeVal, args[1]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
