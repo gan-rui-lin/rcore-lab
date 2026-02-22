@@ -136,7 +136,7 @@ pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<dyn File>> {
     let (readable, writable) = flags.read_write();
     let vfs = ROOT_VFS.exclusive_access();
     if flags.contains(OpenFlags::CREATE) {
-        if let Some(inode) = vfs.resolve(&path) {
+        if let Some(inode) = vfs.resolve_quiet(&path) {
             if flags.contains(OpenFlags::TRUNC) {
                 inode.truncate();
             }
@@ -146,7 +146,7 @@ pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<dyn File>> {
         let inode = parent.create(&name)?;
         Some(Arc::new(VfsFile::new(readable, writable, inode, path)))
     } else {
-        let inode = vfs.resolve(&path)?;
+        let inode = vfs.resolve_quiet(&path)?;
         if flags.contains(OpenFlags::TRUNC) {
             inode.truncate();
         }
@@ -157,7 +157,7 @@ pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<dyn File>> {
 pub fn path_is_dir(path: &str) -> bool {
     let path = normalize_path(path);
     let vfs = ROOT_VFS.exclusive_access();
-    match vfs.resolve(&path) {
+    match vfs.resolve_quiet(&path) {
         Some(inode) => inode.kind() == VfsNodeKind::Dir,
         None => {
             trace!("vfs: path_is_dir not found {}", path);
@@ -169,13 +169,19 @@ pub fn path_is_dir(path: &str) -> bool {
 pub fn create_dir(path: &str) -> bool {
     let path = normalize_path(path);
     let vfs = ROOT_VFS.exclusive_access();
-    if vfs.resolve(&path).is_some() {
+    if vfs.resolve_quiet(&path).is_some() {
         return false;
     }
     let Some((parent, name)) = vfs.resolve_parent(&path) else {
         return false;
     };
     parent.create_dir(&name).is_some()
+}
+
+pub fn path_exists(path: &str) -> bool {
+    let path = normalize_path(path);
+    let vfs = ROOT_VFS.exclusive_access();
+    vfs.resolve_quiet(&path).is_some()
 }
 
 pub fn remove_path(path: &str, is_dir: bool) -> bool {
