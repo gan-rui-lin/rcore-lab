@@ -21,6 +21,8 @@ use crate::mm::{MapPermission, MemorySet};
 pub struct TlsInfo {
     /// Virtual address of TLS template in ELF
     pub vaddr: usize,
+    /// File offset of TLS template in ELF
+    pub file_offset: usize,
     /// Size of initialized data (.tdata) in file
     pub filesz: usize,
     /// Total size in memory (.tdata + .tbss)
@@ -79,10 +81,12 @@ impl TlsArea {
 
         // Copy initialized data from ELF to TLS region
         if tls_info.filesz > 0 {
-            let tls_data = &elf_data[tls_info.vaddr..tls_info.vaddr + tls_info.filesz];
+            let start = tls_info.file_offset;
+            let end = start.saturating_add(tls_info.filesz).min(elf_data.len());
+            let tls_data = &elf_data[start..end];
 
             // Copy data byte by byte
-            for i in 0..tls_info.filesz {
+            for i in 0..tls_data.len() {
                 let va = (tls_base + i) as *mut u8;
                 *translated_refmut(token, va) = tls_data[i];
             }

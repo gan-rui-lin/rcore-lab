@@ -258,6 +258,7 @@ impl MemorySet {
             if ph_type == xmas_elf::program::Type::Tls {
                 tls_info = Some(crate::task::TlsInfo {
                     vaddr: load_base + ph.virtual_addr() as usize,
+                    file_offset: ph.offset() as usize,
                     filesz: ph.file_size() as usize,
                     memsz: ph.mem_size() as usize,
                     align: ph.align() as usize,
