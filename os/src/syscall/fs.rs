@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::task::{current_process, current_task, current_user_token, suspend_current_and_run_next};
 use crate::timer::get_time_ms;
 use super::errno::*;
+use super::process::TimeSpec;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -221,6 +222,38 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     }
 }
 
+/// faccessat - check file existence/permissions
+///
+/// For now we only validate existence and ignore mode/flags.
+pub fn sys_faccessat(dirfd: isize, path: *const u8, _mode: u32, _flags: u32) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_faccessat", pid);
+    }
+    if path.is_null() {
+        return errno(EFAULT);
+    }
+    let token = current_user_token();
+    let raw_path = translated_str(token, path);
+    if raw_path.is_empty() {
+        return errno(EINVAL);
+    }
+    let base = match dirfd_base(dirfd) {
+        Ok(base) => base,
+        Err(err) => return err,
+    };
+    let full_path = if raw_path.starts_with('/') {
+        normalize_path(&raw_path)
+    } else {
+        resolve_path(&base, &raw_path)
+    };
+    if open_file(full_path.as_str(), OpenFlags::empty()).is_some() {
+        0
+    } else {
+        errno(ENOENT)
+    }
+}
+
 pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
@@ -343,6 +376,43 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, _flags: u32) ->
     match copy_to_user(token, st as *mut u8, bytes) {
         Ok(_) => 0,
         Err(err) => err,
+    }
+}
+
+/// utimensat - update file timestamps (no-op)
+///
+/// Busybox uses this for `touch`. We accept the call if the path exists.
+pub fn sys_utimensat(
+    dirfd: isize,
+    path: *const u8,
+    _times: *const TimeSpec,
+    _flags: u32,
+) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_utimensat", pid);
+    }
+    if path.is_null() {
+        return errno(EFAULT);
+    }
+    let token = current_user_token();
+    let raw = translated_str(token, path);
+    if raw.is_empty() {
+        return errno(EINVAL);
+    }
+    let base = match dirfd_base(dirfd) {
+        Ok(base) => base,
+        Err(err) => return err,
+    };
+    let full_path = if raw.starts_with('/') {
+        normalize_path(&raw)
+    } else {
+        resolve_path(&base, &raw)
+    };
+    if open_file(full_path.as_str(), OpenFlags::empty()).is_some() {
+        0
+    } else {
+        errno(ENOENT)
     }
 }
 
@@ -767,6 +837,90 @@ pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> isize {
 
     file.set_offset(new_offset as usize);
     new_offset
+}
+
+/// readv - read data into multiple buffers
+///
+/// # Arguments
+/// * `fd` - file descriptor
+/// * `iov` - pointer to iovec array
+/// * `iovcnt` - number of iovec elements
+///
+/// # Returns
+/// * On success: number of bytes read
+/// * On error: -errno
+pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_readv fd={} iovcnt={}", pid, fd, iovcnt);
+    }
+
+    if iov.is_null() {
+        return errno(EFAULT);
+    }
+
+    if iovcnt == 0 {
+        return 0;
+    }
+
+    let token = current_user_token();
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+
+    if !file.readable() {
+        return errno(EBADF);
+    }
+
+    let file = file.clone();
+    drop(inner);
+
+    let mut total_read = 0isize;
+
+    for i in 0..iovcnt {
+        let iov_ptr = unsafe { iov.add(i * 2) };
+        let iov_buffers = translated_byte_buffer(token, iov_ptr as *const u8, 16);
+
+        let mut iov_data = [0u8; 16];
+        let mut offset = 0;
+        for slice in iov_buffers {
+            let len = slice.len().min(16 - offset);
+            iov_data[offset..offset + len].copy_from_slice(&slice[..len]);
+            offset += len;
+            if offset >= 16 {
+                break;
+            }
+        }
+
+        let base = usize::from_le_bytes([
+            iov_data[0], iov_data[1], iov_data[2], iov_data[3],
+            iov_data[4], iov_data[5], iov_data[6], iov_data[7],
+        ]);
+        let len = usize::from_le_bytes([
+            iov_data[8], iov_data[9], iov_data[10], iov_data[11],
+            iov_data[12], iov_data[13], iov_data[14], iov_data[15],
+        ]);
+
+        if base == 0 || len == 0 {
+            continue;
+        }
+
+        let buffers = translated_byte_buffer(token, base as *const u8, len);
+        let read = file.read(UserBuffer::new(buffers));
+        total_read += read as isize;
+        if read < len {
+            break;
+        }
+    }
+
+    total_read
 }
 
 /// writev - write data from multiple buffers
