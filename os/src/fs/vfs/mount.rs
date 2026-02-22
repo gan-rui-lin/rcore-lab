@@ -3,6 +3,7 @@
 use super::core::ROOT_VFS;
 use super::easyfs::easyfs_root;
 use super::fat32::fat32_root;
+use super::procfs::procfs_root;
 #[cfg(feature = "ext4")]
 use crate::drivers::BLOCK_DEVICE;
 
@@ -28,6 +29,13 @@ pub fn mount_fat32() -> Result<(), i32> {
 
 pub fn mount_fat32_auto() -> bool {
     mount_fat32().is_ok()
+}
+
+pub fn mount_procfs() {
+    let root = procfs_root();
+    let mut vfs = ROOT_VFS.exclusive_access();
+    vfs.mount_at("/proc", root);
+    trace!("vfs: mounted procfs at /proc");
 }
 
 #[cfg(feature = "ext4")]

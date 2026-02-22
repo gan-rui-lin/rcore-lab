@@ -64,6 +64,8 @@ const SYSCALL_FSTATAT: usize = 79;
 const SYSCALL_FSTAT: usize = 80;
 /// utimensat syscall
 const SYSCALL_UTIMENSAT: usize = 88;
+/// renameat2 syscall
+const SYSCALL_RENAMEAT2: usize = 276;
 /// exit syscall
 const SYSCALL_EXIT: usize = 93;
 /// exit_group syscall
@@ -114,6 +116,10 @@ const SYSCALL_SET_PRIORITY: usize = 140;
 const SYSCALL_TIMES: usize = 153;
 /// uname syscall
 const SYSCALL_UNAME: usize = 160;
+/// statfs syscall
+const SYSCALL_STATFS: usize = 43;
+/// fstatfs syscall
+const SYSCALL_FSTATFS: usize = 44;
 /// clock_gettime syscall
 const SYSCALL_CLOCK_GETTIME: usize = 113;
 /// syslog syscall
@@ -483,6 +489,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1] as i32, args[2]),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as isize),
+            SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut StatFs),
+            SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut StatFs),
         SYSCALL_FACCESSAT => sys_faccessat(
             args[0] as isize,
             args[1] as *const u8,
@@ -506,6 +514,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4] as u32,
         ),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_RENAMEAT2 => sys_renameat2(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as isize,
+            args[3] as *const u8,
+            args[4] as u32,
+        ),
         SYSCALL_UMOUNT2 => sys_umount2(args[0] as *const u8, args[1] as u32),
         SYSCALL_MOUNT => sys_mount(
             args[0] as *const u8,

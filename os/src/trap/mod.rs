@@ -76,6 +76,30 @@ fn disable_supervisor_interrupt() {
     }
 }
 
+fn dump_user_stack(page_table: &PageTable, sp: usize, bytes: usize) {
+    let end = sp.saturating_add(bytes);
+    error!("  user stack dump: sp={:#x} len={}", sp, bytes);
+    let mut addr = sp;
+    while addr < end {
+        let mut line = [0u8; 16];
+        let mut any = false;
+        let line_end = core::cmp::min(addr + 16, end);
+        for i in 0..(line_end - addr) {
+            let va = addr + i;
+            if let Some(pa) = page_table.translate_va(VirtAddr::from(va)) {
+                line[i] = *pa.get_ref::<u8>();
+                any = true;
+            }
+        }
+        if any {
+            error!("    {:#x}: {:02x?}", addr, &line[..(line_end - addr)]);
+        } else {
+            error!("    {:#x}: <unmapped>", addr);
+        }
+        addr += 16;
+    }
+}
+
 /// trap handler
 #[no_mangle]
 pub fn trap_handler() -> ! {
@@ -165,6 +189,7 @@ pub fn trap_handler() -> ! {
             error!("    a3 (x13) = {:#x}", trap_cx.x[13]);
             error!("    a4 (x14) = {:#x}", trap_cx.x[14]);
             error!("    a5 (x15) = {:#x}", trap_cx.x[15]);
+            dump_user_stack(&page_table, trap_cx.x[2], 128);
             if name == "busybox" || name == "ld-linux-riscv64-lp64d.so.1" {
                 let path = if name == "busybox" {
                     "/musl/busybox"

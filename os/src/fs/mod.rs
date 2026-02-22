@@ -147,15 +147,54 @@ pub use vfs::mount_ext4;
 /// Auto-detect ext4 and mount it as root if present.
 pub use vfs::mount_ext4_auto;
 pub use vfs::{
-    create_dir, list_apps, mount_easyfs, mount_fat32, mount_fat32_auto, open_file, path_is_dir,
-    remove_path,
+    create_dir, list_apps, mount_easyfs, mount_fat32, mount_fat32_auto, mount_procfs, open_file,
+    path_exists, path_is_dir, remove_path,
 };
 pub use pipe::make_pipe;
 pub use stdio::{Stdin, Stdout};
 
+/// Create minimal /etc and /dev files used by BusyBox tests.
+pub fn ensure_basic_paths() {
+    create_dir("/etc");
+    create_dir("/dev");
+    create_dir("/dev/misc");
+    create_dir("/bin");
+    create_dir("/usr");
+    create_dir("/usr/bin");
+
+    write_file_if_missing(
+        "/etc/passwd",
+        "root:x:0:0:root:/root:/bin/sh\n",
+    );
+    write_file_if_missing("/etc/group", "root:x:0:\n");
+    write_file_if_missing("/etc/localtime", "");
+    write_file_if_missing("/etc/adjtime", "");
+
+    write_file_if_missing("/dev/null", "");
+    write_file_if_missing("/dev/tty", "");
+    write_file_if_missing("/dev/rtc", "");
+    write_file_if_missing("/dev/rtc0", "");
+    write_file_if_missing("/dev/misc/rtc", "");
+}
+
+/// Create a file with content if it does not exist.
+fn write_file_if_missing(path: &str, content: &str) {
+    if path_exists(path) {
+        return;
+    }
+    let Some(file) = open_file(path, OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY)
+    else {
+        return;
+    };
+    let Some(inode) = file.inode() else {
+        return;
+    };
+    let _ = inode.write_at(0, content.as_bytes());
+}
+
 #[cfg(feature = "ext4")]
 fn ensure_hardlink(linkpath: &str, target: &str) {
-    if open_file(linkpath, OpenFlags::empty()).is_some() {
+    if path_exists(linkpath) {
         return;
     }
     let link_c = match CString::new(linkpath) {
@@ -195,8 +234,13 @@ pub fn ensure_busybox_links() {
     create_dir("/lib");
     ensure_hardlink("/bin/sh", BUSYBOX_PATH);
     ensure_hardlink("/bin/basename", BUSYBOX_PATH);
+    ensure_hardlink("/bin/ls", BUSYBOX_PATH);
+    ensure_hardlink("/bin/sleep", BUSYBOX_PATH);
     ensure_hardlink("/usr/bin/basename", BUSYBOX_PATH);
+    ensure_hardlink("/usr/bin/ls", BUSYBOX_PATH);
+    ensure_hardlink("/usr/bin/sleep", BUSYBOX_PATH);
     ensure_hardlink("/musl/basename", BUSYBOX_PATH);
+    ensure_hardlink("/musl/sleep", BUSYBOX_PATH);
     const GLIBC_LOADER: &str = "/glibc/lib/ld-linux-riscv64-lp64d.so.1";
     const MUSL_LOADER: &str = "/musl/lib/libc.so";
     if open_file(MUSL_LOADER, OpenFlags::empty()).is_some() {

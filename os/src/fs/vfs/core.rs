@@ -109,6 +109,24 @@ impl Vfs {
         }
     }
 
+    pub(crate) fn mount_at(&mut self, path: &str, root: Arc<dyn VfsInode>) {
+        let path = normalize_path(path);
+        if let Some(mount) = self.mounts.iter_mut().find(|m| m.path == path) {
+            mount.root = root;
+            #[cfg(feature = "ext4")]
+            {
+                mount._ext4_guard = None;
+            }
+        } else {
+            self.mounts.push(MountPoint {
+                path,
+                root,
+                #[cfg(feature = "ext4")]
+                _ext4_guard: None,
+            });
+        }
+    }
+
     #[cfg(feature = "ext4")]
     pub(crate) fn mount_root_ext4(&mut self, root: Arc<dyn VfsInode>, guard: Arc<Ext4Fs>) {
         if let Some(mount) = self.mounts.iter_mut().find(|m| m.path == "/") {
@@ -146,7 +164,7 @@ impl Vfs {
         Some((mount, rel))
     }
 
-    pub(crate) fn resolve(&self, path: &str) -> Option<Arc<dyn VfsInode>> {
+    fn resolve_inner(&self, path: &str, log_missing: bool) -> Option<Arc<dyn VfsInode>> {
         let path = normalize_path(path);
         let (mount, rel) = self.resolve_mount(&path)?;
         let mut current = mount.root.clone();
@@ -158,12 +176,22 @@ impl Vfs {
             match current.lookup(comp) {
                 Some(next) => current = next,
                 None => {
-                    error!("vfs: resolve failed at {} for {}", comp, path);
+                    if log_missing {
+                        error!("vfs: resolve failed at {} for {}", comp, path);
+                    }
                     return None;
                 }
             }
         }
         Some(current)
+    }
+
+    pub(crate) fn resolve(&self, path: &str) -> Option<Arc<dyn VfsInode>> {
+        self.resolve_inner(path, true)
+    }
+
+    pub(crate) fn resolve_quiet(&self, path: &str) -> Option<Arc<dyn VfsInode>> {
+        self.resolve_inner(path, false)
     }
 
     pub(crate) fn resolve_parent(&self, path: &str) -> Option<(Arc<dyn VfsInode>, String)> {
