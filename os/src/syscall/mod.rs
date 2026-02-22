@@ -116,6 +116,8 @@ const SYSCALL_SET_PRIORITY: usize = 140;
 const SYSCALL_TIMES: usize = 153;
 /// uname syscall
 const SYSCALL_UNAME: usize = 160;
+/// getrlimit syscall
+const SYSCALL_GETRLIMIT: usize = 163;
 /// statfs syscall
 const SYSCALL_STATFS: usize = 43;
 /// fstatfs syscall
@@ -170,6 +172,8 @@ const SYSCALL_MMAP: usize = 222;
 const SYSCALL_MPROTECT: usize = 226;
 /// waitpid syscall
 const SYSCALL_WAITPID: usize = 260;
+/// prlimit64 syscall
+const SYSCALL_PRLIMIT64: usize = 261;
 /// spawn syscall
 const SYSCALL_SPAWN: usize = 400;
 
@@ -193,7 +197,7 @@ use thread::*;
 
 use crate::fs::Stat;
 #[allow(unused_imports)] // debug: for current_trap_cx in syscall() 
-use crate::task::{current_process, current_trap_cx, SignalAction};
+use crate::task::{current_process, current_trap_cx, RLimit, SignalAction};
 
 const fn parse_trace_pid(value: &str) -> Option<usize> {
     let bytes = value.as_bytes();
@@ -353,6 +357,7 @@ const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (158, "getgroups"),
     (159, "setgroups"),
     (160, "uname"),
+    (163, "getrlimit"),
     (161, "sethostname"),
     (162, "setdomainname"),
     (165, "getrusage"),
@@ -562,7 +567,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as *const SignalAction,
             args[2] as *mut SignalAction,
         ),
-        SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as u32),
+        SYSCALL_SIGPROCMASK => sys_sigprocmask(
+            args[0],
+            args[1] as *const usize,
+            args[2] as *mut usize,
+            args[3],
+        ),
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),
         SYSCALL_GETTID => sys_gettid(),
@@ -582,6 +592,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
+        SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut RLimit),
         SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut process::SysInfo),
         SYSCALL_MSGGET => sys_msgget(args[0] as i32, args[1] as i32),
         SYSCALL_MSGSND => sys_msgsnd(args[0] as i32, args[1], args[2], args[3] as i32),
@@ -598,6 +609,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *const usize,
         ),
         SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32),
+        SYSCALL_PRLIMIT64 => sys_prlimit64(
+            args[0],
+            args[1],
+            args[2] as *const RLimit,
+            args[3] as *mut RLimit,
+        ),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),

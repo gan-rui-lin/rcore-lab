@@ -161,6 +161,7 @@ pub fn ensure_basic_paths() {
     create_dir("/bin");
     create_dir("/usr");
     create_dir("/usr/bin");
+    create_dir("/tmp");
 
     write_file_if_missing(
         "/etc/passwd",
