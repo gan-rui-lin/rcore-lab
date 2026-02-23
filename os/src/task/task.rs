@@ -37,6 +37,8 @@ pub struct TaskControlBlockInner {
     pub signal_trap_cx: Option<TrapContext>,
     pub signal_mask_backup: super::SignalFlags,
     pub clear_child_tid: usize,
+    // for debug
+    pub last_syscall: usize,
 }
 
 impl TaskControlBlockInner {
@@ -69,13 +71,14 @@ impl TaskControlBlock {
                     signal_trap_cx: None,
                     signal_mask_backup: super::SignalFlags::empty(),
                     clear_child_tid: 0,
+                    last_syscall: 0,
                 })
             },
         }
     }
 }
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub enum TaskStatus {
     Ready,
     Running,
