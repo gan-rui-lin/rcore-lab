@@ -412,6 +412,8 @@ pub fn shutdown() -> ! {
 #[derive(Debug, Clone, Copy)]
 pub struct SignalAction {
     pub handler: usize,
+    pub flags: usize,
+    pub restorer: usize,
     pub mask: SignalFlags,
 }
 
@@ -419,6 +421,8 @@ impl Default for SignalAction {
     fn default() -> Self {
         Self {
             handler: 0,
+            flags: 0,
+            restorer: 0,
             mask: SignalFlags::empty(),
         }
     }

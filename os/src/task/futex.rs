@@ -4,11 +4,16 @@ use alloc::{
     // vec::Vec,
 };
 use lazy_static::lazy_static;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::mm::PhysAddr;
 use crate::task::{block_current_and_run_next, current_task, wakeup_task, TaskControlBlock};
 
 const FUTEX_BITSET_MATCH_ANY: i32 = -1;
+const FUTEX_TRACE_INTERVAL: u64 = 2000;
+static FUTEX_WAIT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static FUTEX_WAKE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static FUTEX_REQUEUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FutexKey {
@@ -41,14 +46,32 @@ pub fn futex_wait(futex_key: FutexKey) -> isize {
 pub fn futex_wait_bitset(futex_key: FutexKey, bitset: i32) -> isize {
     let task = current_task().unwrap();
     let mut futex_q = FUTEX_Q.lock();
-    futex_q
-        .entry(futex_key)
-        .or_insert_with(VecDeque::new)
-        .push_back(FutexWaiter {
+    let queue = futex_q
+        .entry(futex_key.clone())
+        .or_insert_with(VecDeque::new);
+    queue.push_back(FutexWaiter {
             task: Arc::downgrade(&task),
             bitset,
         });
+    let queue_len = queue.len();
     drop(futex_q);
+    let count = FUTEX_WAIT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if count % FUTEX_TRACE_INTERVAL == 0 {
+        let (pid, tid) = task
+            .process
+            .upgrade()
+            .map(|p| (p.pid.0, task.inner_exclusive_access().res.as_ref().map(|r| r.tid).unwrap_or(0)))
+            .unwrap_or((0, 0));
+        info!(
+            "[futex] wait pid={} tid={} key=({:#x},{}) bitset={:#x} qlen={}",
+            pid,
+            tid,
+            futex_key.paddr.0,
+            futex_key.pid,
+            bitset,
+            queue_len
+        );
+    }
     drop(task);
     block_current_and_run_next();
     0
@@ -61,6 +84,7 @@ pub fn futex_wake(futex_key: FutexKey, max_size: usize) -> usize {
 pub fn futex_wake_bitset(futex_key: FutexKey, max_size: usize, bitset: i32) -> usize {
     let mut futex_q = FUTEX_Q.lock();
     let mut num = 0usize;
+    let before_len = futex_q.get(&futex_key).map(|q| q.len()).unwrap_or(0);
     if let Some(queue) = futex_q.get_mut(&futex_key) {
         let mut i = 0usize;
         while i < queue.len() && num < max_size {
@@ -79,6 +103,26 @@ pub fn futex_wake_bitset(futex_key: FutexKey, max_size: usize, bitset: i32) -> u
         if queue.is_empty() {
             futex_q.remove(&futex_key);
         }
+    }
+    let count = FUTEX_WAKE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if count % FUTEX_TRACE_INTERVAL == 0 {
+        let (pid, tid) = current_task()
+            .and_then(|task| task.process.upgrade().map(|p| {
+                let tid = task.inner_exclusive_access().res.as_ref().map(|r| r.tid).unwrap_or(0);
+                (p.pid.0, tid)
+            }))
+            .unwrap_or((0, 0));
+        info!(
+            "[futex] wake pid={} tid={} key=({:#x},{}) max={} bitset={:#x} woke={} qlen_before={}",
+            pid,
+            tid,
+            futex_key.paddr.0,
+            futex_key.pid,
+            max_size,
+            bitset,
+            num,
+            before_len
+        );
     }
     num
 }
@@ -116,9 +160,31 @@ pub fn futex_requeue(
     }
     if !requeued.is_empty() {
         futex_q
-            .entry(new_key)
+            .entry(new_key.clone())
             .or_insert_with(VecDeque::new)
             .extend(requeued);
+    }
+    let count = FUTEX_REQUEUE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if count % FUTEX_TRACE_INTERVAL == 0 {
+        let (pid, tid) = current_task()
+            .and_then(|task| task.process.upgrade().map(|p| {
+                let tid = task.inner_exclusive_access().res.as_ref().map(|r| r.tid).unwrap_or(0);
+                (p.pid.0, tid)
+            }))
+            .unwrap_or((0, 0));
+        info!(
+            "[futex] requeue pid={} tid={} old=({:#x},{}) new=({:#x},{}) max_wake={} max_requeue={} woke={} moved={}",
+            pid,
+            tid,
+            old_key.paddr.0,
+            old_key.pid,
+            new_key.paddr.0,
+            new_key.pid.clone(),
+            max_wake,
+            max_requeue,
+            woke,
+            moved
+        );
     }
     woke
 }
