@@ -10,6 +10,11 @@ use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
 use lazy_static::*;
 use riscv::register::time;
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+const TIMER_DEBUG_INTERVAL: u64 = 500;
+static SET_TRIGGER_COUNT: AtomicU64 = AtomicU64::new(0);
+static CHECK_TIMER_COUNT: AtomicU64 = AtomicU64::new(0);
 
 const TICKS_PER_SEC: usize = 100;
 const MSEC_PER_SEC: usize = 1000;
@@ -28,6 +33,10 @@ pub fn get_time_us() -> usize {
 }
 
 pub fn set_next_trigger() {
+    let count = SET_TRIGGER_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    if count % TIMER_DEBUG_INTERVAL == 0 {
+        info!("[timer] set_next_trigger count={} time={}", count, get_time());
+    }
     set_timer(get_time() + CLOCK_FREQ / TICKS_PER_SEC);
 }
 
@@ -81,6 +90,10 @@ pub fn remove_timer(task: Arc<TaskControlBlock>) {
 }
 
 pub fn check_timer() {
+    let count = CHECK_TIMER_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    if count % TIMER_DEBUG_INTERVAL == 0 {
+        info!("[timer] check_timer count={} time_ms={}", count, get_time_ms());
+    }
     let current_ms = get_time_ms();
     let mut timers = TIMERS.exclusive_access();
     while let Some(timer) = timers.peek() {

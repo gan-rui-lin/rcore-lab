@@ -32,10 +32,14 @@ impl BlockDevice for VirtIOBlock {
                 "Error when reading VirtIOBlk"
             );
         } else {
-            self.virtio_blk
-                .exclusive_access()
-                .read_block(block_id, buf)
-                .expect("Error when reading VirtIOBlk");
+            let mut blk = self.virtio_blk.exclusive_access();
+            if let Err(err) = blk.read_block(block_id, buf) {
+                error!(
+                    "virtio-blk read failed: block_id={} err={:?}",
+                    block_id, err
+                );
+                panic!("Error when reading VirtIOBlk");
+            }
         }
     }
     fn write_block(&self, block_id: usize, buf: &[u8]) {
@@ -53,10 +57,14 @@ impl BlockDevice for VirtIOBlock {
                 "Error when writing VirtIOBlk"
             );
         } else {
-            self.virtio_blk
-                .exclusive_access()
-                .write_block(block_id, buf)
-                .expect("Error when writing VirtIOBlk");
+            let mut blk = self.virtio_blk.exclusive_access();
+            if let Err(err) = blk.write_block(block_id, buf) {
+                error!(
+                    "virtio-blk write failed: block_id={} err={:?}",
+                    block_id, err
+                );
+                panic!("Error when writing VirtIOBlk");
+            }
         }
     }
     fn handle_irq(&self) {
