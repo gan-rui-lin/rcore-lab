@@ -453,6 +453,7 @@ const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (1003, "xv6_sbrk"),
 ];
 
+// TODO: 现在这个实现好低效
 fn syscall_name(syscall_id: usize) -> &'static str {
     for (num, name) in SYSCALL_NAME_MAP {
         if *num == syscall_id {
@@ -676,10 +677,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
 
     if known && trace && !(syscall_id == SYSCALL_WRITE && args[0] == 1) {
         trace!(
-            "[syscall] pid={} name={} num={} args=[0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x}] ret={}",
+            "[syscall] pid={} name={} num={}({}) args=[0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x}] ret={}",
             pid,
             name,
             syscall_id,
+            syscall_name(syscall_id),
             args[0],
             args[1],
             args[2],

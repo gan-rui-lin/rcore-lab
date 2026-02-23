@@ -127,3 +127,32 @@ impl SignalFlags {
         }
     }
 }
+
+pub fn flags_to_user_mask(flags: SignalFlags) -> u64 {
+    let mut user_mask = 0u64;
+    for signum in 1..=MAX_SIG {
+        let flag = match 1u64.checked_shl(signum as u32) {
+            Some(bits) => SignalFlags::from_bits_truncate(bits),
+            None => continue,
+        };
+        if flags.contains(flag) {
+            user_mask |= 1u64 << (signum - 1);
+        }
+    }
+    user_mask
+}
+
+pub fn user_mask_to_flags(user_mask: u64) -> SignalFlags {
+    let mut flags = SignalFlags::empty();
+    for signum in 1..=MAX_SIG {
+        if (user_mask & (1u64 << (signum - 1))) == 0 {
+            continue;
+        }
+        let flag = match 1u64.checked_shl(signum as u32) {
+            Some(bits) => SignalFlags::from_bits_truncate(bits),
+            None => continue,
+        };
+        flags |= flag;
+    }
+    flags
+}
