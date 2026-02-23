@@ -104,6 +104,8 @@ const SYSCALL_CONDVAR_SIGNAL: usize = 472;
 const SYSCALL_CONDVAR_WAIT: usize = 473;
 /// kill syscall
 const SYSCALL_KILL: usize = 129;
+/// tkill syscall
+const SYSCALL_TKILL: usize = 130;
 /// sigaction syscall
 const SYSCALL_SIGACTION: usize = 134;
 /// sigprocmask syscall
@@ -199,7 +201,7 @@ use thread::*;
 
 use crate::fs::Stat;
 #[allow(unused_imports)] // debug: for current_trap_cx in syscall() 
-use crate::task::{current_process, current_trap_cx, RLimit, SignalAction};
+use crate::task::{current_process, current_task, current_trap_cx, RLimit, SignalAction};
 
 const fn parse_trace_pid(value: &str) -> Option<usize> {
     let bytes = value.as_bytes();
@@ -488,6 +490,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         trace!("[syscall] pid=4 entry name={} cwd={}", name, cwd);
     }
     let trace = should_trace_syscall(pid);
+    // for debug
+    if let Some(task) = current_task() {
+        if let Some(mut task_inner) = task.try_inner_exclusive_access() {
+            task_inner.last_syscall = syscall_id;
+        }
+    }
     let mut known = true;
     let ret = match syscall_id {
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
@@ -566,6 +574,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const TimeSpec, args[1] as *mut TimeSpec),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
+        SYSCALL_TKILL => process::sys_tkill(args[0] as isize, args[1] as i32),
         SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
             args[0] as *const usize,
             args[1] as *mut usize,
@@ -612,7 +621,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHMAT => sys_shmat(args[0] as i32, args[1], args[2] as i32),
         SYSCALL_SHMDT => sys_shmdt(args[0]),
         SYSCALL_SHMCTL => sys_shmctl(args[0] as i32, args[1] as i32, args[2]),
-        SYSCALL_FORK => sys_fork(),
+        SYSCALL_FORK => sys_clone(
+            args[0],
+            args[1] as *const u8,
+            args[2] as *mut i32,
+            args[3] as *mut i32,
+            args[4] as *mut i32,
+        ),
         SYSCALL_EXEC => sys_exec(
             args[0] as *const u8,
             args[1] as *const usize,

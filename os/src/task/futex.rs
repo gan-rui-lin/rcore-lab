@@ -1,6 +1,7 @@
 use alloc::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Weak},
+    // vec::Vec,
 };
 use lazy_static::lazy_static;
 
@@ -140,6 +141,32 @@ pub fn futex_remove_waiter(futex_key: &FutexKey, task: &Arc<TaskControlBlock>) -
             }
             i += 1;
         }
+    }
+    false
+}
+
+pub fn futex_remove_waiter_any(task: &Arc<TaskControlBlock>) -> bool {
+    let mut futex_q = FUTEX_Q.lock();
+    let mut empty_keys = alloc::vec::Vec::new();
+    for (key, queue) in futex_q.iter_mut() {
+        let mut i = 0usize;
+        while i < queue.len() {
+            let remove_entry = match queue[i].task.upgrade() {
+                Some(waiter_task) => Arc::as_ptr(&waiter_task) == Arc::as_ptr(task),
+                None => true,
+            };
+            if remove_entry {
+                queue.remove(i);
+                if queue.is_empty() {
+                    empty_keys.push(key.clone());
+                }
+                return true;
+            }
+            i += 1;
+        }
+    }
+    for key in empty_keys {
+        futex_q.remove(&key);
     }
     false
 }
