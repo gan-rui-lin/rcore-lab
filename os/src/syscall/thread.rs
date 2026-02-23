@@ -57,18 +57,16 @@ pub fn sys_gettid() -> isize {
 }
 
 pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
-    let tid = current_task()
-        .unwrap()
-        .inner_exclusive_access()
-        .res
-        .as_ref()
-        .unwrap()
-        .tid as i32;
+    let task = current_task().unwrap();
+    let mut task_inner = task.inner_exclusive_access();
+    let tid = task_inner.res.as_ref().unwrap().tid as i32;
+    task_inner.clear_child_tid = tidptr as usize;
+    drop(task_inner);
     if !tidptr.is_null() {
         let token = current_user_token();
         let proc = current_process();
         let name = proc.inner_exclusive_access().name.clone();
-        if name == "busybox" || name == "sh" {
+        if name == "busybox" || name == "sh" || name == "entry-static.exe" {
             let tidptr_val = tidptr as usize;
             let task = current_task().unwrap();
             let task_inner = task.inner_exclusive_access();
@@ -99,6 +97,15 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
                 heap_bottom,
                 program_brk,
                 mmap_base
+            );
+        } else {
+            let tidptr_val = tidptr as usize;
+            info!(
+                "[sys_set_tid_address] pid={} name={} tid={} tidptr={:#x}",
+                proc.pid.0,
+                name,
+                tid,
+                tidptr_val
             );
         }
         *translated_refmut(token, tidptr) = tid;
