@@ -12,10 +12,11 @@ use crate::{
     mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission, PageTable, VirtAddr},
     sbi::shutdown,
     task::{
-        current_process, current_task, current_trap_cx, current_user_token, exit_current_and_run_next,
-        futex_requeue, futex_remove_waiter, futex_wait, futex_wait_bitset, futex_wake,
-        futex_wake_bitset, pid2process, suspend_current_and_run_next, FutexKey, RLimit,
-        RLIMIT_NLIMITS, SigNumber, SignalAction, SignalFlags,
+        add_task, current_process, current_task, current_trap_cx, current_user_token,
+        exit_current_and_run_next, futex_requeue, futex_remove_waiter, futex_wait,
+        futex_wait_bitset, futex_wake, futex_wake_bitset, pid2process, suspend_current_and_run_next,
+        FutexKey, RLimit, RLIMIT_NLIMITS, SigNumber, SignalAction, SignalFlags, TaskControlBlock,
+        TaskStatus,
         MAX_SIG,
     },
     timer::{add_timer, get_time, get_time_ms, get_time_us, remove_timer},
@@ -93,6 +94,22 @@ bitflags! {
     }
 }
 
+bitflags! {
+    pub struct CloneFlags: u64 {
+        const VM = 0x0000_0100;
+        const FS = 0x0000_0200;
+        const FILES = 0x0000_0400;
+        const SIGHAND = 0x0000_0800;
+        const VFORK = 0x0000_4000;
+        const THREAD = 0x0001_0000;
+        const SYSVSEM = 0x0004_0000;
+        const SETTLS = 0x0008_0000;
+        const PARENT_SETTID = 0x0010_0000;
+        const CHILD_CLEARTID = 0x0020_0000;
+        const CHILD_SETTID = 0x0100_0000;
+    }
+}
+
 impl Default for UtsName {
     fn default() -> Self {
         Self {
@@ -151,6 +168,7 @@ pub fn sys_futex(
     uaddr2: *mut i32,
     val3: i32,
 ) -> isize {
+    let pid_now = current_process().pid.0;
     if uaddr1.is_null() || (uaddr1 as usize) % core::mem::size_of::<i32>() != 0 {
         return errno(EINVAL);
     }
@@ -165,11 +183,30 @@ pub fn sys_futex(
     let private = opt.contains(FutexOpt::FUTEX_PRIVATE_FLAG);
     let pid = if private { current_process().pid.0 } else { 0 };
     let key = FutexKey::new(pa, pid);
+    trace!(
+        "[sys_futex] pid={} op={:#x} cmd={:?} private={} uaddr1={:#x} pa={:#x} val={} uaddr2={:#x} val3={} timeout={}",
+        pid_now,
+        futex_op,
+        cmd,
+        private,
+        uaddr1 as usize,
+        pa.0,
+        val,
+        uaddr2 as usize,
+        val3,
+        !timeout.is_null()
+    );
 
     match cmd {
         FutexCmd::FUTEX_WAIT => {
             let futex_word = translated_ref(token, uaddr1);
             if *futex_word != val {
+                trace!(
+                    "[sys_futex] pid={} wait mismatch word={} val={}",
+                    pid_now,
+                    *futex_word,
+                    val
+                );
                 return errno(EAGAIN);
             }
             let has_timeout = !timeout.is_null();
@@ -188,18 +225,29 @@ pub fn sys_futex(
                 let expire_ms = get_time_ms().saturating_add(add_ms);
                 add_timer(expire_ms, current_task().unwrap());
             }
+            trace!(
+                "[sys_futex] pid={} wait sleep word={} timeout={}",
+                pid_now,
+                *futex_word,
+                has_timeout
+            );
             futex_wait(key.clone());
             if has_timeout {
                 let task = current_task().unwrap();
                 let timed_out = futex_remove_waiter(&key, &task);
                 remove_timer(task);
                 if timed_out {
+                    trace!("[sys_futex] pid={} wait timed out", pid_now);
                     return errno(ETIMEDOUT);
                 }
             }
             0
         }
-        FutexCmd::FUTEX_WAKE => futex_wake(key, val as usize) as isize,
+        FutexCmd::FUTEX_WAKE => {
+            let woke = futex_wake(key, val as usize) as isize;
+            trace!("[sys_futex] pid={} wake n={}", pid_now, woke);
+            woke
+        }
         FutexCmd::FUTEX_REQUEUE => {
             if uaddr2.is_null() {
                 return errno(EINVAL);
@@ -209,7 +257,15 @@ pub fn sys_futex(
                 None => return errno(EFAULT),
             };
             let new_key = FutexKey::new(pa2, pid);
-            futex_requeue(key, val, new_key, val3) as isize
+            let requeued = futex_requeue(key, val, new_key, val3) as isize;
+            trace!(
+                "[sys_futex] pid={} requeue n={} uaddr2={:#x} pa2={:#x}",
+                pid_now,
+                requeued,
+                uaddr2 as usize,
+                pa2.0
+            );
+            requeued
         }
         FutexCmd::FUTEX_WAIT_BITSET => {
             if val3 == 0 {
@@ -217,6 +273,12 @@ pub fn sys_futex(
             }
             let futex_word = translated_ref(token, uaddr1);
             if *futex_word != val {
+                trace!(
+                    "[sys_futex] pid={} wait_bitset mismatch word={} val={}",
+                    pid_now,
+                    *futex_word,
+                    val
+                );
                 return errno(EAGAIN);
             }
             let has_timeout = !timeout.is_null();
@@ -235,12 +297,20 @@ pub fn sys_futex(
                 let expire_ms = get_time_ms().saturating_add(add_ms);
                 add_timer(expire_ms, current_task().unwrap());
             }
+            trace!(
+                "[sys_futex] pid={} wait_bitset sleep word={} bitset={:#x} timeout={}",
+                pid_now,
+                *futex_word,
+                val3,
+                has_timeout
+            );
             futex_wait_bitset(key.clone(), val3);
             if has_timeout {
                 let task = current_task().unwrap();
                 let timed_out = futex_remove_waiter(&key, &task);
                 remove_timer(task);
                 if timed_out {
+                    trace!("[sys_futex] pid={} wait_bitset timed out", pid_now);
                     return errno(ETIMEDOUT);
                 }
             }
@@ -250,7 +320,9 @@ pub fn sys_futex(
             if val3 == 0 {
                 return errno(EINVAL);
             }
-            futex_wake_bitset(key, val as usize, val3) as isize
+            let woke = futex_wake_bitset(key, val as usize, val3) as isize;
+            trace!("[sys_futex] pid={} wake_bitset n={} bitset={:#x}", pid_now, woke, val3);
+            woke
         }
         _ => errno(ENOSYS),
     }
@@ -316,6 +388,89 @@ pub fn sys_fork() -> isize {
     }
     trap_cx.kernel_sp = new_task.kstack.get_top();
     new_pid as isize
+}
+
+pub fn sys_clone(
+    flags: usize,
+    stack: *const u8,
+    ptid: *mut i32,
+    tls: *mut i32,
+    ctid: *mut i32,
+) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!(
+            "kernel:pid[{}] sys_clone flags={:#x} stack={:#x} ptid={:#x} tls={:#x} ctid={:#x}",
+            pid,
+            flags,
+            stack as usize,
+            ptid as usize,
+            tls as usize,
+            ctid as usize
+        );
+    }
+    let exit_signal = (flags & 0xff) as i32;
+    if exit_signal != 0 && (exit_signal <= 0 || exit_signal > MAX_SIG as i32) {
+        return errno(EINVAL);
+    }
+    let clone_flags = CloneFlags::from_bits_truncate((flags as u64) & !0xff);
+
+    if !clone_flags.contains(CloneFlags::THREAD) {
+        return sys_fork();
+    }
+
+    let task = current_task().unwrap();
+    let process = task.process.upgrade().unwrap();
+    let parent_cx = *current_trap_cx();
+
+    let new_task = Arc::new(TaskControlBlock::new(
+        Arc::clone(&process),
+        task.inner_exclusive_access()
+            .res
+            .as_ref()
+            .unwrap()
+            .ustack_base,
+        true,
+    ));
+    add_task(Arc::clone(&new_task));
+
+    let new_task_inner = new_task.inner_exclusive_access();
+    let new_task_res = new_task_inner.res.as_ref().unwrap();
+    let new_task_tid = new_task_res.tid;
+    let mut process_inner = process.inner_exclusive_access();
+    let tasks = &mut process_inner.tasks;
+    while tasks.len() < new_task_tid + 1 {
+        tasks.push(None);
+    }
+    tasks[new_task_tid] = Some(Arc::clone(&new_task));
+    drop(process_inner);
+
+    let new_trap_cx = new_task_inner.get_trap_cx();
+    *new_trap_cx = parent_cx;
+    new_trap_cx.x[10] = 0;
+    if !stack.is_null() {
+        new_trap_cx.x[2] = stack as usize;
+    }
+    if clone_flags.contains(CloneFlags::SETTLS) && !tls.is_null() {
+        new_trap_cx.x[4] = tls as usize;
+    }
+    new_trap_cx.kernel_sp = new_task.kstack.get_top();
+    drop(new_task_inner);
+    if clone_flags.contains(CloneFlags::CHILD_CLEARTID) && !ctid.is_null() {
+        let mut inner = new_task.inner_exclusive_access();
+        inner.clear_child_tid = ctid as usize;
+    }
+
+    if clone_flags.contains(CloneFlags::PARENT_SETTID) && !ptid.is_null() {
+        let token = current_user_token();
+        *translated_refmut(token, ptid) = new_task_tid as i32;
+    }
+    if clone_flags.contains(CloneFlags::CHILD_SETTID) && !ctid.is_null() {
+        let token = new_task.get_user_token();
+        *translated_refmut(token, ctid) = new_task_tid as i32;
+    }
+
+    new_task_tid as isize
 }
 
 /// Maximum depth for shebang recursion to prevent infinite loops
@@ -700,6 +855,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     loop {
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
+        let _trace_pid = process.getpid();
         if !inner.children.iter().any(|p| pid == -1 || pid as usize == p.getpid()) {
             return errno(ECHILD);
         }
@@ -724,7 +880,22 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
             }
             return found_pid as isize;
         }
+        // let child_count = inner.children.len();
+        // let pending = inner.signal_pending;
+        // let mask = inner.signal_mask;
+        // let name = inner.name.clone();
         drop(inner);
+        // if crate::syscall::should_trace_syscall(trace_pid) {
+        //     trace!(
+        //         "[sys_waitpid] pid={} name={} child_count={} pending={:?} mask={:?} -> yield",
+        //         trace_pid,
+        //         name,
+        //         child_count,
+        //         pending,
+        //         mask
+        //     );
+        //     crate::task::debug_dump_tasks();
+        // }
         suspend_current_and_run_next();
     }
 }
@@ -1308,16 +1479,64 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
     if signum <= 0 || signum > MAX_SIG as i32 {
         return errno(EINVAL);
     }
-    let flag = match SignalFlags::from_bits(1u32 << signum) {
-        Some(flag) => flag,
+    let flag = match 1u64.checked_shl(signum as u32) {
+        Some(bits) => SignalFlags::from_bits_truncate(bits),
         None => return errno(EINVAL),
     };
+    if flag.is_empty() {
+        return errno(EINVAL);
+    }
     let process = match pid2process(pid) {
         Some(process) => process,
         None => return errno(ESRCH),
     };
     let mut inner = process.inner_exclusive_access();
     inner.signal_pending |= flag;
+    // Wake blocked tasks so pending signals can be handled.
+    for task in inner.tasks.iter().filter_map(|t| t.as_ref()) {
+        let mut task_inner = task.inner_exclusive_access();
+        if task_inner.task_status == TaskStatus::Blocked {
+            task_inner.task_status = TaskStatus::Ready;
+            drop(task_inner);
+            add_task(task.clone());
+        }
+    }
+    0
+}
+
+pub fn sys_tkill(tid: isize, signum: i32) -> isize {
+    let pid_now = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid_now) {
+        trace!("kernel:pid[{}] sys_tkill tid={} signum={}", pid_now, tid, signum);
+    }
+    if tid <= 0 {
+        return errno(EINVAL);
+    }
+    if signum <= 0 || signum > MAX_SIG as i32 {
+        return errno(EINVAL);
+    }
+    let flag = match 1u64.checked_shl(signum as u32) {
+        Some(bits) => SignalFlags::from_bits_truncate(bits),
+        None => return errno(EINVAL),
+    };
+    if flag.is_empty() {
+        return errno(EINVAL);
+    }
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let tid = tid as usize;
+    if tid >= inner.tasks.len() || inner.tasks[tid].is_none() {
+        return errno(ESRCH);
+    }
+    inner.signal_pending |= flag;
+    if let Some(task) = inner.tasks[tid].as_ref() {
+        let mut task_inner = task.inner_exclusive_access();
+        if task_inner.task_status == TaskStatus::Blocked {
+            task_inner.task_status = TaskStatus::Ready;
+            drop(task_inner);
+            add_task(task.clone());
+        }
+    }
     0
 }
 
@@ -1389,10 +1608,13 @@ pub fn sys_sigprocmask(
     if !oldset.is_null() {
         let mut user_mask: usize = 0;
         for signum in 1..=MAX_SIG {
-            let flag = match SignalFlags::from_bits(1u32 << signum) {
-                Some(f) => f,
+            let flag = match 1u64.checked_shl(signum as u32) {
+                Some(bits) => SignalFlags::from_bits_truncate(bits),
                 None => continue,
             };
+            if flag == SignalFlags::SIGKILL || flag == SignalFlags::SIGSTOP {
+                continue;
+            }
             if inner.signal_mask.contains(flag) {
                 user_mask |= 1usize << (signum - 1);
             }
@@ -1418,18 +1640,22 @@ pub fn sys_sigprocmask(
             if (user_mask & (1usize << (signum - 1))) == 0 {
                 continue;
             }
-            let flag = match SignalFlags::from_bits(1u32 << signum) {
-                Some(f) => f,
+            let flag = match 1u64.checked_shl(signum as u32) {
+                Some(bits) => SignalFlags::from_bits_truncate(bits),
                 None => continue,
             };
             new_flags |= flag;
         }
+        new_flags.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
         match how {
             0 => inner.signal_mask |= new_flags,    // SIG_BLOCK
             1 => inner.signal_mask &= !new_flags,   // SIG_UNBLOCK
             2 => inner.signal_mask = new_flags,     // SIG_SETMASK
             _ => return errno(EINVAL),
         }
+        inner
+            .signal_mask
+            .remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
     }
     0
 }
@@ -1708,8 +1934,8 @@ pub fn sys_rt_sigtimedwait(
                 if (sigset & (1usize << (signum - 1))) == 0 {
                     continue;
                 }
-                let flag = match SignalFlags::from_bits(1u32 << signum) {
-                    Some(f) => f,
+                let flag = match 1u64.checked_shl(signum as u32) {
+                    Some(bits) => SignalFlags::from_bits_truncate(bits),
                     None => continue,
                 };
                 if inner.signal_pending.contains(flag) {

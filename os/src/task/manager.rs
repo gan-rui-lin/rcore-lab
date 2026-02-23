@@ -71,6 +71,14 @@ pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
     map.get(&pid).map(Arc::clone)
 }
 
+pub fn pid2process_snapshot() -> Vec<(usize, Arc<ProcessControlBlock>)> {
+    PID2PCB
+        .exclusive_access()
+        .iter()
+        .map(|(pid, pcb)| (*pid, Arc::clone(pcb)))
+        .collect()
+}
+
 pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
     PID2PCB.exclusive_access().insert(pid, process);
 }
@@ -80,4 +88,8 @@ pub fn remove_from_pid2process(pid: usize) {
     if map.remove(&pid).is_none() {
         panic!("cannot find pid {} in pid2process!", pid);
     }
+}
+
+pub fn ready_queue_snapshot() -> Vec<Arc<TaskControlBlock>> {
+    TASK_MANAGER.exclusive_access().ready_snapshot()
 }

@@ -17,7 +17,7 @@ mod context;
 use crate::config::TRAMPOLINE;
 use crate::syscall::syscall;
 use crate::task::{
-    current_add_signal, current_process, current_trap_cx, current_trap_cx_user_va,
+    current_add_signal, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
     current_user_token, handle_signals, suspend_current_and_run_next, SignalFlags,
 };
 use crate::mm::{PageTable, VirtAddr};
@@ -26,11 +26,15 @@ use crate::fs::{open_file, OpenFlags};
 use xmas_elf::ElfFile;
 use crate::timer::{check_timer, set_next_trigger};
 use core::arch::{asm, global_asm};
+use core::sync::atomic::{AtomicU64, Ordering};
 use riscv::register::{
     mtvec::TrapMode,
     scause::{self, Exception, Interrupt, Trap},
     sie, sscratch, sstatus, stval, stvec,
 };
+
+const TIMER_SAMPLE_INTERVAL: u64 = 200;
+static TIMER_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 global_asm!(include_str!("trap.S"));
 
@@ -338,6 +342,24 @@ pub fn trap_handler() -> ! {
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             set_next_trigger();
             check_timer();
+            let count = TIMER_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            if count % TIMER_SAMPLE_INTERVAL == 0 {
+                if let Some(task) = current_task() {
+                    if let Some(process) = task.process.upgrade() {
+                        let pid = process.pid.0;
+                        let name = process.inner_exclusive_access().name.clone();
+                        let (sepc, sp, ra) = {
+                            let task_inner = task.inner_exclusive_access();
+                            let trap_cx = task_inner.get_trap_cx();
+                            (trap_cx.sepc, trap_cx.x[2], trap_cx.x[1])
+                        };
+                        info!(
+                            "[sample] pid={} name={} sepc={:#x} sp={:#x} ra={:#x}",
+                            pid, name, sepc, sp, ra
+                        );
+                    }
+                }
+            }
             suspend_current_and_run_next();
         }
         Trap::Interrupt(Interrupt::SupervisorExternal) => {
@@ -414,6 +436,24 @@ fn trap_from_kernel(_trap_cx: &context::KernelTrapContext) {
             // 先设置下次触发时间，等到返回用户态后再检查定时器并切换任务
             set_next_trigger();
             check_timer();
+            let count = TIMER_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            if count % TIMER_SAMPLE_INTERVAL == 0 {
+                if let Some(task) = current_task() {
+                    if let Some(process) = task.process.upgrade() {
+                        let pid = process.pid.0;
+                        let name = process.inner_exclusive_access().name.clone();
+                        let (sepc, sp, ra) = {
+                            let task_inner = task.inner_exclusive_access();
+                            let trap_cx = task_inner.get_trap_cx();
+                            (trap_cx.sepc, trap_cx.x[2], trap_cx.x[1])
+                        };
+                        info!(
+                            "[sample-k] pid={} name={} sepc={:#x} sp={:#x} ra={:#x}",
+                            pid, name, sepc, sp, ra
+                        );
+                    }
+                }
+            }
         }
         _ => {
             panic!(
