@@ -1,11 +1,12 @@
 #![allow(missing_docs)]
 
 use super::__switch;
-use super::{ProcessControlBlock, TaskContext, TaskControlBlock, TaskStatus, fetch_task};
+use super::{ProcessControlBlock, TaskContext, TaskControlBlock, TaskStatus, fetch_task, ready_queue_snapshot};
 use crate::sync::UPIntrFreeCell;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
 use lazy_static::*;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 pub struct Processor {
     current: Option<Arc<TaskControlBlock>>,
@@ -34,6 +35,9 @@ lazy_static! {
     pub static ref PROCESSOR: UPIntrFreeCell<Processor> = unsafe { UPIntrFreeCell::new(Processor::new()) };
 }
 
+const RUN_TASKS_EMPTY_INTERVAL: u64 = 2000;
+static RUN_TASKS_EMPTY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 pub fn run_tasks() {
     loop {
         let mut processor = PROCESSOR.exclusive_access();
@@ -49,7 +53,11 @@ pub fn run_tasks() {
                 __switch(idle_task_cx_ptr, next_task_cx_ptr);
             }
         } else {
-            warn!("no tasks available in run_tasks");
+            let count = RUN_TASKS_EMPTY_COUNTER.fetch_add(1, Ordering::Relaxed);
+            if count % RUN_TASKS_EMPTY_INTERVAL == 0 {
+                let ready_len = ready_queue_snapshot().len();
+                warn!("no tasks available in run_tasks (ready_len={})", ready_len);
+            }
         }
     }
 }

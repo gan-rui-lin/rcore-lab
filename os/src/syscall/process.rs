@@ -16,7 +16,7 @@ use crate::{
         exit_current_and_run_next, futex_requeue, futex_remove_waiter, futex_wait,
         futex_wait_bitset, futex_wake, futex_wake_bitset, pid2process, suspend_current_and_run_next,
         FutexKey, RLimit, RLIMIT_NLIMITS, SigNumber, SignalAction, SignalFlags, TaskControlBlock,
-        TaskStatus,
+        TaskStatus, UserContext, user_mask_to_flags,
         MAX_SIG,
     },
     timer::{add_timer, get_time, get_time_ms, get_time_us, remove_timer},
@@ -183,6 +183,23 @@ pub fn sys_futex(
     let private = opt.contains(FutexOpt::FUTEX_PRIVATE_FLAG);
     let pid = if private { current_process().pid.0 } else { 0 };
     let key = FutexKey::new(pa, pid);
+    let name = current_process().inner_exclusive_access().name.clone();
+    if matches!(cmd, FutexCmd::FUTEX_WAIT | FutexCmd::FUTEX_WAIT_BITSET) && name == "entry-static.exe" {
+        let tid = current_task()
+            .and_then(|task| task.inner_exclusive_access().res.as_ref().map(|r| r.tid))
+            .unwrap_or(0);
+        info!(
+            "[sys_futex] pid={} tid={} name={} cmd={:?} uaddr1={:#x} pa={:#x} private={} val={}",
+            pid_now,
+            tid,
+            name,
+            cmd,
+            uaddr1 as usize,
+            pa.0,
+            private,
+            val
+        );
+    }
     trace!(
         "[sys_futex] pid={} op={:#x} cmd={:?} private={} uaddr1={:#x} pa={:#x} val={} uaddr2={:#x} val3={} timeout={}",
         pid_now,
@@ -459,6 +476,12 @@ pub fn sys_clone(
     if clone_flags.contains(CloneFlags::CHILD_CLEARTID) && !ctid.is_null() {
         let mut inner = new_task.inner_exclusive_access();
         inner.clear_child_tid = ctid as usize;
+        info!(
+            "[clone] pid={} tid={} child_cleartid={:#x}",
+            pid,
+            new_task_tid,
+            ctid as usize
+        );
     }
 
     if clone_flags.contains(CloneFlags::PARENT_SETTID) && !ptid.is_null() {
@@ -1523,14 +1546,14 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
         return errno(EINVAL);
     }
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
+    let inner = process.inner_exclusive_access();
     let tid = tid as usize;
     if tid >= inner.tasks.len() || inner.tasks[tid].is_none() {
         return errno(ESRCH);
     }
-    inner.signal_pending |= flag;
     if let Some(task) = inner.tasks[tid].as_ref() {
         let mut task_inner = task.inner_exclusive_access();
+        task_inner.signal_pending |= flag;
         if task_inner.task_status == TaskStatus::Blocked {
             task_inner.task_status = TaskStatus::Ready;
             drop(task_inner);
@@ -1576,6 +1599,16 @@ pub fn sys_sigaction(
             Ok(v) => v,
             Err(err) => return err,
         };
+        if signum == 33 {
+            info!(
+                "[sigaction] pid={} signum=33 handler={:#x} flags={:#x} restorer={:#x} mask={:?}",
+                pid,
+                new_action.handler,
+                new_action.flags,
+                new_action.restorer,
+                new_action.mask
+            );
+        }
         inner.signal_actions.table[idx] = new_action;
     }
     0
@@ -1672,11 +1705,38 @@ pub fn sys_sigreturn() -> isize {
         None => return errno(EINVAL),
     };
     let saved_a0 = saved.x[10] as isize;
-    *inner.get_trap_cx() = saved;
-    let process = current_process();
-    let mut process_inner = process.inner_exclusive_access();
-    process_inner.signal_mask = inner.signal_mask_backup;
-    saved_a0
+    let ucontext_ptr = inner.signal_ucontext_ptr;
+    inner.signal_ucontext_ptr = 0;
+    if ucontext_ptr != 0 {
+        let token = current_user_token();
+        let ucontext = match read_from_user::<UserContext>(token, ucontext_ptr as *const _) {
+            Ok(value) => value,
+            Err(err) => return err,
+        };
+        trace!(
+            "[sigreturn] pid={} ucontext_ptr={:#x} sigmask={:#x} pc={:#x}",
+            pid,
+            ucontext_ptr,
+            ucontext.uc_sigmask,
+            ucontext.uc_mcontext.gregs[0]
+        );
+        let mut restored = saved;
+        restored.sepc = ucontext.uc_mcontext.gregs[0];
+        restored.x[1..].copy_from_slice(&ucontext.uc_mcontext.gregs[1..]);
+        *inner.get_trap_cx() = restored;
+        let process = current_process();
+        let mut process_inner = process.inner_exclusive_access();
+        let mut new_mask = user_mask_to_flags(ucontext.uc_sigmask);
+        new_mask.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
+        process_inner.signal_mask = new_mask;
+        restored.x[10] as isize
+    } else {
+        *inner.get_trap_cx() = saved;
+        let process = current_process();
+        let mut process_inner = process.inner_exclusive_access();
+        process_inner.signal_mask = inner.signal_mask_backup;
+        saved_a0
+    }
 }
 
 /// Get user ID
