@@ -1,7 +1,22 @@
 [build]
+# Default target (can be overridden with --target flag)
 target = "riscv64gc-unknown-none-elf"
 
 [target.riscv64gc-unknown-none-elf]
 rustflags = [
-    "-Clink-arg=-Tsrc/linker.ld", "-Cforce-frame-pointers=yes"
+    "-Clink-arg=-Tsrc/linker.ld",
+    "-Cforce-frame-pointers=yes"
 ]
+
+[target.loongarch64-unknown-none]
+linker = "rust-lld"
+rustflags = [
+    "-Clink-arg=-Tsrc/arch/loongarch64/linker.ld",
+    "-Cforce-frame-pointers=yes",
+    "-Ctarget-feature=-ual",
+    "--cfg=board=\"qemu\""
+]
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]

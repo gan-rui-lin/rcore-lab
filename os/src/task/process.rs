@@ -5,7 +5,9 @@ use crate::config::{USER_STACK_SIZE};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{KERNEL_SPACE, MemorySet, translated_byte_buffer, translated_ref, translated_refmut, translated_str};
 use crate::sync::{Condvar, Mutex, Semaphore, UPIntrFreeCell};
-use crate::trap::{TrapContext, trap_handler};
+use crate::trap::TrapContext;
+#[cfg(target_arch = "riscv64")]
+use crate::trap::trap_handler;
 use xmas_elf::ElfFile;
 use xmas_elf::sections::{SectionData, ShType};
 use xmas_elf::symbol_table::Entry;
@@ -176,7 +178,12 @@ impl ProcessControlBlock {
             ustack_top,
             KERNEL_SPACE.exclusive_access().token(),
             kstack_top,
-            trap_handler as usize,
+            {
+                #[cfg(target_arch = "riscv64")]
+                { trap_handler as usize }
+                #[cfg(target_arch = "loongarch64")]
+                { crate::arch::trap::trap_handler as usize }
+            },
         );
 
         if gp != 0 {
@@ -471,7 +478,12 @@ impl ProcessControlBlock {
             user_sp,  // sp should point to argc
             KERNEL_SPACE.exclusive_access().token(),
             task.kstack.get_top(),
-            trap_handler as usize,
+            {
+                #[cfg(target_arch = "riscv64")]
+                { trap_handler as usize }
+                #[cfg(target_arch = "loongarch64")]
+                { crate::arch::trap::trap_handler as usize }
+            },
         );
         trap_cx.x[10] = argc;
         trap_cx.x[11] = argv_base;

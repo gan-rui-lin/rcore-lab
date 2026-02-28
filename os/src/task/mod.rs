@@ -15,7 +15,7 @@ mod task;
 mod tls;
 
 use crate::fs::{open_file, OpenFlags};
-use crate::sbi::shutdown;
+use crate::arch::shutdown;
 use crate::timer::remove_timer;
 use alloc::sync::Arc;
 use lazy_static::*;
@@ -122,15 +122,28 @@ lazy_static! {
     };
 }
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, target_arch = "riscv64"))]
 const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../user/target/riscv64gc-unknown-none-elf/debug/initcode"
 ));
-#[cfg(not(debug_assertions))]
+
+#[cfg(all(not(debug_assertions), target_arch = "riscv64"))]
 const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../user/target/riscv64gc-unknown-none-elf/release/initcode"
+));
+
+#[cfg(all(debug_assertions, target_arch = "loongarch64"))]
+const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../user/target/loongarch64-unknown-none/debug/initcode"
+));
+
+#[cfg(all(not(debug_assertions), target_arch = "loongarch64"))]
+const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../user/target/loongarch64-unknown-none/release/initcode"
 ));
 
 pub fn add_initproc() {
@@ -210,7 +223,10 @@ pub fn handle_signals() {
         process_inner.signal_mask |= action.mask | flag;
     }
     let trap_cx = task_inner.get_trap_cx();
-    trap_cx.sepc = action.handler;
+    #[cfg(target_arch = "riscv64")]
+    { trap_cx.sepc = action.handler; }
+    #[cfg(target_arch = "loongarch64")]
+    { trap_cx.era = action.handler; }
 }
 
 pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {

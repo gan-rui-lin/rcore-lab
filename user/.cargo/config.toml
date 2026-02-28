@@ -5,3 +5,11 @@ target = "riscv64gc-unknown-none-elf"
 rustflags = [
     "-Clink-args=-Tsrc/linker.ld",
 ]
+
+[target.loongarch64-unknown-none]
+linker = "rust-lld"
+rustflags = [
+    "-Clink-arg=-Tsrc/linker-loongarch64.ld",
+    "-Cforce-frame-pointers=yes",
+    "-Ctarget-feature=-ual",
+]

@@ -1,5 +1,13 @@
 # Building
-TARGET := riscv64gc-unknown-none-elf
+# Architecture selection: riscv64 (default) or loongarch64
+ARCH ?= riscv64
+
+ifeq ($(ARCH), loongarch64)
+  TARGET := loongarch64-unknown-none
+else
+  TARGET := riscv64gc-unknown-none-elf
+endif
+
 MODE := release
 FEATURES ?= ext4
 LOG ?= TRACE
@@ -27,9 +35,15 @@ endif
 KERNEL_ENTRY_PA := 0x80200000
 
 # Binutils
-OBJDUMP := rust-objdump --arch-name=riscv64
-OBJCOPY := rust-objcopy --binary-architecture=riscv64
-OBJCOPY_ELF := rust-objcopy
+ifeq ($(ARCH), loongarch64)
+  OBJDUMP := rust-objdump --arch-name=loongarch64
+  OBJCOPY := rust-objcopy --binary-architecture=loongarch64
+  OBJCOPY_ELF := rust-objcopy
+else
+  OBJDUMP := rust-objdump --arch-name=riscv64
+  OBJCOPY := rust-objcopy --binary-architecture=riscv64
+  OBJCOPY_ELF := rust-objcopy
+endif
 
 CHAPTER ?= $(shell git rev-parse --abbrev-ref HEAD | sed -nE 's/^ch([0-9]+).*$$/\1/p')
 CHAPTER := $(if $(CHAPTER),$(CHAPTER),0)
@@ -48,7 +62,7 @@ all: env kernel-qemu sbi-qemu
 
 env:
 ifeq ($(OFFLINE),)
-	(rustup target list | grep "riscv64gc-unknown-none-elf (installed)") || rustup target add $(TARGET)
+	(rustup target list | grep "$(TARGET) (installed)") || rustup target add $(TARGET)
 	cargo install cargo-binutils
 	rustup component add rust-src
 	rustup component add llvm-tools-preview
@@ -70,14 +84,20 @@ sbi-qemu:
 	cp $(BOOTLOADER) $(SBI_QEMU)
 
 fs-img: $(APPS)
-	@make -C ../user build MODE=$(MODE) TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE)
+	@make -C ../user build MODE=$(MODE) TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE) ARCH=$(ARCH)
 	@rm -f $(FS_IMG)
-	@cd ../easy-fs-fuse && cargo run --release -- -s ../user/build/app/ -t ../user/target/riscv64gc-unknown-none-elf/release/
+	@cd ../easy-fs-fuse && cargo run --release -- -s ../user/build/app/ -t ../user/target/$(TARGET)/release/
 
 kernel:
-	@make -C ../user build MODE=$(MODE) TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE)
-	@echo Platform: $(BOARD)
+	@make -C ../user build MODE=$(MODE) TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE) ARCH=$(ARCH)
+	@echo Platform: $(BOARD) Architecture: $(ARCH)
+ifeq ($(ARCH), loongarch64)
+	@LOG=$(LOG) cargo build $(MODE_ARG) --target $(TARGET) \
+		-Zbuild-std=core,alloc,compiler_builtins \
+		-Zbuild-std-features=compiler-builtins-mem
+else
 	@LOG=$(LOG) cargo build $(MODE_ARG) --features $(FEATURES)
+endif
 
 clean:
 	@cargo clean
@@ -93,13 +113,24 @@ disasm-vim: kernel
 run: build run-inner
 
 run-inner:
+ifeq ($(ARCH), loongarch64)
+	@qemu-system-loongarch64 \
+		-machine virt \
+		-cpu la464-loongarch-cpu \
+		-m 128M \
+		-nographic \
+		-kernel $(KERNEL_ELF) \
+		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+else
 	@qemu-system-riscv64 \
 		-machine virt \
 		-nographic \
 		-bios $(BOOTLOADER) \
 		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
 		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
-        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+endif
 
 debug: build
 	@tmux new-session -d \

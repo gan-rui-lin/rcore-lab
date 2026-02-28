@@ -2,8 +2,10 @@ use crate::{
     mm::{kernel_token, translated_refmut, PageTable, VirtAddr},
     syscall::errno::{errno, EAGAIN, ECHILD},
     task::{TaskControlBlock, add_task, current_process, current_task, current_user_token},
-    trap::{TrapContext, trap_handler},
+    trap::TrapContext,
 };
+#[cfg(target_arch = "riscv64")]
+use crate::trap::trap_handler;
 use alloc::format;
 use alloc::string::ToString;
 use crate::config::USER_STACK_SIZE;
@@ -35,12 +37,16 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     }
     tasks[new_task_tid] = Some(Arc::clone(&new_task));
     let new_task_trap_cx = new_task_inner.get_trap_cx();
+    #[cfg(target_arch = "riscv64")]
+    let trap_handler_addr = trap_handler as usize;
+    #[cfg(target_arch = "loongarch64")]
+    let trap_handler_addr = crate::arch::trap::trap_handler as usize;
     *new_task_trap_cx = TrapContext::app_init_context(
         entry,
         new_task_res.ustack_top(),
         kernel_token(),
         new_task.kstack.get_top(),
-        trap_handler as usize,
+        trap_handler_addr,
     );
     (*new_task_trap_cx).x[10] = arg;
     new_task_tid as isize

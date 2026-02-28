@@ -7,9 +7,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::{
+    arch::shutdown,
     fs::{open_file, File, OpenFlags},
     mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission, VirtAddr},
-    sbi::shutdown,
     task::{
         current_process, current_task, current_trap_cx, current_user_token, exit_current_and_run_next,
         pid2process, suspend_current_and_run_next, SignalAction, SignalFlags,
@@ -112,12 +112,16 @@ pub fn sys_exit(exit_code: i32) -> ! {
     }
     let name = current_process().inner_exclusive_access().name.clone();
     if pid == 4 || name == "sh" {
+        #[cfg(target_arch = "riscv64")]
+        let sepc = current_trap_cx().sepc;
+        #[cfg(target_arch = "loongarch64")]
+        let sepc = current_trap_cx().era;
         trace!(
             "[sys_exit] pid={} name={} code={} sepc={:#x}",
             pid,
             name,
             exit_code,
-            current_trap_cx().sepc
+            sepc
         );
     }
     exit_current_and_run_next(exit_code);
@@ -943,7 +947,10 @@ pub fn sys_sbrk(arg: isize) -> isize {
     if crate::syscall::should_trace_syscall(pid) {
         trace!("kernel:pid[{}] sys_sbrk", pid);
     }
+    #[cfg(target_arch = "riscv64")]
     let sepc = current_trap_cx().sepc;
+    #[cfg(target_arch = "loongarch64")]
+    let sepc = current_trap_cx().era;
     let name = current_process().inner_exclusive_access().name.clone();
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
@@ -1175,12 +1182,16 @@ pub fn sys_exit_group(exit_code: i32) -> ! {
     let pid = current_process().pid.0;
     let name = current_process().inner_exclusive_access().name.clone();
     if pid == 4 || name == "sh" {
+        #[cfg(target_arch = "riscv64")]
+        let sepc = current_trap_cx().sepc;
+        #[cfg(target_arch = "loongarch64")]
+        let sepc = current_trap_cx().era;
         trace!(
             "[sys_exit_group] pid={} name={} code={} sepc={:#x}",
             pid,
             name,
             exit_code,
-            current_trap_cx().sepc
+            sepc
         );
     }
     sys_exit(exit_code)

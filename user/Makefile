@@ -1,10 +1,20 @@
-TARGET := riscv64gc-unknown-none-elf
+# Architecture selection: riscv64 (default) or loongarch64
+ARCH ?= riscv64
+
+ifeq ($(ARCH), loongarch64)
+  TARGET := loongarch64-unknown-none
+  OBJDUMP := rust-objdump --arch-name=loongarch64
+  OBJCOPY := rust-objcopy --binary-architecture=loongarch64
+else
+  TARGET := riscv64gc-unknown-none-elf
+  OBJDUMP := rust-objdump --arch-name=riscv64
+  OBJCOPY := rust-objcopy --binary-architecture=riscv64
+endif
+
 MODE := release
 APP_DIR := src/bin
 TARGET_DIR := target/$(TARGET)/$(MODE)
 BUILD_DIR := build
-OBJDUMP := rust-objdump --arch-name=riscv64
-OBJCOPY := rust-objcopy --binary-architecture=riscv64
 PY := python3
 
 ifeq ($(MODE), release)
@@ -34,10 +44,14 @@ ELFS := $(patsubst $(APP_DIR)/%.rs, $(TARGET_DIR)/%, $(APPS))
 
 binary:
 	@echo $(ELFS)
-	@if [ ${CHAPTER} -gt 3 ]; then \
-		cargo build $(MODE_ARG) ;\
+	@if [ "$(ARCH)" = "loongarch64" ]; then \
+		cargo build $(MODE_ARG) --target $(TARGET) \
+			-Zbuild-std=core,alloc,compiler_builtins \
+			-Zbuild-std-features=compiler-builtins-mem; \
+	elif [ ${CHAPTER} -gt 3 ]; then \
+		cargo build $(MODE_ARG); \
 	else \
-		CHAPTER=$(CHAPTER) python3 build.py ;\
+		CHAPTER=$(CHAPTER) python3 build.py; \
 	fi
 	@$(foreach elf, $(ELFS), \
 		$(OBJCOPY) $(elf) --strip-all -O binary $(patsubst $(TARGET_DIR)/%, $(TARGET_DIR)/%.bin, $(elf)); \

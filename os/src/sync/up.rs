@@ -2,7 +2,12 @@
 use core::cell::{RefCell, RefMut, UnsafeCell};
 use core::ops::{Deref, DerefMut};
 use lazy_static::lazy_static;
+
+#[cfg(target_arch = "riscv64")]
 use riscv::register::sstatus;
+
+#[cfg(target_arch = "loongarch64")]
+use loongArch64::register::crmd;
 
 /// Wrap a static data structure inside it so that we are
 /// able to access it without any `unsafe`.
@@ -75,10 +80,20 @@ impl IntrMaskingInfo {
     }
 
     pub fn enter(&mut self) {
+        #[cfg(target_arch = "riscv64")]
         let sie = sstatus::read().sie();
+
+        #[cfg(target_arch = "loongarch64")]
+        let sie = crmd::read().ie();
+
+        #[cfg(target_arch = "riscv64")]
         unsafe {
             sstatus::clear_sie();
         }
+
+        #[cfg(target_arch = "loongarch64")]
+        crmd::set_ie(false);
+
         if self.nested_level == 0 {
             self.sie_before_masking = sie;
         }
@@ -88,9 +103,13 @@ impl IntrMaskingInfo {
     pub fn exit(&mut self) {
         self.nested_level -= 1;
         if self.nested_level == 0 && self.sie_before_masking {
+            #[cfg(target_arch = "riscv64")]
             unsafe {
                 sstatus::set_sie();
             }
+
+            #[cfg(target_arch = "loongarch64")]
+            crmd::set_ie(true);
         }
     }
 }

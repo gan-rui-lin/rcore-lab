@@ -2,33 +2,53 @@
 
 use core::cmp::Ordering;
 
+#[cfg(target_arch = "riscv64")]
 use crate::config::CLOCK_FREQ;
-use crate::sbi::set_timer;
 use crate::sync::UPIntrFreeCell;
 use crate::task::{TaskControlBlock, wakeup_task};
 use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
 use lazy_static::*;
+
+#[cfg(target_arch = "riscv64")]
 use riscv::register::time;
+#[cfg(target_arch = "riscv64")]
+use crate::sbi::set_timer;
 
 const TICKS_PER_SEC: usize = 100;
 const MSEC_PER_SEC: usize = 1000;
 const MICRO_PER_SEC: usize = 1_000_000;
 
 pub fn get_time() -> usize {
-    time::read()
+    #[cfg(target_arch = "riscv64")]
+    return time::read();
+
+    #[cfg(target_arch = "loongarch64")]
+    return crate::arch::get_time();
 }
 
 pub fn get_time_ms() -> usize {
-    time::read() / (CLOCK_FREQ / MSEC_PER_SEC)
+    #[cfg(target_arch = "riscv64")]
+    return time::read() / (CLOCK_FREQ / MSEC_PER_SEC);
+
+    #[cfg(target_arch = "loongarch64")]
+    return crate::arch::get_time_ms();
 }
 
 pub fn get_time_us() -> usize {
-    time::read() * MICRO_PER_SEC / CLOCK_FREQ
+    #[cfg(target_arch = "riscv64")]
+    return time::read() * MICRO_PER_SEC / CLOCK_FREQ;
+
+    #[cfg(target_arch = "loongarch64")]
+    return crate::arch::get_time_us();
 }
 
 pub fn set_next_trigger() {
+    #[cfg(target_arch = "riscv64")]
     set_timer(get_time() + CLOCK_FREQ / TICKS_PER_SEC);
+
+    #[cfg(target_arch = "loongarch64")]
+    crate::arch::set_next_trigger();
 }
 
 pub struct TimerCondVar {

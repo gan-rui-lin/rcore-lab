@@ -1,61 +1,73 @@
 //! Implementation of [`TrapContext`]
-use riscv::register::sstatus::{self, Sstatus, SPP};
 
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-///trap context structure containing sstatus, sepc and registers
-pub struct TrapContext {
-    /// General-Purpose Register x0-31
-    pub x: [usize; 32],
-    /// Supervisor Status Register
-    pub sstatus: Sstatus,
-    /// Supervisor Exception Program Counter
-    pub sepc: usize,
-    /// Token of kernel address space
-    pub kernel_satp: usize,
-    /// Kernel stack pointer of the current application
-    pub kernel_sp: usize,
-    /// Virtual address of trap handler entry point in kernel
-    pub trap_handler: usize,
-}
+// For RISC-V, define the TrapContext here
+#[cfg(target_arch = "riscv64")]
+mod riscv_impl {
+    use riscv::register::sstatus::{self, Sstatus, SPP};
 
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-/// Trap context structure for traps/interrupts from kernel mode
-pub(super) struct KernelTrapContext {
-    /// General-Purpose Register x0-31
-    pub x: [usize; 32],
-    /// Supervisor Status Register
-    pub sstatus: Sstatus,
-    /// Supervisor Exception Program Counter
-    pub sepc: usize,
-}
-
-impl TrapContext {
-    /// put the sp(stack pointer) into x\[2\] field of TrapContext
-    pub fn set_sp(&mut self, sp: usize) {
-        self.x[2] = sp;
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
+    ///trap context structure containing sstatus, sepc and registers
+    pub struct TrapContext {
+        /// General-Purpose Register x0-31
+        pub x: [usize; 32],
+        /// Supervisor Status Register
+        pub sstatus: Sstatus,
+        /// Supervisor Exception Program Counter
+        pub sepc: usize,
+        /// Token of kernel address space
+        pub kernel_satp: usize,
+        /// Kernel stack pointer of the current application
+        pub kernel_sp: usize,
+        /// Virtual address of trap handler entry point in kernel
+        pub trap_handler: usize,
     }
-    /// init the trap context of an application
-    pub fn app_init_context(
-        entry: usize,
-        sp: usize,
-        kernel_satp: usize,
-        kernel_sp: usize,
-        trap_handler: usize,
-    ) -> Self {
-        let mut sstatus = sstatus::read();
-        // set CPU privilege to User after trapping back
-        sstatus.set_spp(SPP::User);
-        let mut cx = Self {
-            x: [0; 32],
-            sstatus,
-            sepc: entry,  // entry point of app
-            kernel_satp,  // addr of page table
-            kernel_sp,    // kernel stack
-            trap_handler, // addr of trap_handler function
-        };
-        cx.set_sp(sp); // app's user stack pointer
-        cx // return initial Trap Context of app
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone)]
+    /// Trap context structure for traps/interrupts from kernel mode
+    pub struct KernelTrapContext {
+        /// General-Purpose Register x0-31
+        pub x: [usize; 32],
+        /// Supervisor Status Register
+        pub sstatus: Sstatus,
+        /// Supervisor Exception Program Counter
+        pub sepc: usize,
+    }
+
+    impl TrapContext {
+        /// put the sp(stack pointer) into x\[2\] field of TrapContext
+        pub fn set_sp(&mut self, sp: usize) {
+            self.x[2] = sp;
+        }
+        /// init the trap context of an application
+        pub fn app_init_context(
+            entry: usize,
+            sp: usize,
+            kernel_satp: usize,
+            kernel_sp: usize,
+            trap_handler: usize,
+        ) -> Self {
+            let mut sstatus = sstatus::read();
+            // set CPU privilege to User after trapping back
+            sstatus.set_spp(SPP::User);
+            let mut cx = Self {
+                x: [0; 32],
+                sstatus,
+                sepc: entry,  // entry point of app
+                kernel_satp,  // addr of page table
+                kernel_sp,    // kernel stack
+                trap_handler, // addr of trap_handler function
+            };
+            cx.set_sp(sp); // app's user stack pointer
+            cx // return initial Trap Context of app
+        }
     }
 }
+
+#[cfg(target_arch = "riscv64")]
+pub use riscv_impl::*;
+
+// For LoongArch, use the TrapContext from arch module
+#[cfg(target_arch = "loongarch64")]
+pub use crate::arch::TrapContext;

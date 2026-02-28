@@ -2,6 +2,7 @@
 use super::TaskContext;
 use core::arch::global_asm;
 
+#[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("switch.S"));
 
 extern "C" {

@@ -10,6 +10,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
 use lazy_static::*;
+
+#[cfg(target_arch = "riscv64")]
 use riscv::register::satp;
 
 extern "C" {
@@ -588,12 +590,22 @@ impl MemorySet {
             );
         }
     }
-    /// Change page table by writing satp CSR Register.
+    /// Change page table by writing satp CSR Register (RISC-V) or PGDL (LoongArch).
     pub fn activate(&self) {
         let satp = self.page_table.token();
+
+        #[cfg(target_arch = "riscv64")]
         unsafe {
             satp::write(satp);
             asm!("sfence.vma");
+        }
+
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            // Write to PGDL (Page Global Directory Low) register
+            asm!("csrwr {}, 0x19", in(reg) satp);
+            // Memory barrier + flush all TLB entries
+            asm!("dbar 0; invtlb 0x0, $zero, $zero");
         }
     }
     /// Translate a virtual page number to a page table entry

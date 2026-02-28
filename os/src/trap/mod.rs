@@ -14,31 +14,56 @@
 
 mod context;
 
-use crate::config::TRAMPOLINE;
+#[cfg(target_arch = "riscv64")]
+use crate::config::PAGE_SIZE;
+#[cfg(target_arch = "riscv64")]
+use crate::fs::{open_file, OpenFlags};
+#[cfg(target_arch = "riscv64")]
+use crate::mm::{PageTable, VirtAddr};
+#[cfg(target_arch = "riscv64")]
 use crate::syscall::syscall;
+#[cfg(target_arch = "riscv64")]
 use crate::task::{
     current_add_signal, current_process, current_trap_cx, current_trap_cx_user_va,
     current_user_token, handle_signals, suspend_current_and_run_next, SignalFlags,
 };
-use crate::mm::{PageTable, VirtAddr};
-use crate::config::PAGE_SIZE;
-use crate::fs::{open_file, OpenFlags};
-use xmas_elf::ElfFile;
+#[cfg(target_arch = "riscv64")]
 use crate::timer::{check_timer, set_next_trigger};
+#[cfg(target_arch = "riscv64")]
 use core::arch::{asm, global_asm};
+#[cfg(target_arch = "riscv64")]
+use xmas_elf::ElfFile;
+
+// For LoongArch, we still need some functions for compatibility
+#[cfg(target_arch = "loongarch64")]
+use crate::task::current_user_token;
+#[cfg(target_arch = "loongarch64")]
+use crate::mm::{PageTable, VirtAddr};
+
+#[cfg(target_arch = "riscv64")]
+use crate::config::TRAMPOLINE;
+#[cfg(target_arch = "riscv64")]
 use riscv::register::{
     mtvec::TrapMode,
     scause::{self, Exception, Interrupt, Trap},
     sie, sscratch, sstatus, stval, stvec,
 };
 
+#[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("trap.S"));
 
 /// Initialize trap handling
+#[cfg(target_arch = "riscv64")]
 pub fn init() {
     set_kernel_trap_entry();
 }
 
+#[cfg(target_arch = "loongarch64")]
+pub fn init() {
+    crate::arch::trap_init();
+}
+
+#[cfg(target_arch = "riscv64")]
 fn set_kernel_trap_entry() {
     extern "C" {
         fn __alltraps();
@@ -51,6 +76,7 @@ fn set_kernel_trap_entry() {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 fn set_user_trap_entry() {
     unsafe {
         stvec::write(TRAMPOLINE as usize, TrapMode::Direct);
@@ -58,18 +84,26 @@ fn set_user_trap_entry() {
 }
 
 /// enable timer interrupt in supervisor mode
+#[cfg(target_arch = "riscv64")]
 pub fn enable_timer_interrupt() {
     unsafe {
         sie::set_stimer();
     }
 }
 
+#[cfg(target_arch = "loongarch64")]
+pub fn enable_timer_interrupt() {
+    crate::arch::enable_timer_interrupt();
+}
+
+#[cfg(target_arch = "riscv64")]
 fn enable_supervisor_interrupt() {
     unsafe {
         sstatus::set_sie();
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 fn disable_supervisor_interrupt() {
     unsafe {
         sstatus::clear_sie();
@@ -78,6 +112,7 @@ fn disable_supervisor_interrupt() {
 
 /// trap handler
 #[no_mangle]
+#[cfg(target_arch = "riscv64")]
 pub fn trap_handler() -> ! {
     set_kernel_trap_entry();
     let scause = scause::read();
@@ -277,6 +312,7 @@ pub fn trap_handler() -> ! {
 /// set the new addr of __restore asm function in TRAMPOLINE page,
 /// set the reg a0 = trap_cx_ptr, reg a1 = phy addr of usr page table,
 /// finally, jump to new addr of __restore asm function
+#[cfg(target_arch = "riscv64")]
 pub fn trap_return() -> ! {
     disable_supervisor_interrupt();
     set_user_trap_entry();
@@ -300,6 +336,12 @@ pub fn trap_return() -> ! {
     }
 }
 
+#[cfg(target_arch = "loongarch64")]
+#[allow(missing_docs)]
+pub fn trap_return() -> ! {
+    unsafe { crate::arch::trap_return() }
+}
+
 /// Debug helper for gdb: translate a user virtual address to physical address.
 /// Returns 0 if unmapped.
 #[no_mangle]
@@ -315,6 +357,7 @@ pub extern "C" fn debug_user_va_to_pa(va: usize) -> usize {
 }
 
 #[no_mangle]
+#[cfg(target_arch = "riscv64")]
 /// handle trap from kernel
 /// Unimplement: traps/interrupts/exceptions from kernel mode
 /// Todo: Chapter 9: I/O device

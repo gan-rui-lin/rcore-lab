@@ -11,7 +11,6 @@ bitflags = "1.2.1"
 buddy_system_allocator = "0.6"
 lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
 log = "0.4"
-riscv = { path = "../vendor/riscv", features = ["inline-asm"] }
 xmas-elf = "0.7.0"
 spin = "0.7.0"
 virtio-drivers = { path = "../vendor/virtio-drivers-old" }
@@ -20,7 +19,21 @@ lwext4_rust = { path = "../vendor/lwext4_rust", default-features = false, option
 fatfs = { path = "../vendor/rust-fatfs", default-features = false, features = ["alloc", "lfn", "unicode"] }
 volatile = { path = "../vendor/volatile-0.3.0" }
 
+# Architecture-specific dependencies
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+riscv = { path = "../vendor/riscv", features = ["inline-asm"] }
+
+[target.'cfg(target_arch = "loongarch64")'.dependencies]
+loongArch64 = { path = "../vendor/loongArch64" }
+
 [patch.crates-io]
 volatile = { path = "../vendor/volatile-0.3.0" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
 [features]
 ext4 = ["lwext4_rust"]

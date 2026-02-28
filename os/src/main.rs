@@ -18,12 +18,19 @@
 //! We then call [`task::run_tasks()`] and for the first time go to
 //! userspace.
 
-#![deny(missing_docs)]
+#![cfg_attr(not(target_arch = "loongarch64"), deny(missing_docs))]
 #![deny(warnings)]
+// For LoongArch, allow some lints during development
+#![cfg_attr(target_arch = "loongarch64", allow(dead_code))]
+#![cfg_attr(target_arch = "loongarch64", allow(unused_imports))]
+#![cfg_attr(target_arch = "loongarch64", allow(missing_docs))]
+#![cfg_attr(target_arch = "loongarch64", allow(named_asm_labels))]
 #![no_std]
 #![no_main]
 #![feature(panic_info_message)]
 #![feature(alloc_error_handler)]
+#![feature(naked_functions)]
+#![feature(asm_const)]
 
 #[macro_use]
 extern crate bitflags;
@@ -32,8 +39,33 @@ extern crate log;
 
 extern crate alloc;
 
+// Architecture abstraction layer
+pub mod arch;
+
+// RISC-V specific console
+#[cfg(target_arch = "riscv64")]
 #[macro_use]
 mod console;
+
+// LoongArch uses console from arch module
+#[cfg(target_arch = "loongarch64")]
+#[macro_use]
+mod console {
+    #[macro_export]
+    macro_rules! print {
+        ($fmt: literal $(, $($arg: tt)+)?) => {
+            $crate::arch::console::print(format_args!($fmt $(, $($arg)+)?));
+        }
+    }
+
+    #[macro_export]
+    macro_rules! println {
+        ($fmt: literal $(, $($arg: tt)+)?) => {
+            $crate::arch::console::print(format_args!(concat!($fmt, "\n") $(, $($arg)+)?));
+        }
+    }
+}
+
 #[path = "boards/qemu.rs"]
 mod board;
 pub mod config;
@@ -43,7 +75,11 @@ pub mod fs;
 pub mod lang_items;
 pub mod logging;
 pub mod mm;
+
+// SBI (Supervisor Binary Interface) is RISC-V specific
+#[cfg(target_arch = "riscv64")]
 pub mod sbi;
+
 pub mod sync;
 pub mod syscall;
 pub mod task;
@@ -53,9 +89,11 @@ pub mod trap;
 use lazy_static::lazy_static;
 use sync::UPIntrFreeCell;
 
-use core::arch::global_asm;
+// RISC-V entry point (RISC-V uses separate entry.asm)
+#[cfg(target_arch = "riscv64")]
+core::arch::global_asm!(include_str!("entry.asm"));
 
-global_asm!(include_str!("entry.asm"));
+// LoongArch entry point is in arch/loongarch64/boot.rs (no separate asm file needed)
 /// clear BSS segment
 fn clear_bss() {
     extern "C" {

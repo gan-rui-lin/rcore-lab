@@ -1,8 +1,13 @@
 //!Stdin & Stdout
 use super::File;
 use crate::mm::UserBuffer;
-use crate::sbi::console_getchar;
 use crate::task::suspend_current_and_run_next;
+
+#[cfg(target_arch = "riscv64")]
+use crate::sbi::console_getchar;
+
+#[cfg(target_arch = "loongarch64")]
+use crate::arch::console_getchar;
 
 /// stdin file for getting chars from console
 pub struct Stdin;

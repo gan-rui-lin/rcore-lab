@@ -36,12 +36,17 @@ pub const VIRTGPU_XRES: u32 = 1280;
 /// Default virtio-gpu vertical resolution (pixels).
 pub const VIRTGPU_YRES: u32 = 800;
 
+#[cfg(target_arch = "riscv64")]
 use crate::drivers::block::BLOCK_DEVICE;
+#[cfg(target_arch = "riscv64")]
 use crate::drivers::chardev::{CharDevice, UART};
+#[cfg(target_arch = "riscv64")]
 use crate::drivers::plic::{IntrTargetPriority, PLIC};
+#[cfg(target_arch = "riscv64")]
 use crate::drivers::{KEYBOARD_DEVICE, MOUSE_DEVICE};
 
 /// Initialize board-level devices and PLIC routing.
+#[cfg(target_arch = "riscv64")]
 pub fn device_init() {
     use riscv::register::sie;
     let mut plic = unsafe { PLIC::new(VIRT_PLIC) }; // 创建 PLIC 访问器
@@ -61,6 +66,7 @@ pub fn device_init() {
 }
 
 /// Dispatch a PLIC interrupt to the corresponding device handler.
+#[cfg(target_arch = "riscv64")]
 pub fn irq_handler() {
     let mut plic = unsafe { PLIC::new(VIRT_PLIC) }; // 创建 PLIC 访问器，处理中断
     let intr_src_id = plic.claim(0, IntrTargetPriority::Supervisor); // 领取 hart 0 的挂起 IRQ
@@ -72,4 +78,16 @@ pub fn irq_handler() {
         _ => panic!("unsupported IRQ {}", intr_src_id), // 未知 IRQ
     }
     plic.complete(0, IntrTargetPriority::Supervisor, intr_src_id); // 完成中断，重新使能该 IRQ
+}
+
+/// LoongArch device initialization (placeholder)
+#[cfg(target_arch = "loongarch64")]
+pub fn device_init() {
+    info!("[kernel] LoongArch device initialization skipped (not yet implemented)");
+}
+
+/// LoongArch IRQ handler (placeholder)
+#[cfg(target_arch = "loongarch64")]
+pub fn irq_handler() {
+    panic!("LoongArch IRQ handler not yet implemented");
 }
