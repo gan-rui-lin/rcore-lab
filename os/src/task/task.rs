@@ -39,8 +39,13 @@ pub struct TaskControlBlockInner {
     pub signal_pending: super::SignalFlags,
     pub signal_ucontext_ptr: usize,
     pub clear_child_tid: usize,
+    pub interrupted_by_signal: bool,
+    pub canceltype: u8, // 0=DEFERRED, 1=ASYNCHRONOUS (workaround for missing pthread_setcanceltype)
     // for debug
     pub last_syscall: usize,
+    // SIGCANCEL loop detection to prevent pthread_cancel hanging
+    pub sigcancel_last_pc: usize,
+    pub sigcancel_loop_count: usize,
 }
 
 impl TaskControlBlockInner {
@@ -75,7 +80,11 @@ impl TaskControlBlock {
                     signal_pending: super::SignalFlags::empty(),
                     signal_ucontext_ptr: 0,
                     clear_child_tid: 0,
+                    interrupted_by_signal: false,
+                    canceltype: 0, // DEFERRED by default
                     last_syscall: 0,
+                    sigcancel_last_pc: 0,
+                    sigcancel_loop_count: 0,
                 })
             },
         }
