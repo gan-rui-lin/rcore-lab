@@ -74,7 +74,40 @@ pub fn futex_wait_bitset(futex_key: FutexKey, bitset: i32) -> isize {
     }
     drop(task);
     block_current_and_run_next();
-    0
+
+    // Check if woken by signal (EINTR)
+    let task = current_task().unwrap();
+    let mut task_inner = task.inner_exclusive_access();
+    let interrupted = task_inner.interrupted_by_signal;
+    if interrupted {
+        task_inner.interrupted_by_signal = false; // Clear flag
+    }
+    let (pid, tid) = task.process.upgrade().map(|p| (
+        p.pid.0,
+        task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0)
+    )).unwrap_or((0, 0));
+
+    // Log for pthread tests
+    if pid == 34 || pid == 36 {
+        info!(
+            "[futex] wait_resume pid={} tid={} interrupted={} status={:?}",
+            pid, tid, interrupted, task_inner.task_status
+        );
+    }
+    drop(task_inner);
+    drop(task);
+
+    if interrupted {
+        // Interrupted by signal - return -EINTR
+        info!(
+            "[futex] wait_return pid={} tid={} ret=EINTR(-4)",
+            pid, tid
+        );
+        -4 // EINTR
+    } else {
+        // Woken normally by futex_wake
+        0
+    }
 }
 
 pub fn futex_wake(futex_key: FutexKey, max_size: usize) -> usize {

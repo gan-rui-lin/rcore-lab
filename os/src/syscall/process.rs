@@ -248,7 +248,7 @@ pub fn sys_futex(
                 *futex_word,
                 has_timeout
             );
-            futex_wait(key.clone());
+            let ret = futex_wait(key.clone());
             if has_timeout {
                 let task = current_task().unwrap();
                 let timed_out = futex_remove_waiter(&key, &task);
@@ -258,7 +258,7 @@ pub fn sys_futex(
                     return errno(ETIMEDOUT);
                 }
             }
-            0
+            ret
         }
         FutexCmd::FUTEX_WAKE => {
             let woke = futex_wake(key, val as usize) as isize;
@@ -321,7 +321,7 @@ pub fn sys_futex(
                 val3,
                 has_timeout
             );
-            futex_wait_bitset(key.clone(), val3);
+            let ret = futex_wait_bitset(key.clone(), val3);
             if has_timeout {
                 let task = current_task().unwrap();
                 let timed_out = futex_remove_waiter(&key, &task);
@@ -331,7 +331,7 @@ pub fn sys_futex(
                     return errno(ETIMEDOUT);
                 }
             }
-            0
+            ret
         }
         FutexCmd::FUTEX_WAKE_BITSET => {
             if val3 == 0 {
@@ -1713,12 +1713,13 @@ pub fn sys_sigreturn() -> isize {
             Ok(value) => value,
             Err(err) => return err,
         };
-        trace!(
-            "[sigreturn] pid={} ucontext_ptr={:#x} sigmask={:#x} pc={:#x}",
+        info!(
+            "[sigreturn] pid={} ucontext_ptr={:#x} saved_pc={:#x} ucontext_pc={:#x} sigmask={:#x}",
             pid,
             ucontext_ptr,
-            ucontext.uc_sigmask,
-            ucontext.uc_mcontext.gregs[0]
+            saved.sepc,
+            ucontext.uc_mcontext.gregs[0],
+            ucontext.uc_sigmask
         );
         let mut restored = saved;
         restored.sepc = ucontext.uc_mcontext.gregs[0];
@@ -1729,12 +1730,76 @@ pub fn sys_sigreturn() -> isize {
         let mut new_mask = user_mask_to_flags(ucontext.uc_sigmask);
         new_mask.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
         process_inner.signal_mask = new_mask;
+
+        // Detect SIGCANCEL infinite loop after sigreturn
+        let return_pc = restored.sepc;
+        let proc_pending = process_inner.signal_pending & !process_inner.signal_mask;
+        let task_pending = inner.signal_pending & !process_inner.signal_mask;
+        let has_pending_sigcancel = (proc_pending | task_pending).contains(SignalFlags::SIG33);
+
+        if has_pending_sigcancel {
+            if return_pc == inner.sigcancel_last_pc {
+                inner.sigcancel_loop_count += 1;
+                const MAX_SIGCANCEL_STUCK: usize = 3;
+                if inner.sigcancel_loop_count >= MAX_SIGCANCEL_STUCK {
+                    let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+                    warn!(
+                        "[sigreturn] SIGCANCEL loop detected pid={} tid={} pc={:#x} count={}, forcing exit",
+                        pid, tid, return_pc, inner.sigcancel_loop_count
+                    );
+                    process_inner.signal_pending.remove(SignalFlags::SIG33);
+                    inner.signal_pending.remove(SignalFlags::SIG33);
+                    drop(inner);
+                    drop(process_inner);
+                    exit_current_and_run_next(-33);
+                }
+            } else {
+                inner.sigcancel_last_pc = return_pc;
+                inner.sigcancel_loop_count = 1;
+            }
+        } else {
+            inner.sigcancel_last_pc = 0;
+            inner.sigcancel_loop_count = 0;
+        }
+
         restored.x[10] as isize
     } else {
         *inner.get_trap_cx() = saved;
         let process = current_process();
         let mut process_inner = process.inner_exclusive_access();
         process_inner.signal_mask = inner.signal_mask_backup;
+
+        // Detect SIGCANCEL infinite loop after sigreturn
+        let return_pc = saved.sepc;
+        let proc_pending = process_inner.signal_pending & !process_inner.signal_mask;
+        let task_pending = inner.signal_pending & !process_inner.signal_mask;
+        let has_pending_sigcancel = (proc_pending | task_pending).contains(SignalFlags::SIG33);
+
+        if has_pending_sigcancel {
+            if return_pc == inner.sigcancel_last_pc {
+                inner.sigcancel_loop_count += 1;
+                const MAX_SIGCANCEL_STUCK: usize = 3;
+                if inner.sigcancel_loop_count >= MAX_SIGCANCEL_STUCK {
+                    let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+                    warn!(
+                        "[sigreturn] SIGCANCEL loop detected pid={} tid={} pc={:#x} count={}, forcing exit",
+                        pid, tid, return_pc, inner.sigcancel_loop_count
+                    );
+                    process_inner.signal_pending.remove(SignalFlags::SIG33);
+                    inner.signal_pending.remove(SignalFlags::SIG33);
+                    drop(inner);
+                    drop(process_inner);
+                    exit_current_and_run_next(-33);
+                }
+            } else {
+                inner.sigcancel_last_pc = return_pc;
+                inner.sigcancel_loop_count = 1;
+            }
+        } else {
+            inner.sigcancel_last_pc = 0;
+            inner.sigcancel_loop_count = 0;
+        }
+
         saved_a0
     }
 }
@@ -2020,4 +2085,41 @@ pub fn sys_rt_sigtimedwait(
         }
         suspend_current_and_run_next();
     }
+}
+
+/// Workaround for missing pthread_setcanceltype in test binary
+/// Implements kernel-side tracking of cancel type for SIGCANCEL handler
+pub fn sys_pthread_setcanceltype(new: usize, old: *mut usize) -> isize {
+    const PTHREAD_CANCEL_ASYNCHRONOUS: usize = 1;
+
+    // Validate new type (0=DEFERRED, 1=ASYNCHRONOUS)
+    if new > PTHREAD_CANCEL_ASYNCHRONOUS {
+        return errno(EINVAL);
+    }
+
+    let task = current_task().unwrap();
+    let mut task_inner = task.inner_exclusive_access();
+
+    // Save old value if requested
+    if !old.is_null() {
+        let token = current_user_token();
+        *translated_refmut(token, old) = task_inner.canceltype as usize;
+    }
+
+    // Set new value
+    task_inner.canceltype = new as u8;
+
+    let pid = current_process().pid.0;
+    if pid == 36 {  // Log for pthread_cancel test
+        info!(
+            "[pthread_setcanceltype] pid={} tid={} old={} new={} ({})",
+            pid,
+            task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
+            task_inner.canceltype,
+            new,
+            if new == 1 { "ASYNC" } else { "DEFERRED" }
+        );
+    }
+
+    0
 }
