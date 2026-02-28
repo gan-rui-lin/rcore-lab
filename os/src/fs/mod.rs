@@ -158,6 +158,7 @@ pub fn ensure_basic_paths() {
     create_dir("/etc");
     create_dir("/dev");
     create_dir("/dev/misc");
+    create_dir("/dev/shm");
     create_dir("/bin");
     create_dir("/usr");
     create_dir("/usr/bin");

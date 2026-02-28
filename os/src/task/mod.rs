@@ -314,6 +314,17 @@ pub fn handle_signals() {
         return;
     }
     let signal_trace_count = SIGNAL_TRACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if pending.bits() & (1u64 << 33) != 0 {
+        info!(
+            "[signal] has_sig33 pid={} tid={} proc_pending={:?} task_pending={:?} mask={:?} pending={:?}",
+            process.pid.0,
+            task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
+            process_inner.signal_pending,
+            task_inner.signal_pending,
+            process_inner.signal_mask,
+            pending
+        );
+    }
     if signal_trace_count % SIGNAL_TRACE_INTERVAL == 0 {
         info!(
             "[signal] pending pid={} tid={} status={:?} proc_pending={:?} task_pending={:?} mask={:?} has_trap={}",
@@ -344,22 +355,83 @@ pub fn handle_signals() {
         };
         (signum, flag, true)
     };
-    if task_inner.task_status == TaskStatus::Blocked {
-        let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+    let pid = process.pid.0;
+    let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+    let task_status = task_inner.task_status;
+    let last_syscall = task_inner.last_syscall;
+
+    // Debug: log task status when signal arrives for SIG33
+    if signum == 33 && (pid == 34 || pid == 36) {
+        let saved_pc = task_inner.signal_trap_cx.as_ref()
+            .map(|cx| cx.sepc)
+            .unwrap_or(task_inner.get_trap_cx().sepc);
+        info!(
+            "[signal] deliver_pre pid={} tid={} signum={} status={:?} last_syscall={} saved_pc={:#x} has_saved_cx={}",
+            pid, tid, signum, task_status, last_syscall, saved_pc, task_inner.signal_trap_cx.is_some()
+        );
+    }
+
+    // Detect SIGCANCEL infinite loop (pthread_cancel hanging due to missing pthread_setcanceltype)
+    if signum == 33 {
+        let current_pc = task_inner.signal_trap_cx.as_ref()
+            .map(|cx| cx.sepc)
+            .unwrap_or(task_inner.get_trap_cx().sepc);
+
+        if current_pc == task_inner.sigcancel_last_pc {
+            task_inner.sigcancel_loop_count += 1;
+
+            // If stuck in same PC for too many SIGCANCELs, force exit to prevent hanging
+            const MAX_SIGCANCEL_LOOP: usize = 2;
+            if task_inner.sigcancel_loop_count >= MAX_SIGCANCEL_LOOP {
+                warn!(
+                    "[signal] SIGCANCEL loop detected pid={} tid={} pc={:#x} count={}, forcing exit",
+                    pid, tid, current_pc, task_inner.sigcancel_loop_count
+                );
+                // Clear the pending signal
+                if from_process {
+                    process_inner.signal_pending.remove(flag);
+                } else {
+                    task_inner.signal_pending.remove(flag);
+                }
+                // Force exit with PTHREAD_CANCELED status
+                drop(task_inner);
+                drop(process_inner);
+                exit_current_and_run_next(-33);
+                return;
+            }
+        } else {
+            // Different PC, reset counter
+            task_inner.sigcancel_last_pc = current_pc;
+            task_inner.sigcancel_loop_count = 1;
+        }
+    }
+
+    if task_status == TaskStatus::Blocked {
         futex_remove_waiter_any(&task);
         task_inner.task_status = TaskStatus::Ready;
+        task_inner.interrupted_by_signal = true;
         drop(task_inner);
         add_task(task);
-        if signal_trace_count % SIGNAL_TRACE_INTERVAL == 0 {
+        if signal_trace_count % SIGNAL_TRACE_INTERVAL == 0 || signum == 33 {
             info!(
-                "[signal] wake blocked pid={} tid={} signum={} from_process={}",
-                process.pid.0,
+                "[signal] wake blocked pid={} tid={} signum={} from_process={} set_interrupted=true",
+                pid,
                 tid,
                 signum,
                 from_process
             );
         }
         return;
+    }
+    if signum == 33 {
+        info!(
+            "[signal] check_nest pid={} tid={} signum={} has_trap_cx={} is_sigkill={}",
+            process.pid.0,
+            task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
+            signum,
+            task_inner.signal_trap_cx.is_some(),
+            signum == SignalFlags::SIGKILL.bits().trailing_zeros() as usize
+        );
     }
     if task_inner.signal_trap_cx.is_some()
         && signum != SignalFlags::SIGKILL.bits().trailing_zeros() as usize
@@ -426,9 +498,32 @@ pub fn handle_signals() {
     }
 
     if task_inner.signal_trap_cx.is_none() {
+        let current_pc = task_inner.get_trap_cx().sepc;
         task_inner.signal_trap_cx = Some(*task_inner.get_trap_cx());
+        let old_signal_mask = process_inner.signal_mask;
         task_inner.signal_mask_backup = process_inner.signal_mask;
         process_inner.signal_mask |= action.mask | flag;
+        if signum == 33 {
+            info!(
+                "[signal] save_trap_cx pid={} tid={} signum={} saved_pc={:#x} old_mask={:?} action_mask={:?} flag={:?} new_mask={:?}",
+                process.pid.0,
+                task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
+                signum,
+                current_pc,
+                old_signal_mask,
+                action.mask,
+                flag,
+                process_inner.signal_mask
+            );
+        }
+    } else if signum == 33 {
+        info!(
+            "[signal] already_nested pid={} tid={} signum={} cur_mask={:?}",
+            process.pid.0,
+            task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
+            signum,
+            process_inner.signal_mask
+        );
     }
     let trap_cx = task_inner.get_trap_cx();
     trap_cx.sepc = action.handler;

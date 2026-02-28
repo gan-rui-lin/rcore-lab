@@ -119,7 +119,19 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
 pub fn sys_waittid(tid: usize) -> isize {
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
+    let pid = process.pid.0;
+
     let task_inner = task.inner_exclusive_access();
+    let calling_tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+
+    // Log to verify if pthread_join uses sys_waittid
+    if pid == 34 || pid == 36 {
+        info!(
+            "[sys_waittid] pid={} caller_tid={} waiting_for_tid={}",
+            pid, calling_tid, tid
+        );
+    }
+
     let mut process_inner = process.inner_exclusive_access();
     // a thread cannot wait for itself
     if task_inner.res.as_ref().unwrap().tid == tid {
@@ -141,6 +153,12 @@ pub fn sys_waittid(tid: usize) -> isize {
     if let Some(exit_code) = exit_code {
         // dealloc the exited thread
         process_inner.tasks[tid] = None;
+        if pid == 34 || pid == 36 {
+            info!(
+                "[sys_waittid] pid={} tid={} -> exit_code={}",
+                pid, calling_tid, exit_code
+            );
+        }
         exit_code as isize
     } else {
         // waited thread has not exited
