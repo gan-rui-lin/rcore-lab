@@ -23,6 +23,7 @@ impl Default for SignalAction {
 }
 
 pub const SA_SIGINFO: usize = 4;
+pub const SA_RESETHAND: usize = 0x80000000;
 
 #[derive(Clone)]
 pub struct SignalActions {

@@ -1,1 +1,16 @@
-*/*
+# Dockerignore for ext4 Docker environment
+target/
+.git/
+*.log
+debug*.log
+all*.log
+os/target/
+user/target/
+easy-fs/target/
+easy-fs-fuse/target/
+*.img
+*.xz
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
