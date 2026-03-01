@@ -29,7 +29,7 @@ use manager::fetch_task;
 use process::ProcessControlBlock;
 use switch::__switch;
 
-pub use action::{SignalAction, SignalActions, SA_SIGINFO};
+pub use action::{SignalAction, SignalActions, SA_SIGINFO, SA_RESETHAND};
 pub use auxv::AuxvInfo;
 pub use context::TaskContext;
 pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
@@ -42,8 +42,15 @@ pub use processor::{
     current_user_token, run_tasks, schedule, take_current_task,
 };
 pub use process::{RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY};
-pub use signal::{SignalFlags, SigNumber, MAX_SIG, flags_to_user_mask, user_mask_to_flags};
-pub use task::{TaskControlBlock, TaskStatus};
+pub use signal::{
+    SignalFlags, SigNumber, MAX_SIG, flags_to_user_mask, user_mask_to_flags,
+    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE,
+    SIGKILL, SIGUSR1, SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM,
+    SIGSTKFLT, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU,
+    SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGWINCH, SIGIO,
+    SIGPWR, SIGSYS,
+};
+pub use task::{TaskControlBlock, TaskControlBlockInner, TaskStatus};
 pub use futex::{
     FutexKey, futex_requeue, futex_remove_waiter, futex_remove_waiter_any, futex_wait,
     futex_wait_bitset, futex_wake, futex_wake_bitset,
@@ -52,9 +59,6 @@ pub use tls::{TlsArea, TlsInfo};
 
 const DEBUG_DUMP_INTERVAL: u64 = 200;
 static DEBUG_DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-const SIGNAL_TRACE_INTERVAL: u64 = 2000;
-static SIGNAL_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const LINUX_SIGINFO_SIZE: usize = 128;
 const RISCV_FPU_STATE_SIZE: usize = 528;
@@ -197,15 +201,24 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         let page_table = PageTable::from_token(token);
         if let Some(pa) = page_table.translate_va(VirtAddr::from(clear_child_tid)) {
             *translated_refmut(token, clear_child_tid as *mut i32) = 0;
-            let key = FutexKey::new(pa, pid);
-            let woke = futex_wake(key, 1);
+
+            // 唤醒进程内共享的 futex（FUTEX_PRIVATE_FLAG=1）
+            let thread_shared_key = FutexKey::new(pa, pid);
+            let woke_private = futex_wake(thread_shared_key, 1);
+
+            // 唤醒进程间共享的 futex（FUTEX_PRIVATE_FLAG=0）
+            // 这确保无论 musl/glibc 使用哪种 futex 模式都能被正确唤醒
+            let process_shared_key = FutexKey::new(pa, 0);
+            let woke_shared = futex_wake(process_shared_key, 1);
+
             info!(
-                "[exit] pid={} tid={} clear_child_tid wake addr={:#x} pa={:#x} woke={}",
+                "[exit] pid={} tid={} clear_child_tid wake addr={:#x} pa={:#x} woke_private={} woke_shared={}",
                 pid,
                 tid,
                 clear_child_tid,
                 pa.0,
-                woke
+                woke_private,
+                woke_shared
             );
         } else {
             warn!(
@@ -299,7 +312,139 @@ pub fn current_add_signal(signal: SignalFlags) {
     process_inner.signal_pending |= signal;
 }
 
+/// 查找第一个待处理的信号
+/// 返回：(signum, flag, from_process)
+/// 注意：signum 是信号编号（1-64），对应 bit 位置是 signum-1
+fn find_pending_signal(
+    process_pending: SignalFlags,
+    task_pending: SignalFlags,
+) -> Option<(usize, SignalFlags, bool)> {
+    // 优先处理 SIGKILL
+    if process_pending.contains(SignalFlags::SIGKILL) {
+        return Some((signal::SIGKILL, SignalFlags::SIGKILL, true));
+    }
+
+    // 处理任务级信号
+    if !task_pending.is_empty() {
+        let bit_pos = task_pending.bits().trailing_zeros() as usize;
+        let signum = bit_pos + 1; // bit N 对应 signum N+1
+        let flag = SignalFlags::from_bits_truncate(1u64 << bit_pos);
+        return Some((signum, flag, false));
+    }
+
+    // 处理进程级信号
+    if !process_pending.is_empty() {
+        let bit_pos = process_pending.bits().trailing_zeros() as usize;
+        let signum = bit_pos + 1; // bit N 对应 signum N+1
+        let flag = SignalFlags::from_bits_truncate(1u64 << bit_pos);
+        return Some((signum, flag, true));
+    }
+
+    None
+}
+
+/// 检查 SIGCANCEL 循环（pthread_cancel workaround）
+/// 返回 true 表示需要强制退出
+fn check_sigcancel_loop(
+    signum: usize,
+    task_inner: &mut TaskControlBlockInner,
+    pid: usize,
+    tid: usize,
+) -> bool {
+    if signum != 33 {
+        return false;
+    }
+
+    let current_pc = task_inner.signal_trap_cx.as_ref()
+        .map(|cx| cx.sepc)
+        .unwrap_or(task_inner.get_trap_cx().sepc);
+
+    if current_pc == task_inner.sigcancel_last_pc {
+        task_inner.sigcancel_loop_count += 1;
+
+        const MAX_SIGCANCEL_LOOP: usize = 2;
+        if task_inner.sigcancel_loop_count >= MAX_SIGCANCEL_LOOP {
+            warn!(
+                "[signal] SIGCANCEL loop detected pid={} tid={} pc={:#x} count={}, forcing exit",
+                pid, tid, current_pc, task_inner.sigcancel_loop_count
+            );
+            return true;
+        }
+    } else {
+        task_inner.sigcancel_last_pc = current_pc;
+        task_inner.sigcancel_loop_count = 1;
+    }
+
+    false
+}
+
+/// 设置用户态信号栈（UserContext + LinuxSigInfo + canary）
+fn setup_signal_stack(
+    signum: usize,
+    trap_cx: &mut TrapContext,
+    saved_cx: &TrapContext,
+    signal_mask_backup: SignalFlags,
+    token: usize,
+    need_siginfo: bool,
+) -> usize {
+    let mut user_sp = trap_cx.x[2] & !0xf;
+
+    if need_siginfo {
+        // 压入 UserContext
+        user_sp = user_sp.saturating_sub(USER_UCONTEXT_SIZE);
+        let ucontext_ptr = user_sp;
+        let ucontext = UserContext::from_trap(saved_cx, signal_mask_backup);
+        let ucontext_bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&ucontext as *const UserContext) as *const u8,
+                core::mem::size_of::<UserContext>(),
+            )
+        };
+        let _ = copy_to_user(token, ucontext_ptr as *mut u8, ucontext_bytes);
+
+        // 压入 LinuxSigInfo
+        user_sp = user_sp.saturating_sub(core::mem::size_of::<LinuxSigInfo>());
+        let info_ptr = user_sp;
+        let mut siginfo = LinuxSigInfo::default();
+        siginfo.si_signo = signum as i32;
+        let siginfo_bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&siginfo as *const LinuxSigInfo) as *const u8,
+                core::mem::size_of::<LinuxSigInfo>(),
+            )
+        };
+        let _ = copy_to_user(token, info_ptr as *mut u8, siginfo_bytes);
+
+        // 设置参数寄存器
+        trap_cx.x[10] = signum;
+        trap_cx.x[11] = info_ptr;
+        trap_cx.x[12] = ucontext_ptr;
+
+        // 压入 canary
+        user_sp = user_sp.saturating_sub(core::mem::size_of::<usize>());
+        let canary: usize = 0x11451415;
+        let canary_bytes = canary.to_le_bytes();
+        let _ = copy_to_user(token, user_sp as *mut u8, &canary_bytes);
+
+        trap_cx.x[2] = user_sp;
+        ucontext_ptr // 返回 ucontext_ptr
+    } else {
+        // 没有 siginfo，只设置参数
+        trap_cx.x[10] = signum;
+
+        // 压入 canary
+        user_sp = user_sp.saturating_sub(core::mem::size_of::<usize>());
+        let canary: usize = 0x11451415;
+        let canary_bytes = canary.to_le_bytes();
+        let _ = copy_to_user(token, user_sp as *mut u8, &canary_bytes);
+
+        trap_cx.x[2] = user_sp;
+        0 // 没有 ucontext_ptr
+    }
+}
+
 pub fn handle_signals() {
+    // 1. 获取当前任务和进程
     let task = match current_task() {
         Some(task) => task,
         None => return,
@@ -307,189 +452,95 @@ pub fn handle_signals() {
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
     let mut task_inner = task.inner_exclusive_access();
-    let process_pending = process_inner.signal_pending & !process_inner.signal_mask;
-    let task_pending = task_inner.signal_pending & !process_inner.signal_mask;
-    let pending = process_pending | task_pending;
-    if pending.is_empty() {
+
+    // 2. 检查信号重入
+    if task_inner.handling_sig != -1 {
+        debug!(
+            "[handle_signals] pid={} tid={} already handling signal {}, deferring",
+            process.pid.0,
+            task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
+            task_inner.handling_sig
+        );
         return;
     }
-    let signal_trace_count = SIGNAL_TRACE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    if pending.bits() & (1u64 << 33) != 0 {
-        info!(
-            "[signal] has_sig33 pid={} tid={} proc_pending={:?} task_pending={:?} mask={:?} pending={:?}",
-            process.pid.0,
-            task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
-            process_inner.signal_pending,
-            task_inner.signal_pending,
-            process_inner.signal_mask,
-            pending
-        );
+
+    // 3. 计算待处理信号
+    let process_pending = process_inner.signal_pending & !process_inner.signal_mask;
+    let task_pending = task_inner.signal_pending & !process_inner.signal_mask;
+
+    if (process_pending | task_pending).is_empty() {
+        return;
     }
-    if signal_trace_count % SIGNAL_TRACE_INTERVAL == 0 {
-        info!(
-            "[signal] pending pid={} tid={} status={:?} proc_pending={:?} task_pending={:?} mask={:?} has_trap={}",
-            process.pid.0,
-            task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
-            task_inner.task_status,
-            process_pending,
-            task_pending,
-            process_inner.signal_mask,
-            task_inner.signal_trap_cx.is_some()
-        );
-    }
-    let (signum, flag, from_process) = if process_pending.contains(SignalFlags::SIGKILL) {
-        let sigkill_num = SignalFlags::SIGKILL.bits().trailing_zeros() as usize;
-        (sigkill_num, SignalFlags::SIGKILL, true)
-    } else if !task_pending.is_empty() {
-        let signum = task_pending.bits().trailing_zeros() as usize;
-        let flag = match 1u64.checked_shl(signum as u32) {
-            Some(bits) => SignalFlags::from_bits_truncate(bits),
-            None => return,
-        };
-        (signum, flag, false)
-    } else {
-        let signum = process_pending.bits().trailing_zeros() as usize;
-        let flag = match 1u64.checked_shl(signum as u32) {
-            Some(bits) => SignalFlags::from_bits_truncate(bits),
-            None => return,
-        };
-        (signum, flag, true)
+
+    // 4. 查找第一个待处理的信号
+    let (signum, flag, from_process) = match find_pending_signal(process_pending, task_pending) {
+        Some(result) => result,
+        None => return,
     };
+
     let pid = process.pid.0;
     let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-    let task_status = task_inner.task_status;
-    let last_syscall = task_inner.last_syscall;
 
-    // Debug: log task status when signal arrives for SIG33
-    if signum == 33 && (pid == 34 || pid == 36) {
-        let saved_pc = task_inner.signal_trap_cx.as_ref()
-            .map(|cx| cx.sepc)
-            .unwrap_or(task_inner.get_trap_cx().sepc);
-        info!(
-            "[signal] deliver_pre pid={} tid={} signum={} status={:?} last_syscall={} saved_pc={:#x} has_saved_cx={}",
-            pid, tid, signum, task_status, last_syscall, saved_pc, task_inner.signal_trap_cx.is_some()
-        );
-    }
-
-    // Detect SIGCANCEL infinite loop (pthread_cancel hanging due to missing pthread_setcanceltype)
-    if signum == 33 {
-        let current_pc = task_inner.signal_trap_cx.as_ref()
-            .map(|cx| cx.sepc)
-            .unwrap_or(task_inner.get_trap_cx().sepc);
-
-        if current_pc == task_inner.sigcancel_last_pc {
-            task_inner.sigcancel_loop_count += 1;
-
-            // If stuck in same PC for too many SIGCANCELs, force exit to prevent hanging
-            const MAX_SIGCANCEL_LOOP: usize = 2;
-            if task_inner.sigcancel_loop_count >= MAX_SIGCANCEL_LOOP {
-                warn!(
-                    "[signal] SIGCANCEL loop detected pid={} tid={} pc={:#x} count={}, forcing exit",
-                    pid, tid, current_pc, task_inner.sigcancel_loop_count
-                );
-                // Clear the pending signal
-                if from_process {
-                    process_inner.signal_pending.remove(flag);
-                } else {
-                    task_inner.signal_pending.remove(flag);
-                }
-                // Force exit with PTHREAD_CANCELED status
-                drop(task_inner);
-                drop(process_inner);
-                exit_current_and_run_next(-33);
-                return;
-            }
+    // 5. 检查 SIGCANCEL 循环
+    if check_sigcancel_loop(signum, &mut task_inner, pid, tid) {
+        // 清除 pending 信号并强制退出
+        if from_process {
+            process_inner.signal_pending.remove(flag);
         } else {
-            // Different PC, reset counter
-            task_inner.sigcancel_last_pc = current_pc;
-            task_inner.sigcancel_loop_count = 1;
+            task_inner.signal_pending.remove(flag);
         }
+        drop(task_inner);
+        drop(process_inner);
+        exit_current_and_run_next(-33);
+        return;
     }
 
-    if task_status == TaskStatus::Blocked {
+    // 6. 如果任务被阻塞，唤醒它
+    if task_inner.task_status == TaskStatus::Blocked {
         futex_remove_waiter_any(&task);
         task_inner.task_status = TaskStatus::Ready;
         task_inner.interrupted_by_signal = true;
         drop(task_inner);
         add_task(task);
-        if signal_trace_count % SIGNAL_TRACE_INTERVAL == 0 || signum == 33 {
-            info!(
-                "[signal] wake blocked pid={} tid={} signum={} from_process={} set_interrupted=true",
-                pid,
-                tid,
-                signum,
-                from_process
-            );
-        }
         return;
     }
-    if signum == 33 {
-        info!(
-            "[signal] check_nest pid={} tid={} signum={} has_trap_cx={} is_sigkill={}",
-            process.pid.0,
-            task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
-            signum,
-            task_inner.signal_trap_cx.is_some(),
-            signum == SignalFlags::SIGKILL.bits().trailing_zeros() as usize
-        );
-    }
-    if task_inner.signal_trap_cx.is_some()
-        && signum != SignalFlags::SIGKILL.bits().trailing_zeros() as usize
-    {
-        if signal_trace_count % SIGNAL_TRACE_INTERVAL == 0 {
-            info!(
-                "[signal] skip deliver pid={} tid={} signum={} reason=trap_cx_set",
-                process.pid.0,
-                task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
-                signum
-            );
-        }
+
+    // 7. 如果已经在处理其他信号，跳过（除了 SIGKILL）
+    if task_inner.signal_trap_cx.is_some() && signum != signal::SIGKILL {
         return;
     }
+
+    // 8. 清除 pending 信号
     if from_process {
         process_inner.signal_pending.remove(flag);
     } else {
         task_inner.signal_pending.remove(flag);
     }
 
-    if signum == SignalFlags::SIGSTOP.bits().trailing_zeros() as usize {
+    // 9. 处理内核信号（SIGSTOP、SIGKILL）
+    if signum == signal::SIGSTOP {
         drop(task_inner);
         drop(process_inner);
         block_current_and_run_next();
         return;
     }
 
-    if signum == SignalFlags::SIGKILL.bits().trailing_zeros() as usize {
-        let pid = process.pid.0;
-        let name = process_inner.name.clone();
-        warn!("[signal] pid={} name={} killed by SIGKILL", pid, name);
+    if signum == signal::SIGKILL {
+        warn!("[signal] pid={} name={} killed by SIGKILL", pid, process_inner.name);
         drop(task_inner);
         drop(process_inner);
-        exit_current_and_run_next(-(SigNumber::SigKill as i32));
+        exit_current_and_run_next(-(signal::SIGKILL as i32));
         return;
     }
 
+    // 10. 获取信号处理动作
     let action = process_inner.signal_actions.table[signum];
-    if signum == 33 {
-        info!(
-            "[signal] sig=33 pid={} tid={} handler={:#x} flags={:#x} mask={:?} sepc={:#x} sp={:#x}",
-            process.pid.0,
-            task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
-            action.handler,
-            action.flags,
-            action.mask,
-            task_inner.get_trap_cx().sepc,
-            task_inner.get_trap_cx().x[2]
-        );
-    }
+
+    // 11. 默认处理：终止进程
     if action.handler == 0 {
-        let pid = process.pid.0;
-        let name = process_inner.name.clone();
         warn!(
-            "[signal] pid={} name={} default handler for signum {}",
-            pid,
-            name,
-            signum
+            "[signal] pid={} name={} default handler for signal {}",
+            pid, process_inner.name, signum
         );
         drop(task_inner);
         drop(process_inner);
@@ -497,126 +548,36 @@ pub fn handle_signals() {
         return;
     }
 
+    // 12. 保存 trap context（如果尚未保存）
     if task_inner.signal_trap_cx.is_none() {
-        let current_pc = task_inner.get_trap_cx().sepc;
         task_inner.signal_trap_cx = Some(*task_inner.get_trap_cx());
-        let old_signal_mask = process_inner.signal_mask;
         task_inner.signal_mask_backup = process_inner.signal_mask;
         process_inner.signal_mask |= action.mask | flag;
-        if signum == 33 {
-            info!(
-                "[signal] save_trap_cx pid={} tid={} signum={} saved_pc={:#x} old_mask={:?} action_mask={:?} flag={:?} new_mask={:?}",
-                process.pid.0,
-                task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
-                signum,
-                current_pc,
-                old_signal_mask,
-                action.mask,
-                flag,
-                process_inner.signal_mask
-            );
-        }
-    } else if signum == 33 {
-        info!(
-            "[signal] already_nested pid={} tid={} signum={} cur_mask={:?}",
-            process.pid.0,
-            task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
-            signum,
-            process_inner.signal_mask
-        );
+        task_inner.handling_sig = signum as isize;
     }
+
+    // 13. 设置 trap context 调用用户态 handler
     let trap_cx = task_inner.get_trap_cx();
     trap_cx.sepc = action.handler;
     if action.restorer != 0 {
         trap_cx.x[1] = action.restorer;
     }
+
+    // 14. 设置信号栈
+    let saved_cx = task_inner.signal_trap_cx.as_ref().unwrap();
+    let token = process_inner.memory_set.token();
     let need_siginfo = (action.flags & SA_SIGINFO) != 0 || signum == 33;
-    if need_siginfo {
-        let token = process_inner.memory_set.token();
-        let mut user_sp = trap_cx.x[2] & !0xf;
 
-        user_sp = user_sp.saturating_sub(USER_UCONTEXT_SIZE);
-        let ucontext_ptr = user_sp as *mut u8;
-        if let Some(saved) = task_inner.signal_trap_cx.as_ref() {
-            let ucontext = UserContext::from_trap(saved, task_inner.signal_mask_backup);
-            let ucontext_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    (&ucontext as *const UserContext) as *const u8,
-                    core::mem::size_of::<UserContext>(),
-                )
-            };
-            let _ = copy_to_user(token, ucontext_ptr, ucontext_bytes);
-            task_inner.signal_ucontext_ptr = ucontext_ptr as usize;
-        }
+    let ucontext_ptr = setup_signal_stack(
+        signum,
+        trap_cx,
+        saved_cx,
+        task_inner.signal_mask_backup,
+        token,
+        need_siginfo,
+    );
 
-        user_sp = user_sp.saturating_sub(core::mem::size_of::<LinuxSigInfo>());
-        let info_ptr = user_sp as *mut u8;
-        let mut siginfo = LinuxSigInfo::default();
-        siginfo.si_signo = signum as i32;
-        let siginfo_bytes = unsafe {
-            core::slice::from_raw_parts(
-                (&siginfo as *const LinuxSigInfo) as *const u8,
-                core::mem::size_of::<LinuxSigInfo>(),
-            )
-        };
-        let _ = copy_to_user(token, info_ptr, siginfo_bytes);
-
-        trap_cx.x[10] = signum;
-        trap_cx.x[11] = info_ptr as usize;
-        trap_cx.x[12] = ucontext_ptr as usize;
-        trap_cx.x[2] = user_sp;
-    } else {
-        task_inner.signal_ucontext_ptr = 0;
-    }
-    if signum == 33 && trap_cx.x[11] == 0 {
-        let token = process_inner.memory_set.token();
-        let base_sp = trap_cx.x[2] & !0xf;
-        let info_ptr = base_sp.saturating_sub(LINUX_SIGINFO_SIZE) as *mut u8;
-        let ucontext_ptr = (info_ptr as usize)
-            .saturating_sub(USER_UCONTEXT_SIZE) as *mut u8;
-        let mut siginfo = LinuxSigInfo::default();
-        siginfo.si_signo = signum as i32;
-        let siginfo_bytes = unsafe {
-            core::slice::from_raw_parts(
-                (&siginfo as *const LinuxSigInfo) as *const u8,
-                core::mem::size_of::<LinuxSigInfo>(),
-            )
-        };
-        let _ = copy_to_user(token, info_ptr, siginfo_bytes);
-        if let Some(saved) = task_inner.signal_trap_cx.as_ref() {
-            let ucontext = UserContext::from_trap(saved, task_inner.signal_mask_backup);
-            let ucontext_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    (&ucontext as *const UserContext) as *const u8,
-                    core::mem::size_of::<UserContext>(),
-                )
-            };
-            let _ = copy_to_user(token, ucontext_ptr, ucontext_bytes);
-            task_inner.signal_ucontext_ptr = ucontext_ptr as usize;
-        }
-        trap_cx.x[11] = info_ptr as usize;
-        trap_cx.x[12] = ucontext_ptr as usize;
-    }
-    trap_cx.x[10] = signum;
-    if signum == 33 {
-        trace!(
-            "[signal] deliver sig=33 pid={} tid={} a0={:#x} a1={:#x} a2={:#x} sp={:#x}",
-            process.pid.0,
-            task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
-            trap_cx.x[10],
-            trap_cx.x[11],
-            trap_cx.x[12],
-            trap_cx.x[2]
-        );
-        if task_inner.signal_ucontext_ptr != 0 {
-            let user_mask = signal::flags_to_user_mask(task_inner.signal_mask_backup);
-            trace!(
-                "[signal] sig=33 ucontext_ptr={:#x} mask={:#x}",
-                task_inner.signal_ucontext_ptr,
-                user_mask
-            );
-        }
-    }
+    task_inner.signal_ucontext_ptr = ucontext_ptr;
 }
 
 pub fn debug_dump_tasks() {
