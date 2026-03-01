@@ -679,7 +679,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     // }
 
     if known && trace && !(syscall_id == SYSCALL_WRITE && args[0] == 1) {
-        trace!(
+        syscall!(
             "[syscall] pid={} name={} num={}({}) args=[0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x}] ret={}",
             pid,
             name,

@@ -142,7 +142,7 @@ fn build_statfs() -> StatFs {
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) && fd != 1 {
-        trace!("kernel:pid[{}] sys_write", pid);
+        syscall!("kernel:pid[{}] sys_write", pid);
     }
     let token = current_user_token();
     let process = current_process();
@@ -185,7 +185,7 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
 pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_read", pid);
+        syscall!("kernel:pid[{}] sys_read", pid);
     }
     let token = current_user_token();
     let process = current_process();
@@ -210,7 +210,7 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
 pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_openat", pid);
+        syscall!("kernel:pid[{}] sys_openat", pid);
     }
     if path.is_null() {
         return errno(EFAULT);
@@ -262,7 +262,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
 pub fn sys_faccessat(dirfd: isize, path: *const u8, _mode: u32, _flags: u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_faccessat", pid);
+        syscall!("kernel:pid[{}] sys_faccessat", pid);
     }
     if path.is_null() {
         return errno(EFAULT);
@@ -291,7 +291,7 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, _mode: u32, _flags: u32) -> 
 pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_mkdirat", pid);
+        syscall!("kernel:pid[{}] sys_mkdirat", pid);
     }
     if path.is_null() {
         return errno(EFAULT);
@@ -323,7 +323,7 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
 pub fn sys_close(fd: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_close", pid);
+        syscall!("kernel:pid[{}] sys_close", pid);
     }
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
@@ -345,7 +345,7 @@ pub fn sys_close(fd: usize) -> isize {
 pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, _flags: u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_fstatat", pid);
+        syscall!("kernel:pid[{}] sys_fstatat", pid);
     }
     if path.is_null() {
         return errno(EFAULT);
@@ -424,7 +424,7 @@ pub fn sys_utimensat(
 ) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_utimensat", pid);
+        syscall!("kernel:pid[{}] sys_utimensat", pid);
     }
     if path.is_null() {
         return errno(EFAULT);
@@ -454,7 +454,7 @@ pub fn sys_utimensat(
 pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_fstat", pid);
+        syscall!("kernel:pid[{}] sys_fstat", pid);
     }
     let process = current_process();
     let token = current_user_token();
@@ -498,7 +498,7 @@ pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
 pub fn sys_dup(fd: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_dup", pid);
+        syscall!("kernel:pid[{}] sys_dup", pid);
     }
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
@@ -513,7 +513,7 @@ pub fn sys_dup(fd: usize) -> isize {
 pub fn sys_dup3(oldfd: usize, newfd: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_dup3", pid);
+        syscall!("kernel:pid[{}] sys_dup3", pid);
     }
     if oldfd == newfd {
         return errno(EINVAL);
@@ -540,7 +540,7 @@ pub fn sys_linkat(
 ) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_linkat", pid);
+        syscall!("kernel:pid[{}] sys_linkat", pid);
     }
     if old_name.is_null() || new_name.is_null() {
         return errno(EFAULT);
@@ -602,7 +602,7 @@ pub fn sys_linkat(
 pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_unlinkat", pid);
+        syscall!("kernel:pid[{}] sys_unlinkat", pid);
     }
     if _name.is_null() {
         return errno(EFAULT);
@@ -649,7 +649,7 @@ pub fn sys_renameat2(
 ) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_renameat2", pid);
+        syscall!("kernel:pid[{}] sys_renameat2", pid);
     }
     if flags != 0 {
         return errno(EINVAL);
@@ -753,7 +753,7 @@ pub fn sys_renameat2(
 pub fn sys_getcwd(buf: *mut u8, len: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_getcwd", pid);
+        syscall!("kernel:pid[{}] sys_getcwd", pid);
     }
     if buf.is_null() {
         return errno(EFAULT);
@@ -777,7 +777,7 @@ pub fn sys_getcwd(buf: *mut u8, len: usize) -> isize {
 pub fn sys_chdir(_path: *const u8) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_chdir", pid);
+        syscall!("kernel:pid[{}] sys_chdir", pid);
     }
     if _path.is_null() {
         return errno(EFAULT);
@@ -822,7 +822,7 @@ pub fn sys_chdir(_path: *const u8) -> isize {
 pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_getdents64", pid);
+        syscall!("kernel:pid[{}] sys_getdents64", pid);
     }
     if buf.is_null() {
         return errno(EFAULT);
@@ -876,7 +876,7 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> isize {
 pub fn sys_pipe2(fds: *mut i32, _flags: u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_pipe2", pid);
+        syscall!("kernel:pid[{}] sys_pipe2", pid);
     }
     if fds.is_null() {
         return errno(EFAULT);
@@ -908,7 +908,7 @@ pub fn sys_mount(
 ) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_mount", pid);
+        syscall!("kernel:pid[{}] sys_mount", pid);
     }
     // Mounting is handled at boot; keep as a no-op for tests.
     0
@@ -917,7 +917,7 @@ pub fn sys_mount(
 pub fn sys_umount2(_target: *const u8, _flags: u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_umount2", pid);
+        syscall!("kernel:pid[{}] sys_umount2", pid);
     }
     0
 }
@@ -935,7 +935,7 @@ pub fn sys_umount2(_target: *const u8, _flags: u32) -> isize {
 pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_lseek fd={} offset={} whence={}", pid, fd, offset, whence);
+        syscall!("kernel:pid[{}] sys_lseek fd={} offset={} whence={}", pid, fd, offset, whence);
     }
 
     const SEEK_SET: usize = 0;
@@ -996,7 +996,7 @@ pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> isize {
 pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_readv fd={} iovcnt={}", pid, fd, iovcnt);
+        syscall!("kernel:pid[{}] sys_readv fd={} iovcnt={}", pid, fd, iovcnt);
     }
 
     if iov.is_null() {
@@ -1080,7 +1080,7 @@ pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) && fd != 1 {
-        trace!("kernel:pid[{}] sys_writev fd={} iovcnt={}", pid, fd, iovcnt);
+        syscall!("kernel:pid[{}] sys_writev fd={} iovcnt={}", pid, fd, iovcnt);
     }
 
     if iov.is_null() {
@@ -1180,7 +1180,7 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_fcntl fd={} cmd={} arg={}", pid, fd, cmd, arg);
+        syscall!("kernel:pid[{}] sys_fcntl fd={} cmd={} arg={}", pid, fd, cmd, arg);
     }
 
     const F_DUPFD: i32 = 0;
@@ -1462,7 +1462,7 @@ pub fn sys_ftruncate(fd: usize, length: isize) -> isize {
 pub fn sys_statfs(path: *const u8, buf: *mut StatFs) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_statfs", pid);
+        syscall!("kernel:pid[{}] sys_statfs", pid);
     }
     if path.is_null() || buf.is_null() {
         return errno(EFAULT);
@@ -1497,7 +1497,7 @@ pub fn sys_statfs(path: *const u8, buf: *mut StatFs) -> isize {
 pub fn sys_fstatfs(fd: usize, buf: *mut StatFs) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_fstatfs", pid);
+        syscall!("kernel:pid[{}] sys_fstatfs", pid);
     }
     if buf.is_null() {
         return errno(EFAULT);
