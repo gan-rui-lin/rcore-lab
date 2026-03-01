@@ -15,9 +15,9 @@ use crate::{
         add_task, current_process, current_task, current_trap_cx, current_user_token,
         exit_current_and_run_next, futex_requeue, futex_remove_waiter, futex_wait,
         futex_wait_bitset, futex_wake, futex_wake_bitset, pid2process, suspend_current_and_run_next,
-        FutexKey, RLimit, RLIMIT_NLIMITS, SigNumber, SignalAction, SignalFlags, TaskControlBlock,
+        FutexKey, RLimit, RLIMIT_NLIMITS, SignalAction, SignalFlags, TaskControlBlock,
         TaskStatus, UserContext, user_mask_to_flags,
-        MAX_SIG,
+        MAX_SIG, SIGKILL, SIGSTOP,
     },
     timer::{add_timer, get_time, get_time_ms, get_time_us, remove_timer},
 };
@@ -1502,7 +1502,8 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
     if signum <= 0 || signum > MAX_SIG as i32 {
         return errno(EINVAL);
     }
-    let flag = match 1u64.checked_shl(signum as u32) {
+    // bit (signum-1) 对应 signum：signal 1 → bit 0, signal 9 → bit 8
+    let flag = match 1u64.checked_shl((signum - 1) as u32) {
         Some(bits) => SignalFlags::from_bits_truncate(bits),
         None => return errno(EINVAL),
     };
@@ -1538,7 +1539,8 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
     if signum <= 0 || signum > MAX_SIG as i32 {
         return errno(EINVAL);
     }
-    let flag = match 1u64.checked_shl(signum as u32) {
+    // bit (signum-1) 对应 signum：signal 1 → bit 0, signal 33 → bit 32
+    let flag = match 1u64.checked_shl((signum - 1) as u32) {
         Some(bits) => SignalFlags::from_bits_truncate(bits),
         None => return errno(EINVAL),
     };
@@ -1574,7 +1576,8 @@ pub fn sys_sigaction(
     }
     if signum <= 0
         || signum > MAX_SIG as i32
-        || signum == SignalFlags::SIGKILL.bits().trailing_zeros() as i32
+        || signum == SIGKILL as i32
+        || signum == SIGSTOP as i32
     {
         return errno(EINVAL);
     }
@@ -1641,7 +1644,8 @@ pub fn sys_sigprocmask(
     if !oldset.is_null() {
         let mut user_mask: usize = 0;
         for signum in 1..=MAX_SIG {
-            let flag = match 1u64.checked_shl(signum as u32) {
+            // bit (signum-1) 对应 signum
+            let flag = match 1u64.checked_shl((signum - 1) as u32) {
                 Some(bits) => SignalFlags::from_bits_truncate(bits),
                 None => continue,
             };
@@ -1673,7 +1677,8 @@ pub fn sys_sigprocmask(
             if (user_mask & (1usize << (signum - 1))) == 0 {
                 continue;
             }
-            let flag = match 1u64.checked_shl(signum as u32) {
+            // bit (signum-1) 对应 signum
+            let flag = match 1u64.checked_shl((signum - 1) as u32) {
                 Some(bits) => SignalFlags::from_bits_truncate(bits),
                 None => continue,
             };
@@ -1700,10 +1705,25 @@ pub fn sys_sigreturn() -> isize {
     }
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
+
     let saved = match inner.signal_trap_cx.take() {
         Some(cx) => cx,
         None => return errno(EINVAL),
     };
+
+    // 检查栈底的 canary 值，防止栈溢出
+    let current_sp = inner.get_trap_cx().x[2];
+    let token = current_user_token();
+    if let Ok(canary) = read_from_user::<usize>(token, current_sp as *const _) {
+        if canary != 0x11451415 {
+            error!(
+                "[sigreturn] Stack canary corrupted! pid={} sp={:#x} canary={:#x} (expected 0x11451415)",
+                pid, current_sp, canary
+            );
+            // 栈已被破坏，返回错误（后续会导致 SIGSEGV）
+            return errno(EFAULT);
+        }
+    }
     let saved_a0 = saved.x[10] as isize;
     let ucontext_ptr = inner.signal_ucontext_ptr;
     inner.signal_ucontext_ptr = 0;
@@ -1730,6 +1750,25 @@ pub fn sys_sigreturn() -> isize {
         let mut new_mask = user_mask_to_flags(ucontext.uc_sigmask);
         new_mask.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
         process_inner.signal_mask = new_mask;
+
+        // 保存当前处理的信号编号，用于 SA_RESETHAND 检查
+        let current_sig = inner.handling_sig;
+
+        // 重置 handling_sig，允许处理新的信号
+        inner.handling_sig = -1;
+
+        // 如果设置了 SA_RESETHAND，重置信号处理函数为默认值
+        if current_sig >= 0 && (current_sig as usize) <= crate::task::MAX_SIG {
+            let sig_actions = process_inner.signal_actions.clone();
+            let action = sig_actions.table[current_sig as usize];
+            if (action.flags & crate::task::SA_RESETHAND) != 0 {
+                info!(
+                    "[sigreturn] SA_RESETHAND set for signal {}, resetting handler to SIG_DFL",
+                    current_sig
+                );
+                process_inner.signal_actions.table[current_sig as usize] = SignalAction::default();
+            }
+        }
 
         // Detect SIGCANCEL infinite loop after sigreturn
         let return_pc = restored.sepc;
@@ -1768,6 +1807,25 @@ pub fn sys_sigreturn() -> isize {
         let process = current_process();
         let mut process_inner = process.inner_exclusive_access();
         process_inner.signal_mask = inner.signal_mask_backup;
+
+        // 保存当前处理的信号编号，用于 SA_RESETHAND 检查
+        let current_sig = inner.handling_sig;
+
+        // 重置 handling_sig，允许处理新的信号
+        inner.handling_sig = -1;
+
+        // 如果设置了 SA_RESETHAND，重置信号处理函数为默认值
+        if current_sig >= 0 && (current_sig as usize) <= crate::task::MAX_SIG {
+            let sig_actions = process_inner.signal_actions.clone();
+            let action = sig_actions.table[current_sig as usize];
+            if (action.flags & crate::task::SA_RESETHAND) != 0 {
+                info!(
+                    "[sigreturn] SA_RESETHAND set for signal {}, resetting handler to SIG_DFL",
+                    current_sig
+                );
+                process_inner.signal_actions.table[current_sig as usize] = SignalAction::default();
+            }
+        }
 
         // Detect SIGCANCEL infinite loop after sigreturn
         let return_pc = saved.sepc;
@@ -2053,16 +2111,15 @@ pub fn sys_rt_sigtimedwait(
             let process = current_process();
             let mut inner = process.inner_exclusive_access();
             for signum in 1..=MAX_SIG {
-                if signum == SigNumber::SigKill as usize || signum == SigNumber::SigStop as usize {
+                // SIGKILL 和 SIGSTOP 不能被等待
+                if signum == SIGKILL || signum == SIGSTOP {
                     continue;
                 }
                 if (sigset & (1usize << (signum - 1))) == 0 {
                     continue;
                 }
-                let flag = match 1u64.checked_shl(signum as u32) {
-                    Some(bits) => SignalFlags::from_bits_truncate(bits),
-                    None => continue,
-                };
+                // bit (signum-1) 对应 signum
+                let flag = SignalFlags::from_bits_truncate(1u64 << (signum - 1));
                 if inner.signal_pending.contains(flag) {
                     inner.signal_pending.remove(flag);
                     found = Some(signum as isize);
