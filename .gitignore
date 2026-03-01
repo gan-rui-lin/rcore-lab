@@ -27,3 +27,7 @@ tmp/*
 os/tmp/*
 *.log
 CLAUDE.*
+*.docker*
+Dockerfile.ext4
+*.sh
+!run.shs
