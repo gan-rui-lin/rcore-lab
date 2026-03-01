@@ -34,6 +34,8 @@ extern crate alloc;
 
 #[macro_use]
 mod console;
+#[macro_use]
+mod logging;
 #[path = "boards/qemu.rs"]
 mod board;
 pub mod config;
@@ -41,7 +43,6 @@ pub mod config;
 pub mod drivers;
 pub mod fs;
 pub mod lang_items;
-pub mod logging;
 pub mod mm;
 pub mod sbi;
 pub mod sync;

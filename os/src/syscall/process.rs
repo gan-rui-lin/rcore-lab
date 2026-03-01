@@ -348,7 +348,7 @@ pub fn sys_futex(
 pub fn sys_exit(exit_code: i32) -> ! {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_exit", pid);
+        syscall!("kernel:pid[{}] sys_exit", pid);
     }
     let name = current_process().inner_exclusive_access().name.clone();
     if pid == 4 || name == "sh" {
@@ -388,7 +388,7 @@ pub fn sys_getppid() -> isize {
 pub fn sys_fork() -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_fork", pid);
+        syscall!("kernel:pid[{}] sys_fork", pid);
     }
     let current_process = current_process();
     let new_process = current_process.fork();
@@ -929,7 +929,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_get_time", pid);
+        syscall!("kernel:pid[{}] sys_get_time", pid);
     }
     if _ts.is_null() {
         return errno(EFAULT);
@@ -955,7 +955,7 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
 pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_clock_gettime", pid);
+        syscall!("kernel:pid[{}] sys_clock_gettime", pid);
     }
     if ts.is_null() {
         return errno(EFAULT);
@@ -986,7 +986,7 @@ pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
 pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_nanosleep", pid);
+        syscall!("kernel:pid[{}] sys_nanosleep", pid);
     }
     let token = current_user_token();
     let req = match read_from_user::<TimeSpec>(token, req) {
@@ -1017,7 +1017,7 @@ pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
 pub fn sys_times(tms: *mut Tms) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_times", pid);
+        syscall!("kernel:pid[{}] sys_times", pid);
     }
     let ticks = (get_time() * 100 / CLOCK_FREQ) as i64;
     if !tms.is_null() {
@@ -1044,7 +1044,7 @@ pub fn sys_times(tms: *mut Tms) -> isize {
 pub fn sys_uname(uts: *mut UtsName) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_uname", pid);
+        syscall!("kernel:pid[{}] sys_uname", pid);
     }
     if uts.is_null() {
         return errno(EFAULT);
@@ -1078,7 +1078,7 @@ pub fn sys_uname(uts: *mut UtsName) -> isize {
 pub fn sys_syslog(_log_type: usize, buf: *mut u8, len: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_syslog", pid);
+        syscall!("kernel:pid[{}] sys_syslog", pid);
     }
     if len == 0 {
         return 0;
@@ -1097,7 +1097,7 @@ pub fn sys_syslog(_log_type: usize, buf: *mut u8, len: usize) -> isize {
 pub fn sys_sysinfo(info: *mut SysInfo) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_sysinfo", pid);
+        syscall!("kernel:pid[{}] sys_sysinfo", pid);
     }
     if info.is_null() {
         return errno(EFAULT);
@@ -1142,7 +1142,7 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
 
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_mmap", pid);
+        syscall!("kernel:pid[{}] sys_mmap", pid);
     }
 
     let mut len = len;
@@ -1334,7 +1334,7 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
 pub fn sys_munmap(start: usize, len: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_munmap", pid);
+        syscall!("kernel:pid[{}] sys_munmap", pid);
     }
     if start % PAGE_SIZE != 0 || len == 0 {
         return errno(EINVAL);
@@ -1391,7 +1391,7 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
 pub fn sys_sbrk(arg: isize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_sbrk", pid);
+        syscall!("kernel:pid[{}] sys_sbrk", pid);
     }
     let sepc = current_trap_cx().sepc;
     let name = current_process().inner_exclusive_access().name.clone();
@@ -1497,7 +1497,7 @@ pub fn sys_set_priority(_prio: isize) -> isize {
 pub fn sys_kill(pid: usize, signum: i32) -> isize {
     let pid_now = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid_now) {
-        trace!("kernel:pid[{}] sys_kill pid={} signum={}", pid_now, pid, signum);
+        syscall!("kernel:pid[{}] sys_kill pid={} signum={}", pid_now, pid, signum);
     }
     if signum <= 0 || signum > MAX_SIG as i32 {
         return errno(EINVAL);
@@ -1531,7 +1531,7 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
 pub fn sys_tkill(tid: isize, signum: i32) -> isize {
     let pid_now = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid_now) {
-        trace!("kernel:pid[{}] sys_tkill tid={} signum={}", pid_now, tid, signum);
+        syscall!("kernel:pid[{}] sys_tkill tid={} signum={}", pid_now, tid, signum);
     }
     if tid <= 0 {
         return errno(EINVAL);
@@ -1572,7 +1572,7 @@ pub fn sys_sigaction(
 ) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_sigaction signum={}", pid, signum);
+        syscall!("kernel:pid[{}] sys_sigaction signum={}", pid, signum);
     }
     if signum <= 0
         || signum > MAX_SIG as i32
@@ -1701,7 +1701,7 @@ pub fn sys_sigprocmask(
 pub fn sys_sigreturn() -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_sigreturn", pid);
+        syscall!("kernel:pid[{}] sys_sigreturn", pid);
     }
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -1865,35 +1865,35 @@ pub fn sys_sigreturn() -> isize {
 /// Get user ID
 /// rcore-lab is a single-user system, always returns 0
 pub fn sys_getuid() -> isize {
-    trace!("kernel:pid[{}] sys_getuid", current_process().pid.0);
+    syscall!("kernel:pid[{}] sys_getuid", current_process().pid.0);
     0
 }
 
 /// Get effective user ID
 /// rcore-lab is a single-user system, always returns 0
 pub fn sys_geteuid() -> isize {
-    trace!("kernel:pid[{}] sys_geteuid", current_process().pid.0);
+    syscall!("kernel:pid[{}] sys_geteuid", current_process().pid.0);
     0
 }
 
 /// Get group ID
 /// rcore-lab is a single-user system, always returns 0
 pub fn sys_getgid() -> isize {
-    trace!("kernel:pid[{}] sys_getgid", current_process().pid.0);
+    syscall!("kernel:pid[{}] sys_getgid", current_process().pid.0);
     0
 }
 
 /// Get effective group ID
 /// rcore-lab is a single-user system, always returns 0
 pub fn sys_getegid() -> isize {
-    trace!("kernel:pid[{}] sys_getegid", current_process().pid.0);
+    syscall!("kernel:pid[{}] sys_getegid", current_process().pid.0);
     0
 }
 
 pub fn sys_getrlimit(resource: usize, rlim: *mut RLimit) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_getrlimit resource={}", pid, resource);
+        syscall!("kernel:pid[{}] sys_getrlimit resource={}", pid, resource);
     }
     if rlim.is_null() {
         return errno(EFAULT);
@@ -2006,7 +2006,7 @@ pub fn sys_shutdown() -> ! {
 pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_mprotect addr=0x{:x} len=0x{:x} prot=0x{:x}",
+        syscall!("kernel:pid[{}] sys_mprotect addr=0x{:x} len=0x{:x} prot=0x{:x}",
                pid, addr, len, prot);
     }
 
