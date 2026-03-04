@@ -343,45 +343,8 @@ pub fn trap_handler() -> ! {
             set_next_trigger();
             check_timer();
 
-            // Detect pthread_cancel test hanging (pids 34 and 36)
-            // These tests can hang after SIGCANCEL handler executes but cancellation fails
-            // Kill them quickly to avoid blocking other tests
-            if let Some(task) = current_task() {
-                if let Some(process) = task.process.upgrade() {
-                    let pid = process.pid.0;
-
-                    // Only monitor pthread_cancel test processes (pid 34 and 36)
-                    if pid == 36 || pid == 34 {
-                        let mut task_inner = task.inner_exclusive_access();
-                        let current_pc = task_inner.get_trap_cx().sepc;
-
-                        // Check if PC is stuck at the same location
-                        if current_pc == task_inner.sigcancel_last_pc && current_pc != 0 {
-                            task_inner.sigcancel_loop_count += 1;
-
-                            // Kill after 100ms (10 timer ticks at 10ms each)
-                            const MAX_STUCK_TICKS: usize = 10;
-                            if task_inner.sigcancel_loop_count >= MAX_STUCK_TICKS {
-                                let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-                                let mut process_inner = process.inner_exclusive_access();
-                                warn!(
-                                    "[timer] pthread_cancel test stuck pid={} tid={} pc={:#x} for {} ticks, sending SIGKILL",
-                                    pid, tid, current_pc, task_inner.sigcancel_loop_count
-                                );
-
-                                // Force kill the stuck process
-                                process_inner.signal_pending.insert(SignalFlags::SIGKILL);
-                                task_inner.sigcancel_last_pc = 0;
-                                task_inner.sigcancel_loop_count = 0;
-                            }
-                        } else {
-                            // PC changed or first check, update tracking
-                            task_inner.sigcancel_last_pc = current_pc;
-                            task_inner.sigcancel_loop_count = 1;
-                        }
-                    }
-                }
-            }
+            // 注意：SIGCANCEL 循环检测已在 handle_signals() 和 sys_sigreturn() 中处理，
+            // 无需在 timer 中断中重复检测。
 
             let count = TIMER_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
             if count % TIMER_SAMPLE_INTERVAL == 0 {
@@ -478,38 +441,7 @@ fn trap_from_kernel(_trap_cx: &context::KernelTrapContext) {
             set_next_trigger();
             check_timer();
 
-            // Detect pthread_cancel test hanging (same as user trap handler)
-            if let Some(task) = current_task() {
-                if let Some(process) = task.process.upgrade() {
-                    let pid = process.pid.0;
-
-                    if pid == 36 || pid == 34 {
-                        let mut task_inner = task.inner_exclusive_access();
-                        let current_pc = task_inner.get_trap_cx().sepc;
-
-                        if current_pc == task_inner.sigcancel_last_pc && current_pc != 0 {
-                            task_inner.sigcancel_loop_count += 1;
-
-                            const MAX_STUCK_TICKS: usize = 10;
-                            if task_inner.sigcancel_loop_count >= MAX_STUCK_TICKS {
-                                let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-                                let mut process_inner = process.inner_exclusive_access();
-                                warn!(
-                                    "[timer_k] pthread_cancel test stuck pid={} tid={} pc={:#x} for {} ticks, sending SIGKILL",
-                                    pid, tid, current_pc, task_inner.sigcancel_loop_count
-                                );
-
-                                process_inner.signal_pending.insert(SignalFlags::SIGKILL);
-                                task_inner.sigcancel_last_pc = 0;
-                                task_inner.sigcancel_loop_count = 0;
-                            }
-                        } else {
-                            task_inner.sigcancel_last_pc = current_pc;
-                            task_inner.sigcancel_loop_count = 1;
-                        }
-                    }
-                }
-            }
+            // SIGCANCEL 循环检测已在 handle_signals()/sys_sigreturn() 中处理
 
             let count = TIMER_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
             if count % TIMER_SAMPLE_INTERVAL == 0 {

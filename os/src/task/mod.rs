@@ -343,40 +343,9 @@ fn find_pending_signal(
     None
 }
 
-/// 检查 SIGCANCEL 循环（pthread_cancel workaround）
-/// 返回 true 表示需要强制退出
-fn check_sigcancel_loop(
-    signum: usize,
-    task_inner: &mut TaskControlBlockInner,
-    pid: usize,
-    tid: usize,
-) -> bool {
-    if signum != 33 {
-        return false;
-    }
-
-    let current_pc = task_inner.signal_trap_cx.as_ref()
-        .map(|cx| cx.sepc)
-        .unwrap_or(task_inner.get_trap_cx().sepc);
-
-    if current_pc == task_inner.sigcancel_last_pc {
-        task_inner.sigcancel_loop_count += 1;
-
-        const MAX_SIGCANCEL_LOOP: usize = 2;
-        if task_inner.sigcancel_loop_count >= MAX_SIGCANCEL_LOOP {
-            warn!(
-                "[signal] SIGCANCEL loop detected pid={} tid={} pc={:#x} count={}, forcing exit",
-                pid, tid, current_pc, task_inner.sigcancel_loop_count
-            );
-            return true;
-        }
-    } else {
-        task_inner.sigcancel_last_pc = current_pc;
-        task_inner.sigcancel_loop_count = 1;
-    }
-
-    false
-}
+// SIGCANCEL 循环检测已统一移至 sys_sigreturn 中处理。
+// sigreturn 能判断 handler 是否修改了 PC（成功取消 vs 失败），
+// 在失败时重新注入 SIG33 并在多次失败后强制退出。
 
 /// 设置用户态信号栈（UserContext + LinuxSigInfo + canary）
 fn setup_signal_stack(
@@ -464,9 +433,9 @@ pub fn handle_signals() {
         return;
     }
 
-    // 3. 计算待处理信号
-    let process_pending = process_inner.signal_pending & !process_inner.signal_mask;
-    let task_pending = task_inner.signal_pending & !process_inner.signal_mask;
+    // 3. 计算待处理信号（signal_mask 是 per-thread 的）
+    let process_pending = process_inner.signal_pending & !task_inner.signal_mask;
+    let task_pending = task_inner.signal_pending & !task_inner.signal_mask;
 
     if (process_pending | task_pending).is_empty() {
         return;
@@ -479,23 +448,9 @@ pub fn handle_signals() {
     };
 
     let pid = process.pid.0;
-    let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+    let _tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
 
-    // 5. 检查 SIGCANCEL 循环
-    if check_sigcancel_loop(signum, &mut task_inner, pid, tid) {
-        // 清除 pending 信号并强制退出
-        if from_process {
-            process_inner.signal_pending.remove(flag);
-        } else {
-            task_inner.signal_pending.remove(flag);
-        }
-        drop(task_inner);
-        drop(process_inner);
-        exit_current_and_run_next(-33);
-        return;
-    }
-
-    // 6. 如果任务被阻塞，唤醒它
+    // 5. 如果任务被阻塞，唤醒它
     if task_inner.task_status == TaskStatus::Blocked {
         futex_remove_waiter_any(&task);
         task_inner.task_status = TaskStatus::Ready;
@@ -527,6 +482,21 @@ pub fn handle_signals() {
 
     if signum == signal::SIGKILL {
         warn!("[signal] pid={} name={} killed by SIGKILL", pid, process_inner.name);
+        // SIGKILL 必须终止进程内所有线程，不仅仅是当前线程
+        // 向其他线程也注入 SIGKILL，确保它们在下次调度时退出
+        for other_task in process_inner.tasks.iter().filter_map(|t| t.as_ref()) {
+            if !Arc::ptr_eq(other_task, &task) {
+                let mut other_inner = other_task.inner_exclusive_access();
+                other_inner.signal_pending.insert(SignalFlags::SIGKILL);
+                if other_inner.task_status == TaskStatus::Blocked {
+                    futex_remove_waiter_any(other_task);
+                    other_inner.interrupted_by_signal = true;
+                    other_inner.task_status = TaskStatus::Ready;
+                    drop(other_inner);
+                    add_task(other_task.clone());
+                }
+            }
+        }
         drop(task_inner);
         drop(process_inner);
         exit_current_and_run_next(-(signal::SIGKILL as i32));
@@ -536,23 +506,52 @@ pub fn handle_signals() {
     // 10. 获取信号处理动作
     let action = process_inner.signal_actions.table[signum];
 
-    // 11. 默认处理：终止进程
+    // 11. 默认处理（SIG_DFL）
     if action.handler == 0 {
-        warn!(
-            "[signal] pid={} name={} default handler for signal {}",
-            pid, process_inner.name, signum
-        );
-        drop(task_inner);
-        drop(process_inner);
-        exit_current_and_run_next(-(signum as i32));
-        return;
+        match signum {
+            // 默认忽略的信号
+            signal::SIGCHLD | signal::SIGURG | signal::SIGWINCH => {
+                debug!(
+                    "[signal] pid={} signum={} default=ignore",
+                    pid, signum
+                );
+                return;
+            }
+            // SIGCONT: 恢复被停止的进程（目前简单忽略）
+            signal::SIGCONT => {
+                debug!("[signal] pid={} SIGCONT default=continue", pid);
+                return;
+            }
+            // 默认停止的信号
+            signal::SIGTSTP | signal::SIGTTIN | signal::SIGTTOU => {
+                debug!(
+                    "[signal] pid={} signum={} default=stop",
+                    pid, signum
+                );
+                drop(task_inner);
+                drop(process_inner);
+                block_current_and_run_next();
+                return;
+            }
+            // 其他信号默认终止进程
+            _ => {
+                warn!(
+                    "[signal] pid={} name={} default handler for signal {} -> terminate",
+                    pid, process_inner.name, signum
+                );
+                drop(task_inner);
+                drop(process_inner);
+                exit_current_and_run_next(-(signum as i32));
+                return;
+            }
+        }
     }
 
     // 12. 保存 trap context（如果尚未保存）
     if task_inner.signal_trap_cx.is_none() {
         task_inner.signal_trap_cx = Some(*task_inner.get_trap_cx());
-        task_inner.signal_mask_backup = process_inner.signal_mask;
-        process_inner.signal_mask |= action.mask | flag;
+        task_inner.signal_mask_backup = task_inner.signal_mask;
+        task_inner.signal_mask |= action.mask | flag;
         task_inner.handling_sig = signum as isize;
     }
 
@@ -611,13 +610,12 @@ pub fn debug_dump_tasks() {
     for (pid, process) in processes {
         let inner = process.inner_exclusive_access();
         info!(
-            "[debug] pid={} name={} zombie={} tasks={} pending={:?} mask={:?}",
+            "[debug] pid={} name={} zombie={} tasks={} pending={:?}",
             pid,
             inner.name,
             inner.is_zombie,
             inner.tasks.len(),
-            inner.signal_pending,
-            inner.signal_mask
+            inner.signal_pending
         );
         for (child_idx, child) in inner.children.iter().enumerate() {
             let child_inner = child.inner_exclusive_access();

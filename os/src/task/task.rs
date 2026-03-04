@@ -35,6 +35,8 @@ pub struct TaskControlBlockInner {
     pub task_status: TaskStatus,
     pub exit_code: Option<i32>,
     pub signal_trap_cx: Option<TrapContext>,
+    /// 当前线程的信号掩码（Linux 中 signal_mask 是 per-thread 的）
+    pub signal_mask: super::SignalFlags,
     pub signal_mask_backup: super::SignalFlags,
     pub signal_pending: super::SignalFlags,
     pub signal_ucontext_ptr: usize,
@@ -78,6 +80,7 @@ impl TaskControlBlock {
                     task_status: TaskStatus::Ready,
                     exit_code: None,
                     signal_trap_cx: None,
+                    signal_mask: super::SignalFlags::empty(),
                     signal_mask_backup: super::SignalFlags::empty(),
                     signal_pending: super::SignalFlags::empty(),
                     signal_ucontext_ptr: 0,
