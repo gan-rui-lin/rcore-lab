@@ -248,7 +248,10 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     }
     if let Some(inode) = open_file(full_path.as_str(), flags) {
         let mut inner = process.inner_exclusive_access();
-        let fd = inner.alloc_fd();
+        let fd = match inner.alloc_fd() {
+            Some(fd) => fd,
+            None => return errno(EMFILE),
+        };
         inner.fd_table[fd] = Some(inode);
         fd as isize
     } else {
@@ -505,7 +508,10 @@ pub fn sys_dup(fd: usize) -> isize {
     if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
         return errno(EBADF);
     }
-    let new_fd = inner.alloc_fd();
+    let new_fd = match inner.alloc_fd() {
+        Some(fd) => fd,
+        None => return errno(EMFILE),
+    };
     inner.fd_table[new_fd] = inner.fd_table[fd].clone();
     new_fd as isize
 }
@@ -522,6 +528,10 @@ pub fn sys_dup3(oldfd: usize, newfd: usize) -> isize {
     let mut inner = process.inner_exclusive_access();
     if oldfd >= inner.fd_table.len() || inner.fd_table[oldfd].is_none() {
         return errno(EBADF);
+    }
+    let limit = inner.rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize;
+    if newfd >= limit {
+        return errno(EMFILE);
     }
     if newfd >= inner.fd_table.len() {
         inner.fd_table.resize_with(newfd + 1, || None);
@@ -884,9 +894,18 @@ pub fn sys_pipe2(fds: *mut i32, _flags: u32) -> isize {
     let (read_end, write_end) = make_pipe(0);
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    let fd0 = inner.alloc_fd();
+    let fd0 = match inner.alloc_fd() {
+        Some(fd) => fd,
+        None => return errno(EMFILE),
+    };
     inner.fd_table[fd0] = Some(read_end);
-    let fd1 = inner.alloc_fd();
+    let fd1 = match inner.alloc_fd() {
+        Some(fd) => fd,
+        None => {
+            inner.fd_table[fd0] = None;
+            return errno(EMFILE);
+        }
+    };
     inner.fd_table[fd1] = Some(write_end);
     drop(inner);
     let token = current_user_token();

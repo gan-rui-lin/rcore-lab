@@ -93,7 +93,6 @@ pub struct ProcessControlBlockInner {
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     pub signals: SignalFlags,
     pub signal_pending: SignalFlags,
-    pub signal_mask: SignalFlags,
     pub signal_actions: SignalActions,
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,
@@ -114,12 +113,22 @@ impl ProcessControlBlockInner {
         self.memory_set.token()
     }
 
-    pub fn alloc_fd(&mut self) -> usize {
+    /// Allocate a new file descriptor. Returns None if RLIMIT_NOFILE is reached.
+    pub fn alloc_fd(&mut self) -> Option<usize> {
+        let limit = self.rlimits[RLIMIT_NOFILE].rlim_cur as usize;
         if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
-            fd
+            if fd < limit {
+                Some(fd)
+            } else {
+                None
+            }
         } else {
+            let new_fd = self.fd_table.len();
+            if new_fd >= limit {
+                return None;
+            }
             self.fd_table.push(None);
-            self.fd_table.len() - 1
+            Some(new_fd)
         }
     }
 
@@ -182,7 +191,6 @@ impl ProcessControlBlock {
                     ],
                     signals: SignalFlags::empty(),
                     signal_pending: SignalFlags::empty(),
-                    signal_mask: SignalFlags::empty(),
                     signal_actions: SignalActions::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -557,7 +565,6 @@ impl ProcessControlBlock {
                     fd_table: new_fd_table,
                     signals: SignalFlags::empty(),
                     signal_pending: SignalFlags::empty(),
-                    signal_mask: parent.signal_mask,
                     signal_actions: parent.signal_actions.clone(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -582,6 +589,10 @@ impl ProcessControlBlock {
             .as_ref()
             .unwrap()
             .ustack_base;
+        // 获取父线程的 signal_mask，用于子进程继承
+        let parent_signal_mask = parent.get_task(0)
+            .inner_exclusive_access()
+            .signal_mask;
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&child),
             ustack_base,
@@ -590,9 +601,11 @@ impl ProcessControlBlock {
         let mut child_inner = child.inner_exclusive_access();
         child_inner.tasks.push(Some(Arc::clone(&task)));
         drop(child_inner);
-        let task_inner = task.inner_exclusive_access();
+        let mut task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         trap_cx.kernel_sp = task.kstack.get_top();
+        // 子进程继承父进程的信号掩码（Linux 语义：fork 继承 signal_mask）
+        task_inner.signal_mask = parent_signal_mask;
         drop(task_inner);
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);

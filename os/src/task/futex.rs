@@ -219,7 +219,7 @@ pub fn futex_requeue(
             moved
         );
     }
-    woke
+    woke + moved
 }
 
 pub fn futex_remove_waiter(futex_key: &FutexKey, task: &Arc<TaskControlBlock>) -> bool {
