@@ -13,10 +13,11 @@ use crate::{
     sbi::shutdown,
     task::{
         add_task, current_process, current_task, current_trap_cx, current_user_token,
-        exit_current_and_run_next, futex_requeue, futex_remove_waiter, futex_wait,
-        futex_wait_bitset, futex_wake, futex_wake_bitset, pid2process, suspend_current_and_run_next,
+        exit_current_and_run_next, futex_requeue, futex_remove_waiter, futex_remove_waiter_any,
+        futex_wait, futex_wait_bitset, futex_wake, futex_wake_bitset, pid2process,
+        suspend_current_and_run_next,
         FutexKey, RLimit, RLIMIT_NLIMITS, SignalAction, SignalFlags, TaskControlBlock,
-        TaskStatus, UserContext, user_mask_to_flags,
+        TaskStatus, UserContext, flags_to_user_mask, user_mask_to_flags,
         MAX_SIG, SIGKILL, SIGSTOP,
     },
     timer::{add_timer, get_time, get_time_ms, get_time_us, remove_timer},
@@ -440,15 +441,21 @@ pub fn sys_clone(
     let process = task.process.upgrade().unwrap();
     let parent_cx = *current_trap_cx();
 
+    let parent_task_inner = task.inner_exclusive_access();
+    let ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base;
+    let parent_signal_mask = parent_task_inner.signal_mask;
+    drop(parent_task_inner);
+
     let new_task = Arc::new(TaskControlBlock::new(
         Arc::clone(&process),
-        task.inner_exclusive_access()
-            .res
-            .as_ref()
-            .unwrap()
-            .ustack_base,
+        ustack_base,
         true,
     ));
+    // 新线程继承父线程的信号掩码（Linux 语义：clone(CLONE_THREAD) 继承 signal_mask）
+    {
+        let mut inner = new_task.inner_exclusive_access();
+        inner.signal_mask = parent_signal_mask;
+    }
     add_task(Arc::clone(&new_task));
 
     let new_task_inner = new_task.inner_exclusive_access();
@@ -1517,9 +1524,13 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
     let mut inner = process.inner_exclusive_access();
     inner.signal_pending |= flag;
     // Wake blocked tasks so pending signals can be handled.
+    // 需要设置 interrupted_by_signal 并从 futex 队列移除，
+    // 否则 futex_wait 不会返回 EINTR。
     for task in inner.tasks.iter().filter_map(|t| t.as_ref()) {
         let mut task_inner = task.inner_exclusive_access();
         if task_inner.task_status == TaskStatus::Blocked {
+            futex_remove_waiter_any(task);
+            task_inner.interrupted_by_signal = true;
             task_inner.task_status = TaskStatus::Ready;
             drop(task_inner);
             add_task(task.clone());
@@ -1557,6 +1568,8 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
         let mut task_inner = task.inner_exclusive_access();
         task_inner.signal_pending |= flag;
         if task_inner.task_status == TaskStatus::Blocked {
+            futex_remove_waiter_any(task);
+            task_inner.interrupted_by_signal = true;
             task_inner.task_status = TaskStatus::Ready;
             drop(task_inner);
             add_task(task.clone());
@@ -1638,24 +1651,12 @@ pub fn sys_sigprocmask(
         return errno(EINVAL);
     }
     let token = current_user_token();
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
+    let task = current_task().unwrap();
+    let mut task_inner = task.inner_exclusive_access();
 
     if !oldset.is_null() {
-        let mut user_mask: usize = 0;
-        for signum in 1..=MAX_SIG {
-            // bit (signum-1) 对应 signum
-            let flag = match 1u64.checked_shl((signum - 1) as u32) {
-                Some(bits) => SignalFlags::from_bits_truncate(bits),
-                None => continue,
-            };
-            if flag == SignalFlags::SIGKILL || flag == SignalFlags::SIGSTOP {
-                continue;
-            }
-            if inner.signal_mask.contains(flag) {
-                user_mask |= 1usize << (signum - 1);
-            }
-        }
+        // 使用 flags_to_user_mask 简化转换
+        let user_mask = flags_to_user_mask(task_inner.signal_mask) as usize;
         let bytes = unsafe {
             core::slice::from_raw_parts(
                 (&user_mask as *const usize) as *const u8,
@@ -1672,26 +1673,15 @@ pub fn sys_sigprocmask(
             Ok(v) => v,
             Err(err) => return err,
         };
-        let mut new_flags = SignalFlags::empty();
-        for signum in 1..=MAX_SIG {
-            if (user_mask & (1usize << (signum - 1))) == 0 {
-                continue;
-            }
-            // bit (signum-1) 对应 signum
-            let flag = match 1u64.checked_shl((signum - 1) as u32) {
-                Some(bits) => SignalFlags::from_bits_truncate(bits),
-                None => continue,
-            };
-            new_flags |= flag;
-        }
+        let mut new_flags = user_mask_to_flags(user_mask as u64);
         new_flags.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
         match how {
-            0 => inner.signal_mask |= new_flags,    // SIG_BLOCK
-            1 => inner.signal_mask &= !new_flags,   // SIG_UNBLOCK
-            2 => inner.signal_mask = new_flags,     // SIG_SETMASK
+            0 => task_inner.signal_mask |= new_flags,    // SIG_BLOCK
+            1 => task_inner.signal_mask &= !new_flags,   // SIG_UNBLOCK
+            2 => task_inner.signal_mask = new_flags,     // SIG_SETMASK
             _ => return errno(EINVAL),
         }
-        inner
+        task_inner
             .signal_mask
             .remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
     }
@@ -1727,6 +1717,11 @@ pub fn sys_sigreturn() -> isize {
     let saved_a0 = saved.x[10] as isize;
     let ucontext_ptr = inner.signal_ucontext_ptr;
     inner.signal_ucontext_ptr = 0;
+
+    // 恢复 trap context 和 signal_mask
+    let return_pc;
+    let saved_pc = saved.sepc; // handler 修改前的原始 PC
+    let ret_a0;
     if ucontext_ptr != 0 {
         let token = current_user_token();
         let ucontext = match read_from_user::<UserContext>(token, ucontext_ptr as *const _) {
@@ -1745,121 +1740,52 @@ pub fn sys_sigreturn() -> isize {
         restored.sepc = ucontext.uc_mcontext.gregs[0];
         restored.x[1..].copy_from_slice(&ucontext.uc_mcontext.gregs[1..]);
         *inner.get_trap_cx() = restored;
-        let process = current_process();
-        let mut process_inner = process.inner_exclusive_access();
+        // 从 ucontext 恢复信号掩码（per-thread）
         let mut new_mask = user_mask_to_flags(ucontext.uc_sigmask);
         new_mask.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
-        process_inner.signal_mask = new_mask;
-
-        // 保存当前处理的信号编号，用于 SA_RESETHAND 检查
-        let current_sig = inner.handling_sig;
-
-        // 重置 handling_sig，允许处理新的信号
-        inner.handling_sig = -1;
-
-        // 如果设置了 SA_RESETHAND，重置信号处理函数为默认值
-        if current_sig >= 0 && (current_sig as usize) <= crate::task::MAX_SIG {
-            let sig_actions = process_inner.signal_actions.clone();
-            let action = sig_actions.table[current_sig as usize];
-            if (action.flags & crate::task::SA_RESETHAND) != 0 {
-                info!(
-                    "[sigreturn] SA_RESETHAND set for signal {}, resetting handler to SIG_DFL",
-                    current_sig
-                );
-                process_inner.signal_actions.table[current_sig as usize] = SignalAction::default();
-            }
-        }
-
-        // Detect SIGCANCEL infinite loop after sigreturn
-        let return_pc = restored.sepc;
-        let proc_pending = process_inner.signal_pending & !process_inner.signal_mask;
-        let task_pending = inner.signal_pending & !process_inner.signal_mask;
-        let has_pending_sigcancel = (proc_pending | task_pending).contains(SignalFlags::SIG33);
-
-        if has_pending_sigcancel {
-            if return_pc == inner.sigcancel_last_pc {
-                inner.sigcancel_loop_count += 1;
-                const MAX_SIGCANCEL_STUCK: usize = 3;
-                if inner.sigcancel_loop_count >= MAX_SIGCANCEL_STUCK {
-                    let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-                    warn!(
-                        "[sigreturn] SIGCANCEL loop detected pid={} tid={} pc={:#x} count={}, forcing exit",
-                        pid, tid, return_pc, inner.sigcancel_loop_count
-                    );
-                    process_inner.signal_pending.remove(SignalFlags::SIG33);
-                    inner.signal_pending.remove(SignalFlags::SIG33);
-                    drop(inner);
-                    drop(process_inner);
-                    exit_current_and_run_next(-33);
-                }
-            } else {
-                inner.sigcancel_last_pc = return_pc;
-                inner.sigcancel_loop_count = 1;
-            }
-        } else {
-            inner.sigcancel_last_pc = 0;
-            inner.sigcancel_loop_count = 0;
-        }
-
-        restored.x[10] as isize
+        inner.signal_mask = new_mask;
+        return_pc = restored.sepc;
+        ret_a0 = restored.x[10] as isize;
     } else {
         *inner.get_trap_cx() = saved;
+        // 从 backup 恢复信号掩码（per-thread）
+        inner.signal_mask = inner.signal_mask_backup;
+        return_pc = saved.sepc;
+        ret_a0 = saved_a0;
+    }
+
+    // SA_RESETHAND 处理
+    let current_sig = inner.handling_sig;
+    inner.handling_sig = -1;
+
+    if current_sig >= 0 && (current_sig as usize) <= crate::task::MAX_SIG {
         let process = current_process();
         let mut process_inner = process.inner_exclusive_access();
-        process_inner.signal_mask = inner.signal_mask_backup;
-
-        // 保存当前处理的信号编号，用于 SA_RESETHAND 检查
-        let current_sig = inner.handling_sig;
-
-        // 重置 handling_sig，允许处理新的信号
-        inner.handling_sig = -1;
-
-        // 如果设置了 SA_RESETHAND，重置信号处理函数为默认值
-        if current_sig >= 0 && (current_sig as usize) <= crate::task::MAX_SIG {
-            let sig_actions = process_inner.signal_actions.clone();
-            let action = sig_actions.table[current_sig as usize];
-            if (action.flags & crate::task::SA_RESETHAND) != 0 {
-                info!(
-                    "[sigreturn] SA_RESETHAND set for signal {}, resetting handler to SIG_DFL",
-                    current_sig
-                );
-                process_inner.signal_actions.table[current_sig as usize] = SignalAction::default();
-            }
+        let action = process_inner.signal_actions.table[current_sig as usize];
+        if (action.flags & crate::task::SA_RESETHAND) != 0 {
+            info!(
+                "[sigreturn] SA_RESETHAND set for signal {}, resetting handler to SIG_DFL",
+                current_sig
+            );
+            process_inner.signal_actions.table[current_sig as usize] = SignalAction::default();
         }
-
-        // Detect SIGCANCEL infinite loop after sigreturn
-        let return_pc = saved.sepc;
-        let proc_pending = process_inner.signal_pending & !process_inner.signal_mask;
-        let task_pending = inner.signal_pending & !process_inner.signal_mask;
-        let has_pending_sigcancel = (proc_pending | task_pending).contains(SignalFlags::SIG33);
-
-        if has_pending_sigcancel {
-            if return_pc == inner.sigcancel_last_pc {
-                inner.sigcancel_loop_count += 1;
-                const MAX_SIGCANCEL_STUCK: usize = 3;
-                if inner.sigcancel_loop_count >= MAX_SIGCANCEL_STUCK {
-                    let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-                    warn!(
-                        "[sigreturn] SIGCANCEL loop detected pid={} tid={} pc={:#x} count={}, forcing exit",
-                        pid, tid, return_pc, inner.sigcancel_loop_count
-                    );
-                    process_inner.signal_pending.remove(SignalFlags::SIG33);
-                    inner.signal_pending.remove(SignalFlags::SIG33);
-                    drop(inner);
-                    drop(process_inner);
-                    exit_current_and_run_next(-33);
-                }
-            } else {
-                inner.sigcancel_last_pc = return_pc;
-                inner.sigcancel_loop_count = 1;
-            }
-        } else {
-            inner.sigcancel_last_pc = 0;
-            inner.sigcancel_loop_count = 0;
-        }
-
-        saved_a0
     }
+
+    // SIGCANCEL (signal 33) 处理说明：
+    // musl 的 cancel_handler 总是把 SIG33 加入 uc_sigmask 防止重复投递。
+    // 取消通过两种机制工作：
+    //   1. 异步取消(cancelasync=1)：handler 直接调用 pthread_exit，不会到达 sigreturn
+    //   2. 延迟取消：handler 修改 ucontext PC 指向 __cancel，或者不做任何事
+    //      后续 musl 的 __syscall_cp_asm 会在每个系统调用入口检查 cancel 标志
+    //
+    // 不要重新注入 SIG33！musl 的 cancel flag 机制会在下次系统调用时自动生效。
+    // 如果 handler 修改了 PC（重定向到 __cancel），确保 SIG33 不阻塞后续行为。
+    if current_sig == 33 && return_pc != saved_pc {
+        // handler 成功修改了 PC，确保 SIG33 不被掩码
+        inner.signal_mask.remove(SignalFlags::SIG33);
+    }
+
+    ret_a0
 }
 
 /// Get user ID
