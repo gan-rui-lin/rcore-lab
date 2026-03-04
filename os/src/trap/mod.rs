@@ -25,7 +25,7 @@ use crate::syscall::syscall;
 #[cfg(target_arch = "riscv64")]
 use crate::task::{
     current_add_signal, current_process, current_trap_cx, current_trap_cx_user_va,
-    current_user_token, handle_signals, suspend_current_and_run_next, SignalFlags,
+    current_user_token, handle_signals, suspend_current_and_run_next, SigNumber,
 };
 #[cfg(target_arch = "riscv64")]
 use crate::timer::{check_timer, set_next_trigger};
@@ -257,7 +257,7 @@ pub fn trap_handler() -> ! {
                     error!("  file bytes @sepc: {} not found", path);
                 }
             }
-            current_add_signal(SignalFlags::SIGSEGV);
+            current_add_signal(SigNumber::SigSegv as usize);
         }
         Trap::Exception(Exception::IllegalInstruction) => {
             let trap_cx = current_trap_cx();
@@ -284,7 +284,7 @@ pub fn trap_handler() -> ! {
             } else {
                 error!("  sepc pte: unmapped");
             }
-            current_add_signal(SignalFlags::SIGILL);
+            current_add_signal(SigNumber::SigIll as usize);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             set_next_trigger();

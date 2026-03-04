@@ -175,71 +175,63 @@ pub unsafe extern "C" fn __tlb_refill() {
 /// Main trap handler in Rust
 #[no_mangle]
 pub fn trap_handler(cx: &mut TrapContext) {
+    use crate::task::{current_add_signal, handle_signals, SigNumber};
+
     let estat = estat::read();
     let scause = estat.cause();
 
     match scause {
         // System call
         Trap::Exception(Exception::Syscall) => {
-            cx.era += 4;  // Skip syscall instruction
-            // Call syscall handler (will be implemented by rcore-lab's syscall module)
-            crate::syscall::syscall(
+            cx.era += 4; // Skip syscall instruction
+            let result = crate::syscall::syscall(
                 cx.syscall_number(),
-                cx.syscall_args()
+                cx.syscall_args(),
             );
+            cx.x[4] = result as usize; // a0 = return value (LoongArch: a0 is x4)
         }
 
         // Timer interrupt
         Trap::Interrupt(_) => {
             let irq = estat.is().trailing_zeros() as usize;
-            if irq == 11 {  // Timer IRQ
+            if irq == 11 {
                 ticlr::clear_timer_interrupt();
                 crate::timer::set_next_trigger();
+                crate::timer::check_timer();
                 crate::task::suspend_current_and_run_next();
             } else {
                 panic!("Unknown interrupt: {}", irq);
             }
         }
 
-        // Page faults
-        Trap::Exception(Exception::LoadPageFault) => {
+        // Page faults → send SIGSEGV
+        Trap::Exception(Exception::LoadPageFault)
+        | Trap::Exception(Exception::StorePageFault)
+        | Trap::Exception(Exception::FetchPageFault) => {
             let bad_addr = badv::read().raw();
-            panic!(
-                "PageFault in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                bad_addr, cx.era
+            error!(
+                "[kernel] {:?} in application, bad addr = {:#x}, ERA = {:#x}",
+                scause, bad_addr, cx.era
             );
+            current_add_signal(SigNumber::SigSegv as usize);
         }
 
-        Trap::Exception(Exception::StorePageFault) => {
-            let bad_addr = badv::read().raw();
-            panic!(
-                "PageFault in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                bad_addr, cx.era
-            );
-        }
-
-        Trap::Exception(Exception::FetchPageFault) => {
-            let bad_addr = badv::read().raw();
-            panic!(
-                "InstructionPageFault in application, bad addr = {:#x}, kernel killed it.",
-                bad_addr
-            );
-        }
-
-        // Illegal instruction
+        // Illegal instruction → send SIGILL
         Trap::Exception(Exception::InstructionNotExist) => {
-            panic!(
-                "IllegalInstruction in application, kernel killed it. ERA = {:#x}",
+            error!(
+                "[kernel] IllegalInstruction in application, ERA = {:#x}",
                 cx.era
             );
+            current_add_signal(SigNumber::SigIll as usize);
         }
 
-        // Unaligned access (TODO: implement emulation)
+        // Unaligned access → send SIGBUS
         Trap::Exception(Exception::AddressNotAligned) => {
-            panic!(
-                "UnalignedAccess in application at {:#x}, kernel killed it. (TODO: implement emulation)",
+            error!(
+                "[kernel] UnalignedAccess in application at {:#x}",
                 cx.era
             );
+            current_add_signal(SigNumber::SigBus as usize);
         }
 
         _ => {
@@ -251,6 +243,9 @@ pub fn trap_handler(cx: &mut TrapContext) {
             );
         }
     }
+
+    // Deliver pending signals before returning to user space
+    handle_signals();
 }
 
 /// Initialize trap handling

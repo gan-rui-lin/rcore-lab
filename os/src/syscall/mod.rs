@@ -62,6 +62,8 @@ const SYSCALL_EXIT: usize = 93;
 const SYSCALL_EXIT_GROUP: usize = 94;
 /// set_tid_address syscall
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
+/// futex syscall
+const SYSCALL_FUTEX: usize = 98;
 /// nanosleep syscall
 const SYSCALL_NANOSLEEP: usize = 101;
 /// yield syscall
@@ -92,6 +94,10 @@ const SYSCALL_CONDVAR_SIGNAL: usize = 472;
 const SYSCALL_CONDVAR_WAIT: usize = 473;
 /// kill syscall
 const SYSCALL_KILL: usize = 129;
+/// tkill syscall
+const SYSCALL_TKILL: usize = 130;
+/// tgkill syscall
+const SYSCALL_TGKILL: usize = 131;
 /// sigaction syscall
 const SYSCALL_SIGACTION: usize = 134;
 /// sigprocmask syscall
@@ -173,7 +179,7 @@ use thread::*;
 
 use crate::fs::Stat;
 #[allow(unused_imports)] // debug: for current_trap_cx in syscall() 
-use crate::task::{current_process, current_trap_cx, SignalAction};
+use crate::task::{current_process, current_trap_cx};
 
 const fn parse_trace_pid(value: &str) -> Option<usize> {
     let bytes = value.as_bytes();
@@ -506,9 +512,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
+        SYSCALL_FUTEX => sys_futex(args[0], args[1] as u32, args[2] as u32, args[3], args[4], args[5] as u32),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const TimeSpec, args[1] as *mut TimeSpec),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
+        SYSCALL_TKILL => sys_tkill(args[0], args[1] as i32),
+        SYSCALL_TGKILL => sys_tgkill(args[0], args[1], args[2] as i32),
         SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
             args[0] as *const usize,
             args[1] as *mut usize,
@@ -517,10 +526,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SIGACTION => sys_sigaction(
             args[0] as i32,
-            args[1] as *const SignalAction,
-            args[2] as *mut SignalAction,
+            args[1],
+            args[2],
+            args[3],
         ),
-        SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as u32),
+        SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as i32, args[1], args[2], args[3]),
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),
         SYSCALL_GETTID => sys_gettid(),

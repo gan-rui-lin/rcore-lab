@@ -1,6 +1,7 @@
 //! Synchronization and interior mutability primitives
 
 mod condvar;
+pub mod futex;
 mod mutex;
 mod semaphore;
 mod up;

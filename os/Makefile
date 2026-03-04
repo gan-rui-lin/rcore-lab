@@ -121,7 +121,7 @@ ifeq ($(ARCH), loongarch64)
 		-nographic \
 		-kernel $(KERNEL_ELF) \
 		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
-		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+		-device virtio-blk-pci,drive=x0
 else
 	@qemu-system-riscv64 \
 		-machine virt \

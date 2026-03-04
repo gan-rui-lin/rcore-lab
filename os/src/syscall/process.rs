@@ -12,7 +12,7 @@ use crate::{
     mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission, VirtAddr},
     task::{
         current_process, current_task, current_trap_cx, current_user_token, exit_current_and_run_next,
-        pid2process, suspend_current_and_run_next, SignalAction, SignalFlags,
+        pid2process, suspend_current_and_run_next, SigSet, KSigAction,
         MAX_SIG,
     },
     timer::{get_time, get_time_us},
@@ -1056,71 +1056,181 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
     if crate::syscall::should_trace_syscall(pid_now) {
         trace!("kernel:pid[{}] sys_kill pid={} signum={}", pid_now, pid, signum);
     }
-    if signum <= 0 || signum > MAX_SIG as i32 {
+    if signum < 1 || signum > MAX_SIG as i32 {
         return errno(EINVAL);
     }
-    let flag = match SignalFlags::from_bits(1u32 << signum) {
-        Some(flag) => flag,
-        None => return errno(EINVAL),
+    let pid_isize = pid as isize;
+    if pid_isize > 0 {
+        // Send to specific process
+        let process = match pid2process(pid) {
+            Some(process) => process,
+            None => return errno(ESRCH),
+        };
+        let mut inner = process.inner_exclusive_access();
+        inner.signal_pending.add_sig(signum as usize);
+    } else {
+        // pid == 0 or negative: send to process group (simplified: send to self)
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        inner.signal_pending.add_sig(signum as usize);
+    }
+    0
+}
+
+/// Send a signal to a specific thread (tkill).
+pub fn sys_tkill(tid: usize, signum: i32) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_tkill tid={} signum={}", pid, tid, signum);
+    }
+    if signum < 1 || signum > MAX_SIG as i32 {
+        return errno(EINVAL);
+    }
+    // In our simplified model, tid == pid (main thread)
+    // or tid is the actual thread id. Find the process and thread.
+    let process = match pid2process(tid) {
+        Some(p) => p,
+        None => {
+            // tid might be a thread within the current process
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            if let Some(Some(task)) = inner.tasks.get(tid) {
+                let mut task_inner = task.inner_exclusive_access();
+                task_inner.signal_pending.add_sig(signum as usize);
+                return 0;
+            }
+            return errno(ESRCH);
+        }
     };
-    let process = match pid2process(pid) {
-        Some(process) => process,
+    // Send to the process's main thread (thread-level pending)
+    let inner = process.inner_exclusive_access();
+    if let Some(Some(task)) = inner.tasks.get(0) {
+        let mut task_inner = task.inner_exclusive_access();
+        task_inner.signal_pending.add_sig(signum as usize);
+        0
+    } else {
+        errno(ESRCH)
+    }
+}
+
+/// Send a signal to a specific thread in a specific thread group (tgkill).
+pub fn sys_tgkill(tgid: usize, tid: usize, signum: i32) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        trace!("kernel:pid[{}] sys_tgkill tgid={} tid={} signum={}", pid, tgid, tid, signum);
+    }
+    if signum < 1 || signum > MAX_SIG as i32 {
+        return errno(EINVAL);
+    }
+    // Simplified: tgid is the process pid, tid is the thread index
+    // For compatibility, accept tgid == tid (single-threaded case)
+    let process = match pid2process(tgid) {
+        Some(p) => p,
         None => return errno(ESRCH),
     };
-    let mut inner = process.inner_exclusive_access();
-    inner.signal_pending |= flag;
-    0
+    let inner = process.inner_exclusive_access();
+    // Try to find the thread by tid (as thread index)
+    // In practice, musl often calls tgkill(pid, tid, sig) where tid == pid for main thread
+    let task_idx = if tid == tgid { 0 } else { tid };
+    if let Some(Some(task)) = inner.tasks.get(task_idx) {
+        let mut task_inner = task.inner_exclusive_access();
+        task_inner.signal_pending.add_sig(signum as usize);
+        0
+    } else {
+        errno(ESRCH)
+    }
 }
 
 pub fn sys_sigaction(
     signum: i32,
-    action: *const SignalAction,
-    old_action: *mut SignalAction,
+    action: usize,
+    old_action: usize,
+    sigsetsize: usize,
 ) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_sigaction signum={}", pid, signum);
+        trace!("kernel:pid[{}] sys_sigaction signum={} sigsetsize={}", pid, signum, sigsetsize);
     }
-    if signum <= 0
-        || signum > MAX_SIG as i32
-        || signum == SignalFlags::SIGKILL.bits().trailing_zeros() as i32
-    {
+    // Validate sigsetsize (musl uses 8 bytes for sigset_t on LP64)
+    if sigsetsize != 8 {
+        return errno(EINVAL);
+    }
+    if signum < 1 || signum > MAX_SIG as i32 {
+        return errno(EINVAL);
+    }
+    // Cannot set handler for SIGKILL(9) or SIGSTOP(19)
+    if signum == 9 || signum == 19 {
         return errno(EINVAL);
     }
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let idx = signum as usize;
     let token = inner.memory_set.token();
-    if !old_action.is_null() {
-        let old = inner.signal_actions.table[idx];
+    // Return old action
+    if old_action != 0 {
+        let old = &inner.signal_actions.table[idx];
+        let k_old = KSigAction::from_signal_action(old);
         let bytes = unsafe {
             core::slice::from_raw_parts(
-                (&old as *const SignalAction) as *const u8,
-                core::mem::size_of::<SignalAction>(),
+                (&k_old as *const KSigAction) as *const u8,
+                core::mem::size_of::<KSigAction>(),
             )
         };
         if let Err(err) = copy_to_user(token, old_action as *mut u8, bytes) {
             return err;
         }
     }
-    if !action.is_null() {
-        let new_action = match read_from_user::<SignalAction>(token, action) {
+    // Set new action
+    if action != 0 {
+        let k_new = match read_from_user::<KSigAction>(token, action as *const KSigAction) {
             Ok(v) => v,
             Err(err) => return err,
         };
-        inner.signal_actions.table[idx] = new_action;
+        inner.signal_actions.table[idx] = k_new.to_signal_action();
     }
     0
 }
 
-pub fn sys_sigprocmask(mask: u32) -> isize {
+const SIG_BLOCK: i32 = 0;
+const SIG_UNBLOCK: i32 = 1;
+const SIG_SETMASK: i32 = 2;
+
+pub fn sys_sigprocmask(how: i32, set: usize, oldset: usize, sigsetsize: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        trace!("kernel:pid[{}] sys_sigprocmask mask=0x{:x}", pid, mask);
+        trace!("kernel:pid[{}] sys_sigprocmask how={} set={:#x} oldset={:#x} sigsetsize={}", pid, how, set, oldset, sigsetsize);
     }
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    inner.signal_mask = SignalFlags::from_bits_truncate(mask);
+    if sigsetsize != 8 {
+        return errno(EINVAL);
+    }
+    let task = current_task().unwrap();
+    let process = task.process.upgrade().unwrap();
+    let token = process.inner_exclusive_access().get_user_token();
+    let mut task_inner = task.inner_exclusive_access();
+    // Return old mask
+    if oldset != 0 {
+        let old_bits = task_inner.signal_mask.raw();
+        let bytes = old_bits.to_ne_bytes();
+        if let Err(err) = copy_to_user(token, oldset as *mut u8, &bytes) {
+            return err;
+        }
+    }
+    // Apply new mask
+    if set != 0 {
+        let new_bits = match read_from_user::<u64>(token, set as *const u64) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+        let sigset = SigSet::from_raw(new_bits);
+        match how {
+            SIG_BLOCK => task_inner.signal_mask.union(sigset),
+            SIG_UNBLOCK => task_inner.signal_mask.subtract(sigset),
+            SIG_SETMASK => task_inner.signal_mask = sigset,
+            _ => return errno(EINVAL),
+        }
+        // SIGKILL and SIGSTOP can never be masked
+        task_inner.signal_mask.sanitize_mask();
+    }
     0
 }
 
@@ -1131,16 +1241,36 @@ pub fn sys_sigreturn() -> isize {
     }
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
-    let saved = match inner.signal_trap_cx.take() {
-        Some(cx) => cx,
-        None => return errno(EINVAL),
+    let token = {
+        let process = task.process.upgrade().unwrap();
+        let token = process.inner_exclusive_access().memory_set.token();
+        token
     };
-    let saved_a0 = saved.x[10] as isize;
-    *inner.get_trap_cx() = saved;
-    let process = current_process();
-    let mut process_inner = process.inner_exclusive_access();
-    process_inner.signal_mask = inner.signal_mask_backup;
-    saved_a0
+    let trap_cx = inner.get_trap_cx();
+
+    // Restore registers and signal mask from the sigframe on user stack
+    match crate::task::restore_signal_frame(token, trap_cx) {
+        Some((original_a0, mask)) => {
+            // Sanitize the restored mask (never allow masking SIGKILL/SIGSTOP)
+            let mut restored_mask = mask;
+            restored_mask.sanitize_mask();
+            inner.signal_mask = restored_mask;
+            // Clear any kernel-side backup (LoongArch64 fallback)
+            inner.signal_trap_cx = None;
+            original_a0 as isize
+        }
+        None => {
+            // LoongArch64 fallback: restore from kernel-saved context
+            let saved = match inner.signal_trap_cx.take() {
+                Some(cx) => cx,
+                None => return errno(EINVAL),
+            };
+            let saved_a0 = saved.x[10] as isize;
+            *inner.get_trap_cx() = saved;
+            inner.signal_mask = inner.signal_mask_backup;
+            saved_a0
+        }
+    }
 }
 
 /// Get user ID

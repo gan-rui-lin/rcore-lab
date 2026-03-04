@@ -7,6 +7,7 @@ mod id;
 mod manager;
 mod process;
 mod processor;
+mod sigframe;
 mod signal;
 mod switch;
 #[allow(clippy::module_inception)]
@@ -25,7 +26,12 @@ use manager::fetch_task;
 use process::ProcessControlBlock;
 use switch::__switch;
 
-pub use action::{SignalAction, SignalActions};
+pub use action::{
+    SignalAction, SignalActions, KSigAction,
+    SIG_DFL, SIG_IGN,
+    SA_NOCLDSTOP, SA_NOCLDWAIT, SA_SIGINFO, SA_ONSTACK,
+    SA_RESTART, SA_NODEFER, SA_RESETHAND, SA_RESTORER,
+};
 pub use auxv::AuxvInfo;
 pub use context::TaskContext;
 pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
@@ -36,7 +42,8 @@ pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
     current_user_token, run_tasks, schedule, take_current_task,
 };
-pub use signal::{SignalFlags, SigNumber, MAX_SIG};
+pub use sigframe::restore_signal_frame;
+pub use signal::{SigNumber, SigSet, SigDefaultAction, sig_default_action, MAX_SIG};
 pub use task::{TaskControlBlock, TaskStatus};
 pub use tls::{TlsArea, TlsInfo};
 
@@ -150,12 +157,15 @@ pub fn add_initproc() {
     let _initproc = INITPROC.clone();
 }
 
-pub fn current_add_signal(signal: SignalFlags) {
+/// Add a signal to the process-level pending set (for kill() etc.)
+pub fn current_add_signal(signum: usize) {
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
-    process_inner.signal_pending |= signal;
+    process_inner.signal_pending.add_sig(signum);
 }
 
+/// Check and deliver pending signals to the current task.
+/// Called at trap exit before returning to user space.
 pub fn handle_signals() {
     let task = match current_task() {
         Some(task) => task,
@@ -163,35 +173,39 @@ pub fn handle_signals() {
     };
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
-    let pending = process_inner.signal_pending & !process_inner.signal_mask;
-    if pending.is_empty() {
-        return;
-    }
     let mut task_inner = task.inner_exclusive_access();
-    if task_inner.signal_trap_cx.is_some() && !pending.contains(SignalFlags::SIGKILL) {
+
+    // Merge process-level and thread-level pending signals
+    let all_pending = process_inner.signal_pending.or(task_inner.signal_pending);
+
+    // SIGKILL and SIGSTOP are never maskable
+    let effective_mask = task_inner.signal_mask.and_not(SigSet::unmaskable());
+    let deliverable = all_pending.and_not(effective_mask);
+
+    if deliverable.is_empty() {
         return;
     }
-    let (signum, flag) = if pending.contains(SignalFlags::SIGKILL) {
-        let sigkill_num = SignalFlags::SIGKILL.bits().trailing_zeros() as usize;
-        (sigkill_num, SignalFlags::SIGKILL)
-    } else {
-        let signum = pending.bits().trailing_zeros() as usize;
-        let flag = match SignalFlags::from_bits(1u32 << signum) {
-            Some(flag) => flag,
-            None => return,
-        };
-        (signum, flag)
-    };
-    process_inner.signal_pending.remove(flag);
 
-    if signum == SignalFlags::SIGSTOP.bits().trailing_zeros() as usize {
+    // Pick the lowest signal number
+    let signum = deliverable.lowest_signal().unwrap(); // 1-indexed
+
+    // Dequeue from the correct source (prefer thread-level)
+    if task_inner.signal_pending.contains_sig(signum) {
+        task_inner.signal_pending.remove_sig(signum);
+    } else {
+        process_inner.signal_pending.remove_sig(signum);
+    }
+
+    // SIGSTOP: block the task
+    if signum == 19 {
         drop(task_inner);
         drop(process_inner);
         block_current_and_run_next();
         return;
     }
 
-    if signum == SignalFlags::SIGKILL.bits().trailing_zeros() as usize {
+    // SIGKILL: terminate immediately
+    if signum == 9 {
         let pid = process.pid.0;
         let name = process_inner.name.clone();
         warn!("[signal] pid={} name={} killed by SIGKILL", pid, name);
@@ -202,31 +216,77 @@ pub fn handle_signals() {
     }
 
     let action = process_inner.signal_actions.table[signum];
-    if action.handler == 0 {
-        let pid = process.pid.0;
-        let name = process_inner.name.clone();
-        warn!(
-            "[signal] pid={} name={} default handler for signum {}",
-            pid,
-            name,
-            signum
-        );
-        drop(task_inner);
-        drop(process_inner);
-        exit_current_and_run_next(-(signum as i32));
+
+    // SIG_DFL (handler == 0): default action
+    if action.handler == SIG_DFL {
+        use SigDefaultAction::*;
+        match sig_default_action(signum) {
+            Term | Core => {
+                let pid = process.pid.0;
+                let name = process_inner.name.clone();
+                warn!(
+                    "[signal] pid={} name={} default handler for signum {} (terminate)",
+                    pid, name, signum
+                );
+                drop(task_inner);
+                drop(process_inner);
+                exit_current_and_run_next(-(signum as i32));
+                return;
+            }
+            Stop => {
+                drop(task_inner);
+                drop(process_inner);
+                block_current_and_run_next();
+                return;
+            }
+            Cont => {
+                // Continue: just return to user space
+                return;
+            }
+            Ignore => {
+                // Ignored signal: discard
+                return;
+            }
+        }
+    }
+
+    // SIG_IGN (handler == 1): ignore
+    if action.handler == SIG_IGN {
         return;
     }
 
-    if task_inner.signal_trap_cx.is_none() {
-        task_inner.signal_trap_cx = Some(*task_inner.get_trap_cx());
-        task_inner.signal_mask_backup = process_inner.signal_mask;
-        process_inner.signal_mask |= action.mask | flag;
-    }
+    // User handler: push signal frame to user stack
+    let old_mask = task_inner.signal_mask;
+    let token = process_inner.memory_set.token();
     let trap_cx = task_inner.get_trap_cx();
-    #[cfg(target_arch = "riscv64")]
-    { trap_cx.sepc = action.handler; }
+
+    // Save kernel-side backup for LoongArch64 fallback (no real sigframe yet)
     #[cfg(target_arch = "loongarch64")]
-    { trap_cx.era = action.handler; }
+    {
+        task_inner.signal_trap_cx = Some(*trap_cx);
+        task_inner.signal_mask_backup = old_mask;
+    }
+
+    if sigframe::setup_signal_frame(token, trap_cx, signum, &action, old_mask).is_none() {
+        // Failed to set up frame (e.g. stack overflow) — kill with SIGSEGV
+        warn!("[signal] failed to setup signal frame for signum={}, killing", signum);
+        drop(task_inner);
+        drop(process_inner);
+        exit_current_and_run_next(-(SigNumber::SigSegv as i32));
+        return;
+    }
+
+    // Update signal mask: block sa_mask + the signal itself (unless SA_NODEFER)
+    task_inner.signal_mask.union(action.mask);
+    if action.flags & SA_NODEFER == 0 {
+        task_inner.signal_mask.add_sig(signum);
+    }
+    task_inner.signal_mask.sanitize_mask();
+
+    // SA_RESETHAND: reset handler to SIG_DFL after delivery
+    if action.flags & SA_RESETHAND != 0 {
+        process_inner.signal_actions.table[signum] = SignalAction::default();
+    }
 }
 
 pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
@@ -237,8 +297,7 @@ pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
 pub fn block_and_yield() {
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
-    process_inner.signal_pending.remove(SignalFlags::SIGCONT);
+    process_inner.signal_pending.remove_sig(18); // SIGCONT
     drop(process_inner);
     block_current_and_run_next();
-
 }

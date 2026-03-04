@@ -1,4 +1,5 @@
 use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
+use crate::sync::futex::{futex_wait, futex_wake, FUTEX_WAIT, FUTEX_WAKE, FUTEX_PRIVATE_FLAG};
 use crate::task::current_process;
 use alloc::sync::Arc;
 
@@ -122,4 +123,25 @@ pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
     drop(process_inner);
     condvar.wait(mutex);
     0
+}
+
+/// sys_futex(uaddr, op, val, timeout, uaddr2, val3)
+/// Currently supports FUTEX_WAIT and FUTEX_WAKE (with or without FUTEX_PRIVATE_FLAG).
+pub fn sys_futex(
+    uaddr: usize,
+    op: u32,
+    val: u32,
+    _timeout: usize,
+    _uaddr2: usize,
+    _val3: u32,
+) -> isize {
+    let cmd = op & !FUTEX_PRIVATE_FLAG; // strip private flag
+    match cmd {
+        FUTEX_WAIT => futex_wait(uaddr, val),
+        FUTEX_WAKE => futex_wake(uaddr, val),
+        _ => {
+            warn!("[futex] unsupported op={:#x}", op);
+            -38 // ENOSYS
+        }
+    }
 }

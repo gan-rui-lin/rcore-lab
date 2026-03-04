@@ -34,8 +34,11 @@ pub struct TaskControlBlockInner {
     pub task_cx: TaskContext,
     pub task_status: TaskStatus,
     pub exit_code: Option<i32>,
+    // Signal fields (per-thread)
+    pub signal_mask: super::SigSet,
+    pub signal_pending: super::SigSet,
     pub signal_trap_cx: Option<TrapContext>,
-    pub signal_mask_backup: super::SignalFlags,
+    pub signal_mask_backup: super::SigSet,
     pub clear_child_tid: usize,
 }
 
@@ -66,8 +69,10 @@ impl TaskControlBlock {
                     task_cx: TaskContext::goto_trap_return(kstack_top),
                     task_status: TaskStatus::Ready,
                     exit_code: None,
+                    signal_mask: super::SigSet::empty(),
+                    signal_pending: super::SigSet::empty(),
                     signal_trap_cx: None,
-                    signal_mask_backup: super::SignalFlags::empty(),
+                    signal_mask_backup: super::SigSet::empty(),
                     clear_child_tid: 0,
                 })
             },

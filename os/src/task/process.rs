@@ -1,6 +1,6 @@
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
-use super::{PidHandle, SignalActions, SignalFlags, TaskControlBlock, TlsArea, add_task, pid_alloc};
+use super::{PidHandle, SignalActions, SigSet, TaskControlBlock, TlsArea, add_task, pid_alloc};
 use crate::config::{USER_STACK_SIZE};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{KERNEL_SPACE, MemorySet, translated_byte_buffer, translated_ref, translated_refmut, translated_str};
@@ -61,10 +61,9 @@ pub struct ProcessControlBlockInner {
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub exit_code: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
-    pub signals: SignalFlags,
-    pub signal_pending: SignalFlags,
-    pub signal_mask: SignalFlags,
-    pub signal_actions: SignalActions,
+    // Signal fields (process-wide)
+    pub signal_pending: SigSet,       // Process-directed pending signals (from kill())
+    pub signal_actions: SignalActions, // Signal dispositions (shared by all threads)
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,
     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
@@ -149,9 +148,7 @@ impl ProcessControlBlock {
                         Some(Arc::new(Stdout)),
                         Some(Arc::new(Stdout)),
                     ],
-                    signals: SignalFlags::empty(),
-                    signal_pending: SignalFlags::empty(),
-                    signal_mask: SignalFlags::empty(),
+                    signal_pending: SigSet::empty(),
                     signal_actions: SignalActions::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -535,9 +532,7 @@ impl ProcessControlBlock {
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table: new_fd_table,
-                    signals: SignalFlags::empty(),
-                    signal_pending: SignalFlags::empty(),
-                    signal_mask: parent.signal_mask,
+                    signal_pending: SigSet::empty(),
                     signal_actions: parent.signal_actions.clone(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
