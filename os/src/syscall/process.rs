@@ -432,6 +432,15 @@ pub fn sys_clone(
         return errno(EINVAL);
     }
     let clone_flags = CloneFlags::from_bits_truncate((flags as u64) & !0xff);
+    info!(
+        "[clone] flags={:#x} clone_flags={:#x} stack={:#x} ptid={:#x} tls={:#x} ctid={:#x}",
+        flags,
+        clone_flags.bits(),
+        stack as usize,
+        ptid as usize,
+        tls as usize,
+        ctid as usize
+    );
 
     if !clone_flags.contains(CloneFlags::THREAD) {
         return sys_fork();
@@ -446,10 +455,11 @@ pub fn sys_clone(
     let parent_signal_mask = parent_task_inner.signal_mask;
     drop(parent_task_inner);
 
+    let alloc_user_stack = stack.is_null();
     let new_task = Arc::new(TaskControlBlock::new(
         Arc::clone(&process),
         ustack_base,
-        true,
+        alloc_user_stack,
     ));
     // 新线程继承父线程的信号掩码（Linux 语义：clone(CLONE_THREAD) 继承 signal_mask）
     {
@@ -493,10 +503,36 @@ pub fn sys_clone(
 
     if clone_flags.contains(CloneFlags::PARENT_SETTID) && !ptid.is_null() {
         let token = current_user_token();
+        let ptid_addr = ptid as usize;
+        let pt = PageTable::from_token(token);
+        let vpn = VirtAddr::from(ptid_addr).floor();
+        match pt.translate(vpn) {
+            Some(pte) => info!(
+                "[clone] ptid addr={:#x} vpn={:?} pte_valid={} flags={:?}",
+                ptid_addr,
+                vpn,
+                pte.is_valid(),
+                pte.flags()
+            ),
+            None => info!("[clone] ptid addr={:#x} vpn={:?} pte=None", ptid_addr, vpn),
+        }
         *translated_refmut(token, ptid) = new_task_tid as i32;
     }
     if clone_flags.contains(CloneFlags::CHILD_SETTID) && !ctid.is_null() {
         let token = new_task.get_user_token();
+        let ctid_addr = ctid as usize;
+        let pt = PageTable::from_token(token);
+        let vpn = VirtAddr::from(ctid_addr).floor();
+        match pt.translate(vpn) {
+            Some(pte) => info!(
+                "[clone] ctid addr={:#x} vpn={:?} pte_valid={} flags={:?}",
+                ctid_addr,
+                vpn,
+                pte.is_valid(),
+                pte.flags()
+            ),
+            None => info!("[clone] ctid addr={:#x} vpn={:?} pte=None", ctid_addr, vpn),
+        }
         *translated_refmut(token, ctid) = new_task_tid as i32;
     }
 
@@ -1566,7 +1602,28 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
     }
     if let Some(task) = inner.tasks[tid].as_ref() {
         let mut task_inner = task.inner_exclusive_access();
+        if signum == 33 {
+            let target_tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+            let tp = task_inner.get_trap_cx().x[4];
+            info!(
+                "[tkill] pid={} target_tid={} canceltype={} tp={:#x} mask={:?} pending_before={:?}",
+                pid_now,
+                target_tid,
+                task_inner.canceltype,
+                tp,
+                task_inner.signal_mask,
+                task_inner.signal_pending
+            );
+        }
         task_inner.signal_pending |= flag;
+        if signum == 33 {
+            info!(
+                "[tkill] pid={} target_tid={} pending_after={:?}",
+                pid_now,
+                task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
+                task_inner.signal_pending
+            );
+        }
         if task_inner.task_status == TaskStatus::Blocked {
             futex_remove_waiter_any(task);
             task_inner.interrupted_by_signal = true;
@@ -1783,6 +1840,21 @@ pub fn sys_sigreturn() -> isize {
     if current_sig == 33 && return_pc != saved_pc {
         // handler 成功修改了 PC，确保 SIG33 不被掩码
         inner.signal_mask.remove(SignalFlags::SIG33);
+    }
+
+    if current_sig == 33 {
+        let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+        let tp = inner.get_trap_cx().x[4];
+        info!(
+            "[sigreturn] pid={} tid={} sig33 canceltype={} tp={:#x} saved_pc={:#x} return_pc={:#x} mask={:?}",
+            pid,
+            tid,
+            inner.canceltype,
+            tp,
+            saved_pc,
+            return_pc,
+            inner.signal_mask
+        );
     }
 
     ret_a0
@@ -2063,6 +2135,7 @@ pub fn sys_rt_sigtimedwait(
 
         if let Some(dl) = deadline {
             if get_time_us() >= dl {
+
                 return errno(EAGAIN);
             }
         }
