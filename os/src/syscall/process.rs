@@ -1606,10 +1606,9 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
             let target_tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
             let tp = task_inner.get_trap_cx().x[4];
             info!(
-                "[tkill] pid={} target_tid={} canceltype={} tp={:#x} mask={:?} pending_before={:?}",
+                "[tkill] pid={} target_tid={} tp={:#x} mask={:?} pending_before={:?}",
                 pid_now,
                 target_tid,
-                task_inner.canceltype,
                 tp,
                 task_inner.signal_mask,
                 task_inner.signal_pending
@@ -1791,14 +1790,14 @@ pub fn sys_sigreturn() -> isize {
             ucontext_ptr,
             saved.sepc,
             ucontext.uc_mcontext.gregs[0],
-            ucontext.uc_sigmask
+            ucontext.uc_sigmask[0]
         );
         let mut restored = saved;
         restored.sepc = ucontext.uc_mcontext.gregs[0];
         restored.x[1..].copy_from_slice(&ucontext.uc_mcontext.gregs[1..]);
         *inner.get_trap_cx() = restored;
         // 从 ucontext 恢复信号掩码（per-thread）
-        let mut new_mask = user_mask_to_flags(ucontext.uc_sigmask);
+        let mut new_mask = user_mask_to_flags(ucontext.uc_sigmask[0]);
         new_mask.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
         inner.signal_mask = new_mask;
         return_pc = restored.sepc;
@@ -1846,10 +1845,9 @@ pub fn sys_sigreturn() -> isize {
         let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
         let tp = inner.get_trap_cx().x[4];
         info!(
-            "[sigreturn] pid={} tid={} sig33 canceltype={} tp={:#x} saved_pc={:#x} return_pc={:#x} mask={:?}",
+            "[sigreturn] pid={} tid={} sig33 tp={:#x} saved_pc={:#x} return_pc={:#x} mask={:?}",
             pid,
             tid,
-            inner.canceltype,
             tp,
             saved_pc,
             return_pc,
@@ -2143,39 +2141,3 @@ pub fn sys_rt_sigtimedwait(
     }
 }
 
-/// Workaround for missing pthread_setcanceltype in test binary
-/// Implements kernel-side tracking of cancel type for SIGCANCEL handler
-pub fn sys_pthread_setcanceltype(new: usize, old: *mut usize) -> isize {
-    const PTHREAD_CANCEL_ASYNCHRONOUS: usize = 1;
-
-    // Validate new type (0=DEFERRED, 1=ASYNCHRONOUS)
-    if new > PTHREAD_CANCEL_ASYNCHRONOUS {
-        return errno(EINVAL);
-    }
-
-    let task = current_task().unwrap();
-    let mut task_inner = task.inner_exclusive_access();
-
-    // Save old value if requested
-    if !old.is_null() {
-        let token = current_user_token();
-        *translated_refmut(token, old) = task_inner.canceltype as usize;
-    }
-
-    // Set new value
-    task_inner.canceltype = new as u8;
-
-    let pid = current_process().pid.0;
-    if pid == 36 {  // Log for pthread_cancel test
-        info!(
-            "[pthread_setcanceltype] pid={} tid={} old={} new={} ({})",
-            pid,
-            task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
-            task_inner.canceltype,
-            new,
-            if new == 1 { "ASYNC" } else { "DEFERRED" }
-        );
-    }
-
-    0
-}

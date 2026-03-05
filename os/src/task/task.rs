@@ -42,7 +42,6 @@ pub struct TaskControlBlockInner {
     pub signal_ucontext_ptr: usize,
     pub clear_child_tid: usize,
     pub interrupted_by_signal: bool,
-    pub canceltype: u8, // 0=DEFERRED, 1=ASYNCHRONOUS (workaround for missing pthread_setcanceltype)
     /// 当前正在处理的信号编号（-1 表示未处理信号，用于防止信号重入）
     pub handling_sig: isize,
     // for debug
@@ -86,7 +85,6 @@ impl TaskControlBlock {
                     signal_ucontext_ptr: 0,
                     clear_child_tid: 0,
                     interrupted_by_signal: false,
-                    canceltype: 0, // DEFERRED by default
                     handling_sig: -1, // -1 表示未处理信号
                     last_syscall: 0,
                     sigcancel_last_pc: 0,
