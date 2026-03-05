@@ -14,7 +14,7 @@ mod switch;
 mod task;
 mod futex;
 mod tls;
-
+#[allow(unused_imports)]
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, PageTable, VirtAddr};
 use crate::sbi::shutdown;
@@ -449,6 +449,29 @@ pub fn handle_signals() {
 
     let pid = process.pid.0;
     let _tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+    if signum == 33 {
+        let tp = task_inner.get_trap_cx().x[4];
+        info!(
+            "[handle_signals] pid={} tid={} sig33 canceltype={} tp={:#x} mask={:?} task_pending={:?} proc_pending={:?}",
+            pid,
+            _tid,
+            task_inner.canceltype,
+            tp,
+            task_inner.signal_mask,
+            task_pending,
+            process_pending
+        );
+    }
+    if signum == 33 {
+        info!(
+            "[handle_signals] pid={} tid={} sig33 mask={:?} task_pending={:?} proc_pending={:?}",
+            pid,
+            _tid,
+            task_inner.signal_mask,
+            task_pending,
+            process_pending
+        );
+    }
 
     // 5. 如果任务被阻塞，唤醒它
     if task_inner.task_status == TaskStatus::Blocked {
@@ -505,6 +528,16 @@ pub fn handle_signals() {
 
     // 10. 获取信号处理动作
     let action = process_inner.signal_actions.table[signum];
+    if signum == 33 {
+        info!(
+            "[handle_signals] pid={} tid={} sig33 handler={:#x} flags={:#x} restorer={:#x}",
+            pid,
+            _tid,
+            action.handler,
+            action.flags,
+            action.restorer
+        );
+    }
 
     // 11. 默认处理（SIG_DFL）
     if action.handler == 0 {
