@@ -144,13 +144,19 @@ impl TaskUserRes {
             ustack_base,
             process: Arc::downgrade(&process),
         };
+        task_user_res.alloc_trap_cx();
         if alloc_user_res {
-            task_user_res.alloc_user_res();
+            task_user_res.alloc_ustack();
         }
         task_user_res
     }
 
     pub fn alloc_user_res(&self) {
+        self.alloc_trap_cx();
+        self.alloc_ustack();
+    }
+
+    fn alloc_ustack(&self) {
         let process = self.process.upgrade().unwrap();
         let mut process_inner = process.inner_exclusive_access();
         let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
@@ -172,8 +178,21 @@ impl TaskUserRes {
                 pte.bits
             );
         }
+    }
+
+    fn alloc_trap_cx(&self) {
+        let process = self.process.upgrade().unwrap();
+        let mut process_inner = process.inner_exclusive_access();
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
+            if let Some(pte) = process_inner
+                .memory_set
+                .translate(VirtAddr::from(trap_cx_bottom).floor())
+            {
+                if pte.is_valid() {
+                    return;
+                }
+            }
         process_inner.memory_set.insert_framed_area(
             trap_cx_bottom.into(),
             trap_cx_top.into(),
