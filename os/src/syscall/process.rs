@@ -860,16 +860,18 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
             }
             if let Some(mut interp_path) = interp {
                 if open_file(interp_path.as_str(), OpenFlags::empty()).is_none() {
-                    // ! 实际已经先 ensure_flink 了
-                    if interp_path == "/lib/ld-linux-riscv64-lp64d.so.1" {
-                        let musl_loader = "/musl/lib/libc.so";
-                        let glibc_loader = "/glibc/lib/ld-linux-riscv64-lp64d.so.1";
+                    // Fallback: try musl/glibc loader for known interpreter paths
+                    let musl_loader = "/musl/lib/libc.so";
+                    let glibc_loader = "/glibc/lib/ld-linux-riscv64-lp64d.so.1";
+                    if interp_path == "/lib/ld-linux-riscv64-lp64d.so.1"
+                        || interp_path.contains("ld-musl-riscv64")
+                    {
                         if open_file(musl_loader, OpenFlags::empty()).is_some() {
+                            info!("[sys_exec] interp {} not found, fallback to musl loader: {}", interp_path, musl_loader);
                             interp_path = String::from(musl_loader);
-                            info!("[sys_exec] prefer musl loader: {}", interp_path);
                         } else if open_file(glibc_loader, OpenFlags::empty()).is_some() {
+                            info!("[sys_exec] interp {} not found, fallback to glibc loader: {}", interp_path, glibc_loader);
                             interp_path = String::from(glibc_loader);
-                            info!("[sys_exec] fallback glibc loader: {}", interp_path);
                         }
                     }
                 }
