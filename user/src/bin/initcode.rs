@@ -7,7 +7,7 @@ extern crate user_lib;
 extern crate alloc;
 
 use alloc::vec::Vec;
-use user_lib::{chdir, dup, execve, exit, fork, open, shutdown, wait, OpenFlags};
+use user_lib::{chdir, close, dup, execve, exit, fork, open, shutdown, wait, write, OpenFlags};
 
 const ENABLE_SINGLE_ELF_SUITE: bool = false;
 const ENABLE_BASIC_TEST: bool = false;
@@ -22,6 +22,13 @@ const SINGLE_TEST: Option<&str> = option_env!("SINGLE_TEST");
 const BUSYBOX: &str = "/musl/busybox\0";
 const SH: &[u8] = b"sh\0";
 const PATH_ENV: &[u8] = b"PATH=/bin:/musl:/usr/bin\0";
+const RUN_EMBEDDED_PTHREAD: bool = false;
+const PTHREAD_TEST_PATH: &str = "/tmp/pthread_cancel_test";
+// Embed the pthread_cancel test ELF to avoid touching the disk image.
+const EMBEDDED_PTHREAD_ELF: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../pthread_cancel_small"
+));
 
 fn cstring(s: &str) -> Vec<u8> {
     let mut v = Vec::from(s.as_bytes());
@@ -31,6 +38,32 @@ fn cstring(s: &str) -> Vec<u8> {
     v
 }
 
+fn write_embedded_elf(path: &str, data: &[u8]) -> isize {
+    let path_c = cstring(path);
+    let path_str = unsafe { core::str::from_utf8_unchecked(&path_c) };
+    let fd = open(
+        path_str,
+        OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY,
+    );
+    if fd < 0 {
+        println!("open {} failed (ret={})", path, fd);
+        return fd;
+    }
+    let fd = fd as usize;
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let n = write(fd, &data[offset..]);
+        if n <= 0 {
+            println!("write {} failed (ret={})", path, n);
+            let _ = close(fd);
+            return n;
+        }
+        offset += n as usize;
+    }
+    let _ = close(fd);
+    0
+}
+
 #[no_mangle]
 fn main() -> i32 {
     let _ = open("console\0", OpenFlags::RDWR);
@@ -38,6 +71,12 @@ fn main() -> i32 {
     let _ = dup(0);
 
     println!("\n=== rCore initcode ===");
+
+    if RUN_EMBEDDED_PTHREAD {
+        let _ = write_embedded_elf(PTHREAD_TEST_PATH, EMBEDDED_PTHREAD_ELF);
+        let _ = run_single_binary(PTHREAD_TEST_PATH);
+        shutdown();
+    }
 
     if let Some(test_path) = SINGLE_TEST {
         let _ = run_single_binary(test_path);

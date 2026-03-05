@@ -343,8 +343,24 @@ pub fn trap_handler() -> ! {
             set_next_trigger();
             check_timer();
 
-            // 注意：SIGCANCEL 循环检测已在 handle_signals() 和 sys_sigreturn() 中处理，
-            // 无需在 timer 中断中重复检测。
+            // Ensure pending signals are handled even if we preempt from user mode.
+            // Without this, pure user-space loops may never process SIGCANCEL.
+            if let Some(task) = current_task() {
+                let task_inner = task.inner_exclusive_access();
+                if task_inner.signal_pending.contains(SignalFlags::SIG33) {
+                    let pid = current_process().pid.0;
+                    let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+                    let tp = task_inner.get_trap_cx().x[4];
+                    info!(
+                        "[trap-timer] pid={} tid={} sig33 pending tp={:#x} mask={:?}",
+                        pid,
+                        tid,
+                        tp,
+                        task_inner.signal_mask
+                    );
+                }
+            }
+            handle_signals();
 
             let count = TIMER_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
             if count % TIMER_SAMPLE_INTERVAL == 0 {
@@ -378,6 +394,21 @@ pub fn trap_handler() -> ! {
         }
     }
     //println!("before trap_return");
+    if let Some(task) = current_task() {
+        let task_inner = task.inner_exclusive_access();
+        if task_inner.signal_pending.contains(SignalFlags::SIG33) {
+            let pid = current_process().pid.0;
+            let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+            let tp = task_inner.get_trap_cx().x[4];
+            info!(
+                "[trap] pid={} tid={} sig33 pending tp={:#x} mask={:?}",
+                pid,
+                tid,
+                tp,
+                task_inner.signal_mask
+            );
+        }
+    }
     handle_signals();
     trap_return();
 }
