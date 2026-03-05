@@ -5,6 +5,12 @@ use crate::mm::UserBuffer;
 use crate::sbi::console_getchar;
 use crate::task::suspend_current_and_run_next;
 
+/// /dev/null device: reads return 0 (EOF), writes succeed silently
+pub struct DevNull;
+
+/// /dev/zero device: reads return zero bytes, writes succeed silently
+pub struct DevZero;
+
 /// stdin file for getting chars from console
 pub struct Stdin;
 
@@ -83,4 +89,25 @@ impl File for Stdout {
         }
         return PollEvents::empty();
     }
+}
+
+impl File for DevNull {
+    fn readable(&self) -> bool { true }
+    fn writable(&self) -> bool { true }
+    fn read(&self, _user_buf: UserBuffer) -> usize { 0 }
+    fn write(&self, user_buf: UserBuffer) -> usize { user_buf.len() }
+}
+
+impl File for DevZero {
+    fn readable(&self) -> bool { true }
+    fn writable(&self) -> bool { true }
+    fn read(&self, mut user_buf: UserBuffer) -> usize {
+        let mut total = 0;
+        for buffer in user_buf.buffers.iter_mut() {
+            buffer.fill(0);
+            total += buffer.len();
+        }
+        total
+    }
+    fn write(&self, user_buf: UserBuffer) -> usize { user_buf.len() }
 }

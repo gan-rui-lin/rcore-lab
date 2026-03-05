@@ -1,6 +1,7 @@
 //! File and filesystem-related syscalls
 use crate::fs::{
-    create_dir, make_pipe, open_file, path_is_dir, remove_path, OpenFlags, Stat, StatMode,PollEvents
+    create_dir, make_pipe, open_file, path_is_dir, remove_path, DevNull, DevZero,
+    OpenFlags, Stat, StatMode, PollEvents,
 };
 use crate::mm::{translated_byte_buffer, translated_str, translated_refmut, UserBuffer};
 #[allow(unused_imports)] // for debug
@@ -12,7 +13,31 @@ use super::errno::*;
 use super::process::TimeSpec;
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+
+/// Check if a path is a character device.
+fn is_char_device(path: &str) -> bool {
+    matches!(
+        path,
+        "/dev/null" | "/dev/zero" | "/dev/tty" | "/dev/urandom" | "/dev/random"
+            | "/dev/rtc" | "/dev/rtc0" | "/dev/misc/rtc"
+    )
+}
+
+fn rdev_for_path(path: &str) -> u64 {
+    match path {
+        "/dev/null" => 0x0103,
+        "/dev/zero" => 0x0105,
+        "/dev/tty" => 0x0500,
+        "/dev/urandom" | "/dev/random" => 0x0109,
+        _ => 0,
+    }
+}
+
+use alloc::collections::BTreeMap;
+use crate::sync::UPSafeCell;
+use lazy_static::lazy_static;
 
 #[cfg(feature = "ext4")]
 use alloc::ffi::CString;
@@ -21,6 +46,57 @@ use lwext4_rust::bindings::ext4_flink;
 
 const AT_FDCWD: isize = -100;
 const AT_REMOVEDIR: u32 = 0x200;
+const UTIME_NOW: isize = 0x3fffffff;
+const UTIME_OMIT: isize = 0x3ffffffe;
+
+/// Per-file stored timestamps (atime, mtime).
+#[derive(Clone, Copy, Debug)]
+struct FileTimestamps {
+    atime_sec: i64,
+    atime_nsec: i64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+}
+
+lazy_static! {
+    /// Global map: fd-unique-key -> timestamps.
+    /// We key by a monotonic counter assigned per open() to track fd-level timestamps
+    /// (since multiple fds can share the same path but need independent timestamps via tmpfile).
+    static ref TIMESTAMPS: UPSafeCell<BTreeMap<usize, FileTimestamps>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
+    static ref TS_NEXT_ID: UPSafeCell<usize> = unsafe { UPSafeCell::new(1) };
+}
+
+#[allow(dead_code)]
+fn ts_alloc_id() -> usize {
+    let mut id = TS_NEXT_ID.exclusive_access();
+    let ret = *id;
+    *id += 1;
+    ret
+}
+
+fn get_current_timespec() -> (i64, i64) {
+    let us = crate::timer::get_time_us();
+    let sec = (us / 1_000_000) as i64;
+    let nsec = ((us % 1_000_000) * 1000) as i64;
+    (sec, nsec)
+}
+
+fn ts_get(id: usize) -> Option<FileTimestamps> {
+    let map = TIMESTAMPS.exclusive_access();
+    map.get(&id).copied()
+}
+
+fn ts_set(id: usize, ts: FileTimestamps) {
+    let mut map = TIMESTAMPS.exclusive_access();
+    map.insert(id, ts);
+}
+
+#[allow(dead_code)]
+fn ts_remove(id: usize) {
+    let mut map = TIMESTAMPS.exclusive_access();
+    map.remove(&id);
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -129,8 +205,8 @@ fn build_statfs() -> StatFs {
         f_blocks: 1024 * 1024,
         f_bfree: 512 * 1024,
         f_bavail: 512 * 1024,
-        f_files: 0,
-        f_ffree: 0,
+        f_files: 1024 * 1024,
+        f_ffree: 512 * 1024,
         f_fsid: [0, 0],
         f_namelen: 255,
         f_frsize: 1024,
@@ -245,6 +321,21 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     let flags = OpenFlags::from_bits_truncate(flags);
     if flags.contains(OpenFlags::DIRECTORY) && !path_is_dir(&full_path) {
         return errno(ENOTDIR);
+    }
+    // Special device files
+    let dev_file: Option<Arc<dyn crate::fs::File + Send + Sync>> = match full_path.as_str() {
+        "/dev/null" => Some(Arc::new(DevNull)),
+        "/dev/zero" => Some(Arc::new(DevZero)),
+        _ => None,
+    };
+    if let Some(file) = dev_file {
+        let mut inner = process.inner_exclusive_access();
+        let fd = match inner.alloc_fd() {
+            Some(fd) => fd,
+            None => return errno(EMFILE),
+        };
+        inner.fd_table[fd] = Some(file);
+        return fd as isize;
     }
     if let Some(inode) = open_file(full_path.as_str(), flags) {
         let mut inner = process.inner_exclusive_access();
@@ -380,30 +471,47 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, _flags: u32) ->
     //     full_path
     // );
 
-    let open_flags = if path_is_dir(&full_path) {
-        OpenFlags::DIRECTORY
-    } else {
-        OpenFlags::empty()
-    };
-    let Some(file) = open_file(full_path.as_str(), open_flags) else {
-        return errno(ENOENT);
-    };
+    // Check for path traversal through non-directory (e.g. /dev/null/invalid)
+    let comps: Vec<&str> = full_path.split('/').filter(|s| !s.is_empty()).collect();
+    for i in 0..comps.len().saturating_sub(1) {
+        let partial = format!("/{}", comps[..=i].join("/"));
+        if is_char_device(&partial) {
+            return errno(ENOTDIR);
+        }
+    }
+
     let mut stat = Stat::default();
-    let (mode_bits, size) = if let Some(inode) = file.inode() {
-        let mode = if inode.is_dir() {
-            StatMode::DIR
-        } else {
-            StatMode::FILE
-        };
-        (mode.bits() | 0o777, inode.size())
+    // Handle character devices specially
+    if is_char_device(&full_path) {
+        stat.mode = StatMode::CHR.bits() | 0o666;
+        stat.nlink = 1;
+        stat.rdev = rdev_for_path(&full_path);
     } else {
-        (StatMode::FILE.bits() | 0o666, 0)
-    };
-    stat.mode = mode_bits;
-    stat.nlink = 1;
-    stat.size = size as i64;
-    stat.blksize = 512;
-    stat.blocks = ((size + 511) / 512) as i64;
+        let open_flags = if path_is_dir(&full_path) {
+            OpenFlags::DIRECTORY
+        } else {
+            OpenFlags::empty()
+        };
+        let Some(file) = open_file(full_path.as_str(), open_flags) else {
+            return errno(ENOENT);
+        };
+        let (mode_bits, size) = if let Some(inode) = file.inode() {
+            let mode = if inode.is_dir() {
+                StatMode::DIR
+            } else {
+                StatMode::FILE
+            };
+            (mode.bits() | 0o777, inode.size())
+        } else {
+            (StatMode::FILE.bits() | 0o666, 0)
+        };
+        stat.mode = mode_bits;
+        stat.nlink = 1;
+        stat.size = size as i64;
+        stat.blksize = 512;
+        stat.blocks = ((size + 511) / 512) as i64;
+    }
+    fill_stat_timestamps(&mut stat, None);
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&stat as *const Stat) as *const u8,
@@ -416,41 +524,163 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, _flags: u32) ->
     }
 }
 
-/// utimensat - update file timestamps (no-op)
+/// Read two TimeSpec values from user space (the `times[2]` array).
+fn read_times_from_user(token: usize, times: *const TimeSpec) -> Option<(TimeSpec, TimeSpec)> {
+    if times.is_null() {
+        return None;
+    }
+    let size = core::mem::size_of::<TimeSpec>() * 2;
+    let mut data = [0u8; 32]; // 2 * TimeSpec (each 16 bytes on rv64)
+    let slices = translated_byte_buffer(token, times as *const u8, size);
+    let mut offset = 0usize;
+    for slice in slices {
+        let len = slice.len().min(size - offset);
+        data[offset..offset + len].copy_from_slice(&slice[..len]);
+        offset += len;
+    }
+    let ts0 = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const TimeSpec) };
+    let ts1 = unsafe {
+        core::ptr::read_unaligned(data.as_ptr().add(core::mem::size_of::<TimeSpec>()) as *const TimeSpec)
+    };
+    Some((ts0, ts1))
+}
+
+/// Apply utimensat semantics to a file's stored timestamps.
+fn apply_utimensat_to_fd(fd: usize, times: *const TimeSpec, token: usize) -> isize {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+        return errno(EBADF);
+    }
+    let file = inner.fd_table[fd].as_ref().unwrap().clone();
+    drop(inner);
+
+    let ts_id = match file.ts_id() {
+        Some(id) => id,
+        None => return 0, // pipes/stdio — just succeed silently
+    };
+
+    let (now_sec, now_nsec) = get_current_timespec();
+
+    // Get existing timestamps or default to current time
+    let mut ts = ts_get(ts_id).unwrap_or(FileTimestamps {
+        atime_sec: now_sec,
+        atime_nsec: now_nsec,
+        mtime_sec: now_sec,
+        mtime_nsec: now_nsec,
+    });
+
+    if times.is_null() {
+        // NULL times => set both to current time
+        ts.atime_sec = now_sec;
+        ts.atime_nsec = now_nsec;
+        ts.mtime_sec = now_sec;
+        ts.mtime_nsec = now_nsec;
+    } else if let Some((ts0, ts1)) = read_times_from_user(token, times) {
+        // times[0] = atime
+        match ts0.tv_nsec as isize {
+            UTIME_NOW => {
+                ts.atime_sec = now_sec;
+                ts.atime_nsec = now_nsec;
+            }
+            UTIME_OMIT => { /* don't change */ }
+            _ => {
+                ts.atime_sec = ts0.tv_sec as i64;
+                ts.atime_nsec = ts0.tv_nsec as i64;
+            }
+        }
+        // times[1] = mtime
+        match ts1.tv_nsec as isize {
+            UTIME_NOW => {
+                ts.mtime_sec = now_sec;
+                ts.mtime_nsec = now_nsec;
+            }
+            UTIME_OMIT => { /* don't change */ }
+            _ => {
+                ts.mtime_sec = ts1.tv_sec as i64;
+                ts.mtime_nsec = ts1.tv_nsec as i64;
+            }
+        }
+    }
+
+    ts_set(ts_id, ts);
+    0
+}
+
+/// utimensat - update file timestamps.
 ///
-/// Busybox uses this for `touch`. We accept the call if the path exists.
+/// When path is NULL, operates on dirfd (implements futimens).
 pub fn sys_utimensat(
     dirfd: isize,
     path: *const u8,
-    _times: *const TimeSpec,
+    times: *const TimeSpec,
     _flags: u32,
 ) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_utimensat", pid);
-    }
-    if path.is_null() {
-        return errno(EFAULT);
+        syscall!("kernel:pid[{}] sys_utimensat dirfd={}", pid, dirfd);
     }
     let token = current_user_token();
+
+    if path.is_null() {
+        // futimens(fd, times) => utimensat(fd, NULL, times, 0)
+        if dirfd < 0 {
+            return errno(EBADF);
+        }
+        return apply_utimensat_to_fd(dirfd as usize, times, token);
+    }
     let raw = translated_str(token, path);
     if raw.is_empty() {
-        return errno(EINVAL);
+        return errno(ENOENT);
     }
-    let base = match dirfd_base(dirfd) {
-        Ok(base) => base,
-        Err(err) => return err,
-    };
     let full_path = if raw.starts_with('/') {
         normalize_path(&raw)
     } else {
+        let base = match dirfd_base(dirfd) {
+            Ok(base) => base,
+            Err(err) => return err,
+        };
         resolve_path(&base, &raw)
     };
-    if open_file(full_path.as_str(), OpenFlags::empty()).is_some() {
+    // Check for path traversal through non-directory (e.g. /dev/null/invalid)
+    let comps: Vec<&str> = full_path.split('/').filter(|s| !s.is_empty()).collect();
+    for i in 0..comps.len().saturating_sub(1) {
+        let partial = format!("/{}", comps[..=i].join("/"));
+        if is_char_device(&partial) {
+            return errno(ENOTDIR);
+        }
+    }
+    if is_char_device(&full_path)
+        || open_file(full_path.as_str(), OpenFlags::empty()).is_some()
+    {
         0
     } else {
         errno(ENOENT)
     }
+}
+
+/// Fill timestamp fields in a Stat from stored timestamps or current time.
+fn fill_stat_timestamps(stat: &mut Stat, ts_id: Option<usize>) {
+    if let Some(id) = ts_id {
+        if let Some(ts) = ts_get(id) {
+            stat.atime_sec = ts.atime_sec;
+            stat.atime_nsec = ts.atime_nsec;
+            stat.mtime_sec = ts.mtime_sec;
+            stat.mtime_nsec = ts.mtime_nsec;
+            let (now_sec, now_nsec) = get_current_timespec();
+            stat.ctime_sec = now_sec;
+            stat.ctime_nsec = now_nsec;
+            return;
+        }
+    }
+    // No stored timestamps — return current time as default
+    let (sec, nsec) = get_current_timespec();
+    stat.atime_sec = sec;
+    stat.atime_nsec = nsec;
+    stat.mtime_sec = sec;
+    stat.mtime_nsec = nsec;
+    stat.ctime_sec = sec;
+    stat.ctime_nsec = nsec;
 }
 
 /// YOUR JOB: Implement fstat.
@@ -471,21 +701,28 @@ pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
     let file = file.clone();
     drop(inner);
     let mut stat = Stat::default();
-    let (mode_bits, size) = if let Some(inode) = file.inode() {
-        let mode = if inode.is_dir() {
-            StatMode::DIR
-        } else {
-            StatMode::FILE
-        };
-        (mode.bits() | 0o777, inode.size())
+    let path = file.path().unwrap_or("");
+    if is_char_device(path) {
+        stat.mode = StatMode::CHR.bits() | 0o666;
+        stat.rdev = rdev_for_path(path);
     } else {
-        (StatMode::FILE.bits() | 0o666, 0)
-    };
-    stat.mode = mode_bits;
+        let (mode_bits, size) = if let Some(inode) = file.inode() {
+            let mode = if inode.is_dir() {
+                StatMode::DIR
+            } else {
+                StatMode::FILE
+            };
+            (mode.bits() | 0o777, inode.size())
+        } else {
+            (StatMode::FILE.bits() | 0o666, 0)
+        };
+        stat.mode = mode_bits;
+        stat.size = size as i64;
+        stat.blksize = 512;
+        stat.blocks = ((size + 511) / 512) as i64;
+    }
     stat.nlink = 1;
-    stat.size = size as i64;
-    stat.blksize = 512;
-    stat.blocks = ((size + 511) / 512) as i64;
+    fill_stat_timestamps(&mut stat, file.ts_id());
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&stat as *const Stat) as *const u8,
@@ -1684,5 +1921,95 @@ pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: i32) -> isize {
         }
         suspend_current_and_run_next();
     }
+}
+
+/// sys_pread64 (syscall 67) - read at a given offset without changing file position
+pub fn sys_pread64(fd: usize, buf: *const u8, count: usize, offset: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_pread64 fd={} count={} offset={}", pid, fd, count, offset);
+    }
+    let token = current_user_token();
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+    let file = file.clone();
+    drop(inner);
+    if !file.readable() {
+        return errno(EBADF);
+    }
+    let Some(inode) = file.inode() else {
+        return errno(ESPIPE);
+    };
+    let mut total = 0usize;
+    let mut off = offset;
+    let slices = translated_byte_buffer(token, buf, count);
+    for slice in slices {
+        let n = inode.read_at(off, slice);
+        if n == 0 {
+            break;
+        }
+        off += n;
+        total += n;
+        if n < slice.len() {
+            break;
+        }
+    }
+    total as isize
+}
+
+/// sys_pwrite64 (syscall 68) - write at a given offset without changing file position
+pub fn sys_pwrite64(fd: usize, buf: *const u8, count: usize, offset: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_pwrite64 fd={} count={} offset={}", pid, fd, count, offset);
+    }
+    let token = current_user_token();
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+    let file = file.clone();
+    drop(inner);
+    if !file.writable() {
+        return errno(EBADF);
+    }
+    let Some(inode) = file.inode() else {
+        return errno(ESPIPE);
+    };
+    let mut total = 0usize;
+    let mut off = offset;
+    let slices = translated_byte_buffer(token, buf, count);
+    for slice in slices {
+        let n = inode.write_at(off, slice);
+        if n == 0 {
+            break;
+        }
+        off += n;
+        total += n;
+        if n < slice.len() {
+            break;
+        }
+    }
+    total as isize
+}
+
+/// sys_set_robust_list (syscall 99) - stub
+pub fn sys_set_robust_list(_head: usize, _len: usize) -> isize {
+    0
+}
+
+/// sys_get_robust_list (syscall 100) - stub
+pub fn sys_get_robust_list(_pid: usize, _head: *mut u8, _len: *mut u8) -> isize {
+    0
 }
 

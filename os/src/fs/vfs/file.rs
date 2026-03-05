@@ -12,8 +12,12 @@ pub struct VfsFile {
     readable: bool,
     writable: bool,
     path: String,
+    ts_id: usize,
     inner: UPIntrFreeCell<VfsFileInner>,
 }
+
+/// Monotonic counter for timestamp tracking IDs.
+static NEXT_TS_ID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
 
 struct VfsFileInner {
     offset: usize,
@@ -26,6 +30,7 @@ impl VfsFile {
             readable,
             writable,
             path,
+            ts_id: NEXT_TS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             inner: unsafe {
                 UPIntrFreeCell::new(VfsFileInner {
                     offset: 0,
@@ -117,6 +122,10 @@ impl File for VfsFile {
     fn set_offset(&self, offset: usize) {
         let mut inner = self.inner.exclusive_access();
         inner.offset = offset;
+    }
+
+    fn ts_id(&self) -> Option<usize> {
+        Some(self.ts_id)
     }
 }
 
