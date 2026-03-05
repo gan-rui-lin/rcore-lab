@@ -47,10 +47,14 @@ pub trait File: Send + Sync {
     }
     /// Optional: set current file offset.
     fn set_offset(&self, _offset: usize) {}
+    /// Optional: timestamp tracking id for per-file timestamp storage.
+    fn ts_id(&self) -> Option<usize> {
+        None
+    }
 
 }
 
-/// Linux-compatible stat layout (riscv64).
+/// Linux-compatible stat layout (riscv64, matches musl struct stat).
 #[allow(missing_docs)]
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -64,7 +68,7 @@ pub struct Stat {
     pub rdev: u64,
     pub _pad: u64,
     pub size: i64,
-    pub blksize: i64,
+    pub blksize: i32,
     pub _pad2: i32,
     pub blocks: i64,
     pub atime_sec: i64,
@@ -73,7 +77,7 @@ pub struct Stat {
     pub mtime_nsec: i64,
     pub ctime_sec: i64,
     pub ctime_nsec: i64,
-    pub _unused: [i64; 2],
+    pub _unused: [u32; 2],
 }
 
 bitflags! {
@@ -82,10 +86,16 @@ bitflags! {
     pub struct StatMode: u32 {
         /// null
         const NULL  = 0;
+        /// character device
+        const CHR   = 0o020000;
         /// directory
         const DIR   = 0o040000;
+        /// block device
+        const BLK   = 0o060000;
         /// ordinary regular file
         const FILE  = 0o100000;
+        /// symbolic link
+        const LNK   = 0o120000;
     }
 }
 
@@ -151,7 +161,7 @@ pub use vfs::{
     path_exists, path_is_dir, remove_path,
 };
 pub use pipe::make_pipe;
-pub use stdio::{Stdin, Stdout};
+pub use stdio::{DevNull, DevZero, Stdin, Stdout};
 
 /// Create minimal /etc and /dev files used by BusyBox tests.
 pub fn ensure_basic_paths() {
@@ -173,6 +183,7 @@ pub fn ensure_basic_paths() {
     write_file_if_missing("/etc/adjtime", "");
 
     write_file_if_missing("/dev/null", "");
+    write_file_if_missing("/dev/zero", "");
     write_file_if_missing("/dev/tty", "");
     write_file_if_missing("/dev/rtc", "");
     write_file_if_missing("/dev/rtc0", "");
@@ -247,6 +258,9 @@ pub fn ensure_busybox_links() {
     const MUSL_LOADER: &str = "/musl/lib/libc.so";
     if open_file(MUSL_LOADER, OpenFlags::empty()).is_some() {
         ensure_hardlink("/lib/ld-linux-riscv64-lp64d.so.1", MUSL_LOADER);
+        // Also create musl-specific interpreter links (soft-float and hard-float variants)
+        ensure_hardlink("/lib/ld-musl-riscv64-sf.so.1", MUSL_LOADER);
+        ensure_hardlink("/lib/ld-musl-riscv64.so.1", MUSL_LOADER);
     } else if open_file(GLIBC_LOADER, OpenFlags::empty()).is_some() {
         ensure_hardlink("/lib/ld-linux-riscv64-lp64d.so.1", GLIBC_LOADER);
     } else {

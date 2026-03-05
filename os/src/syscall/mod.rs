@@ -54,6 +54,10 @@ const SYSCALL_WRITE: usize = 64;
 const SYSCALL_READV: usize = 65;
 /// writev syscall
 const SYSCALL_WRITEV: usize = 66;
+/// pread64 syscall
+const SYSCALL_PREAD64: usize = 67;
+/// pwrite64 syscall
+const SYSCALL_PWRITE64: usize = 68;
 /// sendfile syscall
 const SYSCALL_SENDFILE: usize = 71;
 /// ppoll syscall
@@ -74,6 +78,10 @@ const SYSCALL_EXIT_GROUP: usize = 94;
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
 /// futex syscall
 const SYSCALL_FUTEX: usize = 98;
+/// set_robust_list syscall
+const SYSCALL_SET_ROBUST_LIST: usize = 99;
+/// get_robust_list syscall
+const SYSCALL_GET_ROBUST_LIST: usize = 100;
 /// nanosleep syscall
 const SYSCALL_NANOSLEEP: usize = 101;
 /// yield syscall
@@ -552,6 +560,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_READV => sys_readv(args[0], args[1] as *const usize, args[2]),
         SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const usize, args[2]),
+        SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *const u8, args[2], args[3]),
+        SYSCALL_PWRITE64 => sys_pwrite64(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut isize, args[3]),
         SYSCALL_FSTATAT => sys_fstatat(args[0] as isize, args[1] as *const u8, args[2] as *mut Stat, args[3] as u32),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut Stat),
@@ -564,6 +574,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
+        SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
+        SYSCALL_GET_ROBUST_LIST => sys_get_robust_list(args[0], args[1] as *mut u8, args[2] as *mut u8),
         SYSCALL_FUTEX => sys_futex(
             args[0] as *mut i32,
             args[1] as u32,
