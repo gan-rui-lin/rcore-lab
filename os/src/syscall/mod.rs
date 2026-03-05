@@ -102,8 +102,6 @@ const SYSCALL_CONDVAR_CREATE: usize = 471;
 const SYSCALL_CONDVAR_SIGNAL: usize = 472;
 /// condvar_wait syscall
 const SYSCALL_CONDVAR_WAIT: usize = 473;
-/// pthread_setcanceltype syscall (kernel workaround for missing userspace implementation)
-const SYSCALL_PTHREAD_SETCANCELTYPE: usize = 500;
 /// kill syscall
 const SYSCALL_KILL: usize = 129;
 /// tkill syscall
@@ -608,7 +606,6 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CONDVAR_CREATE => sys_condvar_create(),
         SYSCALL_CONDVAR_SIGNAL => sys_condvar_signal(args[0]),
         SYSCALL_CONDVAR_WAIT => sys_condvar_wait(args[0], args[1]),
-        SYSCALL_PTHREAD_SETCANCELTYPE => sys_pthread_setcanceltype(args[0], args[1] as *mut usize),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETPPID => sys_getppid(),
         SYSCALL_GETUID => sys_getuid(),

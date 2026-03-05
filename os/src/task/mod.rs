@@ -61,7 +61,7 @@ const DEBUG_DUMP_INTERVAL: u64 = 200;
 static DEBUG_DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const LINUX_SIGINFO_SIZE: usize = 128;
-const RISCV_FPU_STATE_SIZE: usize = 528;
+const LINUX_SIGSET_WORDS: usize = 16; // 128 bytes / 8
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -81,11 +81,19 @@ pub struct StackT {
     pub ss_size: usize,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RiscvFpRegs {
+    pub f: [u64; 32],
+    pub fcsr: u32,
+    pub _pad: u32,
+}
+
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 pub struct MContext {
     pub gregs: [usize; 32],
-    pub fpregs: [u8; RISCV_FPU_STATE_SIZE],
+    pub fpregs: RiscvFpRegs,
 }
 
 #[repr(C)]
@@ -94,7 +102,7 @@ pub struct UserContext {
     pub uc_flags: usize,
     pub uc_link: usize,
     pub uc_stack: StackT,
-    pub uc_sigmask: u64,
+    pub uc_sigmask: [u64; LINUX_SIGSET_WORDS],
     pub uc_mcontext: MContext,
 }
 
@@ -105,6 +113,8 @@ impl UserContext {
         let mut gregs = [0usize; 32];
         gregs[0] = trap_cx.sepc;
         gregs[1..].copy_from_slice(&trap_cx.x[1..]);
+        let mut user_sigset = [0u64; LINUX_SIGSET_WORDS];
+        user_sigset[0] = signal::flags_to_user_mask(sigmask);
         Self {
             uc_flags: 0,
             uc_link: 0,
@@ -114,10 +124,14 @@ impl UserContext {
                 _pad: 0,
                 ss_size: 0,
             },
-            uc_sigmask: signal::flags_to_user_mask(sigmask),
+            uc_sigmask: user_sigset,
             uc_mcontext: MContext {
                 gregs,
-                fpregs: [0u8; RISCV_FPU_STATE_SIZE],
+                fpregs: RiscvFpRegs {
+                    f: [0u64; 32],
+                    fcsr: 0,
+                    _pad: 0,
+                },
             },
         }
     }
@@ -233,8 +247,16 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     task_inner.res = None;
     drop(task_inner);
     drop(task);
-    if tid == 0 {
-        let pid = process.getpid();
+    let pid = process.getpid();
+    let all_threads_exited = {
+        let process_inner = process.inner_exclusive_access();
+        process_inner
+            .tasks
+            .iter()
+            .filter_map(|t| t.as_ref())
+            .all(|t| t.inner_exclusive_access().exit_code.is_some())
+    };
+    if tid == 0 || all_threads_exited {
         if pid == IDLE_PID {
             shutdown();
         }
@@ -452,10 +474,9 @@ pub fn handle_signals() {
     if signum == 33 {
         let tp = task_inner.get_trap_cx().x[4];
         info!(
-            "[handle_signals] pid={} tid={} sig33 canceltype={} tp={:#x} mask={:?} task_pending={:?} proc_pending={:?}",
+            "[handle_signals] pid={} tid={} sig33 tp={:#x} mask={:?} task_pending={:?} proc_pending={:?}",
             pid,
             _tid,
-            task_inner.canceltype,
             tp,
             task_inner.signal_mask,
             task_pending,
