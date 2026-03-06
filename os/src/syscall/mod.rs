@@ -192,6 +192,24 @@ const SYSCALL_SPAWN: usize = 400;
 // shutdown syscall, never returns
 const SYSCALL_SHUTDOWN: usize = 1001;
 
+// ---- Network syscalls ----
+const SYSCALL_SOCKET: usize = 198;
+const SYSCALL_SOCKETPAIR: usize = 199;
+const SYSCALL_BIND: usize = 200;
+const SYSCALL_LISTEN: usize = 201;
+const SYSCALL_ACCEPT: usize = 202;
+const SYSCALL_CONNECT: usize = 203;
+const SYSCALL_GETSOCKNAME: usize = 204;
+const SYSCALL_GETPEERNAME: usize = 205;
+const SYSCALL_SENDTO: usize = 206;
+const SYSCALL_RECVFROM: usize = 207;
+const SYSCALL_SETSOCKOPT: usize = 208;
+const SYSCALL_GETSOCKOPT: usize = 209;
+const SYSCALL_SHUTDOWN_SOCKET: usize = 210;
+const SYSCALL_SENDMSG: usize = 211;
+const SYSCALL_RECVMSG: usize = 212;
+const SYSCALL_ACCEPT4: usize = 242;
+
 mod errno;
 mod fs;
 mod ipc;
@@ -666,6 +684,22 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
         SYSCALL_POLL => sys_ppoll(args[0] as *mut PollFd, args[1], args[2] as i32),
         SYSCALL_SHUTDOWN => sys_shutdown(),
+        // ---- Network syscalls ----
+        SYSCALL_SOCKET => crate::net::syscall::sys_socket(args[0], args[1], args[2]),
+        SYSCALL_SOCKETPAIR => crate::net::syscall::sys_socketpair(),
+        SYSCALL_BIND => crate::net::syscall::sys_bind(args[0], args[1] as *const u8, args[2]),
+        SYSCALL_LISTEN => crate::net::syscall::sys_listen(args[0], args[1]),
+        SYSCALL_ACCEPT | SYSCALL_ACCEPT4 => crate::net::syscall::sys_accept(args[0], args[1] as *mut u8, args[2] as *mut u32),
+        SYSCALL_CONNECT => crate::net::syscall::sys_connect(args[0], args[1] as *const u8, args[2]),
+        SYSCALL_GETSOCKNAME => crate::net::syscall::sys_getsockname(args[0], args[1] as *mut u8, args[2] as *mut u32),
+        SYSCALL_GETPEERNAME => crate::net::syscall::sys_getpeername(args[0], args[1] as *mut u8, args[2] as *mut u32),
+        SYSCALL_SENDTO => crate::net::syscall::sys_sendto(args[0], args[1] as *const u8, args[2], args[3], args[4] as *const u8, args[5]),
+        SYSCALL_RECVFROM => crate::net::syscall::sys_recvfrom(args[0], args[1] as *mut u8, args[2], args[3], args[4] as *mut u8, args[5] as *mut u32),
+        SYSCALL_SETSOCKOPT => crate::net::syscall::sys_setsockopt(args[0], args[1], args[2], args[3] as *const u8, args[4]),
+        SYSCALL_GETSOCKOPT => crate::net::syscall::sys_getsockopt(args[0], args[1], args[2], args[3] as *mut u8, args[4] as *mut u32),
+        SYSCALL_SHUTDOWN_SOCKET => crate::net::syscall::sys_shutdown_socket(args[0], args[1] as i32),
+        SYSCALL_SENDMSG => crate::net::syscall::sys_sendmsg(),
+        SYSCALL_RECVMSG => crate::net::syscall::sys_recvmsg(),
         _ => {
             known = false;
             error!(

@@ -44,6 +44,8 @@ pub mod drivers;
 pub mod fs;
 pub mod lang_items;
 pub mod mm;
+/// Network subsystem (smoltcp-based TCP/IP stack).
+pub mod net;
 pub mod sbi;
 pub mod sync;
 pub mod syscall;
@@ -105,6 +107,7 @@ pub fn rust_main() -> ! {
     fs::mount_procfs();
     fs::ensure_basic_paths();
     fs::list_apps();
+    net::init();
     task::add_initproc();
     *DEV_NON_BLOCKING_ACCESS.exclusive_access() = false;  // Disable non-blocking I/O to avoid Unsupported error
     task::run_tasks();

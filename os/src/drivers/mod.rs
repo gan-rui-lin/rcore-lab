@@ -15,4 +15,3 @@ pub mod plic;
 pub use block::BLOCK_DEVICE;
 pub use bus::*;
 pub use input::*;
-pub use net::*;
