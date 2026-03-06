@@ -1493,9 +1493,9 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
             new_fd as isize
         }
         F_GETFD => {
-            // Get file descriptor flags (currently only FD_CLOEXEC is supported)
-            // For simplicity, return 0 (no flags set)
-            0
+            // Get file descriptor flags (FD_CLOEXEC)
+            let file = inner.fd_table[fd].as_ref().unwrap();
+            file.fd_flags() as isize
         }
         F_SETFD => {
             // Set file descriptor flags
@@ -1504,15 +1504,18 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
         }
         F_GETFL => {
             // Get file status flags
-            // Return basic flags based on file properties
             let file = &inner.fd_table[fd].as_ref().unwrap();
+            let custom_flags = file.status_flags();
+            if custom_flags != 0 {
+                return custom_flags as isize;
+            }
+            // Default: derive from readable/writable
             let mut flags = 0u32;
             if file.readable() && file.writable() {
                 flags |= 0b10; // O_RDWR
             } else if file.writable() {
                 flags |= 0b01; // O_WRONLY
             }
-            // O_RDONLY is 0
             flags as isize
         }
         F_SETFL => {

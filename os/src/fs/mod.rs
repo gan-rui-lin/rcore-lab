@@ -51,7 +51,32 @@ pub trait File: Send + Sync {
     fn ts_id(&self) -> Option<usize> {
         None
     }
-
+    /// Optional: downcast to socket handle + type for network syscalls.
+    fn as_socket(&self) -> Option<(smoltcp::iface::SocketHandle, crate::net::SocketType)> {
+        None
+    }
+    /// Optional: get FD flags (FD_CLOEXEC). Returns 0 by default.
+    fn fd_flags(&self) -> u32 {
+        0
+    }
+    /// Optional: get file status flags (O_NONBLOCK, etc.). Returns 0 by default.
+    fn status_flags(&self) -> u32 {
+        0
+    }
+    /// Optional: get bound port for TCP sockets.
+    fn bound_port(&self) -> u16 {
+        0
+    }
+    /// Optional: set bound port for TCP sockets.
+    fn set_bound_port(&self, _port: u16) {}
+    /// Optional: check if socket is listening.
+    fn is_listening(&self) -> bool {
+        false
+    }
+    /// Optional: set listening state.
+    fn set_listening(&self, _listening: bool) {}
+    /// Optional: mark socket handle as transferred (prevents Drop from cleaning up).
+    fn mark_transferred(&self) {}
 }
 
 /// Linux-compatible stat layout (riscv64, matches musl struct stat).
