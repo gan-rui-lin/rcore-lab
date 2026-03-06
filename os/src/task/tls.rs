@@ -72,13 +72,19 @@ impl TlsArea {
 
         let align = if tls_info.align > 0 { tls_info.align } else { 8 };
 
-        // Total layout: pthread_reserve + GAP + tls_data(memsz)
-        let total_size = PTHREAD_STRUCT_RESERVE + GAP_ABOVE_TP + tls_info.memsz;
-        let num_pages = (total_size + PAGE_SIZE - 1) / PAGE_SIZE;
-        let total_size = num_pages * PAGE_SIZE;
-
         // Place TLS at a fixed virtual address
         let tls_base = 0x7000_0000;
+
+        // tp = tls_base + pthread_reserve + GAP_ABOVE_TP
+        // Align tp to the TLS alignment requirement
+        let tp_value = Self::align_up(tls_base + PTHREAD_STRUCT_RESERVE + GAP_ABOVE_TP, align);
+
+        // TLS data starts at tp (TLS_ABOVE_TP: data is above tp)
+        let tls_data_start = tp_value;
+        let tls_end = tls_data_start.saturating_add(tls_info.memsz);
+        let total_size = tls_end.saturating_sub(tls_base);
+        let num_pages = (total_size + PAGE_SIZE - 1) / PAGE_SIZE;
+        let total_size = num_pages * PAGE_SIZE;
 
         // Insert TLS area into memory set
         memory_set.insert_framed_area(
@@ -88,13 +94,6 @@ impl TlsArea {
         );
 
         let token = memory_set.token();
-
-        // tp = tls_base + pthread_reserve + GAP_ABOVE_TP
-        // Align tp to the TLS alignment requirement
-        let tp_value = Self::align_up(tls_base + PTHREAD_STRUCT_RESERVE + GAP_ABOVE_TP, align);
-
-        // TLS data starts at tp (TLS_ABOVE_TP: data is above tp)
-        let tls_data_start = tp_value;
 
         // Copy initialized data (.tdata) from ELF
         if tls_info.filesz > 0 {
