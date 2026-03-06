@@ -104,6 +104,29 @@ fn dump_user_stack(page_table: &PageTable, sp: usize, bytes: usize) {
     }
 }
 
+fn dump_user_bytes(tag: &str, page_table: &PageTable, addr: usize, bytes: usize) {
+    let end = addr.saturating_add(bytes);
+    let mut cur = addr;
+    while cur < end {
+        let mut line = [0u8; 16];
+        let mut any = false;
+        let line_end = core::cmp::min(cur + 16, end);
+        for i in 0..(line_end - cur) {
+            let va = cur + i;
+            if let Some(pa) = page_table.translate_va(VirtAddr::from(va)) {
+                line[i] = *pa.get_ref::<u8>();
+                any = true;
+            }
+        }
+        if any {
+            error!("  {} {:#x}: {:02x?}", tag, cur, &line[..(line_end - cur)]);
+        } else {
+            error!("  {} {:#x}: <unmapped>", tag, cur);
+        }
+        cur += 16;
+    }
+}
+
 /// trap handler
 #[no_mangle]
 pub fn trap_handler() -> ! {
@@ -194,6 +217,14 @@ pub fn trap_handler() -> ! {
             error!("    a4 (x14) = {:#x}", trap_cx.x[14]);
             error!("    a5 (x15) = {:#x}", trap_cx.x[15]);
             dump_user_stack(&page_table, trap_cx.x[2], 128);
+            if name == "entry-static.exe" {
+                let tp = trap_cx.x[4];
+                error!("  tp dump: tp={:#x}", tp);
+                let base = tp.saturating_sub(256);
+                dump_user_bytes("tp-0x100", &page_table, base, 128);
+                dump_user_bytes("tp-0x80", &page_table, tp.saturating_sub(128), 128);
+                dump_user_bytes("tp+0x0", &page_table, tp, 64);
+            }
             if name == "busybox" || name == "ld-linux-riscv64-lp64d.so.1" {
                 let path = if name == "busybox" {
                     "/musl/busybox"
