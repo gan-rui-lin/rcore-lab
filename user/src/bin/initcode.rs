@@ -7,7 +7,7 @@ extern crate user_lib;
 extern crate alloc;
 
 use alloc::vec::Vec;
-use user_lib::{chdir, close, dup, execve, exit, fork, open, shutdown, wait, write, OpenFlags};
+use user_lib::{chdir, dup, execve, exit, fork, open, shutdown, wait, OpenFlags};
 
 const ENABLE_SINGLE_ELF_SUITE: bool = false;
 const ENABLE_BASIC_TEST: bool = false;
@@ -23,6 +23,7 @@ const SINGLE_TEST: Option<&str> = option_env!("SINGLE_TEST");
 const BUSYBOX: &str = "/musl/busybox\0";
 const SH: &[u8] = b"sh\0";
 const PATH_ENV: &[u8] = b"PATH=/bin:/musl:/usr/bin\0";
+#[allow(dead_code)]
 const RUN_EMBEDDED_PTHREAD: bool = false;
 
 #[cfg(feature = "embedded_pthread")]
@@ -41,6 +42,9 @@ fn cstring(s: &str) -> Vec<u8> {
     }
     v
 }
+
+#[cfg(feature = "embedded_pthread")]
+use user_lib::{close, write};
 
 #[cfg(feature = "embedded_pthread")]
 fn write_embedded_elf(path: &str, data: &[u8]) -> isize {
