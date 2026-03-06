@@ -52,7 +52,7 @@ pub fn device_init() {
     plic.set_threshold(hart_id, supervisor, 0); // S 态阈值设为 0，放开所有优先级
     plic.set_threshold(hart_id, machine, 1); // M 态阈值提高，避免接管这些中断
     // Enable IRQs for devices that are actually attached.
-    for intr_src_id in [VIRTIO_BLK_IRQ, VIRT_UART_IRQ] {
+    for intr_src_id in [VIRTIO_BLK_IRQ, VIRTIO_NET_IRQ, VIRT_UART_IRQ] {
         plic.enable(hart_id, supervisor, intr_src_id as usize); // 让该 IRQ 送达 S 态
         plic.set_priority(intr_src_id as usize, 1); // 设置 IRQ 优先级
     }
@@ -71,6 +71,7 @@ pub fn irq_handler() {
         6 => MOUSE_DEVICE.handle_irq(), // 鼠标输入
         VIRTIO_BLK_IRQ => BLOCK_DEVICE.handle_irq(), // virtio 块设备
         VIRT_UART_IRQ => UART.handle_irq(), // 串口控制台
+        VIRTIO_NET_IRQ => crate::net::poll_net_if_available(), // VirtIO 网络设备
         _ => panic!("unsupported IRQ {}", intr_src_id), // 未知 IRQ
     }
     plic.complete(0, IntrTargetPriority::Supervisor, intr_src_id); // 完成中断，重新使能该 IRQ

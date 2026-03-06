@@ -1,52 +1,118 @@
-use core::any::Any;
+//! VirtIO network device driver adapted for smoltcp.
 
-use crate::drivers::virtio::VirtioHal;
-use crate::sync::UPIntrFreeCell;
-use alloc::sync::Arc;
-use lazy_static::*;
+use alloc::vec;
+use alloc::vec::Vec;
+
+use crate::drivers::bus::virtio::VirtioHal;
+use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
+use smoltcp::time::Instant;
 use virtio_drivers::{VirtIOHeader, VirtIONet};
 
-const VIRTIO8: usize = 0x10004000;
+/// VirtIO-Net MMIO address on QEMU virt machine (virtio-mmio-bus.1).
+const VIRTIO_NET_ADDR: usize = 0x1000_2000;
 
-lazy_static! {
-    /// Global network device instance.
-    pub static ref NET_DEVICE: Arc<dyn NetDevice> = Arc::new(VirtIONetWrapper::new());
+/// Maximum Ethernet frame size (MTU 1500 + header 14).
+const ETH_FRAME_SIZE: usize = 1514;
+
+/// VirtIO network device implementing smoltcp's Device trait.
+pub struct VirtIONetDevice {
+    inner: VirtIONet<'static, VirtioHal>,
+    rx_buf: Vec<u8>,
 }
 
-/// Network device interface.
-pub trait NetDevice: Send + Sync + Any {
-    /// Transmit a packet.
-    fn transmit(&self, data: &[u8]);
-    /// Receive a packet into the buffer, returning the length.
-    fn receive(&self, data: &mut [u8]) -> usize;
-}
-
-/// VirtIO network device wrapper.
-pub struct VirtIONetWrapper(UPIntrFreeCell<VirtIONet<'static, VirtioHal>>);
-
-impl NetDevice for VirtIONetWrapper {
-    fn transmit(&self, data: &[u8]) {
-        self.0
-            .exclusive_access()
-            .send(data)
-            .expect("can't send data")
-    }
-
-    fn receive(&self, data: &mut [u8]) -> usize {
-        self.0
-            .exclusive_access()
-            .recv(data)
-            .expect("can't receive data")
-    }
-}
-
-impl VirtIONetWrapper {
-    /// Create a new VirtIO network device wrapper.
+impl VirtIONetDevice {
+    /// Create a new VirtIO network device.
     pub fn new() -> Self {
-        unsafe {
-            let virtio = VirtIONet::<VirtioHal>::new(&mut *(VIRTIO8 as *mut VirtIOHeader))
-                .expect("can't create net device by virtio");
-            VirtIONetWrapper(UPIntrFreeCell::new(virtio))
+        let inner = unsafe {
+            VirtIONet::<VirtioHal>::new(&mut *(VIRTIO_NET_ADDR as *mut VirtIOHeader))
+                .expect("failed to create virtio-net device")
+        };
+        Self {
+            inner,
+            rx_buf: vec![0u8; 2048],
         }
+    }
+
+    /// Get the MAC address from VirtIO config space.
+    pub fn mac_address(&self) -> [u8; 6] {
+        self.inner.mac()
+    }
+}
+
+/// Receive token: holds the received frame data in an owned buffer.
+pub struct VirtioRxToken {
+    buf: Vec<u8>,
+}
+
+impl phy::RxToken for VirtioRxToken {
+    fn consume<R, F>(mut self, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        f(&mut self.buf)
+    }
+}
+
+/// Transmit token: allocates a buffer, lets smoltcp fill it, then sends.
+pub struct VirtioTxToken<'a> {
+    driver: &'a mut VirtIONet<'static, VirtioHal>,
+}
+
+impl<'a> phy::TxToken for VirtioTxToken<'a> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut buf = vec![0u8; len];
+        let result = f(&mut buf);
+        if let Err(e) = self.driver.send(&buf) {
+            log::warn!("[net] virtio-net send failed: {:?}", e);
+        }
+        result
+    }
+}
+
+impl Device for VirtIONetDevice {
+    type RxToken<'a> = VirtioRxToken where Self: 'a;
+    type TxToken<'a> = VirtioTxToken<'a> where Self: 'a;
+
+    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if !self.inner.can_recv() {
+            return None;
+        }
+        match self.inner.recv(&mut self.rx_buf) {
+            Ok(len) => {
+                // Copy received data into an owned buffer for the RxToken
+                let data = self.rx_buf[..len].to_vec();
+                Some((
+                    VirtioRxToken { buf: data },
+                    VirtioTxToken {
+                        driver: &mut self.inner,
+                    },
+                ))
+            }
+            Err(e) => {
+                log::warn!("[net] virtio-net recv failed: {:?}", e);
+                None
+            }
+        }
+    }
+
+    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        if self.inner.can_send() {
+            Some(VirtioTxToken {
+                driver: &mut self.inner,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.medium = Medium::Ethernet;
+        caps.max_transmission_unit = ETH_FRAME_SIZE;
+        caps.max_burst_size = Some(1);
+        caps
     }
 }
