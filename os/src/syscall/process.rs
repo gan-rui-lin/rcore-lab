@@ -26,6 +26,30 @@ use crate::{
 use super::errno::*;
 use crate::config::{CLOCK_FREQ, PAGE_SIZE};
 
+fn dump_user_bytes(tag: &str, token: usize, addr: usize, len: usize) {
+    let page_table = PageTable::from_token(token);
+    let end = addr.saturating_add(len);
+    let mut cur = addr;
+    while cur < end {
+        let mut line = [0u8; 16];
+        let mut any = false;
+        let line_end = core::cmp::min(cur + 16, end);
+        for i in 0..(line_end - cur) {
+            let va = cur + i;
+            if let Some(pa) = page_table.translate_va(VirtAddr::from(va)) {
+                line[i] = *pa.get_ref::<u8>();
+                any = true;
+            }
+        }
+        if any {
+            info!("[clone-tls] {} {:#x}: {:02x?}", tag, cur, &line[..(line_end - cur)]);
+        } else {
+            info!("[clone-tls] {} {:#x}: <unmapped>", tag, cur);
+        }
+        cur += 16;
+    }
+}
+
 #[repr(C)]
 #[derive(Debug)]
 pub struct TimeVal {
@@ -487,6 +511,22 @@ pub fn sys_clone(
     }
     if clone_flags.contains(CloneFlags::SETTLS) && !tls.is_null() {
         new_trap_cx.x[4] = tls as usize;
+        let name = current_process().inner_exclusive_access().name.clone();
+        if name == "entry-static.exe" {
+            let token = current_user_token();
+            let tls_addr = tls as usize;
+            info!(
+                "[clone-tls] pid={} tid={} tls={:#x} stack={:#x}",
+                pid,
+                new_task_tid,
+                tls_addr,
+                stack as usize
+            );
+            let base = tls_addr.saturating_sub(256);
+            dump_user_bytes("tp-0x100", token, base, 128);
+            dump_user_bytes("tp-0x80", token, tls_addr.saturating_sub(128), 128);
+            dump_user_bytes("tp+0x0", token, tls_addr, 64);
+        }
     }
     new_trap_cx.kernel_sp = new_task.kstack.get_top();
     drop(new_task_inner);
