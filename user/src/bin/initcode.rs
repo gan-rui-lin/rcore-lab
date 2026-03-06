@@ -14,6 +14,7 @@ const ENABLE_BASIC_TEST: bool = false;
 const ENABLE_BUSYBOX_TEST: bool = false;
 const ENABLE_LUA_TEST: bool = false;
 const ENABLE_LIBC_TEST: bool = true;
+const ENABLE_DYNAMIC_TEST: bool = false;
 const ENABLE_LTP_TEST: bool = false;
 const ENABLE_ALL_TESTS: bool = false;
 const ENABLE_FAT32_TESTS: bool = false;
@@ -90,6 +91,9 @@ fn main() -> i32 {
     } else if ENABLE_SINGLE_ELF_SUITE {
         run_single_elf_suite();
     } else {
+        if ENABLE_DYNAMIC_TEST {
+            test_dynamic();
+        }
         if ENABLE_BASIC_TEST {
             test_basic();
         }
@@ -259,6 +263,10 @@ fn test_basic() {
 
 fn test_ltp() {
     run_testcode("/musl/ltp_testcode.sh");
+}
+
+fn test_dynamic() {
+    run_testcode("/musl/run-dynamic.sh");
 }
 
 fn test_all_tests() {
