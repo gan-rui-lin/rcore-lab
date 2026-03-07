@@ -1,13 +1,16 @@
 # Building
-TARGET := riscv64gc-unknown-none-elf
+TARGET_RV := riscv64gc-unknown-none-elf
+TARGET_LA := loongarch64-unknown-none
 MODE := release
 FEATURES ?= ext4
 LOG ?= TRACE
-KERNEL_ELF := target/$(TARGET)/$(MODE)/os
-KERNEL_BIN := $(KERNEL_ELF).bin
-KERNEL_QEMU := kernel-qemu
-DISASM_TMP := target/$(TARGET)/$(MODE)/asm
-FS_IMG := ../user/target/$(TARGET)/$(MODE)/fs.img
+KERNEL_RV_ELF := target/$(TARGET_RV)/$(MODE)/os
+KERNEL_RV_BIN := $(KERNEL_RV_ELF).bin
+KERNEL_LA_ELF := target/$(TARGET_LA)/$(MODE)/os
+KERNEL_RV := kernel-rv
+KERNEL_LA := kernel-la
+DISASM_TMP := target/$(TARGET_RV)/$(MODE)/asm
+FS_IMG := ../user/target/$(TARGET_RV)/$(MODE)/fs.img
 APPS := ../user/src/bin/*
 OFFLINE :=
 
@@ -42,23 +45,35 @@ DISASM ?= -x
 # Run usertests or usershell
 TEST ?=
 
-build: env $(KERNEL_BIN) fs-img 
+build: env $(KERNEL_RV_BIN) fs-img 
 
-all: env kernel-qemu sbi-qemu
+rv: env kernel-rv sbi-qemu
+la: env-la kernel-la
+all: rv la
 
 env:
 ifeq ($(OFFLINE),)
-	(rustup target list | grep "riscv64gc-unknown-none-elf (installed)") || rustup target add $(TARGET)
+	(rustup target list | grep "riscv64gc-unknown-none-elf (installed)") || rustup target add $(TARGET_RV)
 	cargo install cargo-binutils
 	rustup component add rust-src
 	rustup component add llvm-tools-preview
 endif
 
-$(KERNEL_BIN): kernel
-	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $@
+env-la:
+ifeq ($(OFFLINE),)
+	(rustup target list | grep "loongarch64-unknown-none (installed)") || rustup +nightly-2024-08-01 target add $(TARGET_LA)
+endif
 
-kernel-qemu: kernel
-	@cp $(KERNEL_ELF) $(KERNEL_QEMU)
+$(KERNEL_RV_BIN): kernel
+	@$(OBJCOPY) $(KERNEL_RV_ELF) --strip-all -O binary $@
+
+kernel-rv: kernel
+	@cp $(KERNEL_RV_ELF) $(KERNEL_RV)
+
+kernel-la: env-la
+	@echo Platform: loongarch64
+	@LOG=$(LOG) cargo +nightly-2024-08-01 build $(MODE_ARG) --target $(TARGET_LA) --features $(FEATURES)
+	@cp $(KERNEL_LA_ELF) $(KERNEL_LA)
 
 sbi-qemu:
 	@$(OBJCOPY_ELF) -I binary -O elf64-littleriscv -B riscv:rv64 \
@@ -83,10 +98,10 @@ clean:
 	@cargo clean
 
 disasm: kernel
-	@$(OBJDUMP) $(DISASM) $(KERNEL_ELF) | less
+	@$(OBJDUMP) $(DISASM) $(KERNEL_RV_ELF) | less
 
 disasm-vim: kernel
-	@$(OBJDUMP) $(DISASM) $(KERNEL_ELF) > $(DISASM_TMP)
+	@$(OBJDUMP) $(DISASM) $(KERNEL_RV_ELF) > $(DISASM_TMP)
 	@vim $(DISASM_TMP)
 	@rm $(DISASM_TMP)
 
@@ -97,21 +112,21 @@ run-inner:
 		-machine virt \
 		-nographic \
 		-bios $(BOOTLOADER) \
-		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
+		-device loader,file=$(KERNEL_RV_BIN),addr=$(KERNEL_ENTRY_PA) \
 		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
         -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 
 debug: build
 	@tmux new-session -d \
-		"qemu-system-riscv64 -machine virt -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -s -S" && \
-		tmux split-window -h "riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'" && \
+		"qemu-system-riscv64 -machine virt -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_RV_BIN),addr=$(KERNEL_ENTRY_PA) -s -S" && \
+		tmux split-window -h "riscv64-unknown-elf-gdb -ex 'file $(KERNEL_RV_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'" && \
 		tmux -2 attach-session -d
 
 
 gdbserver: build
-	@qemu-system-riscv64 -machine virt -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -s -S
+	@qemu-system-riscv64 -machine virt -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_RV_BIN),addr=$(KERNEL_ENTRY_PA) -s -S
 
 gdbclient:
-	@riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
+	@riscv64-unknown-elf-gdb -ex 'file $(KERNEL_RV_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all build env kernel clean disasm disasm-vim run-inner fs-img gdbserver gdbclient kernel-qemu sbi-qemu
+.PHONY: all rv la build env env-la kernel kernel-rv kernel-la clean disasm disasm-vim run-inner fs-img gdbserver gdbclient sbi-qemu
