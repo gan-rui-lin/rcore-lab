@@ -81,6 +81,7 @@
 //! breaking change and may occur in patch version releases.
 #![cfg_attr(docsrs, feature(doc_cfg), feature(doc_auto_cfg))]
 #![cfg_attr(not(test), no_std)]
+#![allow(unexpected_cfgs)]
 #![deny(missing_docs)]
 #![deny(warnings)]
 
