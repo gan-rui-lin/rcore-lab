@@ -20,7 +20,7 @@ BRIDGE_NAME="br0"
 usage() {
     echo "用法: $0 [选项]"
     echo "选项:"
-    echo "  -t, --type TYPE    构建类型 (rv/all/debug), 默认: $BUILD_TYPE"
+    echo "  -t, --type TYPE    构建类型 (rv/all/debug), 默认: $BUILD_TYPE (all 等同于 rv)"
     echo "  -f, --file FILE    镜像文件名, 默认: $IMAGE_FILE"
     echo "  -d                 启用 GDB 调试 (为 QEMU 添加 -s -S)"
     echo "  -n, --netforward   启用 user net hostfwd (UDP 12345)"
@@ -90,6 +90,10 @@ done
 if [[ "$BUILD_TYPE" != "debug" && "$BUILD_TYPE" != "all" && "$BUILD_TYPE" != "rv" ]]; then
     echo "错误: 构建类型必须是 'rv'、'debug' 或 'all'"
     exit 1
+fi
+
+if [[ "$BUILD_TYPE" == "all" ]]; then
+    BUILD_TYPE="rv"
 fi
 
 # 默认日志级别：debug 显示全部日志，其他关闭日志
