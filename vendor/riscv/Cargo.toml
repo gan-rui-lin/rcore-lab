@@ -39,3 +39,6 @@ riscv-target = "0.1.2"
 
 [features]
 inline-asm = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(riscv)"] }

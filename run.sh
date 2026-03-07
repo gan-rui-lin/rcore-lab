@@ -4,8 +4,8 @@
 export PATH="$HOME/.rustup/toolchains/nightly-2024-05-02-aarch64-apple-darwin/bin:$HOME/.rustup/toolchains/nightly-2024-05-02-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin:$PATH"
 
 # 默认配置
-BUILD_TYPE="all"
-IMAGE_FILE="sdcard-final.img"
+BUILD_TYPE="rv"
+IMAGE_FILE="sdcard-rv.img"
 GDB_DEBUG="0"
 GDB_FLAGS=""
 LOG="${LOG-}"
@@ -20,7 +20,7 @@ BRIDGE_NAME="br0"
 usage() {
     echo "用法: $0 [选项]"
     echo "选项:"
-    echo "  -t, --type TYPE    构建类型 (debug/all), 默认: $BUILD_TYPE"
+    echo "  -t, --type TYPE    构建类型 (rv/all/debug), 默认: $BUILD_TYPE"
     echo "  -f, --file FILE    镜像文件名, 默认: $IMAGE_FILE"
     echo "  -d                 启用 GDB 调试 (为 QEMU 添加 -s -S)"
     echo "  -n, --netforward   启用 user net hostfwd (UDP 12345)"
@@ -32,7 +32,7 @@ usage() {
     echo ""
     echo "示例:"
     echo "  $0 -t debug -f sdcard-final.img"
-    echo "  $0 --type all --file sdcard.img"
+    echo "  $0 --type rv --file sdcard.img"
     echo "  $0 -t debug -f sdcard-final.img -d"
     echo "  $0 -t debug -f sdcard-final.img --netforward"
     echo "  $0 -t debug -f sdcard-final.img --netmode tap --tap-ifname tap0"
@@ -87,12 +87,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 # 验证构建类型
-if [[ "$BUILD_TYPE" != "debug" && "$BUILD_TYPE" != "all" ]]; then
-    echo "错误: 构建类型必须是 'debug' 或 'all'"
+if [[ "$BUILD_TYPE" != "debug" && "$BUILD_TYPE" != "all" && "$BUILD_TYPE" != "rv" ]]; then
+    echo "错误: 构建类型必须是 'rv'、'debug' 或 'all'"
     exit 1
 fi
 
-# 默认日志级别：debug 显示全部日志，all 关闭日志
+# 默认日志级别：debug 显示全部日志，其他关闭日志
 if [[ -z "$LOG" ]]; then
     if [[ "$BUILD_TYPE" == "debug" ]]; then
         LOG="TRACE"
@@ -177,7 +177,7 @@ fi
 # 运行QEMU
 echo "启动QEMU模拟器..."
 qemu-system-riscv64 -machine virt \
-  -kernel kernel-qemu \
+    -kernel kernel-rv \
   -m 128M \
   -nographic \
   -smp 1 \

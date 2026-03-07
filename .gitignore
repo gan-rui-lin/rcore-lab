@@ -21,7 +21,6 @@ os/vendor/
 *.img*
 *.code-workspace
 AGENT.*
-kernel-qemu
 sbi-qemu
 tmp/*
 os/tmp/*
@@ -31,3 +30,6 @@ CLAUDE.*
 Dockerfile.ext4
 *.sh
 !run.shs
+kernel-la
+kernel-rv
+kernel-qemu
