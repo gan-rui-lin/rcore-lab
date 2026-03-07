@@ -412,6 +412,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 pub struct IntoIter<K, V, const N: usize>
 where
     K: Eq,
