@@ -18,7 +18,7 @@ mod tls;
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, PageTable, VirtAddr};
 use crate::sbi::shutdown;
-use crate::trap::TrapContext;
+use crate::arch::TrapContext;
 use crate::timer::remove_timer;
 use alloc::sync::Arc;
 use lazy_static::*;

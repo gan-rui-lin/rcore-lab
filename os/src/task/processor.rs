@@ -3,7 +3,7 @@
 use super::__switch;
 use super::{ProcessControlBlock, TaskContext, TaskControlBlock, TaskStatus, fetch_task, ready_queue_snapshot};
 use crate::sync::UPIntrFreeCell;
-use crate::trap::TrapContext;
+use crate::arch::TrapContext;
 use alloc::sync::Arc;
 use lazy_static::*;
 use core::sync::atomic::{AtomicU64, Ordering};

@@ -20,7 +20,7 @@ fn clear_bss() {
 /// The Rust entry-point of the LoongArch64 kernel.
 pub fn rust_main() -> ! {
     clear_bss();
-    crate::console::console_init();
+    crate::arch::loongarch64::console::console_init();
     println!("[kernel] loongarch64 boot");
     loop {
         core::hint::spin_loop();

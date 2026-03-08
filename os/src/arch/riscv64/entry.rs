@@ -31,8 +31,8 @@ pub fn rust_main() -> ! {
     crate::logging::init();
     crate::mm::init();
     crate::mm::remap_test();
-    crate::trap::init();
-    crate::trap::enable_timer_interrupt();
+    crate::arch::trap_init();
+    crate::arch::trap_enable_timer_interrupt();
     crate::timer::set_next_trigger();
     crate::board::device_init();
     #[cfg(feature = "ext4")]
