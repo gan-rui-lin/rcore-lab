@@ -1,7 +1,7 @@
 //! batch subsystem
 
 use crate::sync::UPIntrFreeCell;
-use crate::trap::TrapContext;
+use crate::arch::TrapContext;
 use core::arch::asm;
 use lazy_static::*;
 

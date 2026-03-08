@@ -5,7 +5,7 @@ use crate::config::{USER_STACK_SIZE};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{KERNEL_SPACE, MemorySet, translated_byte_buffer, translated_ref, translated_refmut, translated_str};
 use crate::sync::{Condvar, Mutex, Semaphore, UPIntrFreeCell};
-use crate::trap::{TrapContext, trap_handler};
+use crate::arch::{TrapContext, trap_handler};
 use xmas_elf::ElfFile;
 use xmas_elf::sections::{SectionData, ShType};
 use xmas_elf::symbol_table::Entry;

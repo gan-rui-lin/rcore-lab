@@ -4,14 +4,12 @@ use core::fmt::{self, Write};
 #[cfg(target_arch = "riscv64")]
 use crate::arch::riscv64::console::{
     console_getchar as raw_getchar,
-    console_init as arch_console_init,
     console_putchar as raw_putchar,
 };
 
 #[cfg(target_arch = "loongarch64")]
 use crate::arch::loongarch64::console::{
     console_getchar as raw_getchar,
-    console_init as arch_console_init,
     console_putchar as raw_putchar,
 };
 
@@ -28,12 +26,6 @@ impl Write for Stdout {
 
 pub fn print(args: fmt::Arguments) {
     Stdout.write_fmt(args).unwrap();
-}
-
-/// Initialize the console device (arch-specific).
-#[allow(dead_code)]
-pub fn console_init() {
-    arch_console_init();
 }
 
 /// Read a byte from console if available (LoongArch64 only).

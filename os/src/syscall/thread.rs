@@ -2,7 +2,7 @@ use crate::{
     mm::{kernel_token, translated_refmut, PageTable, VirtAddr},
     syscall::errno::{errno, EAGAIN, ECHILD},
     task::{TaskControlBlock, add_task, current_process, current_task, current_user_token},
-    trap::{TrapContext, trap_handler},
+    arch::{TrapContext, trap_handler},
 };
 use alloc::format;
 use alloc::string::ToString;
