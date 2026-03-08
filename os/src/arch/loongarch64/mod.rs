@@ -61,7 +61,7 @@ pub use trap::{
 	try_write_user,
 };
 
-pub use trap::{trap_enable_timer_interrupt, trap_handler, trap_init, trap_return};
+pub use trap::{task_entry, trap_enable_timer_interrupt, trap_handler, trap_init, trap_return};
 
 pub type TrapContext = TrapFrame;
 pub type TaskContext = KContext;

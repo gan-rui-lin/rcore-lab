@@ -213,59 +213,78 @@ pub fn trap_enable_timer_interrupt() {
     enable_irq();
 }
 
-/// Main trap handler entry.
+/// Task entry point for LoongArch64.
+///
+/// This is the initial KPC for new tasks. It implements the user-mode entry
+/// and trap handling loop. The flow is:
+///   context_switch_pt → task_entry → user_restore → user mode
+///                                  ↑                    |
+///                                  └── handle trap ← user_vec
+///
+/// When `user_vec` returns (after a user trap), we handle the trap here,
+/// then loop back to re-enter user mode.
+pub fn task_entry() {
+    loop {
+        // Activate user page table and enter user mode
+        let trap_cx_user_va = current_trap_cx_user_va();
+        let user_token = current_user_token();
+        crate::arch::loongarch64::page_table::activate_page_table(user_token);
+        user_restore(trap_cx_user_va as *mut TrapFrame);
+
+        // user_vec returned — a user trap occurred. Handle it.
+        let trap_cx = current_trap_cx();
+        trace!(
+            "[trap] sepc={:#x} sp={:#x} estat={:#x} badv={:#x} era={:#x}",
+            trap_cx.sepc,
+            trap_cx.x[3],
+            estat::read().raw(),
+            badv::read().raw(),
+            era::read().raw(),
+        );
+        match loongarch64_trap_handler(trap_cx) {
+            TrapType::UserEnvCall => {
+                trap_cx.syscall_ok();
+                let result = syscall(trap_cx.x[11], trap_cx.args());
+                trap_cx.x[4] = result as usize;
+            }
+            TrapType::Time => {
+                set_next_trigger();
+                check_timer();
+                handle_signals();
+                suspend_current_and_run_next();
+                // After being rescheduled, loop back to re-enter user mode
+                continue;
+            }
+            TrapType::StorePageFault(addr)
+            | TrapType::LoadPageFault(addr)
+            | TrapType::InstructionPageFault(addr) => {
+                error!("[kernel] trap_handler: page fault addr={:#x}", addr);
+                current_add_signal(SignalFlags::SIGSEGV);
+            }
+            TrapType::IllegalInstruction(addr) => {
+                error!("[kernel] trap_handler: illegal instruction addr={:#x}", addr);
+                current_add_signal(SignalFlags::SIGILL);
+            }
+            TrapType::Breakpoint => {
+                warn!("[kernel] trap_handler: breakpoint at {:#x}", trap_cx.sepc);
+            }
+            TrapType::SupervisorExternal => {}
+            TrapType::Unknown => {
+                warn!("[kernel] trap_handler: unknown trap at {:#x}", trap_cx.sepc);
+            }
+        }
+        if current_task().is_some() {
+            handle_signals();
+        }
+        // Loop back to re-enter user mode with (possibly modified) trap context
+    }
+}
+
+/// trap_handler and trap_return are kept as stubs for API compatibility.
+/// On LoongArch64, user traps are handled by task_entry above.
 #[no_mangle]
 pub fn trap_handler() -> ! {
-    let trap_cx = current_trap_cx();
-    trace!(
-        "[trap] sepc={:#x} sp={:#x} estat={:#x} badv={:#x} era={:#x} crmd={:#x} prmd={:#x} pgdl={:#x} pgdh={:#x}",
-        trap_cx.sepc,
-        trap_cx.x[3],
-        estat::read().raw(),
-        badv::read().raw(),
-        era::read().raw(),
-        crmd::read().raw(),
-        prmd::read().raw(),
-        pgdl::read().raw(),
-        pgdh::read().raw(),
-    );
-    match loongarch64_trap_handler(trap_cx) {
-        TrapType::UserEnvCall => {
-            trap_cx.syscall_ok();
-            let result = syscall(trap_cx.x[11], trap_cx.args());
-            trap_cx.x[4] = result as usize;
-        }
-        TrapType::Time => {
-            set_next_trigger();
-            check_timer();
-            handle_signals();
-            suspend_current_and_run_next();
-        }
-        TrapType::StorePageFault(addr)
-        | TrapType::LoadPageFault(addr)
-        | TrapType::InstructionPageFault(addr) => {
-            error!("[kernel] trap_handler: page fault addr={:#x}", addr);
-            current_add_signal(SignalFlags::SIGSEGV);
-        }
-        TrapType::IllegalInstruction(addr) => {
-            error!("[kernel] trap_handler: illegal instruction addr={:#x}", addr);
-            current_add_signal(SignalFlags::SIGILL);
-        }
-        TrapType::Breakpoint => {
-            warn!("[kernel] trap_handler: breakpoint at {:#x}", trap_cx.sepc);
-        }
-        TrapType::SupervisorExternal => {
-            #[cfg(target_arch = "riscv64")]
-            crate::board::irq_handler();
-        }
-        TrapType::Unknown => {
-            warn!("[kernel] trap_handler: unknown trap at {:#x}", trap_cx.sepc);
-        }
-    }
-    if current_task().is_some() {
-        handle_signals();
-    }
-    trap_return();
+    panic!("trap_handler() should not be called on loongarch64; use task_entry instead");
 }
 
 #[naked]
@@ -279,6 +298,37 @@ pub unsafe extern "C" fn trap_vector_base() {
                 andi    $sp, $sp, 0x3
                 bnez    $sp, {user_vec}
 
+                // ── Kernel trap path ──
+
+                // Fast path for PageModifyFault (PME, ecode=4):
+                // LoongArch D-bit is software-managed. When a store hits a
+                // TLB entry with D=0, we get PME.  Fix it by re-walking
+                // the page table (which has D=1) and overwriting the TLB entry.
+                csrrd   $sp, 0x5          // ESTAT
+                srli.d  $sp, $sp, 16
+                andi    $sp, $sp, 0x3f    // ecode
+                ori     $t0, $zero, 4     // PME ecode = 4
+                bne     $sp, $t0, 1f
+
+                // Handle PME: LoongArch D-bit is software-managed.
+                // tlbfill never sets D=1; first store always triggers PME.
+                // Fix: tlbsrch → tlbrd → set D in TLBELO → tlbwr.
+                tlbsrch                   // find the TLB entry (sets TLBIDX)
+                tlbrd                     // read TLB → TLBEHI, TLBELO0, TLBELO1
+                // Set D bit (bit 1) in both TLBELO0 and TLBELO1
+                ori     $t0, $zero, 0x2   // D bit mask
+                csrrd   $sp, 0x0c         // read TLBELO0
+                or      $sp, $sp, $t0     // set D
+                csrwr   $sp, 0x0c         // write TLBELO0
+                csrrd   $sp, 0x0d         // read TLBELO1
+                or      $sp, $sp, $t0     // set D
+                csrwr   $sp, 0x0d         // write TLBELO1
+                tlbwr                     // write back TLB entry with D=1
+                csrrd   $sp, KSAVE_USP    // restore SP
+                ertn                      // retry the faulting instruction
+
+            1:
+                // Normal kernel trap path
                 csrrd   $sp, KSAVE_USP
                 addi.d  $sp, $sp, -{trapframe_size} // allocate space
 
@@ -463,20 +513,8 @@ pub unsafe fn set_kernel_trap() {
 }
 
 /// Return to user space.
+/// On LoongArch64 this is only used as a stub — the actual user-return
+/// is handled by the task_entry loop above.
 pub fn trap_return() -> ! {
-    let trap_cx_ptr = current_trap_cx_user_va();
-    if trap_cx_ptr < TRAP_CONTEXT_BASE || trap_cx_ptr >= TRAMPOLINE {
-        panic!("invalid trap context va {:#x}", trap_cx_ptr);
-    }
-    let user_token = current_user_token();
-    crate::arch::loongarch64::page_table::activate_page_table(user_token);
-    unsafe {
-        asm!(
-            "move $a0, {trap_cx}",
-            "jr {restore}",
-            trap_cx = in(reg) trap_cx_ptr,
-            restore = in(reg) user_restore as usize,
-            options(noreturn)
-        );
-    }
+    panic!("trap_return() should not be called on loongarch64; user return is handled by task_entry");
 }
