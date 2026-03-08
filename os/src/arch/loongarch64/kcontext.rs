@@ -6,7 +6,7 @@ use core::{
 };
 
 use super::KContextArgs;
-use super::trap_return;
+use super::trap::task_entry;
 
 /// Kernel Context
 ///
@@ -41,7 +41,7 @@ impl KContext {
     pub fn goto_trap_return(kstack_top: usize) -> Self {
         let mut cx = Self::blank();
         cx.ksp = kstack_top;
-        cx.kpc = trap_return as usize;
+        cx.kpc = task_entry as usize;
         cx
     }
 }
