@@ -52,6 +52,7 @@ pub trait File: Send + Sync {
         None
     }
     /// Optional: downcast to socket handle + type for network syscalls.
+    #[cfg(target_arch = "riscv64")]
     fn as_socket(&self) -> Option<(smoltcp::iface::SocketHandle, crate::net::SocketType)> {
         None
     }
