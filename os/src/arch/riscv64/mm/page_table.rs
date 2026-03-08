@@ -1,5 +1,8 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
-use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+
+#![allow(missing_docs)]
+use super::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use crate::mm::{frame_alloc, FrameTracker};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -8,7 +11,7 @@ use bitflags::*;
 bitflags! {
     /// page table entry flags
     pub struct PTEFlags: u8 {
-        const V = 1 << 0;
+        const V = 1 << 0; 
         const R = 1 << 1;
         const W = 1 << 2;
         const X = 1 << 3;

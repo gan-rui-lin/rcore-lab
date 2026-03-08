@@ -188,6 +188,16 @@ impl PhysAddr {
     }
 }
 impl PhysPageNum {
+    /// Get the immutable reference of physical page number
+    pub fn get_ref<T>(&self) -> &'static T {
+        let pa: PhysAddr = (*self).into();
+        pa.get_ref::<T>()
+    }
+    /// Get the mutable reference of physical page number
+    pub fn get_mut<T>(&self) -> &'static mut T {
+        let pa: PhysAddr = (*self).into();
+        pa.get_mut::<T>()
+    }
     /// Get the reference of page table(array of ptes)
     pub fn get_pte_array(&self) -> &'static mut [PageTableEntry] {
         let pa: PhysAddr = (*self).into();
@@ -198,93 +208,58 @@ impl PhysPageNum {
         let pa: PhysAddr = (*self).into();
         unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut u8, 4096) }
     }
-    /// Get the mutable reference of physical address
-    pub fn get_mut<T>(&self) -> &'static mut T {
-        let pa: PhysAddr = (*self).into();
-        pa.get_mut()
+}
+
+/// A range of VPNs
+#[derive(Copy, Clone, Debug)]
+pub struct VPNRange {
+    start: VirtPageNum,
+    end: VirtPageNum,
+}
+
+impl VPNRange {
+    /// Create a new VPNRange from start and end VPNs
+    pub fn new(start: VirtPageNum, end: VirtPageNum) -> Self {
+        assert!(start <= end);
+        Self { start, end }
+    }
+    /// Get start VPN
+    pub fn get_start(&self) -> VirtPageNum {
+        self.start
+    }
+    /// Get end VPN
+    pub fn get_end(&self) -> VirtPageNum {
+        self.end
     }
 }
 
-/// iterator for phy/virt page number
+/// Required by `VPNRange` for step-by-one iteration
 pub trait StepByOne {
-    /// step by one element(page number)
+    /// Increment by one step
     fn step(&mut self);
 }
+
 impl StepByOne for VirtPageNum {
     fn step(&mut self) {
         self.0 += 1;
     }
 }
+
 impl StepByOne for PhysPageNum {
     fn step(&mut self) {
         self.0 += 1;
     }
 }
 
-#[derive(Copy, Clone)]
-/// a simple range structure for type T
-pub struct SimpleRange<T>
-where
-    T: StepByOne + Copy + PartialEq + PartialOrd + Debug,
-{
-    l: T,
-    r: T,
-}
-impl<T> SimpleRange<T>
-where
-    T: StepByOne + Copy + PartialEq + PartialOrd + Debug,
-{
-    pub fn new(start: T, end: T) -> Self {
-        assert!(start <= end, "start {:?} > end {:?}!", start, end);
-        Self { l: start, r: end }
-    }
-    pub fn get_start(&self) -> T {
-        self.l
-    }
-    pub fn get_end(&self) -> T {
-        self.r
-    }
-}
-impl<T> IntoIterator for SimpleRange<T>
-where
-    T: StepByOne + Copy + PartialEq + PartialOrd + Debug,
-{
-    type Item = T;
-    type IntoIter = SimpleRangeIterator<T>;
-    fn into_iter(self) -> Self::IntoIter {
-        SimpleRangeIterator::new(self.l, self.r)
-    }
-}
-/// iterator for the simple range structure
-pub struct SimpleRangeIterator<T>
-where
-    T: StepByOne + Copy + PartialEq + PartialOrd + Debug,
-{
-    current: T,
-    end: T,
-}
-impl<T> SimpleRangeIterator<T>
-where
-    T: StepByOne + Copy + PartialEq + PartialOrd + Debug,
-{
-    pub fn new(l: T, r: T) -> Self {
-        Self { current: l, end: r }
-    }
-}
-impl<T> Iterator for SimpleRangeIterator<T>
-where
-    T: StepByOne + Copy + PartialEq + PartialOrd + Debug,
-{
-    type Item = T;
+impl Iterator for VPNRange {
+    type Item = VirtPageNum;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current == self.end {
+        if self.start >= self.end {
             None
         } else {
-            let t = self.current;
-            self.current.step();
+            let t = self.start;
+            self.start.step();
             Some(t)
         }
     }
 }
-/// a simple range structure for virtual page number
-pub type VPNRange = SimpleRange<VirtPageNum>;
