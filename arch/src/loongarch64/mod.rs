@@ -33,13 +33,14 @@ pub use entry::clear_bss;
 pub use context::TrapFrame;
 pub use kcontext::{context_switch, context_switch_pt, read_current_tp, KContext};
 pub use page_table::*; // PhysAddr, VirtAddr, PageTable, etc.
+pub use page_table::init_kernel_page_table;
 pub use sbi::shutdown;
 pub use signal::{FpRegs, MContext};
 pub use timer::{get_time, get_time_ms, get_time_us, set_next_trigger, init_timer, Time};
 pub use trap::{trap_init, trap_enable_timer_interrupt, trap_return};
 pub use trap::{disable_irq as disable_interrupts, enable_irq as enable_interrupts};
 pub use trap::{set_kernel_trap, set_kernel_user_rw_trap, set_trap_vector_base};
-pub use trap::{try_read_user, try_write_user, run_user_task};
+pub use trap::{try_read_user, try_write_user, run_user_task, user_restore};
 pub use trap::{disable_irq, enable_irq, enable_external_irq, init_interrupt};
 pub use consts::*;
 

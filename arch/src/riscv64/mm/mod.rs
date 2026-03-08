@@ -21,3 +21,9 @@ pub fn activate_page_table(token: usize) {
         asm!("sfence.vma");
     }
 }
+
+/// On RISC-V, init_kernel_page_table is identical to activate_page_table.
+/// On LoongArch64, this also sets PGDH for kernel-space VA[47]=1 addresses.
+pub fn init_kernel_page_table(token: usize) {
+    activate_page_table(token);
+}
