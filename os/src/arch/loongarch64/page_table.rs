@@ -10,7 +10,9 @@ use super::consts::VIRT_ADDR_START;
 use crate::mm::{frame_alloc, FrameTracker};
 
 bitflags::bitflags! {
-    /// page table entry flags (kept compatible with MapPermission bits)
+    /// Software page table entry flags.
+    /// These are abstract permission bits used by the kernel; PageTableEntry
+    /// translates them to LoongArch64 hardware PTE format.
     pub struct PTEFlags: u8 {
         const V = 1 << 0;
         const R = 1 << 1;
@@ -20,20 +22,53 @@ bitflags::bitflags! {
     }
 }
 
+/// LoongArch64 hardware PTE bit positions.
+mod la_pte {
+    pub const V:   usize = 1 << 0;   // Valid
+    pub const D:   usize = 1 << 1;   // Dirty
+    pub const PLV: usize = 0b11 << 2; // PLV=3 (user mode)
+    pub const MAT: usize = 0b01 << 4; // Coherent Cacheable
+    pub const P:   usize = 1 << 7;   // Present (physical page exists)
+    pub const W:   usize = 1 << 8;   // Writable
+    pub const NR:  usize = 1 << 11;  // Not Readable
+    pub const NX:  usize = 1 << 12;  // Not eXecutable
+}
+
 /// page table entry structure
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct PageTableEntry {
-    /// bits of page table entry
+    /// bits of page table entry (in LoongArch64 hardware format)
     pub bits: usize,
 }
 
 impl PageTableEntry {
-    /// Create a new page table entry
+    /// Create a new LoongArch64 **leaf** page table entry.
+    ///
+    /// LoongArch64 PTE layout:
+    ///   bits[47:12] = physical page frame (PPN << 12 = physical address)
+    ///   bits[11:0]  = flags (V, D, PLV, MAT, P, W, ...)
+    ///
+    /// IMPORTANT: directory entries (non-leaf) must use `new()` with ONLY
+    /// `PTEFlags::V` — we detect this and store a clean `ppn << 12` without
+    /// extra flags, because the hardware `lddir` instruction uses the raw
+    /// entry value as a base address for the next-level walk.
     pub fn new(ppn: PhysPageNum, flags: PTEFlags) -> Self {
-        PageTableEntry {
-            bits: ppn.0 << 10 | flags.bits as usize,
+        // Directory entry: only V flag → store clean physical address
+        // (lddir uses the raw value as base; extra flag bits corrupt it)
+        if flags == PTEFlags::V {
+            return PageTableEntry { bits: ppn.0 << 12 };
         }
+        // Leaf PTE: translate software flags to hardware format
+        let mut hw: usize = ppn.0 << 12;
+        hw |= la_pte::V | la_pte::P | la_pte::MAT;
+        if flags.contains(PTEFlags::W) {
+            hw |= la_pte::W | la_pte::D;
+        }
+        if flags.contains(PTEFlags::U) {
+            hw |= la_pte::PLV;
+        }
+        PageTableEntry { bits: hw }
     }
     /// Create an empty page table entry
     pub fn empty() -> Self {
@@ -41,27 +76,35 @@ impl PageTableEntry {
     }
     /// Get the physical page number from the page table entry
     pub fn ppn(&self) -> PhysPageNum {
-        (self.bits >> 10 & ((1usize << 44) - 1)).into()
+        ((self.bits >> 12) & ((1usize << 36) - 1)).into()
     }
-    /// Get the flags from the page table entry
+    /// Decode LoongArch64 hardware PTE bits back to software PTEFlags.
     pub fn flags(&self) -> PTEFlags {
-        PTEFlags::from_bits(self.bits as u8).unwrap_or(PTEFlags::empty())
+        let mut f = PTEFlags::empty();
+        if self.bits != 0 { f |= PTEFlags::V; }
+        f |= PTEFlags::R; // Always readable (NR not used)
+        if self.bits & la_pte::W != 0  { f |= PTEFlags::W; }
+        f |= PTEFlags::X; // Always executable (NX not used)
+        if self.bits & la_pte::PLV == la_pte::PLV { f |= PTEFlags::U; }
+        f
     }
     /// The page pointed by page table entry is valid?
+    /// For directory entries (no flags, just ppn<<12), non-zero means valid.
+    /// For leaf PTEs, the hardware V bit at position 0 is set.
     pub fn is_valid(&self) -> bool {
-        (self.flags() & PTEFlags::V) != PTEFlags::empty()
+        self.bits != 0
     }
     /// The page pointed by page table entry is readable?
     pub fn readable(&self) -> bool {
-        (self.flags() & PTEFlags::R) != PTEFlags::empty()
+        self.is_valid()
     }
     /// The page pointed by page table entry is writable?
     pub fn writable(&self) -> bool {
-        (self.flags() & PTEFlags::W) != PTEFlags::empty()
+        self.bits & la_pte::W != 0
     }
     /// The page pointed by page table entry is executable?
     pub fn executable(&self) -> bool {
-        (self.flags() & PTEFlags::X) != PTEFlags::empty()
+        self.is_valid()
     }
 }
 
@@ -533,11 +576,24 @@ impl Iterator for VPNRangeIter {
     }
 }
 
-/// Change page table by writing pgdl.
+/// Change user page table by writing pgdl (for VA[47]=0 addresses).
 pub fn activate_page_table(token: usize) {
     use loongArch64::register::pgdl;
 
     pgdl::set_base(token);
+    unsafe {
+        core::arch::asm!("dbar 0; invtlb 0x00, $r0, $r0");
+    }
+}
+
+/// Set the kernel page table in PGDH (for VA[47]=1 addresses).
+/// This must be called once during init so that kernel-space virtual addresses
+/// (e.g. kernel stacks at TRAMPOLINE region) can be resolved via the TLB.
+pub fn init_kernel_page_table(token: usize) {
+    use loongArch64::register::{pgdh, pgdl};
+
+    pgdl::set_base(token);
+    pgdh::set_base(token);
     unsafe {
         core::arch::asm!("dbar 0; invtlb 0x00, $r0, $r0");
     }
