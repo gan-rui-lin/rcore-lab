@@ -1,5 +1,5 @@
 //! Implementation of [`TaskContext`]
-use crate::trap::trap_return;
+use crate::arch::trap_return;
 
 #[repr(C)]
 /// task context structure containing some registers
