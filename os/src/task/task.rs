@@ -1,6 +1,6 @@
 use super::id::TaskUserRes;
 use super::{KernelStack, ProcessControlBlock, TaskContext, kstack_alloc};
-use crate::trap::TrapContext;
+use crate::arch::TrapContext;
 use crate::sync::UPIntrFreeCell;
 use alloc::sync::{Arc, Weak};
 use crate::sync::UPIntrRefMut;
