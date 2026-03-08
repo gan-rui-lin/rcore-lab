@@ -1,5 +1,7 @@
 pub mod console;
 pub mod entry;
+pub mod interrupt;
+pub mod signal;
 pub mod task;
 pub mod mm;
 pub mod sbi;
