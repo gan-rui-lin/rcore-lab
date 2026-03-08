@@ -2,6 +2,8 @@
 
 #[allow(unused)]
 
+pub use arch::{CLOCK_FREQ, MEMORY_END, MMIO};
+
 /// user app's stack size
 pub const USER_STACK_SIZE: usize = 4096 * 5;
 /// kernel stack size
@@ -17,17 +19,3 @@ pub const PAGE_SIZE_BITS: usize = 0xc;
 pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
 /// the virtual addr of trap context
 pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;
-
-/// clock frequency, memory end, and MMIO ranges are board-specific (RISC-V).
-#[cfg(target_arch = "riscv64")]
-pub use crate::board::{CLOCK_FREQ, MEMORY_END, MMIO};
-
-/// LoongArch64 board constants.
-#[cfg(target_arch = "loongarch64")]
-pub const CLOCK_FREQ: usize = 12_500_000;
-#[cfg(target_arch = "loongarch64")]
-/// End of usable memory for LoongArch64.
-pub const MEMORY_END: usize = 0xB000_0000;
-#[cfg(target_arch = "loongarch64")]
-/// MMIO ranges for LoongArch64 (none for now).
-pub const MMIO: &[(usize, usize)] = &[];

@@ -2,7 +2,14 @@
 use super::PollEvents;
 use super::File;
 use crate::mm::UserBuffer;
-use crate::sbi::console_getchar;
+/// Read a character from the SBI console, returning the raw usize value.
+/// 0 means no character available.
+fn console_getchar() -> usize {
+    match arch::console_getchar() {
+        Some(ch) => ch as usize,
+        None => 0,
+    }
+}
 use crate::task::suspend_current_and_run_next;
 
 /// /dev/null device: reads return 0 (EOF), writes succeed silently

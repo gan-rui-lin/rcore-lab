@@ -1,8 +1,9 @@
+use arch::TrapContext;
 use crate::{
     mm::{kernel_token, translated_refmut, PageTable, VirtAddr},
     syscall::errno::{errno, EAGAIN, ECHILD},
     task::{TaskControlBlock, add_task, current_process, current_task, current_user_token},
-    arch::{TrapContext, trap_handler},
+    trap::trap_handler,
 };
 use alloc::format;
 use alloc::string::ToString;
