@@ -25,14 +25,14 @@ mod logging;
 #[path = "boards/qemu.rs"]
 mod board;
 
+#[cfg(target_arch = "loongarch64")]
+#[path = "boards/qemu_la.rs"]
+mod board;
+
 pub mod config;
 /// Device drivers and device manager glue.
-#[cfg(target_arch = "riscv64")]
 pub mod drivers;
-#[cfg(target_arch = "riscv64")]
-pub mod fs;
-#[cfg(target_arch = "loongarch64")]
-#[path = "fs_stub.rs"]
+/// File system layer (shared across all architectures).
 pub mod fs;
 pub mod lang_items;
 pub mod mm;
@@ -41,6 +41,7 @@ pub mod mm;
 pub mod net;
 #[cfg(target_arch = "loongarch64")]
 #[path = "net_stub.rs"]
+/// Network subsystem stub for LoongArch64.
 pub mod net;
 pub mod sync;
 pub mod syscall;
