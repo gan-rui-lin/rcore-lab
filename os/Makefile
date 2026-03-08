@@ -71,6 +71,7 @@ kernel-rv: kernel
 	@cp $(KERNEL_RV_ELF) $(KERNEL_RV)
 
 kernel-la: env-la
+	@make -C ../user build ARCH=la MODE=$(MODE) TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE)
 	@echo Platform: loongarch64
 	@LOG=$(LOG) cargo +nightly-2024-08-01 build $(MODE_ARG) --target $(TARGET_LA) --features $(FEATURES)
 	@cp $(KERNEL_LA_ELF) $(KERNEL_LA)

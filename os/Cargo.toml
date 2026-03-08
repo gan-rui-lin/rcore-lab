@@ -33,3 +33,6 @@ legacy_qemu = []
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 riscv = { path = "../vendor/riscv", features = ["inline-asm"] }
+
+[target.'cfg(target_arch = "loongarch64")'.dependencies]
+loongArch64 = { path = "../vendor/loongArch64" }

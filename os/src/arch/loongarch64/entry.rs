@@ -21,8 +21,14 @@ fn clear_bss() {
 pub fn rust_main() -> ! {
     clear_bss();
     crate::arch::loongarch64::console::console_init();
+    crate::logging::init();
+    crate::mm::init();
+    crate::arch::trap_init();
+    crate::arch::trap_enable_timer_interrupt();
+    crate::timer::set_next_trigger();
+    crate::arch::loongarch64::sigtrx::init();
     println!("[kernel] loongarch64 boot");
-    loop {
-        core::hint::spin_loop();
-    }
+    crate::task::add_initproc();
+    crate::task::run_tasks();
+    panic!("Unreachable in rust_main!");
 }
