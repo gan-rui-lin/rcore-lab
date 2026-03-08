@@ -8,9 +8,7 @@ use crate::sync::UPIntrFreeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::arch::asm;
 use lazy_static::*;
-use riscv::register::satp;
 
 extern "C" {
     fn stext();
@@ -624,11 +622,7 @@ impl MemorySet {
     }
     /// Change page table by writing satp CSR Register.
     pub fn activate(&self) {
-        let satp = self.page_table.token();
-        unsafe {
-            satp::write(satp);
-            asm!("sfence.vma");
-        }
+        crate::arch::riscv64::mm::activate_page_table(self.page_table.token());
     }
     /// Translate a virtual page number to a page table entry
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
