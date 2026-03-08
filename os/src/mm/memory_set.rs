@@ -622,7 +622,7 @@ impl MemorySet {
     }
     /// Change page table by writing satp CSR Register.
     pub fn activate(&self) {
-        arch::activate_page_table(self.page_table.token());
+        arch::init_kernel_page_table(self.page_table.token());
     }
     /// Translate a virtual page number to a page table entry
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {

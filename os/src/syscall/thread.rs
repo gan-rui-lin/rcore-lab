@@ -3,8 +3,11 @@ use crate::{
     mm::{kernel_token, translated_refmut, PageTable, VirtAddr},
     syscall::errno::{errno, EAGAIN, ECHILD},
     task::{TaskControlBlock, add_task, current_process, current_task, current_user_token},
-    trap::trap_handler,
 };
+#[cfg(target_arch = "riscv64")]
+use crate::trap::trap_handler;
+#[cfg(target_arch = "loongarch64")]
+use crate::trap::task_entry as trap_handler;
 use alloc::format;
 use alloc::string::ToString;
 use crate::config::USER_STACK_SIZE;

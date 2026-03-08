@@ -28,6 +28,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use manager::fetch_task;
 use process::ProcessControlBlock;
+#[cfg(target_arch = "riscv64")]
 use switch::__switch;
 
 pub use action::{SignalAction, SignalActions, SA_SIGINFO, SA_RESETHAND};

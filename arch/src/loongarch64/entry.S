@@ -13,7 +13,7 @@ _start:
     csrwr       $t0, 0x0
     li.w        $t0, 0x00
     csrwr       $t0, 0x1
-    li.w        $t0, 0x00
+    li.w        $t0, 0x07
     csrwr       $t0, 0x2
 
     la.global   $sp, boot_stack_top

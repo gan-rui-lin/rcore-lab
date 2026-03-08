@@ -445,82 +445,93 @@ pub fn trap_handler() -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// User-mode trap handler (LoongArch64)
+// User-mode trap entry loop (LoongArch64)
+//
+// On LoongArch64 the kernel enters user mode via a loop: restore user
+// registers -> ertn -> (user runs) -> trap -> user_vec returns here.
+// This replaces the RISC-V approach of calling `trap_return()` which
+// jumps to the trampoline page.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "loongarch64")]
-#[no_mangle]
-pub fn trap_handler() -> ! {
+pub fn task_entry() {
     use arch::TrapType;
-    let trap_cx = current_trap_cx();
-    // loongarch64_trap_handler is in the arch crate; we classify here
-    // by reading ESTAT directly.
-    let estat = loongArch64::register::estat::read();
-    let trap_type = match estat.cause() {
-        loongArch64::register::estat::Trap::Exception(
-            loongArch64::register::estat::Exception::Syscall,
-        ) => TrapType::UserEnvCall,
-        loongArch64::register::estat::Trap::Interrupt(_) => {
-            let irq_num = estat.is().trailing_zeros() as usize;
-            if irq_num == 11 {
-                loongArch64::register::ticlr::clear_timer_interrupt();
-                TrapType::Time
-            } else {
-                TrapType::Unknown
+    loop {
+        let trap_cx_user_va = current_trap_cx_user_va();
+        let user_token = current_user_token();
+        arch::activate_page_table(user_token);
+        // user_restore enters user mode; user_vec returns here after trap
+        arch::user_restore(trap_cx_user_va as *mut arch::TrapContext);
+
+        // Handle the trap
+        let trap_cx = current_trap_cx();
+        let estat = loongArch64::register::estat::read();
+        let trap_type = match estat.cause() {
+            loongArch64::register::estat::Trap::Exception(
+                loongArch64::register::estat::Exception::Syscall,
+            ) => TrapType::UserEnvCall,
+            loongArch64::register::estat::Trap::Interrupt(_) => {
+                let irq_num = estat.is().trailing_zeros() as usize;
+                if irq_num == 11 {
+                    loongArch64::register::ticlr::clear_timer_interrupt();
+                    TrapType::Time
+                } else {
+                    TrapType::Unknown
+                }
+            }
+            loongArch64::register::estat::Trap::Exception(
+                loongArch64::register::estat::Exception::StorePageFault,
+            )
+            | loongArch64::register::estat::Trap::Exception(
+                loongArch64::register::estat::Exception::PagePrivilegeIllegal,
+            )
+            | loongArch64::register::estat::Trap::Exception(
+                loongArch64::register::estat::Exception::PageModifyFault,
+            ) => TrapType::StorePageFault(loongArch64::register::badv::read().raw()),
+            loongArch64::register::estat::Trap::Exception(
+                loongArch64::register::estat::Exception::LoadPageFault,
+            )
+            | loongArch64::register::estat::Trap::Exception(
+                loongArch64::register::estat::Exception::FetchPageFault,
+            ) => TrapType::LoadPageFault(loongArch64::register::badv::read().raw()),
+            loongArch64::register::estat::Trap::Exception(
+                loongArch64::register::estat::Exception::InstructionNotExist,
+            ) => TrapType::IllegalInstruction(loongArch64::register::badv::read().raw()),
+            _ => TrapType::Unknown,
+        };
+
+        match trap_type {
+            TrapType::UserEnvCall => {
+                trap_cx.sepc += 4;
+                let result = syscall(trap_cx.x[11], trap_cx.args());
+                let trap_cx = current_trap_cx();
+                trap_cx.x[4] = result as usize;
+            }
+            TrapType::Time => {
+                set_next_trigger();
+                check_timer();
+                handle_signals();
+                suspend_current_and_run_next();
+            }
+            TrapType::StorePageFault(addr)
+            | TrapType::LoadPageFault(addr)
+            | TrapType::InstructionPageFault(addr) => {
+                error!("[kernel] trap_handler: page fault addr={:#x}", addr);
+                current_add_signal(SignalFlags::SIGSEGV);
+            }
+            TrapType::IllegalInstruction(addr) => {
+                error!("[kernel] trap_handler: illegal instruction addr={:#x}", addr);
+                current_add_signal(SignalFlags::SIGILL);
+            }
+            _ => {
+                warn!("[kernel] trap_handler: unknown trap at sepc={:#x}", trap_cx.sepc);
             }
         }
-        loongArch64::register::estat::Trap::Exception(
-            loongArch64::register::estat::Exception::StorePageFault,
-        )
-        | loongArch64::register::estat::Trap::Exception(
-            loongArch64::register::estat::Exception::PagePrivilegeIllegal,
-        )
-        | loongArch64::register::estat::Trap::Exception(
-            loongArch64::register::estat::Exception::PageModifyFault,
-        ) => TrapType::StorePageFault(loongArch64::register::badv::read().raw()),
-        loongArch64::register::estat::Trap::Exception(
-            loongArch64::register::estat::Exception::LoadPageFault,
-        )
-        | loongArch64::register::estat::Trap::Exception(
-            loongArch64::register::estat::Exception::FetchPageFault,
-        ) => TrapType::LoadPageFault(loongArch64::register::badv::read().raw()),
-        loongArch64::register::estat::Trap::Exception(
-            loongArch64::register::estat::Exception::InstructionNotExist,
-        ) => TrapType::IllegalInstruction(loongArch64::register::badv::read().raw()),
-        _ => TrapType::Unknown,
-    };
-
-    match trap_type {
-        TrapType::UserEnvCall => {
-            trap_cx.sepc += 4;
-            let result = syscall(trap_cx.x[11], trap_cx.args());
-            let trap_cx = current_trap_cx();
-            trap_cx.x[4] = result as usize;
-        }
-        TrapType::Time => {
-            set_next_trigger();
-            check_timer();
+        if current_task().is_some() {
             handle_signals();
-            suspend_current_and_run_next();
         }
-        TrapType::StorePageFault(addr)
-        | TrapType::LoadPageFault(addr)
-        | TrapType::InstructionPageFault(addr) => {
-            error!("[kernel] trap_handler: page fault addr={:#x}", addr);
-            current_add_signal(SignalFlags::SIGSEGV);
-        }
-        TrapType::IllegalInstruction(addr) => {
-            error!("[kernel] trap_handler: illegal instruction addr={:#x}", addr);
-            current_add_signal(SignalFlags::SIGILL);
-        }
-        _ => {
-            warn!("[kernel] trap_handler: unknown trap at sepc={:#x}", trap_cx.sepc);
-        }
+        // loop back to re-enter user mode
     }
-    if current_task().is_some() {
-        handle_signals();
-    }
-    do_trap_return();
 }
 
 // ---------------------------------------------------------------------------
