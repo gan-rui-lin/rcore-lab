@@ -3,3 +3,99 @@
 #[cfg(target_arch = "riscv64")]
 pub use crate::arch::riscv64::timer::*;
 
+#[cfg(target_arch = "loongarch64")]
+mod la_timer {
+	use super::super::arch::loongarch64::timer::Time;
+	use crate::sync::UPIntrFreeCell;
+	use crate::task::{TaskControlBlock, wakeup_task};
+	use alloc::collections::BinaryHeap;
+	use alloc::sync::Arc;
+	use lazy_static::lazy_static;
+	use core::cmp::Ordering;
+
+	const TICKS_PER_SEC: usize = 100;
+	const _MSEC_PER_SEC: usize = 1000;
+
+	pub fn get_time() -> usize {
+		Time::now().raw()
+	}
+
+	pub fn get_time_ms() -> usize {
+		Time::now().to_msec()
+	}
+
+	pub fn get_time_us() -> usize {
+		Time::now().to_usec()
+	}
+
+	pub fn set_next_trigger() {
+		// LoongArch timer is periodic; keep the call for interface parity.
+		let _ = get_time() + Time::get_freq() / TICKS_PER_SEC;
+	}
+
+	pub struct TimerCondVar {
+		pub expire_ms: usize,
+		pub task: Arc<TaskControlBlock>,
+	}
+
+	impl PartialEq for TimerCondVar {
+		fn eq(&self, other: &Self) -> bool {
+			self.expire_ms == other.expire_ms
+		}
+	}
+
+	impl Eq for TimerCondVar {}
+
+	impl PartialOrd for TimerCondVar {
+		fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+			let a = -(self.expire_ms as isize);
+			let b = -(other.expire_ms as isize);
+			Some(a.cmp(&b))
+		}
+	}
+
+	impl Ord for TimerCondVar {
+		fn cmp(&self, other: &Self) -> Ordering {
+			self.partial_cmp(other).unwrap()
+		}
+	}
+
+	lazy_static! {
+		static ref TIMERS: UPIntrFreeCell<BinaryHeap<TimerCondVar>> =
+			unsafe { UPIntrFreeCell::new(BinaryHeap::<TimerCondVar>::new()) };
+	}
+
+	pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
+		let mut timers = TIMERS.exclusive_access();
+		timers.push(TimerCondVar { expire_ms, task });
+	}
+
+	pub fn remove_timer(task: Arc<TaskControlBlock>) {
+		let mut timers = TIMERS.exclusive_access();
+		let mut temp = BinaryHeap::<TimerCondVar>::new();
+		for condvar in timers.drain() {
+			if Arc::as_ptr(&task) != Arc::as_ptr(&condvar.task) {
+				temp.push(condvar);
+			}
+		}
+		timers.clear();
+		timers.append(&mut temp);
+	}
+
+	pub fn check_timer() {
+		let current_ms = get_time_ms();
+		let mut timers = TIMERS.exclusive_access();
+		while let Some(timer) = timers.peek() {
+			if timer.expire_ms <= current_ms {
+				wakeup_task(Arc::clone(&timer.task));
+				timers.pop();
+			} else {
+				break;
+			}
+		}
+	}
+}
+
+#[cfg(target_arch = "loongarch64")]
+pub use la_timer::*;
+

@@ -1,11 +1,19 @@
+ARCH ?= rv
+ifeq ($(ARCH),la)
+TARGET := loongarch64-unknown-none
+OBJDUMP := rust-objdump --arch-name=loongarch64
+OBJCOPY := rust-objcopy --binary-architecture=loongarch64
+else
 TARGET := riscv64gc-unknown-none-elf
+OBJDUMP := rust-objdump --arch-name=riscv64
+OBJCOPY := rust-objcopy --binary-architecture=riscv64
+endif
 MODE := release
 APP_DIR := src/bin
 TARGET_DIR := target/$(TARGET)/$(MODE)
 BUILD_DIR := build
-OBJDUMP := rust-objdump --arch-name=riscv64
-OBJCOPY := rust-objcopy --binary-architecture=riscv64
 PY := python3
+RUST_TOOLCHAIN ?= +nightly-2024-08-01
 
 ifeq ($(MODE), release)
 	MODE_ARG := --release
@@ -35,9 +43,9 @@ ELFS := $(patsubst $(APP_DIR)/%.rs, $(TARGET_DIR)/%, $(APPS))
 binary:
 	@echo $(ELFS)
 	@if [ ${CHAPTER} -gt 3 ]; then \
-		cargo build $(MODE_ARG) ;\
+		cargo $(RUST_TOOLCHAIN) build $(MODE_ARG) --target $(TARGET) ;\
 	else \
-		CHAPTER=$(CHAPTER) python3 build.py ;\
+		ARCH=$(ARCH) CHAPTER=$(CHAPTER) MODE=$(MODE) RUST_TOOLCHAIN=$(RUST_TOOLCHAIN) python3 build.py ;\
 	fi
 	@$(foreach elf, $(ELFS), \
 		$(OBJCOPY) $(elf) --strip-all -O binary $(patsubst $(TARGET_DIR)/%, $(TARGET_DIR)/%.bin, $(elf)); \
