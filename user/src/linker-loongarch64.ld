@@ -1,54 +1,33 @@
 OUTPUT_ARCH(loongarch)
 ENTRY(_start)
-BASE_ADDRESS = 0x9000000090000000;
+
+BASE_ADDRESS = 0x0;
 
 SECTIONS
 {
     . = BASE_ADDRESS;
-    skernel = .;
-
-    stext = .;
     .text : {
         *(.text.entry)
-        . = ALIGN(4K);
-        strampoline = .;
         *(.text .text.*)
     }
-
     . = ALIGN(4K);
-    etext = .;
-    srodata = .;
     .rodata : {
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
     }
-
     . = ALIGN(4K);
-    erodata = .;
-    sdata = .;
     .data : {
         *(.data .data.*)
         *(.sdata .sdata.*)
     }
-
-    . = ALIGN(4K);
-    edata = .;
-    sbss_with_stack = .;
     .bss : {
-        *(.bss.stack)
-        sbss = .;
+        start_bss = .;
         *(.bss .bss.*)
         *(.sbss .sbss.*)
+        end_bss = .;
     }
-
-    . = ALIGN(4K);
-    ebss = .;
-    ekernel = .;
-
     /DISCARD/ : {
         *(.eh_frame)
-        *(.comment)
-        *(.gnu*)
-        *(.note*)
+        *(.debug*)
     }
 }
