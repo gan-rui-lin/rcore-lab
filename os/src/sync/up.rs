@@ -2,7 +2,7 @@
 use core::cell::{RefCell, RefMut, UnsafeCell};
 use core::ops::{Deref, DerefMut};
 use lazy_static::lazy_static;
-use riscv::register::sstatus;
+use crate::arch::riscv64::interrupt::{disable_interrupts, enable_interrupts, interrupts_enabled};
 
 /// Wrap a static data structure inside it so that we are
 /// able to access it without any `unsafe`.
@@ -75,10 +75,8 @@ impl IntrMaskingInfo {
     }
 
     pub fn enter(&mut self) {
-        let sie = sstatus::read().sie();
-        unsafe {
-            sstatus::clear_sie();
-        }
+        let sie = interrupts_enabled();
+        disable_interrupts();
         if self.nested_level == 0 {
             self.sie_before_masking = sie;
         }
@@ -88,9 +86,7 @@ impl IntrMaskingInfo {
     pub fn exit(&mut self) {
         self.nested_level -= 1;
         if self.nested_level == 0 && self.sie_before_masking {
-            unsafe {
-                sstatus::set_sie();
-            }
+            enable_interrupts();
         }
     }
 }
