@@ -1,5 +1,6 @@
 pub mod console;
 pub mod entry;
+pub mod mm;
 pub mod sbi;
 pub mod trap;
 pub mod timer;
