@@ -1,15 +1,4 @@
-/// QEMU virt machine clock frequency (Hz).
-pub const CLOCK_FREQ: usize = 12500000;
-/// QEMU virt machine physical memory end.
-pub const MEMORY_END: usize = 0x8800_0000;
-
-/// QEMU virt machine MMIO ranges.
-pub const MMIO: &[(usize, usize)] = &[
-    (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine
-    (0x2000000, 0x10000),
-    (0xc000000, 0x210000), // VIRT_PLIC in virt machine
-    (0x10000000, 0x9000),  // VIRT_UART0 with GPU  in virt machine
-];
+// Board constants CLOCK_FREQ, MEMORY_END, MMIO are now provided by the arch crate.
 
 /// Block device implementation on this board.
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
@@ -54,7 +43,7 @@ pub fn device_init() {
         plic.enable(hart_id, supervisor, intr_src_id as usize); // 让该 IRQ 送达 S 态
         plic.set_priority(intr_src_id as usize, 1); // 设置 IRQ 优先级
     }
-    crate::arch::riscv64::interrupt::enable_supervisor_external(); // 开启 S 态外部中断
+    arch::enable_supervisor_external(); // 开启 S 态外部中断
 }
 
 /// Dispatch a PLIC interrupt to the corresponding device handler.

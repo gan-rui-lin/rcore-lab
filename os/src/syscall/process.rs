@@ -10,7 +10,6 @@ use bitflags::bitflags;
 use crate::{
     fs::{open_file, File, OpenFlags},
     mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission, PageTable, VirtAddr},
-    sbi::shutdown,
     task::{
         add_task, current_process, current_task, current_trap_cx, current_user_token,
         exit_current_and_run_next, futex_requeue, futex_remove_waiter, futex_remove_waiter_any,
@@ -2028,7 +2027,7 @@ pub fn sys_shutdown() -> ! {
     trace!(
         "kernel:pid[{}] sys_shutdown",
         current_process().pid.0);
-    shutdown();
+    arch::shutdown();
 }
 
 /// mprotect - change memory region protection

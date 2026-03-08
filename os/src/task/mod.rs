@@ -17,13 +17,10 @@ mod tls;
 #[allow(unused_imports)]
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, PageTable, VirtAddr};
-use crate::arch::shutdown;
-use crate::arch::TrapContext;
+use arch::{shutdown, TrapContext, FpRegs, MContext};
 use crate::timer::remove_timer;
-#[cfg(target_arch = "riscv64")]
-use crate::arch::riscv64::signal::{MContext, RiscvFpRegs};
-#[cfg(target_arch = "loongarch64")]
-use crate::arch::loongarch64::signal::{MContext, RiscvFpRegs};
+/// Alias for backward compatibility within this module.
+type RiscvFpRegs = FpRegs;
 use alloc::sync::Arc;
 use lazy_static::*;
 #[allow(unused_imports)]

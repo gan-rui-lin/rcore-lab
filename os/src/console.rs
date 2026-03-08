@@ -1,17 +1,7 @@
 //! Console output for text mode.
 use core::fmt::{self, Write};
 
-#[cfg(target_arch = "riscv64")]
-use crate::arch::riscv64::console::{
-    console_getchar as raw_getchar,
-    console_putchar as raw_putchar,
-};
-
-#[cfg(target_arch = "loongarch64")]
-use crate::arch::loongarch64::console::{
-    console_getchar as raw_getchar,
-    console_putchar as raw_putchar,
-};
+use arch::{console_getchar as raw_getchar, console_putchar as raw_putchar};
 
 struct Stdout;
 
