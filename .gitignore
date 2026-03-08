@@ -29,7 +29,10 @@ CLAUDE.*
 *.docker*
 Dockerfile.ext4
 *.sh
-!run.shs
+!run.sh
+!run-la.sh
+!install-gdb-12.1.sh
+!install-gdb-12.1-bash.sh
 kernel-la
 kernel-rv
 kernel-qemu
