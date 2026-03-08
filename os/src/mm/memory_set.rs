@@ -622,7 +622,10 @@ impl MemorySet {
     }
     /// Change page table by writing satp CSR Register.
     pub fn activate(&self) {
+        #[cfg(target_arch = "riscv64")]
         crate::arch::riscv64::mm::activate_page_table(self.page_table.token());
+        #[cfg(target_arch = "loongarch64")]
+        crate::arch::loongarch64::page_table::activate_page_table(self.page_table.token());
     }
     /// Translate a virtual page number to a page table entry
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {

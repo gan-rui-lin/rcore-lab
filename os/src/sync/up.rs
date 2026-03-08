@@ -2,7 +2,18 @@
 use core::cell::{RefCell, RefMut, UnsafeCell};
 use core::ops::{Deref, DerefMut};
 use lazy_static::lazy_static;
+#[cfg(target_arch = "riscv64")]
 use crate::arch::riscv64::interrupt::{disable_interrupts, enable_interrupts, interrupts_enabled};
+
+#[cfg(target_arch = "loongarch64")]
+use crate::arch::loongarch64::trap::{disable_irq as disable_interrupts, enable_irq as enable_interrupts};
+
+#[cfg(target_arch = "loongarch64")]
+fn interrupts_enabled() -> bool {
+    use loongArch64::register::prmd;
+
+    prmd::read().pie()
+}
 
 /// Wrap a static data structure inside it so that we are
 /// able to access it without any `unsafe`.

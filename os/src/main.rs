@@ -4,21 +4,23 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
+#![cfg_attr(target_arch = "loongarch64", feature(naked_functions))]
+#![cfg_attr(target_arch = "loongarch64", feature(asm_const))]
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 #[macro_use]
 extern crate bitflags;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 #[macro_use]
 extern crate log;
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 extern crate alloc;
 
 #[macro_use]
 mod console;
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 #[macro_use]
 mod logging;
 
@@ -26,29 +28,35 @@ mod logging;
 #[path = "boards/qemu.rs"]
 mod board;
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub mod config;
 /// Device drivers and device manager glue.
 #[cfg(target_arch = "riscv64")]
 pub mod drivers;
 #[cfg(target_arch = "riscv64")]
 pub mod fs;
+#[cfg(target_arch = "loongarch64")]
+#[path = "fs_stub.rs"]
+pub mod fs;
 pub mod lang_items;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub mod mm;
 #[cfg(target_arch = "riscv64")]
 /// Network subsystem (smoltcp-based TCP/IP stack).
 pub mod net;
+#[cfg(target_arch = "loongarch64")]
+#[path = "net_stub.rs"]
+pub mod net;
 pub mod sbi;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub mod sync;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub mod syscall;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub mod task;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub mod timer;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 pub mod trap;
 
 mod arch;

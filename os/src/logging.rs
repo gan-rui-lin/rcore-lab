@@ -27,6 +27,7 @@ macro_rules! syscall {
 }
 
 /// a simple logger
+#[allow(dead_code)]
 struct SimpleLogger;
 
 impl Log for SimpleLogger {
@@ -55,6 +56,7 @@ impl Log for SimpleLogger {
 }
 
 /// initiate logger
+#[allow(dead_code)]
 pub fn init() {
     static LOGGER: SimpleLogger = SimpleLogger;
     log::set_logger(&LOGGER).unwrap();

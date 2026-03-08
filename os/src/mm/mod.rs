@@ -10,11 +10,23 @@ mod frame_allocator;
 mod heap_allocator;
 mod memory_set;
 
+#[cfg(target_arch = "riscv64")]
 pub use crate::arch::riscv64::mm::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, VPNRange};
+#[cfg(target_arch = "loongarch64")]
+pub use crate::arch::loongarch64::page_table::{
+    PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, VPNRange,
+};
 pub use frame_allocator::{frame_alloc, frame_alloc_more, frame_dealloc, FrameTracker};
 pub use memory_set::remap_test;
 pub use memory_set::{kernel_token, MapPermission, MemorySet, KERNEL_SPACE};
+#[cfg(target_arch = "riscv64")]
 pub use crate::arch::riscv64::mm::{
+    PTEFlags,
+    translated_byte_buffer, translated_ref, translated_refmut, translated_str, PageTable,
+    PageTableEntry, UserBuffer, UserBufferIterator,
+};
+#[cfg(target_arch = "loongarch64")]
+pub use crate::arch::loongarch64::page_table::{
     PTEFlags,
     translated_byte_buffer, translated_ref, translated_refmut, translated_str, PageTable,
     PageTableEntry, UserBuffer, UserBufferIterator,

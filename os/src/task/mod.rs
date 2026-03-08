@@ -20,7 +20,10 @@ use crate::mm::{translated_byte_buffer, translated_refmut, PageTable, VirtAddr};
 use crate::arch::shutdown;
 use crate::arch::TrapContext;
 use crate::timer::remove_timer;
+#[cfg(target_arch = "riscv64")]
 use crate::arch::riscv64::signal::{MContext, RiscvFpRegs};
+#[cfg(target_arch = "loongarch64")]
+use crate::arch::loongarch64::signal::{MContext, RiscvFpRegs};
 use alloc::sync::Arc;
 use lazy_static::*;
 #[allow(unused_imports)]
@@ -299,15 +302,20 @@ lazy_static! {
     };
 }
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, target_arch = "riscv64"))]
 const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../user/target/riscv64gc-unknown-none-elf/debug/initcode"
 ));
-#[cfg(not(debug_assertions))]
+#[cfg(all(not(debug_assertions), target_arch = "riscv64"))]
 const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../user/target/riscv64gc-unknown-none-elf/release/initcode"
+));
+#[cfg(target_arch = "loongarch64")]
+const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../user/build/elf/initcode.elf"
 ));
 
 pub fn add_initproc() {

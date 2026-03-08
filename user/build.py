@@ -9,6 +9,11 @@ apps = os.listdir("build/app")
 apps.sort()
 chapter = os.getenv("CHAPTER")
 mode = os.getenv("MODE", default = "release")
+arch = os.getenv("ARCH", default = "rv")
+if arch == "la":
+    target = "loongarch64-unknown-none"
+else:
+    target = "riscv64gc-unknown-none-elf"
 if mode == "release" :
 	mode_arg = "--release"
 else :
@@ -17,8 +22,8 @@ else :
 for app in apps:
     app = app[: app.find(".")]
     os.system(
-        "cargo rustc --bin %s %s -- -Clink-args=-Ttext=%x"
-        % (app, mode_arg, base_address + step * app_id)
+        "cargo rustc --bin %s %s --target %s -- -Clink-args=-Ttext=%x"
+        % (app, mode_arg, target, base_address + step * app_id)
     )
     print(
         "[build.py] application %s start with address %s"
