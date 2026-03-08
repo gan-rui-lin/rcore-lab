@@ -15,5 +15,5 @@ pub use riscv64::{
 #[allow(unused_imports)]
 pub use loongarch64::{
 	TrapContext, trap_handler, trap_return, trap_init, trap_enable_timer_interrupt, shutdown,
-	TaskContext, __switch,
+	TaskContext, __switch, task_entry,
 };
