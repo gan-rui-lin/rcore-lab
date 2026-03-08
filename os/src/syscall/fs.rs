@@ -8,7 +8,7 @@ use crate::mm::{translated_byte_buffer, translated_str, translated_refmut, UserB
 use core::sync::atomic::{AtomicUsize, Ordering};
 #[allow(unused_imports)] // for debug
 use crate::task::{current_process, current_task, current_user_token, suspend_current_and_run_next};
-use crate::timer::get_time_ms;
+use crate::timer::{get_time_ms, get_time_us};
 use super::errno::*;
 use super::process::TimeSpec;
 use alloc::format;
@@ -76,7 +76,7 @@ fn ts_alloc_id() -> usize {
 }
 
 fn get_current_timespec() -> (i64, i64) {
-    let us = crate::timer::get_time_us();
+    let us = get_time_us();
     let sec = (us / 1_000_000) as i64;
     let nsec = ((us % 1_000_000) * 1000) as i64;
     (sec, nsec)
