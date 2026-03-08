@@ -266,6 +266,30 @@ pub unsafe extern "C" fn trap_vector_base() {
                 andi    $sp, $sp, 0x3
                 bnez    $sp, {user_vec}
 
+                // ── Kernel trap path ──
+                // Fast path for PageModifyFault (PME, ecode=4)
+                csrrd   $sp, 0x5          // ESTAT
+                srli.d  $sp, $sp, 16
+                andi    $sp, $sp, 0x3f    // ecode
+                ori     $t0, $zero, 4     // PME ecode = 4
+                bne     $sp, $t0, 1f
+
+                // Handle PME: set D bit in TLB
+                tlbsrch
+                tlbrd
+                ori     $t0, $zero, 0x2   // D bit mask
+                csrrd   $sp, 0x0c         // TLBELO0
+                or      $sp, $sp, $t0
+                csrwr   $sp, 0x0c
+                csrrd   $sp, 0x0d         // TLBELO1
+                or      $sp, $sp, $t0
+                csrwr   $sp, 0x0d
+                tlbwr
+                csrrd   $sp, KSAVE_USP
+                ertn
+
+            1:
+                // Normal kernel trap path
                 csrrd   $sp, KSAVE_USP
                 addi.d  $sp, $sp, -{trapframe_size} // allocate space
 
@@ -472,20 +496,7 @@ pub unsafe fn set_kernel_trap() {
 // and `current_user_token` which live in the kernel crate.
 // ---------------------------------------------------------------------------
 
-/// Return to user space.
-///
-/// `trap_cx_ptr` -- virtual address of the user TrapFrame (must be within
-///                  the valid TRAP_CONTEXT region).
-/// `user_satp`   -- page-table token for the user address space.
-pub fn trap_return(trap_cx_ptr: usize, user_satp: usize) -> ! {
-    super::page_table::activate_page_table(user_satp);
-    unsafe {
-        asm!(
-            "move $a0, {trap_cx}",
-            "jr {restore}",
-            trap_cx = in(reg) trap_cx_ptr,
-            restore = in(reg) user_restore as usize,
-            options(noreturn)
-        );
-    }
+/// Stub: LoongArch64 does not use trap_return; user return is handled by task_entry.
+pub fn trap_return(_trap_cx_ptr: usize, _user_satp: usize) -> ! {
+    panic!("trap_return() should not be called on loongarch64; user return is handled by task_entry");
 }

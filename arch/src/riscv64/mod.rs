@@ -45,6 +45,7 @@ pub use mm::{translated_byte_buffer, translated_ref, translated_refmut, translat
 pub use mm::{UserBuffer, UserBufferIterator};
 pub use mm::{PAGE_SIZE, PAGE_SIZE_BITS};
 pub use mm::activate_page_table;
+pub use mm::init_kernel_page_table;
 
 // ---------------------------------------------------------------------------
 // SBI
