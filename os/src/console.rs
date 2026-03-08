@@ -31,6 +31,7 @@ pub fn print(args: fmt::Arguments) {
 }
 
 /// Initialize the console device (arch-specific).
+#[allow(dead_code)]
 pub fn console_init() {
     arch_console_init();
 }
