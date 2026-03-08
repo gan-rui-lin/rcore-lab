@@ -1,6 +1,6 @@
 use super::id::TaskUserRes;
 use super::{KernelStack, ProcessControlBlock, TaskContext, kstack_alloc};
-use crate::arch::TrapContext;
+use arch::TrapContext;
 use crate::sync::UPIntrFreeCell;
 use alloc::sync::{Arc, Weak};
 use crate::sync::UPIntrRefMut;
@@ -75,7 +75,12 @@ impl TaskControlBlock {
                 UPIntrFreeCell::new(TaskControlBlockInner {
                     res: Some(res),
                     trap_cx_ppn,
-                    task_cx: TaskContext::goto_trap_return(kstack_top),
+                    task_cx: TaskContext::goto_trap_return(kstack_top, {
+                        #[cfg(target_arch = "riscv64")]
+                        { crate::trap::do_trap_return as usize }
+                        #[cfg(target_arch = "loongarch64")]
+                        { crate::trap::task_entry as usize }
+                    }),
                     task_status: TaskStatus::Ready,
                     exit_code: None,
                     signal_trap_cx: None,

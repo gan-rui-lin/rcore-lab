@@ -1,6 +1,6 @@
 //! The panic handler
 
-use crate::arch::shutdown;
+use arch::shutdown;
 use core::panic::PanicInfo;
 
 #[panic_handler]

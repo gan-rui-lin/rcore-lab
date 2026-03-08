@@ -1,0 +1,16 @@
+[package]
+name = "arch"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4"
+bitflags = "1.2.1"
+crate_interface = { git = "https://github.com/Byte-OS/crate_interface.git" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+riscv = { path = "../vendor/riscv", features = ["inline-asm"] }
+
+[target.'cfg(target_arch = "loongarch64")'.dependencies]
+loongArch64 = { path = "../vendor/loongArch64" }
+spin = { version = "0.7.0" }

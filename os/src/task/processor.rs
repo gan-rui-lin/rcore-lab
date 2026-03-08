@@ -1,18 +1,13 @@
 #![allow(missing_docs)]
 
+#[cfg(target_arch = "riscv64")]
+use super::__switch;
 use super::{ProcessControlBlock, TaskContext, TaskControlBlock, TaskStatus, fetch_task, ready_queue_snapshot};
 use crate::sync::UPIntrFreeCell;
-use crate::arch::TrapContext;
+use arch::TrapContext;
 use alloc::sync::Arc;
 use lazy_static::*;
 use core::sync::atomic::{AtomicU64, Ordering};
-
-#[cfg(target_arch = "riscv64")]
-use super::__switch;
-#[cfg(target_arch = "loongarch64")]
-use crate::arch::loongarch64::kcontext::context_switch_pt;
-#[cfg(target_arch = "loongarch64")]
-use crate::mm::kernel_token;
 
 pub struct Processor {
     current: Option<Arc<TaskControlBlock>>,
@@ -53,18 +48,16 @@ pub fn run_tasks() {
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
             drop(task_inner);
-            // On LoongArch64, we need the user page table token for context_switch_pt
+            // Get the page table token for LoongArch context_switch_pt
             #[cfg(target_arch = "loongarch64")]
-            let user_token = task.get_user_token();
+            let pt_token = task.get_user_token();
             processor.current = Some(task);
             drop(processor);
-            #[cfg(target_arch = "riscv64")]
             unsafe {
+                #[cfg(target_arch = "riscv64")]
                 __switch(idle_task_cx_ptr, next_task_cx_ptr);
-            }
-            #[cfg(target_arch = "loongarch64")]
-            unsafe {
-                context_switch_pt(idle_task_cx_ptr, next_task_cx_ptr, user_token);
+                #[cfg(target_arch = "loongarch64")]
+                arch::context_switch_pt(idle_task_cx_ptr, next_task_cx_ptr, pt_token);
             }
         } else {
             let count = RUN_TASKS_EMPTY_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -118,13 +111,10 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     let mut processor = PROCESSOR.exclusive_access();
     let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
     drop(processor);
-    #[cfg(target_arch = "riscv64")]
     unsafe {
+        #[cfg(target_arch = "riscv64")]
         __switch(switched_task_cx_ptr, idle_task_cx_ptr);
-    }
-    #[cfg(target_arch = "loongarch64")]
-    unsafe {
-        // Switch back to kernel page table when returning to idle loop
-        context_switch_pt(switched_task_cx_ptr, idle_task_cx_ptr, kernel_token());
+        #[cfg(target_arch = "loongarch64")]
+        arch::context_switch(switched_task_cx_ptr, idle_task_cx_ptr);
     }
 }
