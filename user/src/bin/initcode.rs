@@ -13,9 +13,10 @@ const ENABLE_SINGLE_ELF_SUITE: bool = false;
 const ENABLE_BASIC_TEST: bool = false;
 const ENABLE_BUSYBOX_TEST: bool = false;
 const ENABLE_LUA_TEST: bool = false;
-const ENABLE_LIBC_TEST: bool = true;
+const ENABLE_LIBC_TEST: bool = false;
 const ENABLE_DYNAMIC_TEST: bool = false;
 const ENABLE_LTP_TEST: bool = false;
+const ENABLE_IPERF_TEST: bool = true;
 const ENABLE_ALL_TESTS: bool = false;
 const ENABLE_FAT32_TESTS: bool = false;
 const SINGLE_TEST: Option<&str> = option_env!("SINGLE_TEST");
@@ -112,6 +113,10 @@ fn main() -> i32 {
         }
         if ENABLE_LTP_TEST {
             test_ltp();
+        }
+
+        if ENABLE_IPERF_TEST {
+            test_iperf();
         }
 
         if ENABLE_FAT32_TESTS {
@@ -267,6 +272,10 @@ fn test_basic() {
 
 fn test_ltp() {
     run_testcode("/musl/ltp_testcode.sh");
+}
+
+fn test_iperf() {
+    run_testcode("/musl/iperf_testcode.sh");
 }
 
 fn test_dynamic() {
