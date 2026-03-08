@@ -55,6 +55,25 @@ pub fn rust_main() -> ! {
     arch::trap_init();
     arch::trap_enable_timer_interrupt();
     crate::timer::set_next_trigger();
+    crate::board::device_init();
+    #[cfg(feature = "ext4")]
+    if crate::fs::mount_ext4_auto() {
+        info!("[kernel] ext4 mounted as root");
+        crate::fs::ensure_busybox_links();
+    } else if crate::fs::mount_fat32_auto() {
+        info!("[kernel] fat32 mounted as root");
+    } else {
+        crate::fs::mount_easyfs();
+    }
+    #[cfg(not(feature = "ext4"))]
+    if crate::fs::mount_fat32_auto() {
+        info!("[kernel] fat32 mounted as root");
+    } else {
+        crate::fs::mount_easyfs();
+    }
+    crate::fs::mount_procfs();
+    crate::fs::ensure_basic_paths();
+    crate::fs::list_apps();
     crate::task::add_initproc();
     crate::task::run_tasks();
     panic!("Unreachable in rust_main!");
