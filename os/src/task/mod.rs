@@ -20,6 +20,7 @@ use crate::mm::{translated_byte_buffer, translated_refmut, PageTable, VirtAddr};
 use crate::arch::shutdown;
 use crate::arch::TrapContext;
 use crate::timer::remove_timer;
+use crate::arch::riscv64::signal::{MContext, RiscvFpRegs};
 use alloc::sync::Arc;
 use lazy_static::*;
 #[allow(unused_imports)]
@@ -79,21 +80,6 @@ pub struct StackT {
     pub ss_flags: i32,
     pub _pad: i32,
     pub ss_size: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct RiscvFpRegs {
-    pub f: [u64; 32],
-    pub fcsr: u32,
-    pub _pad: u32,
-}
-
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-pub struct MContext {
-    pub gregs: [usize; 32],
-    pub fpregs: RiscvFpRegs,
 }
 
 #[repr(C)]

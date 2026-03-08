@@ -43,8 +43,6 @@ use crate::drivers::{KEYBOARD_DEVICE, MOUSE_DEVICE};
 
 /// Initialize board-level devices and PLIC routing.
 pub fn device_init() {
-    #[allow(unused)]
-    use riscv::register::sie;
     let mut plic = unsafe { PLIC::new(VIRT_PLIC) }; // 创建 PLIC 访问器
     let hart_id: usize = 0; // 单核环境使用 hart 0
     let supervisor = IntrTargetPriority::Supervisor;
@@ -56,9 +54,7 @@ pub fn device_init() {
         plic.enable(hart_id, supervisor, intr_src_id as usize); // 让该 IRQ 送达 S 态
         plic.set_priority(intr_src_id as usize, 1); // 设置 IRQ 优先级
     }
-    unsafe {
-        sie::set_sext(); // 开启 S 态外部中断
-    }
+    crate::arch::riscv64::interrupt::enable_supervisor_external(); // 开启 S 态外部中断
 }
 
 /// Dispatch a PLIC interrupt to the corresponding device handler.
