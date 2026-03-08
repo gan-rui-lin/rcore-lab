@@ -32,7 +32,7 @@ pub(super) struct KernelTrapContext {
 }
 
 impl TrapContext {
-    /// put the sp(stack pointer) into x\[2\] field of TrapContext
+    /// put the sp(stack pointer) into x[2] field of TrapContext
     pub fn set_sp(&mut self, sp: usize) {
         self.x[2] = sp;
     }
