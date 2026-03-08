@@ -4,7 +4,7 @@ use crate::sync::UPIntrFreeCell;
 use core::arch::global_asm;
 use lazy_static::lazy_static;
 
-global_asm!(include_str!("../../entry.asm"));
+global_asm!(include_str!("entry.asm"));
 
 /// Clear BSS segment.
 fn clear_bss() {
