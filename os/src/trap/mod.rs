@@ -15,12 +15,18 @@ use crate::task::{
 use crate::mm::{PageTable, VirtAddr};
 use crate::config::PAGE_SIZE;
 use crate::timer::{check_timer, set_next_trigger};
+use arch::TrapFrameArgs;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_arch = "riscv64")]
 use crate::fs::{open_file, OpenFlags};
 #[cfg(target_arch = "riscv64")]
 use xmas_elf::ElfFile;
+
+#[cfg(target_arch = "riscv64")]
+pub use trap_handler as user_trap_entry;
+#[cfg(target_arch = "loongarch64")]
+pub use task_entry as user_trap_entry;
 
 const TIMER_SAMPLE_INTERVAL: u64 = 200;
 static TIMER_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -53,7 +59,11 @@ pub fn kernel_interrupt_dispatch(trap_type: arch::TrapType) {
                         let (sepc, sp, ra) = {
                             let task_inner = task.inner_exclusive_access();
                             let trap_cx = task_inner.get_trap_cx();
-                            (trap_cx.sepc, trap_cx.x[2], trap_cx.x[1])
+                            (
+                                trap_cx.sepc,
+                                trap_cx[TrapFrameArgs::SP],
+                                trap_cx[TrapFrameArgs::RA],
+                            )
                         };
                         info!(
                             "[sample-k] pid={} name={} sepc={:#x} sp={:#x} ra={:#x}",
@@ -144,12 +154,9 @@ pub fn trap_handler() -> ! {
             cx.sepc += 4;
             // Enable S-mode interrupts during syscall processing
             unsafe { riscv::register::sstatus::set_sie(); }
-            let result = syscall(
-                cx.x[17],
-                [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
-            );
+            let result = syscall(cx[TrapFrameArgs::SYSCALL], cx.args());
             cx = current_trap_cx();
-            cx.x[10] = result as usize;
+            cx[TrapFrameArgs::RET] = result as usize;
         }
         Trap::Exception(Exception::StoreFault)
         | Trap::Exception(Exception::StorePageFault)
@@ -205,22 +212,23 @@ pub fn trap_handler() -> ! {
             } else {
                 error!("  sepc pte: unmapped");
             }
+            let args = trap_cx.args();
             error!("  Registers:");
-            error!("    ra (x1) = {:#x}", trap_cx.x[1]);
-            error!("    sp (x2) = {:#x}", trap_cx.x[2]);
-            error!("    gp (x3) = {:#x}", trap_cx.x[3]);
-            error!("    tp (x4) = {:#x}", trap_cx.x[4]);
-            error!("    t0 (x5) = {:#x}", trap_cx.x[5]);
-            error!("    t1 (x6) = {:#x}", trap_cx.x[6]);
-            error!("    a0 (x10) = {:#x}", trap_cx.x[10]);
-            error!("    a1 (x11) = {:#x}", trap_cx.x[11]);
-            error!("    a2 (x12) = {:#x}", trap_cx.x[12]);
-            error!("    a3 (x13) = {:#x}", trap_cx.x[13]);
-            error!("    a4 (x14) = {:#x}", trap_cx.x[14]);
-            error!("    a5 (x15) = {:#x}", trap_cx.x[15]);
-            dump_user_stack(&page_table, trap_cx.x[2], 128);
+            error!("    ra (x1) = {:#x}", trap_cx[TrapFrameArgs::RA]);
+            error!("    sp (x2) = {:#x}", trap_cx[TrapFrameArgs::SP]);
+            error!("    gp (x3) = {:#x}", trap_cx.gp());
+            error!("    tp (x4) = {:#x}", trap_cx[TrapFrameArgs::TLS]);
+            error!("    t0 (x5) = {:#x}", trap_cx.t0());
+            error!("    t1 (x6) = {:#x}", trap_cx.t1());
+            error!("    a0 (x10) = {:#x}", args[0]);
+            error!("    a1 (x11) = {:#x}", args[1]);
+            error!("    a2 (x12) = {:#x}", args[2]);
+            error!("    a3 (x13) = {:#x}", args[3]);
+            error!("    a4 (x14) = {:#x}", args[4]);
+            error!("    a5 (x15) = {:#x}", args[5]);
+            dump_user_stack(&page_table, trap_cx[TrapFrameArgs::SP], 128);
             if name == "entry-static.exe" {
-                let tp = trap_cx.x[4];
+                let tp = trap_cx[TrapFrameArgs::TLS];
                 error!("  tp dump: tp={:#x}", tp);
                 let base = tp.saturating_sub(256);
                 dump_user_bytes("tp-0x100", &page_table, base, 128);
@@ -381,7 +389,7 @@ pub fn trap_handler() -> ! {
                 if task_inner.signal_pending.contains(SignalFlags::SIG33) {
                     let pid = current_process().pid.0;
                     let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-                    let tp = task_inner.get_trap_cx().x[4];
+                    let tp = task_inner.get_trap_cx()[TrapFrameArgs::TLS];
                     info!(
                         "[trap-timer] pid={} tid={} sig33 pending tp={:#x} mask={:?}",
                         pid,
@@ -402,7 +410,11 @@ pub fn trap_handler() -> ! {
                         let (sepc, sp, ra) = {
                             let task_inner = task.inner_exclusive_access();
                             let trap_cx = task_inner.get_trap_cx();
-                            (trap_cx.sepc, trap_cx.x[2], trap_cx.x[1])
+                            (
+                                trap_cx.sepc,
+                                trap_cx[TrapFrameArgs::SP],
+                                trap_cx[TrapFrameArgs::RA],
+                            )
                         };
                         info!(
                             "[sample] pid={} name={} sepc={:#x} sp={:#x} ra={:#x}",
@@ -430,7 +442,7 @@ pub fn trap_handler() -> ! {
         if task_inner.signal_pending.contains(SignalFlags::SIG33) {
             let pid = current_process().pid.0;
             let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-            let tp = task_inner.get_trap_cx().x[4];
+            let tp = task_inner.get_trap_cx()[TrapFrameArgs::TLS];
             info!(
                 "[trap] pid={} tid={} sig33 pending tp={:#x} mask={:?}",
                 pid,
@@ -457,11 +469,11 @@ pub fn trap_handler() -> ! {
 pub fn task_entry() {
     use arch::TrapType;
     loop {
-        let trap_cx_user_va = current_trap_cx_user_va();
         let user_token = current_user_token();
         arch::activate_page_table(user_token);
         // user_restore enters user mode; user_vec returns here after trap
-        arch::user_restore(trap_cx_user_va as *mut arch::TrapContext);
+        let trap_cx_ptr = current_trap_cx() as *mut arch::TrapContext;
+        arch::user_restore(trap_cx_ptr);
 
         // Handle the trap
         let trap_cx = current_trap_cx();
@@ -503,9 +515,9 @@ pub fn task_entry() {
         match trap_type {
             TrapType::UserEnvCall => {
                 trap_cx.sepc += 4;
-                let result = syscall(trap_cx.x[11], trap_cx.args());
+                let result = syscall(trap_cx[TrapFrameArgs::SYSCALL], trap_cx.args());
                 let trap_cx = current_trap_cx();
-                trap_cx.x[4] = result as usize;
+                trap_cx[TrapFrameArgs::RET] = result as usize;
             }
             TrapType::Time => {
                 set_next_trigger();
