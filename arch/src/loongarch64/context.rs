@@ -39,6 +39,14 @@ impl TrapFrame {
         self.x[3] = sp;
     }
 
+    /// Set the global pointer (no-op on LoongArch).
+    pub fn set_gp(&mut self, _gp: usize) {}
+
+    /// Read the global pointer (returns 0 on LoongArch).
+    pub fn gp(&self) -> usize {
+        0
+    }
+
     /// Init the trap context of an application.
     pub fn app_init_context(
         entry: usize,
@@ -71,6 +79,16 @@ impl TrapFrame {
             self.x[8],
             self.x[9],
         ]
+    }
+
+    pub fn write_ucontext_gregs(&self, out: &mut [usize; 32]) {
+        out[0] = self.sepc;
+        out[1..].copy_from_slice(&self.x[1..]);
+    }
+
+    pub fn restore_from_ucontext_gregs(&mut self, gregs: &[usize; 32]) {
+        self.sepc = gregs[0];
+        self.x[1..].copy_from_slice(&gregs[1..]);
     }
 }
 

@@ -22,6 +22,8 @@ use crate::{
     timer::{add_timer, get_time, get_time_ms, get_time_us, remove_timer},
 };
 
+use arch::TrapFrameArgs;
+
 use super::errno::*;
 use crate::config::{CLOCK_FREQ, PAGE_SIZE};
 
@@ -419,13 +421,17 @@ pub fn sys_fork() -> isize {
     let new_pid = new_process.pid.0;
     let new_task = new_process.inner_exclusive_access().get_task(0);
     let parent_cx = *current_trap_cx();
-    let clone_stack = parent_cx.x[11];
+    let clone_stack = parent_cx[TrapFrameArgs::ARG1];
     let new_task_inner = new_task.inner_exclusive_access();
     let trap_cx = new_task_inner.get_trap_cx();
     *trap_cx = parent_cx;
-    trap_cx.x[10] = 0;
+    trap_cx[TrapFrameArgs::RET] = 0;
+    #[cfg(target_arch = "loongarch64")]
+    if trap_cx[TrapFrameArgs::TLS] == 0 {
+        trap_cx[TrapFrameArgs::TLS] = 0x7000_1000;
+    }
     if clone_stack != 0 {
-        trap_cx.x[2] = clone_stack;
+        trap_cx[TrapFrameArgs::SP] = clone_stack;
     }
     trap_cx.kernel_sp = new_task.kstack.get_top();
     new_pid as isize
@@ -504,12 +510,12 @@ pub fn sys_clone(
 
     let new_trap_cx = new_task_inner.get_trap_cx();
     *new_trap_cx = parent_cx;
-    new_trap_cx.x[10] = 0;
+    new_trap_cx[TrapFrameArgs::RET] = 0;
     if !stack.is_null() {
-        new_trap_cx.x[2] = stack as usize;
+        new_trap_cx[TrapFrameArgs::SP] = stack as usize;
     }
     if clone_flags.contains(CloneFlags::SETTLS) && !tls.is_null() {
-        new_trap_cx.x[4] = tls as usize;
+        new_trap_cx[TrapFrameArgs::TLS] = tls as usize;
         let name = current_process().inner_exclusive_access().name.clone();
         if name == "entry-static.exe" {
             let token = current_user_token();
@@ -1238,8 +1244,8 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
         //// 针对 musl busybox 的问题排查代码
         // let cx = current_trap_cx();
         // let sepc = cx.sepc;
-        // let ra = cx.x[1];
-        // let gp = cx.x[3];
+        // let ra = cx[TrapFrameArgs::RA];
+        // let gp = cx.gp();
         // let process = current_process();
         // let inner = process.inner_exclusive_access();
         // let name = inner.name.clone();
@@ -1373,6 +1379,23 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
         flags,
         start
     );
+
+    let overlap = inner
+        .memory_set
+        .overlap_count(VirtAddr(start), VirtAddr(start + len));
+    if overlap > 0 {
+        if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
+            let ranges = inner
+                .memory_set
+                .overlap_ranges(VirtAddr(start), VirtAddr(start + len));
+            for (idx, (r_start, r_end)) in ranges.into_iter().enumerate() {
+                trace!(
+                    "[sys_mmap] pid={} overlap[{}]=[{:#x},{:#x})", pid, idx, r_start.0, r_end.0
+                );
+            }
+        }
+        return errno(ENOMEM);
+    }
 
     // 在进程的内存空间里插入一个新的映射区域，起始地址为 start，长度为 len，权限为 map_perm。
     inner
@@ -1645,7 +1668,7 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
         let mut task_inner = task.inner_exclusive_access();
         if signum == 33 {
             let target_tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-            let tp = task_inner.get_trap_cx().x[4];
+            let tp = task_inner.get_trap_cx()[TrapFrameArgs::TLS];
             info!(
                 "[tkill] pid={} target_tid={} tp={:#x} mask={:?} pending_before={:?}",
                 pid_now,
@@ -1799,7 +1822,7 @@ pub fn sys_sigreturn() -> isize {
     };
 
     // 检查栈底的 canary 值，防止栈溢出
-    let current_sp = inner.get_trap_cx().x[2];
+    let current_sp = inner.get_trap_cx()[TrapFrameArgs::SP];
     let token = current_user_token();
     if let Ok(canary) = read_from_user::<usize>(token, current_sp as *const _) {
         if canary != 0x11451415 {
@@ -1811,7 +1834,7 @@ pub fn sys_sigreturn() -> isize {
             return errno(EFAULT);
         }
     }
-    let saved_a0 = saved.x[10] as isize;
+    let saved_a0 = saved[TrapFrameArgs::RET] as isize;
     let ucontext_ptr = inner.signal_ucontext_ptr;
     inner.signal_ucontext_ptr = 0;
 
@@ -1834,15 +1857,14 @@ pub fn sys_sigreturn() -> isize {
             ucontext.uc_sigmask[0]
         );
         let mut restored = saved;
-        restored.sepc = ucontext.uc_mcontext.gregs[0];
-        restored.x[1..].copy_from_slice(&ucontext.uc_mcontext.gregs[1..]);
+        restored.restore_from_ucontext_gregs(&ucontext.uc_mcontext.gregs);
         *inner.get_trap_cx() = restored;
         // 从 ucontext 恢复信号掩码（per-thread）
         let mut new_mask = user_mask_to_flags(ucontext.uc_sigmask[0]);
         new_mask.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
         inner.signal_mask = new_mask;
         return_pc = restored.sepc;
-        ret_a0 = restored.x[10] as isize;
+        ret_a0 = restored[TrapFrameArgs::RET] as isize;
     } else {
         *inner.get_trap_cx() = saved;
         // 从 backup 恢复信号掩码（per-thread）
@@ -1884,7 +1906,7 @@ pub fn sys_sigreturn() -> isize {
 
     if current_sig == 33 {
         let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-        let tp = inner.get_trap_cx().x[4];
+        let tp = inner.get_trap_cx()[TrapFrameArgs::TLS];
         info!(
             "[sigreturn] pid={} tid={} sig33 tp={:#x} saved_pc={:#x} return_pc={:#x} mask={:?}",
             pid,
