@@ -7,7 +7,7 @@ use super::BlockDevice;
 use crate::drivers::bus::virtio::VirtioHal;
 use spin::Mutex;
 use virtio_drivers_new::device::blk::VirtIOBlk;
-use virtio_drivers_new::transport::pci::bus::{Cam, PciRoot};
+use virtio_drivers_new::transport::pci::bus::{BarInfo, Cam, Command, MemoryBarType, PciRoot};
 use virtio_drivers_new::transport::pci::{virtio_device_type, PciTransport};
 use virtio_drivers_new::transport::DeviceType;
 
@@ -15,6 +15,39 @@ use virtio_drivers_new::transport::DeviceType;
 const PCI_ECAM_BASE: usize = 0x2000_0000;
 /// LoongArch64 DMW uncached window base.
 const DMW_BASE: usize = 0x8000_0000_0000_0000;
+/// PCI BAR allocation window (physical address range).
+const VIRT_PCI_BASE: usize = 0x4000_0000;
+const VIRT_PCI_SIZE: usize = 0x0020_0000;
+
+struct PciRangeAllocator {
+    end: usize,
+    current: usize,
+}
+
+impl PciRangeAllocator {
+    const fn new(base: usize, size: usize) -> Self {
+        Self {
+            end: base + size,
+            current: base,
+        }
+    }
+
+    fn alloc(&mut self, size: usize) -> Option<usize> {
+        if !size.is_power_of_two() {
+            return None;
+        }
+        let addr = align_up(self.current, size);
+        if addr + size > self.end {
+            return None;
+        }
+        self.current = addr + size;
+        Some(addr)
+    }
+}
+
+const fn align_up(addr: usize, align: usize) -> usize {
+    (addr + align - 1) & !(align - 1)
+}
 
 /// VirtIO block device over PCI transport (polling-only).
 pub struct VirtIOPCIBlock {
@@ -46,8 +79,42 @@ impl VirtIOPCIBlock {
 
         let dev_fn = blk_dev_fn.expect("No VirtIO block device found on PCI bus 0");
 
+        // Allocate BARs for the device.
+        let mut allocator = PciRangeAllocator::new(VIRT_PCI_BASE, VIRT_PCI_SIZE);
+        let mut bar_index = 0u8;
+        while bar_index < 6 {
+            let bar_info = pci_root
+                .bar_info(dev_fn, bar_index)
+                .expect("pci bar_info");
+            if let BarInfo::Memory {
+                address,
+                size,
+                address_type,
+                ..
+            } = bar_info
+            {
+                if address == 0 && size != 0 {
+                    let addr = allocator
+                        .alloc(size as usize)
+                        .expect("pci bar alloc");
+                    match address_type {
+                        MemoryBarType::Width64 => {
+                            pci_root.set_bar_64(dev_fn, bar_index, addr as u64)
+                        }
+                        MemoryBarType::Width32 => {
+                            pci_root.set_bar_32(dev_fn, bar_index, addr as u32)
+                        }
+                        MemoryBarType::Below1MiB => {}
+                    }
+                }
+            }
+            bar_index += 1;
+            if bar_info.takes_two_entries() {
+                bar_index += 1;
+            }
+        }
+
         // Enable bus-mastering and memory space for this device.
-        use virtio_drivers_new::transport::pci::bus::Command;
         let (_, _) = pci_root.get_status_command(dev_fn);
         pci_root.set_command(
             dev_fn,

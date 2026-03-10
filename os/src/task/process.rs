@@ -1,15 +1,14 @@
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
 use super::{PidHandle, SignalActions, SignalFlags, TaskControlBlock, TlsArea, add_task, pid_alloc};
-use crate::config::{USER_STACK_SIZE};
+use crate::config::USER_STACK_SIZE;
+#[cfg(target_arch = "loongarch64")]
+use crate::config::USER_MMAP_TOP;
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{KERNEL_SPACE, MemorySet, translated_byte_buffer, translated_ref, translated_refmut, translated_str};
 use crate::sync::{Condvar, Mutex, Semaphore, UPIntrFreeCell};
-use arch::TrapContext;
-#[cfg(target_arch = "riscv64")]
-use crate::trap::trap_handler;
-#[cfg(target_arch = "loongarch64")]
-use crate::trap::task_entry as trap_handler;
+use arch::{TrapContext, TrapFrameArgs};
+use crate::trap::user_trap_entry;
 use xmas_elf::ElfFile;
 use xmas_elf::sections::{SectionData, ShType};
 use xmas_elf::symbol_table::Entry;
@@ -19,7 +18,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use crate::sync::UPIntrRefMut;
 
+#[allow(unused)]
 const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
+#[cfg(target_arch = "loongarch64")]
+const LOONGARCH_MIN_TCB_ADDR: usize = 0x7000_1000;
 
 pub const RLIMIT_NLIMITS: usize = 16;
 pub const RLIMIT_STACK: usize = 3;
@@ -154,6 +156,20 @@ impl ProcessControlBlockInner {
 }
 
 impl ProcessControlBlock {
+    #[cfg(target_arch = "loongarch64")]
+    fn alloc_minimal_tcb(memory_set: &mut MemorySet) -> usize {
+        let base = LOONGARCH_MIN_TCB_ADDR;
+        let end = base + crate::config::PAGE_SIZE;
+        memory_set.insert_framed_area(
+            base.into(),
+            end.into(),
+            crate::mm::MapPermission::R | crate::mm::MapPermission::W | crate::mm::MapPermission::U,
+        );
+        let token = memory_set.token();
+        *translated_refmut(token, base as *mut usize) = 0;
+        *translated_refmut(token, (base + 8) as *mut usize) = base;
+        base
+    }
     pub fn inner_exclusive_access(&self) -> UPIntrRefMut<'_, ProcessControlBlockInner> {
         self.inner.exclusive_access()
     }
@@ -178,6 +194,13 @@ impl ProcessControlBlock {
         let tls_area = tls_info.map(|info| {
             TlsArea::new(&info, &mut memory_set, elf_data)
         });
+        #[cfg(target_arch = "loongarch64")]
+        let minimal_tcb = if tls_area.is_none() {
+            Some(Self::alloc_minimal_tcb(&mut memory_set))
+        } else {
+            None
+        };
+
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
             pid: pid_handle,
@@ -205,6 +228,9 @@ impl ProcessControlBlock {
                     cwd: String::from("/"),
                     heap_bottom,
                     program_brk: heap_bottom,
+                    #[cfg(target_arch = "loongarch64")]
+                    mmap_base: USER_MMAP_TOP,
+                    #[cfg(not(target_arch = "loongarch64"))]
                     mmap_base: DEFAULT_MMAP_BASE,
                     tls_area: tls_area.clone(),
                     rlimits: default_rlimits(),
@@ -222,27 +248,39 @@ impl ProcessControlBlock {
             ustack_top,
             KERNEL_SPACE.exclusive_access().token(),
             kstack_top,
-            trap_handler as usize,
+            user_trap_entry as usize,
         );
 
         if gp != 0 {
-            trap_cx_value.x[3] = gp;  // gp = x3
+            trap_cx_value.set_gp(gp);
             info!("[kernel] GP initialized: gp = {:#x}", gp);
         }
         if let Some(ref tls) = tls_area {
-            trap_cx_value.x[4] = tls.tp_value;  // tp = x4
+            trap_cx_value[TrapFrameArgs::TLS] = tls.tp_value;
             info!("[kernel] TLS initialized: tp = {:#x}", tls.tp_value);
         } else {
-            // Even without PT_TLS, allocate a minimal TCB near top of user stack
-            let tcb_addr = ustack_top - 16;  // 16 bytes TCB
-            let token = process.inner_exclusive_access().memory_set.token();
+            let tcb_addr = {
+                #[cfg(not(target_arch = "loongarch64"))]
+                {
+                    // Even without PT_TLS, allocate a minimal TCB near top of user stack.
+                    let tcb_addr = ustack_top - 16; // 16 bytes TCB
+                    let token = process.inner_exclusive_access().memory_set.token();
 
-            // Initialize minimal TCB
-            *translated_refmut(token, tcb_addr as *mut usize) = 0;
-            *translated_refmut(token, (tcb_addr + 8) as *mut usize) = tcb_addr;
-
-            trap_cx_value.x[4] = tcb_addr;  // tp = x4
-            info!("[kernel] Minimal TCB initialized (no PT_TLS): tp = {:#x}", tcb_addr);
+                    // Initialize minimal TCB.
+                    *translated_refmut(token, tcb_addr as *mut usize) = 0;
+                    *translated_refmut(token, (tcb_addr + 8) as *mut usize) = tcb_addr;
+                    tcb_addr
+                }
+                #[cfg(target_arch = "loongarch64")]
+                {
+                    minimal_tcb.unwrap_or(0)
+                }
+            };
+            trap_cx_value[TrapFrameArgs::TLS] = tcb_addr;
+            info!(
+                "[kernel] Minimal TCB initialized (no PT_TLS): tp = {:#x}",
+                tcb_addr
+            );
         }
 
         *trap_cx = trap_cx_value;
@@ -310,6 +348,13 @@ impl ProcessControlBlock {
             TlsArea::new(&info, &mut memory_set, elf_data)
         });
 
+        #[cfg(target_arch = "loongarch64")]
+        let minimal_tcb = if tls_area.is_none() {
+            Some(Self::alloc_minimal_tcb(&mut memory_set))
+        } else {
+            None
+        };
+
         let new_token = memory_set.token();
         if exec_name == "sh" || exec_name == "busybox" {
             let mut bytes = [0u8; 8];
@@ -337,7 +382,14 @@ impl ProcessControlBlock {
             inner.memory_set = memory_set;
             inner.heap_bottom = heap_bottom;
             inner.program_brk = heap_bottom;
-            inner.mmap_base = core::cmp::max(DEFAULT_MMAP_BASE, user_stack_top);
+            #[cfg(target_arch = "loongarch64")]
+            {
+                inner.mmap_base = USER_MMAP_TOP;
+            }
+            #[cfg(not(target_arch = "loongarch64"))]
+            {
+                inner.mmap_base = core::cmp::max(DEFAULT_MMAP_BASE, user_stack_top);
+            }
             inner.tls_area = tls_area.clone();
         }
         let task = self.inner_exclusive_access().get_task(0);
@@ -388,13 +440,20 @@ impl ProcessControlBlock {
         }
 
         // Allocate a minimal TCB for programs without PT_TLS so tp is valid.
-        let tp_value = if tls_area.is_none() {
-            user_sp = user_sp.saturating_sub(16);
-            user_sp &= !0xf;
-            let tcb_addr = user_sp;
-            *translated_refmut(new_token, tcb_addr as *mut usize) = 0;
-            *translated_refmut(new_token, (tcb_addr + 8) as *mut usize) = tcb_addr;
-            Some(tcb_addr)
+        let tp_value: Option<usize> = if tls_area.is_none() {
+            #[cfg(not(target_arch = "loongarch64"))]
+            {
+                user_sp = user_sp.saturating_sub(16);
+                user_sp &= !0xf;
+                let tcb_addr = user_sp;
+                *translated_refmut(new_token, tcb_addr as *mut usize) = 0;
+                *translated_refmut(new_token, (tcb_addr + 8) as *mut usize) = tcb_addr;
+                Some(tcb_addr)
+            }
+            #[cfg(target_arch = "loongarch64")]
+            {
+                minimal_tcb
+            }
         } else {
             None
         };
@@ -517,24 +576,26 @@ impl ProcessControlBlock {
             user_sp,  // sp should point to argc
             KERNEL_SPACE.exclusive_access().token(),
             task.kstack.get_top(),
-            trap_handler as usize,
+            user_trap_entry as usize,
         );
-        trap_cx.x[10] = argc;
-        trap_cx.x[11] = argv_base;
-        trap_cx.x[12] = envp_base;
+        trap_cx[TrapFrameArgs::ARG0] = argc;
+        trap_cx[TrapFrameArgs::ARG1] = argv_base;
+        trap_cx[TrapFrameArgs::ARG2] = envp_base;
 
         if gp != 0 {
-            trap_cx.x[3] = gp;  // gp = x3
+            trap_cx.set_gp(gp);
             info!("[kernel] exec: GP initialized: gp = {:#x}", gp);
         }
         // Set tp register
         if let Some(ref tls) = tls_area {
-            trap_cx.x[4] = tls.tp_value;  // tp = x4
+            trap_cx[TrapFrameArgs::TLS] = tls.tp_value;
             info!("[kernel] exec: TLS initialized: tp = {:#x}", tls.tp_value);
         } else if let Some(tcb_addr) = tp_value {
-            // Use the TCB we allocated earlier (before argc)
-            trap_cx.x[4] = tcb_addr;  // tp = x4
-            info!("[kernel] exec: Minimal TCB initialized (no PT_TLS): tp = {:#x}", tcb_addr);
+            trap_cx[TrapFrameArgs::TLS] = tcb_addr;
+            info!(
+                "[kernel] exec: Minimal TCB initialized (no PT_TLS): tp = {:#x}",
+                tcb_addr
+            );
         }
 
         *task_inner.get_trap_cx() = trap_cx;

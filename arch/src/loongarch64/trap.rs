@@ -125,9 +125,6 @@ global_asm!(
 // ---------------------------------------------------------------------------
 
 pub fn init_interrupt() {
-    unsafe {
-        core::arch::asm!("break 2");
-    }
     tlb_init(tlb_fill as _);
 }
 

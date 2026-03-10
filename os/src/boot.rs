@@ -51,8 +51,9 @@ pub fn rust_main() -> ! {
 pub fn rust_main() -> ! {
     arch::clear_bss();
     crate::logging::init();
-    crate::mm::init();
+    arch::init_interrupt();
     arch::trap_init();
+    crate::mm::init();
     arch::trap_enable_timer_interrupt();
     crate::timer::set_next_trigger();
     crate::board::device_init();
