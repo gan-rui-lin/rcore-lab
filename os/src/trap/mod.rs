@@ -17,6 +17,7 @@ use crate::config::PAGE_SIZE;
 use crate::timer::{check_timer, set_next_trigger};
 use arch::TrapFrameArgs;
 use core::sync::atomic::{AtomicU64, Ordering};
+use alloc::string::String;
 
 #[cfg(target_arch = "riscv64")]
 use crate::fs::{open_file, OpenFlags};
@@ -528,11 +529,52 @@ pub fn task_entry() {
             TrapType::StorePageFault(addr)
             | TrapType::LoadPageFault(addr)
             | TrapType::InstructionPageFault(addr) => {
-                error!("[kernel] trap_handler: page fault addr={:#x}", addr);
+                let (pid, tid, name) = if let Some(task) = current_task() {
+                    let task_inner = task.inner_exclusive_access();
+                    let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+                    let name = task
+                        .process
+                        .upgrade()
+                        .map(|p| p.inner_exclusive_access().name.clone())
+                        .unwrap_or_else(|| String::from("<unknown>"));
+                    (current_process().pid.0, tid, name)
+                } else {
+                    (0, 0, String::from("<no-task>"))
+                };
+                let args = trap_cx.args();
+                error!(
+                    "[kernel] trap_handler: page fault addr={:#x} pid={} tid={} name={} sepc={:#x}",
+                    addr,
+                    pid,
+                    tid,
+                    name,
+                    trap_cx.sepc
+                );
+                error!(
+                    "[kernel] trap_handler: ra={:#x} sp={:#x} tp={:#x} syscall={:#x} args={:x?}",
+                    trap_cx[TrapFrameArgs::RA],
+                    trap_cx[TrapFrameArgs::SP],
+                    trap_cx[TrapFrameArgs::TLS],
+                    trap_cx[TrapFrameArgs::SYSCALL],
+                    args
+                );
                 current_add_signal(SignalFlags::SIGSEGV);
             }
             TrapType::IllegalInstruction(addr) => {
-                error!("[kernel] trap_handler: illegal instruction addr={:#x}", addr);
+                let args = trap_cx.args();
+                error!(
+                    "[kernel] trap_handler: illegal instruction addr={:#x} sepc={:#x}",
+                    addr,
+                    trap_cx.sepc
+                );
+                error!(
+                    "[kernel] trap_handler: ra={:#x} sp={:#x} tp={:#x} syscall={:#x} args={:x?}",
+                    trap_cx[TrapFrameArgs::RA],
+                    trap_cx[TrapFrameArgs::SP],
+                    trap_cx[TrapFrameArgs::TLS],
+                    trap_cx[TrapFrameArgs::SYSCALL],
+                    args
+                );
                 current_add_signal(SignalFlags::SIGILL);
             }
             _ => {

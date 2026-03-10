@@ -271,6 +271,8 @@ pub fn ensure_busybox_links() {
     create_dir("/usr");
     create_dir("/usr/bin");
     create_dir("/lib");
+    #[cfg(target_arch = "loongarch64")]
+    create_dir("/lib64");
     ensure_hardlink("/bin/sh", BUSYBOX_PATH);
     ensure_hardlink("/bin/basename", BUSYBOX_PATH);
     ensure_hardlink("/bin/ls", BUSYBOX_PATH);
@@ -287,6 +289,8 @@ pub fn ensure_busybox_links() {
         // Also create musl-specific interpreter links (soft-float and hard-float variants)
         ensure_hardlink("/lib/ld-musl-riscv64-sf.so.1", MUSL_LOADER);
         ensure_hardlink("/lib/ld-musl-riscv64.so.1", MUSL_LOADER);
+        #[cfg(target_arch = "loongarch64")]
+        ensure_hardlink("/lib64/ld-linux-loongarch-lp64d.so.1", MUSL_LOADER);
     } else if open_file(GLIBC_LOADER, OpenFlags::empty()).is_some() {
         ensure_hardlink("/lib/ld-linux-riscv64-lp64d.so.1", GLIBC_LOADER);
     } else {
