@@ -718,7 +718,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     // // Extra verbose logging for syscall 96 (set_tid_address)
     // if syscall_id == 96 {
     //     info!("[syscall] set_tid_address returned {} to {}, ra={:#x}, sepc={:#x}",
-    //         ret, name, current_trap_cx().x[1], current_trap_cx().sepc);
+    //         ret, name, current_trap_cx()[arch::TrapFrameArgs::RA], current_trap_cx().sepc);
     // }
 
     if known && trace && !(syscall_id == SYSCALL_WRITE && args[0] == 1) {

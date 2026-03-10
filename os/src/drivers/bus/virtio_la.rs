@@ -6,13 +6,13 @@
 //! mapping is a simple offset.
 
 use crate::mm::{
-    FrameTracker, PhysAddr, PhysPageNum, frame_alloc_more,
-    frame_dealloc,
+    frame_alloc_more, frame_dealloc, FrameTracker, PhysAddr, PhysPageNum,
 };
 use crate::sync::UPIntrFreeCell;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use lazy_static::*;
+use arch::VIRT_ADDR_START;
 use virtio_drivers_new::{BufferDirection, Hal, PhysAddr as VirtioPhysAddr, PAGE_SIZE};
 
 lazy_static! {
@@ -23,9 +23,8 @@ lazy_static! {
 /// HAL implementation for virtio-drivers v0.7.1 on LoongArch64.
 pub struct VirtioHal;
 
-/// LoongArch64 DMW uncached window base address.
-/// Physical address `pa` maps to virtual address `pa | DMW_BASE`.
-const DMW_BASE: usize = 0x8000_0000_0000_0000;
+/// LoongArch64 DMW uncached window base address (MMIO).
+const DMW_UC_BASE: usize = 0x8000_0000_0000_0000;
 
 unsafe impl Hal for VirtioHal {
     fn dma_alloc(pages: usize, _direction: BufferDirection) -> (VirtioPhysAddr, NonNull<u8>) {
@@ -35,7 +34,7 @@ unsafe impl Hal for VirtioHal {
             .exclusive_access()
             .append(&mut trackers.unwrap());
         let pa: PhysAddr = ppn_base.into();
-        let vaddr = pa.0 | DMW_BASE;
+        let vaddr = pa.0 | DMW_UC_BASE;
         // Zero the allocated pages
         unsafe {
             core::ptr::write_bytes(vaddr as *mut u8, 0, pages * PAGE_SIZE);
@@ -54,15 +53,18 @@ unsafe impl Hal for VirtioHal {
     }
 
     unsafe fn mmio_phys_to_virt(paddr: VirtioPhysAddr, _size: usize) -> NonNull<u8> {
-        let vaddr = paddr | DMW_BASE;
+        let vaddr = paddr | DMW_UC_BASE;
         NonNull::new(vaddr as *mut u8).unwrap()
     }
 
     unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> VirtioPhysAddr {
-        // LoongArch with DMW: virtual address = physical address | DMW_BASE
-        // So physical = virtual & !DMW_BASE
+        // Accept both cached (0x9000...) and uncached (0x8000...) DMW windows.
         let vaddr = buffer.as_ptr() as *const u8 as usize;
-        vaddr & !DMW_BASE
+        if vaddr & VIRT_ADDR_START == VIRT_ADDR_START {
+            vaddr & !VIRT_ADDR_START
+        } else {
+            vaddr & !DMW_UC_BASE
+        }
     }
 
     unsafe fn unshare(

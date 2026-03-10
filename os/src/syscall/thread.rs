@@ -1,13 +1,10 @@
-use arch::TrapContext;
+use arch::{TrapContext, TrapFrameArgs};
 use crate::{
     mm::{kernel_token, translated_refmut, PageTable, VirtAddr},
     syscall::errno::{errno, EAGAIN, ECHILD},
     task::{TaskControlBlock, add_task, current_process, current_task, current_user_token},
 };
-#[cfg(target_arch = "riscv64")]
-use crate::trap::trap_handler;
-#[cfg(target_arch = "loongarch64")]
-use crate::trap::task_entry as trap_handler;
+use crate::trap::user_trap_entry;
 use alloc::format;
 use alloc::string::ToString;
 use crate::config::USER_STACK_SIZE;
@@ -44,9 +41,9 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         new_task_res.ustack_top(),
         kernel_token(),
         new_task.kstack.get_top(),
-        trap_handler as usize,
+        user_trap_entry as usize,
     );
-    (*new_task_trap_cx).x[10] = arg;
+    new_task_trap_cx[TrapFrameArgs::ARG0] = arg;
     new_task_tid as isize
 }
 

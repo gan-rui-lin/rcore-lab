@@ -10,13 +10,13 @@ use alloc::vec::Vec;
 use user_lib::{chdir, dup, execve, exit, fork, open, shutdown, wait, OpenFlags};
 
 const ENABLE_SINGLE_ELF_SUITE: bool = false;
-const ENABLE_BASIC_TEST: bool = false;
+const ENABLE_BASIC_TEST: bool = true;
 const ENABLE_BUSYBOX_TEST: bool = false;
 const ENABLE_LUA_TEST: bool = false;
 const ENABLE_LIBC_TEST: bool = false;
 const ENABLE_DYNAMIC_TEST: bool = false;
 const ENABLE_LTP_TEST: bool = false;
-const ENABLE_IPERF_TEST: bool = true;
+const ENABLE_IPERF_TEST: bool = false;
 const ENABLE_ALL_TESTS: bool = false;
 const ENABLE_FAT32_TESTS: bool = false;
 const SINGLE_TEST: Option<&str> = option_env!("SINGLE_TEST");

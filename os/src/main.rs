@@ -80,7 +80,10 @@ impl arch::api::ArchInterface for ArchInterfaceImpl {
     }
 
     fn frame_alloc() -> usize {
-        crate::mm::frame_alloc().unwrap().ppn.0
+        let frame = crate::mm::frame_alloc().unwrap();
+        let ppn = frame.ppn.0;
+        core::mem::forget(frame);
+        ppn
     }
 
     fn frame_dealloc(ppn: usize) {

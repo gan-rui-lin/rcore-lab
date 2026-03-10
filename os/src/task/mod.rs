@@ -17,7 +17,7 @@ mod tls;
 #[allow(unused_imports)]
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, PageTable, VirtAddr};
-use arch::{shutdown, TrapContext, FpRegs, MContext};
+use arch::{shutdown, TrapContext, TrapFrameArgs, FpRegs, MContext};
 use crate::timer::remove_timer;
 /// Alias for backward compatibility within this module.
 type RiscvFpRegs = FpRegs;
@@ -98,8 +98,7 @@ const USER_UCONTEXT_SIZE: usize = core::mem::size_of::<UserContext>();
 impl UserContext {
     fn from_trap(trap_cx: &TrapContext, sigmask: SignalFlags) -> Self {
         let mut gregs = [0usize; 32];
-        gregs[0] = trap_cx.sepc;
-        gregs[1..].copy_from_slice(&trap_cx.x[1..]);
+        trap_cx.write_ucontext_gregs(&mut gregs);
         let mut user_sigset = [0u64; LINUX_SIGSET_WORDS];
         user_sigset[0] = signal::flags_to_user_mask(sigmask);
         Self {
@@ -370,7 +369,7 @@ fn setup_signal_stack(
     token: usize,
     need_siginfo: bool,
 ) -> usize {
-    let mut user_sp = trap_cx.x[2] & !0xf;
+    let mut user_sp = trap_cx[TrapFrameArgs::SP] & !0xf;
 
     if need_siginfo {
         // 压入 UserContext
@@ -399,9 +398,9 @@ fn setup_signal_stack(
         let _ = copy_to_user(token, info_ptr as *mut u8, siginfo_bytes);
 
         // 设置参数寄存器
-        trap_cx.x[10] = signum;
-        trap_cx.x[11] = info_ptr;
-        trap_cx.x[12] = ucontext_ptr;
+        trap_cx[TrapFrameArgs::ARG0] = signum;
+        trap_cx[TrapFrameArgs::ARG1] = info_ptr;
+        trap_cx[TrapFrameArgs::ARG2] = ucontext_ptr;
 
         // 压入 canary
         user_sp = user_sp.saturating_sub(core::mem::size_of::<usize>());
@@ -409,11 +408,11 @@ fn setup_signal_stack(
         let canary_bytes = canary.to_le_bytes();
         let _ = copy_to_user(token, user_sp as *mut u8, &canary_bytes);
 
-        trap_cx.x[2] = user_sp;
+        trap_cx[TrapFrameArgs::SP] = user_sp;
         ucontext_ptr // 返回 ucontext_ptr
     } else {
         // 没有 siginfo，只设置参数
-        trap_cx.x[10] = signum;
+        trap_cx[TrapFrameArgs::ARG0] = signum;
 
         // 压入 canary
         user_sp = user_sp.saturating_sub(core::mem::size_of::<usize>());
@@ -421,7 +420,7 @@ fn setup_signal_stack(
         let canary_bytes = canary.to_le_bytes();
         let _ = copy_to_user(token, user_sp as *mut u8, &canary_bytes);
 
-        trap_cx.x[2] = user_sp;
+        trap_cx[TrapFrameArgs::SP] = user_sp;
         0 // 没有 ucontext_ptr
     }
 }
@@ -464,7 +463,7 @@ pub fn handle_signals() {
     let pid = process.pid.0;
     let _tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
     if signum == 33 {
-        let tp = task_inner.get_trap_cx().x[4];
+        let tp = task_inner.get_trap_cx()[TrapFrameArgs::TLS];
         info!(
             "[handle_signals] pid={} tid={} sig33 tp={:#x} mask={:?} task_pending={:?} proc_pending={:?}",
             pid,
@@ -605,7 +604,7 @@ pub fn handle_signals() {
     let trap_cx = task_inner.get_trap_cx();
     trap_cx.sepc = action.handler;
     if action.restorer != 0 {
-        trap_cx.x[1] = action.restorer;
+        trap_cx[TrapFrameArgs::RA] = action.restorer;
     }
 
     // 14. 设置信号栈
@@ -646,8 +645,8 @@ pub fn debug_dump_tasks() {
                 task_inner.task_status,
                 task_inner.last_syscall,
                 trap_cx.sepc,
-                trap_cx.x[2],
-                trap_cx.x[1]
+                trap_cx[TrapFrameArgs::SP],
+                trap_cx[TrapFrameArgs::RA]
             );
         } else {
             info!("[debug] ready[{}] pid={} <busy>", idx, pid);
@@ -687,8 +686,8 @@ pub fn debug_dump_tasks() {
                     task_inner.exit_code,
                     task_inner.last_syscall,
                     trap_cx.sepc,
-                    trap_cx.x[2],
-                    trap_cx.x[1]
+                    trap_cx[TrapFrameArgs::SP],
+                    trap_cx[TrapFrameArgs::RA]
                 );
             } else {
                 info!("[debug]   tid={} <busy>", tid);
