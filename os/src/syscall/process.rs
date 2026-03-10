@@ -1889,6 +1889,21 @@ pub fn sys_sigreturn() -> isize {
         ret_a0 = saved_a0;
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let trap_cx = inner.get_trap_cx();
+        trace!(
+            "[sigreturn] pid={} sig={} ucontext_ptr={:#x} saved_pc={:#x} return_pc={:#x} sp={:#x} ra={:#x}",
+            pid,
+            inner.handling_sig,
+            ucontext_ptr,
+            saved_pc,
+            return_pc,
+            trap_cx[TrapFrameArgs::SP],
+            trap_cx[TrapFrameArgs::RA]
+        );
+    }
+
     // SA_RESETHAND 处理
     let current_sig = inner.handling_sig;
     inner.handling_sig = -1;

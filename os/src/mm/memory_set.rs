@@ -391,6 +391,13 @@ impl MemorySet {
             let tramp_base = user_stack_bottom.saturating_sub(PAGE_SIZE);
             let tramp_addr = arch::sigtrx::sigreturn_trampoline_addr();
             let tramp_page = tramp_addr & !(PAGE_SIZE - 1);
+            info!(
+                "[sigtrx_map] tramp_base={:#x} tramp_addr={:#x} tramp_page={:#x} offset={:#x}",
+                tramp_base,
+                tramp_addr,
+                tramp_page,
+                tramp_addr & (PAGE_SIZE - 1)
+            );
             let tramp_bytes = unsafe {
                 core::slice::from_raw_parts(tramp_page as *const u8, PAGE_SIZE)
             };
