@@ -372,6 +372,7 @@ impl MemorySet {
             (USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_TOP);
         #[cfg(not(target_arch = "loongarch64"))]
         let (user_stack_bottom, user_stack_top) = {
+            #[allow(unused_mut)]
             let mut bottom = heap_bottom + PAGE_SIZE;
             let top = bottom + USER_STACK_SIZE;
             (bottom, top)
@@ -385,6 +386,24 @@ impl MemorySet {
             ),
             None,
         );
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let tramp_base = user_stack_bottom.saturating_sub(PAGE_SIZE);
+            let tramp_addr = arch::sigtrx::sigreturn_trampoline_addr();
+            let tramp_page = tramp_addr & !(PAGE_SIZE - 1);
+            let tramp_bytes = unsafe {
+                core::slice::from_raw_parts(tramp_page as *const u8, PAGE_SIZE)
+            };
+            memory_set.push(
+                MapArea::new(
+                    tramp_base.into(),
+                    (tramp_base + PAGE_SIZE).into(),
+                    MapType::Framed,
+                    MapPermission::R | MapPermission::W | MapPermission::X | MapPermission::U,
+                ),
+                Some(tramp_bytes),
+            );
+        }
         if let Some(pte) = memory_set.page_table.translate(VirtAddr::from(user_stack_bottom).floor()) {
             trace!(
                 "[stack_map] bottom={:#x} top={:#x} pte_bits={:#x}",
@@ -866,10 +885,10 @@ impl MapArea {
         page_table.unmap(vpn);
     }
     pub fn map(&mut self, page_table: &mut PageTable) {
-        for (i, vpn) in self.vpn_range.into_iter().enumerate() {
+        for (_i, vpn) in self.vpn_range.into_iter().enumerate() {
             self.map_one(page_table, vpn);
             #[cfg(target_arch = "loongarch64")]
-            if i == 0 {
+            if _i == 0 {
                 if let Some(pte) = page_table.translate(vpn) {
                     info!(
                         "[ELF] map_one first vpn: vpn={:#x} pte_bits={:#x}",

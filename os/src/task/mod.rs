@@ -18,6 +18,12 @@ mod tls;
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, PageTable, VirtAddr};
 use arch::{shutdown, TrapContext, TrapFrameArgs, FpRegs, MContext};
+#[cfg(target_arch = "loongarch64")]
+use crate::config::PAGE_SIZE;
+#[cfg(target_arch = "loongarch64")]
+use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
+#[cfg(not(target_arch = "loongarch64"))]
+use crate::config::TRAMPOLINE as USER_ADDR_MAX;
 use crate::timer::remove_timer;
 /// Alias for backward compatibility within this module.
 type RiscvFpRegs = FpRegs;
@@ -539,7 +545,20 @@ pub fn handle_signals() {
     }
 
     // 10. 获取信号处理动作
-    let action = process_inner.signal_actions.table[signum];
+    let mut action = process_inner.signal_actions.table[signum];
+    if action.handler == 1 {
+        debug!("[signal] pid={} signum={} handler=SIG_IGN", pid, signum);
+        return;
+    }
+    if action.handler >= USER_ADDR_MAX && action.handler > 1 {
+        error!(
+            "[signal] pid={} signum={} invalid handler={:#x}, falling back to SIG_DFL",
+            pid,
+            signum,
+            action.handler
+        );
+        action.handler = 0;
+    }
     if signum == 33 {
         info!(
             "[handle_signals] pid={} tid={} sig33 handler={:#x} flags={:#x} restorer={:#x}",
@@ -603,8 +622,43 @@ pub fn handle_signals() {
     // 13. 设置 trap context 调用用户态 handler
     let trap_cx = task_inner.get_trap_cx();
     trap_cx.sepc = action.handler;
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let mut use_trampoline = action.restorer == 0;
+        if action.restorer != 0 {
+            if action.restorer < USER_ADDR_MAX {
+                trap_cx[TrapFrameArgs::RA] = action.restorer;
+            } else {
+                error!(
+                    "[signal] pid={} signum={} invalid restorer={:#x}, using trampoline",
+                    pid,
+                    signum,
+                    action.restorer
+                );
+                use_trampoline = true;
+            }
+        }
+        if use_trampoline {
+            if let Some(res) = task_inner.res.as_ref() {
+                let tramp_base = res.ustack_base().saturating_sub(PAGE_SIZE);
+                let tramp_offset = arch::sigtrx::sigreturn_trampoline_offset();
+                let tramp = tramp_base + tramp_offset;
+                trap_cx[TrapFrameArgs::RA] = tramp;
+            }
+        }
+    }
+    #[cfg(not(target_arch = "loongarch64"))]
     if action.restorer != 0 {
-        trap_cx[TrapFrameArgs::RA] = action.restorer;
+        if action.restorer < USER_ADDR_MAX {
+            trap_cx[TrapFrameArgs::RA] = action.restorer;
+        } else {
+            error!(
+                "[signal] pid={} signum={} invalid restorer={:#x}, ignoring",
+                pid,
+                signum,
+                action.restorer
+            );
+        }
     }
 
     // 14. 设置信号栈

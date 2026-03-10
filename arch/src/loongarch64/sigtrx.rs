@@ -33,6 +33,14 @@ pub fn init() {
     }
 }
 
+pub fn sigreturn_trampoline_addr() -> usize {
+    _sigreturn as usize
+}
+
+pub fn sigreturn_trampoline_offset() -> usize {
+    sigreturn_trampoline_addr() & (PageTable::PAGE_SIZE - 1)
+}
+
 pub fn get_trx_mapping() -> usize {
     unsafe { (TRX_STEP.as_ptr() as usize + PageTable::PAGE_SIZE) & !VIRT_ADDR_START }
 }
