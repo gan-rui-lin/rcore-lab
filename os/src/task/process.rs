@@ -1,6 +1,6 @@
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
-use super::{PidHandle, SignalActions, SignalFlags, TaskControlBlock, TlsArea, add_task, pid_alloc};
+use super::{PidHandle, SignalAction, SignalActions, SignalFlags, TaskControlBlock, TlsArea, add_task, pid_alloc};
 use crate::config::USER_STACK_SIZE;
 #[cfg(target_arch = "loongarch64")]
 use crate::config::USER_MMAP_TOP;
@@ -382,6 +382,12 @@ impl ProcessControlBlock {
             inner.memory_set = memory_set;
             inner.heap_bottom = heap_bottom;
             inner.program_brk = heap_bottom;
+            // Exec resets signal dispositions to default, except SIG_IGN.
+            for action in inner.signal_actions.table.iter_mut().skip(1) {
+                if action.handler != 1 {
+                    *action = SignalAction::default();
+                }
+            }
             #[cfg(target_arch = "loongarch64")]
             {
                 inner.mmap_base = USER_MMAP_TOP;

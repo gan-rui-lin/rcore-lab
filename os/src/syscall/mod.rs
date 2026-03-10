@@ -68,6 +68,8 @@ const SYSCALL_FSTATAT: usize = 79;
 const SYSCALL_FSTAT: usize = 80;
 /// utimensat syscall
 const SYSCALL_UTIMENSAT: usize = 88;
+/// statx syscall
+const SYSCALL_STATX: usize = 291;
 /// renameat2 syscall
 const SYSCALL_RENAMEAT2: usize = 276;
 /// exit syscall
@@ -583,6 +585,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut isize, args[3]),
         SYSCALL_FSTATAT => sys_fstatat(args[0] as isize, args[1] as *const u8, args[2] as *mut Stat, args[3] as u32),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut Stat),
+        SYSCALL_STATX => sys_statx(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as i32,
+            args[3] as u32,
+            args[4] as *mut Statx,
+        ),
         SYSCALL_UTIMENSAT => sys_utimensat(
             args[0] as isize,
             args[1] as *const u8,

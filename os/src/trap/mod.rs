@@ -558,6 +558,44 @@ pub fn task_entry() {
                     trap_cx[TrapFrameArgs::SYSCALL],
                     args
                 );
+                let token = current_user_token();
+                let page_table = PageTable::from_token(token);
+                let fault_va = VirtAddr::from(addr as usize);
+                if let Some(pte) = page_table.translate(fault_va.floor()) {
+                    if pte.is_valid() {
+                        let offset = fault_va.page_offset();
+                        let end = core::cmp::min(offset + 8, PAGE_SIZE);
+                        let bytes = &pte.ppn().get_bytes_array()[offset..end];
+                        error!(
+                            "[kernel] trap_handler: fault pte ppn={:#x} flags={:?} bytes={:02x?}",
+                            pte.ppn().0,
+                            pte.flags(),
+                            bytes
+                        );
+                    } else {
+                        error!("[kernel] trap_handler: fault pte invalid flags={:?}", pte.flags());
+                    }
+                } else {
+                    error!("[kernel] trap_handler: fault pte unmapped");
+                }
+                let sepc_va = VirtAddr::from(trap_cx.sepc);
+                if let Some(pte) = page_table.translate(sepc_va.floor()) {
+                    if pte.is_valid() {
+                        let offset = sepc_va.page_offset();
+                        let end = core::cmp::min(offset + 8, PAGE_SIZE);
+                        let bytes = &pte.ppn().get_bytes_array()[offset..end];
+                        error!(
+                            "[kernel] trap_handler: sepc pte ppn={:#x} flags={:?} bytes={:02x?}",
+                            pte.ppn().0,
+                            pte.flags(),
+                            bytes
+                        );
+                    } else {
+                        error!("[kernel] trap_handler: sepc pte invalid flags={:?}", pte.flags());
+                    }
+                } else {
+                    error!("[kernel] trap_handler: sepc pte unmapped");
+                }
                 current_add_signal(SignalFlags::SIGSEGV);
                 // ! 暂时直接 shutdown，后续可以考虑杀死进程
                 use arch::shutdown;
