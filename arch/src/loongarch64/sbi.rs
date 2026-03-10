@@ -2,7 +2,8 @@
 
 #![allow(missing_docs)]
 
-const VIRT_ADDR_START: usize = 0x9000_0000_0000_0000;
+use crate::consts::VIRT_ADDR_START;
+// const VIRT_ADDR_START: usize = 0x9000_0000_0000_0000;
 const UART_BASE: usize = 0x1fe0_01e0 | VIRT_ADDR_START;
 const UART_THR: usize = UART_BASE + 0x0;
 const UART_LSR: usize = UART_BASE + 0x5;
@@ -25,6 +26,15 @@ pub fn console_getchar() -> usize {
 }
 
 pub fn shutdown() -> ! {
+    
+    // 往物理地址 0x100E001C 写入 0x34 来关闭 QEMU 模拟器
+    const POWER_OFF_ADDR: usize = 0x100E001C;
+    const POWER_OFF_VALUE: u8 = 0x34;
+    // warn!("virt_addr_start: {:#x}", VIRT_ADDR_START);
+    unsafe {
+        core::ptr::write_volatile((POWER_OFF_ADDR | VIRT_ADDR_START) as *mut u8, POWER_OFF_VALUE);
+    }
+    warn!("Shutting down...");
     loop {
         core::hint::spin_loop();
     }
