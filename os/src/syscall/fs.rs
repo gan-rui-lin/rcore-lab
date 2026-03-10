@@ -46,6 +46,7 @@ use lwext4_rust::bindings::ext4_flink;
 
 const AT_FDCWD: isize = -100;
 const AT_REMOVEDIR: u32 = 0x200;
+const AT_EMPTY_PATH: u32 = 0x1000;
 const UTIME_NOW: isize = 0x3fffffff;
 const UTIME_OMIT: isize = 0x3ffffffe;
 
@@ -113,6 +114,40 @@ pub struct StatFs {
     pub f_frsize: i64,
     pub f_flags: i64,
     pub f_spare: [i64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StatxTimestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    pub pad: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Statx {
+    pub stx_mask: u32,
+    pub stx_blksize: u32,
+    pub stx_attributes: u64,
+    pub stx_nlink: u32,
+    pub stx_uid: u32,
+    pub stx_gid: u32,
+    pub stx_mode: u16,
+    pub pad1: u16,
+    pub stx_ino: u64,
+    pub stx_size: u64,
+    pub stx_blocks: u64,
+    pub stx_attributes_mask: u64,
+    pub stx_atime: StatxTimestamp,
+    pub stx_btime: StatxTimestamp,
+    pub stx_ctime: StatxTimestamp,
+    pub stx_mtime: StatxTimestamp,
+    pub stx_rdev_major: u32,
+    pub stx_rdev_minor: u32,
+    pub stx_dev_major: u32,
+    pub stx_dev_minor: u32,
+    pub spare: [u64; 14],
 }
 
 // static WRITE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -683,6 +718,86 @@ fn fill_stat_timestamps(stat: &mut Stat, ts_id: Option<usize>) {
     stat.ctime_nsec = nsec;
 }
 
+fn split_rdev(rdev: u64) -> (u32, u32) {
+    let major = ((rdev >> 8) & 0xff) as u32;
+    let minor = (rdev & 0xff) as u32;
+    (major, minor)
+}
+
+fn stat_from_fd(fd: usize) -> Result<Stat, isize> {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return Err(errno(EBADF));
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return Err(errno(EBADF));
+    };
+    let file = file.clone();
+    drop(inner);
+
+    let mut stat = Stat::default();
+    let path = file.path().unwrap_or("");
+    if is_char_device(path) {
+        stat.mode = StatMode::CHR.bits() | 0o666;
+        stat.rdev = rdev_for_path(path);
+    } else {
+        let (mode_bits, size) = if let Some(inode) = file.inode() {
+            let mode = if inode.is_dir() {
+                StatMode::DIR
+            } else {
+                StatMode::FILE
+            };
+            (mode.bits() | 0o777, inode.size())
+        } else {
+            (StatMode::FILE.bits() | 0o666, 0)
+        };
+        stat.mode = mode_bits;
+        stat.size = size as i64;
+        stat.blksize = 512;
+        stat.blocks = ((size + 511) / 512) as i64;
+    }
+    stat.nlink = 1;
+    fill_stat_timestamps(&mut stat, file.ts_id());
+    Ok(stat)
+}
+
+fn stat_from_path(full_path: &str) -> Result<Stat, isize> {
+    let mut stat = Stat::default();
+    if is_char_device(full_path) {
+        stat.mode = StatMode::CHR.bits() | 0o666;
+        stat.nlink = 1;
+        stat.rdev = rdev_for_path(full_path);
+        fill_stat_timestamps(&mut stat, None);
+        return Ok(stat);
+    }
+    let open_flags = if path_is_dir(full_path) {
+        OpenFlags::DIRECTORY
+    } else {
+        OpenFlags::empty()
+    };
+    let Some(file) = open_file(full_path, open_flags) else {
+        return Err(errno(ENOENT));
+    };
+    let (mode_bits, size) = if let Some(inode) = file.inode() {
+        let mode = if inode.is_dir() {
+            StatMode::DIR
+        } else {
+            StatMode::FILE
+        };
+        (mode.bits() | 0o777, inode.size())
+    } else {
+        (StatMode::FILE.bits() | 0o666, 0)
+    };
+    stat.mode = mode_bits;
+    stat.nlink = 1;
+    stat.size = size as i64;
+    stat.blksize = 512;
+    stat.blocks = ((size + 511) / 512) as i64;
+    fill_stat_timestamps(&mut stat, None);
+    Ok(stat)
+}
+
 /// YOUR JOB: Implement fstat.
 pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
     let pid = current_process().pid.0;
@@ -730,6 +845,97 @@ pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
         )
     };
     match copy_to_user(token, st as *mut u8, bytes) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
+}
+
+pub fn sys_statx(dirfd: isize, path: *const u8, flags: i32, _mask: u32, buf: *mut Statx) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_statx dirfd={}", pid, dirfd);
+    }
+    if path.is_null() || buf.is_null() {
+        return errno(EFAULT);
+    }
+    if flags < 0 {
+        return errno(EINVAL);
+    }
+    let flags = flags as u32;
+    if flags & !AT_EMPTY_PATH != 0 {
+        return errno(EINVAL);
+    }
+
+    let token = current_user_token();
+    let raw_path = translated_str(token, path);
+
+    let stat = if raw_path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return errno(ENOENT);
+        }
+        if dirfd == AT_FDCWD {
+            let cwd = current_process().inner_exclusive_access().cwd.clone();
+            stat_from_path(&cwd)
+        } else if dirfd < 0 {
+            return errno(EBADF);
+        } else {
+            stat_from_fd(dirfd as usize)
+        }
+    } else {
+        let base = if raw_path.starts_with('/') {
+            String::new()
+        } else {
+            match dirfd_base(dirfd) {
+                Ok(base) => base,
+                Err(err) => return err,
+            }
+        };
+        let full_path = if raw_path.starts_with('/') {
+            normalize_path(&raw_path)
+        } else {
+            resolve_path(&base, &raw_path)
+        };
+        stat_from_path(&full_path)
+    };
+
+    let stat = match stat {
+        Ok(stat) => stat,
+        Err(err) => return err,
+    };
+
+    let mut stx = Statx::default();
+    stx.stx_blksize = stat.blksize as u32;
+    stx.stx_nlink = stat.nlink;
+    stx.stx_uid = stat.uid;
+    stx.stx_gid = stat.gid;
+    stx.stx_mode = stat.mode as u16;
+    stx.stx_ino = stat.ino;
+    stx.stx_size = if stat.size < 0 { 0 } else { stat.size as u64 };
+    stx.stx_blocks = if stat.blocks < 0 { 0 } else { stat.blocks as u64 };
+    stx.stx_atime = StatxTimestamp {
+        tv_sec: stat.atime_sec,
+        tv_nsec: stat.atime_nsec as u32,
+        pad: 0,
+    };
+    stx.stx_btime = StatxTimestamp::default();
+    stx.stx_ctime = StatxTimestamp {
+        tv_sec: stat.ctime_sec,
+        tv_nsec: stat.ctime_nsec as u32,
+        pad: 0,
+    };
+    stx.stx_mtime = StatxTimestamp {
+        tv_sec: stat.mtime_sec,
+        tv_nsec: stat.mtime_nsec as u32,
+        pad: 0,
+    };
+    let (rdev_major, rdev_minor) = split_rdev(stat.rdev);
+    stx.stx_rdev_major = rdev_major;
+    stx.stx_rdev_minor = rdev_minor;
+
+    let bytes = unsafe {
+        core::slice::from_raw_parts((&stx as *const Statx) as *const u8, core::mem::size_of::<Statx>())
+    };
+    match copy_to_user(token, buf as *mut u8, bytes) {
         Ok(_) => 0,
         Err(err) => err,
     }

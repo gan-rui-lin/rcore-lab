@@ -546,6 +546,23 @@ pub fn handle_signals() {
 
     // 10. 获取信号处理动作
     let mut action = process_inner.signal_actions.table[signum];
+    if signum == SIGCHLD && action.handler != 0 {
+        let page_table = PageTable::from_token(process_inner.memory_set.token());
+        let handler_va = VirtAddr::from(action.handler);
+        let invalid = match page_table.translate(handler_va.floor()) {
+            Some(pte) => !pte.is_valid(),
+            None => true,
+        };
+        if invalid {
+            warn!(
+                "[signal] pid={} sigchld invalid handler={:#x}, resetting to default",
+                pid,
+                action.handler
+            );
+            action = SignalAction::default();
+            process_inner.signal_actions.table[signum] = action;
+        }
+    }
     if action.handler == 1 {
         debug!("[signal] pid={} signum={} handler=SIG_IGN", pid, signum);
         return;
@@ -567,6 +584,17 @@ pub fn handle_signals() {
             action.handler,
             action.flags,
             action.restorer
+        );
+    }
+    if signum == SIGCHLD {
+        trace!(
+            "[handle_signals] pid={} tid={} sigchld handler={:#x} flags={:#x} restorer={:#x} mask={:?}",
+            pid,
+            _tid,
+            action.handler,
+            action.flags,
+            action.restorer,
+            task_inner.signal_mask
         );
     }
 
@@ -635,6 +663,14 @@ pub fn handle_signals() {
                     signum,
                     action.restorer
                 );
+                trace!(
+                    "[signal] pid={} signum={} sepc={:#x} sp={:#x} handler={:#x}",
+                    pid,
+                    signum,
+                    trap_cx.sepc,
+                    trap_cx[TrapFrameArgs::SP],
+                    action.handler
+                );
                 use_trampoline = true;
             }
         }
@@ -644,6 +680,22 @@ pub fn handle_signals() {
                 let tramp_offset = arch::sigtrx::sigreturn_trampoline_offset();
                 let tramp = tramp_base + tramp_offset;
                 trap_cx[TrapFrameArgs::RA] = tramp;
+                trace!(
+                    "[signal] pid={} signum={} tramp_base={:#x} tramp={:#x} offset={:#x} sp={:#x}",
+                    pid,
+                    signum,
+                    tramp_base,
+                    tramp,
+                    tramp_offset,
+                    trap_cx[TrapFrameArgs::SP]
+                );
+            } else {
+                trace!(
+                    "[signal] pid={} signum={} no res; sp={:#x}",
+                    pid,
+                    signum,
+                    trap_cx[TrapFrameArgs::SP]
+                );
             }
         }
     }
