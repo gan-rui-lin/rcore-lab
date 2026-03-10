@@ -8,10 +8,10 @@ pub use arch::{CLOCK_FREQ, MEMORY_END, MMIO};
 pub const USER_STACK_SIZE: usize = 4096 * 5;
 /// user stack top for LoongArch64
 #[cfg(target_arch = "loongarch64")]
-pub const USER_STACK_TOP: usize = 0x8000_0000;
+pub const USER_STACK_TOP: usize = 0x8_0000_0000;
 /// user mmap top for LoongArch64
 #[cfg(target_arch = "loongarch64")]
-pub const USER_MMAP_TOP: usize = 0x6000_0000;
+pub const USER_MMAP_TOP: usize = 0x6_0000_0000;
 /// kernel stack size
 pub const KERNEL_STACK_SIZE: usize = 4096 * 20;
 /// kernel heap size

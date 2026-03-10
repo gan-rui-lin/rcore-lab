@@ -26,6 +26,10 @@ use arch::TrapFrameArgs;
 
 use super::errno::*;
 use crate::config::{CLOCK_FREQ, PAGE_SIZE};
+#[cfg(target_arch = "loongarch64")]
+use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
+#[cfg(not(target_arch = "loongarch64"))]
+use crate::config::TRAMPOLINE as USER_ADDR_MAX;
 
 fn dump_user_bytes(tag: &str, token: usize, addr: usize, len: usize) {
     let page_table = PageTable::from_token(token);
@@ -804,9 +808,10 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
         let mut resolved_path = None;
         let mut app = None;
         // 根据 exec_path 和 PATH 环境变量构建候选路径列表，并尝试打开找到第一个存在的文件
-        for candidate in build_exec_candidates(exec_path.as_str(), &envs) {
+        let candidates = build_exec_candidates(exec_path.as_str(), &envs);
+        for candidate in &candidates {
             if let Some(found) = open_file(candidate.as_str(), OpenFlags::empty()) {
-                resolved_path = Some(candidate);
+                resolved_path = Some(candidate.clone());
                 app = Some(found);
                 break;
             }
@@ -910,6 +915,8 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
                     let glibc_loader = "/glibc/lib/ld-linux-riscv64-lp64d.so.1";
                     if interp_path == "/lib/ld-linux-riscv64-lp64d.so.1"
                         || interp_path.contains("ld-musl-riscv64")
+                        || interp_path == "/lib64/ld-linux-loongarch-lp64d.so.1"
+                        || interp_path.contains("ld-musl-loongarch")
                     {
                         if open_file(musl_loader, OpenFlags::empty()).is_some() {
                             info!("[sys_exec] interp {} not found, fallback to musl loader: {}", interp_path, musl_loader);
@@ -1735,15 +1742,24 @@ pub fn sys_sigaction(
             Ok(v) => v,
             Err(err) => return err,
         };
-        if signum == 33 {
+        if signum == 33 || signum == crate::task::SIGCHLD as i32 {
             info!(
-                "[sigaction] pid={} signum=33 handler={:#x} flags={:#x} restorer={:#x} mask={:?}",
+                "[sigaction] pid={} signum={} handler={:#x} flags={:#x} restorer={:#x} mask={:?}",
                 pid,
+                signum,
                 new_action.handler,
                 new_action.flags,
                 new_action.restorer,
                 new_action.mask
             );
+            if new_action.handler >= USER_ADDR_MAX && new_action.handler > 1 {
+                warn!(
+                    "[sigaction] pid={} signum={} handler out of range: {:#x}",
+                    pid,
+                    signum,
+                    new_action.handler
+                );
+            }
         }
         inner.signal_actions.table[idx] = new_action;
     }
