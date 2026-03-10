@@ -559,6 +559,10 @@ pub fn task_entry() {
                     args
                 );
                 current_add_signal(SignalFlags::SIGSEGV);
+                // ! 暂时直接 shutdown，后续可以考虑杀死进程
+                use arch::shutdown;
+                shutdown();
+
             }
             TrapType::IllegalInstruction(addr) => {
                 let args = trap_cx.args();
