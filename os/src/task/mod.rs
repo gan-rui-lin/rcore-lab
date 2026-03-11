@@ -583,7 +583,7 @@ pub fn handle_signals() {
             _tid,
             action.handler,
             action.flags,
-            action.restorer
+            action.restorer()
         );
     }
     if signum == SIGCHLD {
@@ -593,7 +593,7 @@ pub fn handle_signals() {
             _tid,
             action.handler,
             action.flags,
-            action.restorer,
+            action.restorer(),
             task_inner.signal_mask
         );
     }
@@ -650,55 +650,26 @@ pub fn handle_signals() {
     // 13. 设置 trap context 调用用户态 handler
     let trap_cx = task_inner.get_trap_cx();
     trap_cx.sepc = action.handler;
+    // LoongArch: no SA_RESTORER, always use kernel trampoline for sigreturn
     #[cfg(target_arch = "loongarch64")]
     {
-        let mut use_trampoline = action.restorer == 0;
-        if action.restorer != 0 {
-            if action.restorer < USER_ADDR_MAX {
-                trap_cx[TrapFrameArgs::RA] = action.restorer;
-            } else {
-                error!(
-                    "[signal] pid={} signum={} invalid restorer={:#x}, using trampoline",
-                    pid,
-                    signum,
-                    action.restorer
-                );
-                trace!(
-                    "[signal] pid={} signum={} sepc={:#x} sp={:#x} handler={:#x}",
-                    pid,
-                    signum,
-                    trap_cx.sepc,
-                    trap_cx[TrapFrameArgs::SP],
-                    action.handler
-                );
-                use_trampoline = true;
-            }
-        }
-        if use_trampoline {
-            if let Some(res) = task_inner.res.as_ref() {
-                let tramp_base = res.ustack_base().saturating_sub(PAGE_SIZE);
-                let tramp_offset = arch::sigtrx::sigreturn_trampoline_offset();
-                let tramp = tramp_base + tramp_offset;
-                trap_cx[TrapFrameArgs::RA] = tramp;
-                trace!(
-                    "[signal] pid={} signum={} tramp_base={:#x} tramp={:#x} offset={:#x} sp={:#x}",
-                    pid,
-                    signum,
-                    tramp_base,
-                    tramp,
-                    tramp_offset,
-                    trap_cx[TrapFrameArgs::SP]
-                );
-            } else {
-                trace!(
-                    "[signal] pid={} signum={} no res; sp={:#x}",
-                    pid,
-                    signum,
-                    trap_cx[TrapFrameArgs::SP]
-                );
-            }
+        if let Some(res) = task_inner.res.as_ref() {
+            let tramp_base = res.ustack_base().saturating_sub(PAGE_SIZE);
+            let tramp_offset = arch::sigtrx::sigreturn_trampoline_offset();
+            let tramp = tramp_base + tramp_offset;
+            trap_cx[TrapFrameArgs::RA] = tramp;
+            trace!(
+                "[signal] pid={} signum={} tramp_base={:#x} tramp={:#x} offset={:#x} sp={:#x}",
+                pid,
+                signum,
+                tramp_base,
+                tramp,
+                tramp_offset,
+                trap_cx[TrapFrameArgs::SP]
+            );
         }
     }
+    // RISC-V and others: use sa_restorer if valid, otherwise no RA override
     #[cfg(not(target_arch = "loongarch64"))]
     if action.restorer != 0 {
         if action.restorer < USER_ADDR_MAX {

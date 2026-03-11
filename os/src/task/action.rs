@@ -2,6 +2,11 @@
 use crate::task::{MAX_SIG, SignalFlags};
 
 /// Action for a signal
+///
+/// On RISC-V (and most arches), the layout includes `sa_restorer`.
+/// On LoongArch, Linux does NOT define SA_RESTORER, so the kernel
+/// struct has no `restorer` field — mask follows flags directly.
+#[cfg(not(target_arch = "loongarch64"))]
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 pub struct SignalAction {
@@ -11,12 +16,43 @@ pub struct SignalAction {
     pub mask: SignalFlags,
 }
 
+#[cfg(target_arch = "loongarch64")]
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy)]
+pub struct SignalAction {
+    pub handler: usize,
+    pub flags: usize,
+    pub mask: SignalFlags,
+}
+
+impl SignalAction {
+    /// Returns the restorer address. Always 0 on LoongArch (no SA_RESTORER).
+    pub fn restorer(&self) -> usize {
+        #[cfg(not(target_arch = "loongarch64"))]
+        { self.restorer }
+        #[cfg(target_arch = "loongarch64")]
+        { 0 }
+    }
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
 impl Default for SignalAction {
     fn default() -> Self {
         Self {
             handler: 0,
             flags: 0,
             restorer: 0,
+            mask: SignalFlags::empty(),
+        }
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+impl Default for SignalAction {
+    fn default() -> Self {
+        Self {
+            handler: 0,
+            flags: 0,
             mask: SignalFlags::empty(),
         }
     }

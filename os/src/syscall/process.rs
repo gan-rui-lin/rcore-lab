@@ -1749,7 +1749,7 @@ pub fn sys_sigaction(
                 signum,
                 new_action.handler,
                 new_action.flags,
-                new_action.restorer,
+                new_action.restorer(),
                 new_action.mask
             );
             if new_action.handler >= USER_ADDR_MAX && new_action.handler > 1 {
