@@ -661,13 +661,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHMAT => sys_shmat(args[0] as i32, args[1], args[2] as i32),
         SYSCALL_SHMDT => sys_shmdt(args[0]),
         SYSCALL_SHMCTL => sys_shmctl(args[0] as i32, args[1] as i32, args[2]),
-        SYSCALL_FORK => sys_clone(
-            args[0],
-            args[1] as *const u8,
-            args[2] as *mut i32,
-            args[3] as *mut i32,
-            args[4] as *mut i32,
-        ),
+        // clone ABI differs between architectures:
+        //   RISC-V:     clone(flags, stack, ptid, tls, ctid)
+        //   LoongArch:  clone(flags, stack, ptid, ctid, tls)
+        SYSCALL_FORK => {
+            #[cfg(target_arch = "riscv64")]
+            { sys_clone(args[0], args[1] as *const u8, args[2] as *mut i32, args[3] as *mut i32, args[4] as *mut i32) }
+            #[cfg(target_arch = "loongarch64")]
+            { sys_clone(args[0], args[1] as *const u8, args[2] as *mut i32, args[4] as *mut i32, args[3] as *mut i32) }
+        },
         SYSCALL_EXEC => sys_exec(
             args[0] as *const u8,
             args[1] as *const usize,

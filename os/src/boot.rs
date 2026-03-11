@@ -54,6 +54,7 @@ pub fn rust_main() -> ! {
     arch::init_interrupt();
     arch::trap_init();
     crate::mm::init();
+    arch::init_timer();
     arch::trap_enable_timer_interrupt();
     crate::timer::set_next_trigger();
     crate::board::device_init();

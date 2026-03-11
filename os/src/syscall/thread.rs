@@ -1,13 +1,10 @@
 use arch::{TrapContext, TrapFrameArgs};
 use crate::{
-    mm::{kernel_token, translated_refmut, PageTable, VirtAddr},
+    mm::kernel_token,
     syscall::errno::{errno, EAGAIN, ECHILD},
-    task::{TaskControlBlock, add_task, current_process, current_task, current_user_token},
+    task::{TaskControlBlock, add_task, current_process, current_task},
 };
 use crate::trap::user_trap_entry;
-use alloc::format;
-use alloc::string::ToString;
-use crate::config::USER_STACK_SIZE;
 use alloc::sync::Arc;
 
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
@@ -63,54 +60,13 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
     let tid = task_inner.res.as_ref().unwrap().tid as i32;
     task_inner.clear_child_tid = tidptr as usize;
     drop(task_inner);
-    if !tidptr.is_null() {
-        let token = current_user_token();
-        let proc = current_process();
-        let name = proc.inner_exclusive_access().name.clone();
-        if name == "busybox" || name == "sh" || name == "entry-static.exe" {
-            let tidptr_val = tidptr as usize;
-            let task = current_task().unwrap();
-            let task_inner = task.inner_exclusive_access();
-            let ustack_base = task_inner
-                .res
-                .as_ref()
-                .map(|res| res.ustack_base)
-                .unwrap_or(0);
-            let ustack_top = ustack_base.saturating_add(USER_STACK_SIZE);
-            let proc_inner = proc.inner_exclusive_access();
-            let heap_bottom = proc_inner.heap_bottom;
-            let program_brk = proc_inner.program_brk;
-            let mmap_base = proc_inner.mmap_base;
-            drop(proc_inner);
-            let page_table = PageTable::from_token(token);
-            let pte_flags = page_table
-                .translate(VirtAddr::from(tidptr_val).floor())
-                .map(|pte| format!("{:?}", pte.flags()))
-                .unwrap_or_else(|| "unmapped".to_string());
-            trace!(
-                "[sys_set_tid_address] pid={} name={} tidptr={:#x} pte={} ustack=[{:#x},{:#x}) hb={:#x} brk={:#x} mmap_base={:#x}",
-                proc.pid.0,
-                name,
-                tidptr_val,
-                pte_flags,
-                ustack_base,
-                ustack_top,
-                heap_bottom,
-                program_brk,
-                mmap_base
-            );
-        } else {
-            let tidptr_val = tidptr as usize;
-            info!(
-                "[sys_set_tid_address] pid={} name={} tid={} tidptr={:#x}",
-                proc.pid.0,
-                name,
-                tid,
-                tidptr_val
-            );
-        }
-        *translated_refmut(token, tidptr) = tid;
-    }
+    // Linux set_tid_address: only saves the pointer for clear_child_tid on exit,
+    // and returns the caller's TID. It does NOT write to *tidptr.
+    // Writing TID to a user pointer is CLONE_CHILD_SETTID's job in clone().
+    info!(
+        "[sys_set_tid_address] pid={} tid={} tidptr={:#x}",
+        current_process().pid.0, tid, tidptr as usize
+    );
     tid as isize
 }
 
