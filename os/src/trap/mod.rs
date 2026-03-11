@@ -598,8 +598,8 @@ pub fn task_entry() {
                 }
                 current_add_signal(SignalFlags::SIGSEGV);
                 // ! 暂时直接 shutdown，后续可以考虑杀死进程
-                use arch::shutdown;
-                shutdown();
+                // use arch::shutdown;
+                // shutdown();
 
             }
             TrapType::IllegalInstruction(addr) => {
