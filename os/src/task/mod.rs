@@ -196,7 +196,9 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         exit_code
     );
     let clear_child_tid = task_inner.clear_child_tid;
-    if tid != 0 && clear_child_tid != 0 {
+    // Linux processes clear_child_tid for ALL threads, including the main thread (tid=0).
+    // musl's __init_tls calls set_tid_address for the main thread.
+    if clear_child_tid != 0 {
         info!(
             "[exit] pid={} tid={} clear_child_tid={:#x}",
             pid,
