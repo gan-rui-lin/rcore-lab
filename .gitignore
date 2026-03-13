@@ -21,6 +21,7 @@ os/vendor/
 *.img*
 *.code-workspace
 AGENT.*
+Agent.*
 sbi-qemu
 tmp/*
 os/tmp/*
