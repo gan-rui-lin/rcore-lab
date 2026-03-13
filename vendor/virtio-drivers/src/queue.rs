@@ -12,7 +12,7 @@ use core::hint::spin_loop;
 use core::mem::{size_of, take};
 #[cfg(test)]
 use core::ptr;
-use core::ptr::NonNull;
+use core::ptr::{read_volatile, write_volatile, NonNull};
 use core::sync::atomic::{fence, Ordering};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
@@ -341,12 +341,12 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         if self.event_idx {
             // Safe because self.used points to a valid, aligned, initialised, dereferenceable, readable
             // instance of UsedRing.
-            let avail_event = unsafe { (*self.used.as_ptr()).avail_event };
+            let avail_event = unsafe { read_volatile(&(*self.used.as_ptr()).avail_event) };
             self.avail_idx >= avail_event.wrapping_add(1)
         } else {
             // Safe because self.used points to a valid, aligned, initialised, dereferenceable, readable
             // instance of UsedRing.
-            unsafe { (*self.used.as_ptr()).flags & 0x0001 == 0 }
+            unsafe { read_volatile(&(*self.used.as_ptr()).flags) & 0x0001 == 0 }
         }
     }
 
@@ -368,7 +368,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
 
         // Safe because self.used points to a valid, aligned, initialised, dereferenceable, readable
         // instance of UsedRing.
-        self.last_used_idx != unsafe { (*self.used.as_ptr()).idx }
+        self.last_used_idx != unsafe { read_volatile(&(*self.used.as_ptr()).idx) }
     }
 
     /// Returns the descriptor index (a.k.a. token) of the next used element without popping it, or
@@ -378,7 +378,9 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             let last_used_slot = self.last_used_idx & (SIZE as u16 - 1);
             // Safe because self.used points to a valid, aligned, initialised, dereferenceable,
             // readable instance of UsedRing.
-            Some(unsafe { (*self.used.as_ptr()).ring[last_used_slot as usize].id as u16 })
+            Some(unsafe {
+                read_volatile(&(*self.used.as_ptr()).ring[last_used_slot as usize].id) as u16
+            })
         } else {
             None
         }
@@ -515,8 +517,8 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         // Safe because self.used points to a valid, aligned, initialised, dereferenceable, readable
         // instance of UsedRing.
         unsafe {
-            index = (*self.used.as_ptr()).ring[last_used_slot as usize].id as u16;
-            len = (*self.used.as_ptr()).ring[last_used_slot as usize].len;
+            index = read_volatile(&(*self.used.as_ptr()).ring[last_used_slot as usize].id) as u16;
+            len = read_volatile(&(*self.used.as_ptr()).ring[last_used_slot as usize].len);
         }
 
         if index != token {
@@ -532,7 +534,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
 
         if self.event_idx {
             unsafe {
-                (*self.avail.as_ptr()).used_event = self.last_used_idx;
+                write_volatile(&mut (*self.avail.as_ptr()).used_event, self.last_used_idx);
             }
         }
 
