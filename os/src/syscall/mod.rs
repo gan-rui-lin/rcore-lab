@@ -86,6 +86,8 @@ const SYSCALL_SET_ROBUST_LIST: usize = 99;
 const SYSCALL_GET_ROBUST_LIST: usize = 100;
 /// nanosleep syscall
 const SYSCALL_NANOSLEEP: usize = 101;
+/// clock_nanosleep syscall
+const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 /// yield syscall
 const SYSCALL_YIELD: usize = 124;
 /// thread_create syscall
@@ -116,6 +118,8 @@ const SYSCALL_CONDVAR_WAIT: usize = 473;
 const SYSCALL_KILL: usize = 129;
 /// tkill syscall
 const SYSCALL_TKILL: usize = 130;
+/// tgkill syscall
+const SYSCALL_TGKILL: usize = 131;
 /// sigaction syscall
 const SYSCALL_SIGACTION: usize = 134;
 /// sigprocmask syscall
@@ -623,9 +627,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[5] as i32,
         ),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const TimeSpec, args[1] as *mut TimeSpec),
+        SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(
+            args[0],
+            args[1],
+            args[2] as *const TimeSpec,
+            args[3] as *mut TimeSpec,
+        ),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
         SYSCALL_TKILL => process::sys_tkill(args[0] as isize, args[1] as i32),
+        SYSCALL_TGKILL => process::sys_tgkill(args[0] as isize, args[1] as isize, args[2] as i32),
         SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
             args[0] as *const usize,
             args[1] as *mut usize,
