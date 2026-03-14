@@ -7,7 +7,7 @@ extern crate user_lib;
 extern crate alloc;
 
 use alloc::vec::Vec;
-use user_lib::{chdir, dup, execve, exit, fork, open, shutdown, wait, OpenFlags};
+use user_lib::{chdir, close, dup, execve, exit, fork, open, shutdown, wait, write, OpenFlags};
 
 const ENABLE_SINGLE_ELF_SUITE: bool = false;
 const ENABLE_BASIC_TEST: bool = false;
@@ -25,12 +25,8 @@ const BUSYBOX: &str = "/musl/busybox\0";
 const SH: &[u8] = b"sh\0";
 const PATH_ENV: &[u8] = b"PATH=/bin:/musl:/usr/bin\0";
 #[allow(dead_code)]
-const RUN_EMBEDDED_PTHREAD: bool = false;
-
-#[cfg(feature = "embedded_pthread")]
-const PTHREAD_TEST_PATH: &str = "/tmp/pthread_cancel_test";
-
-#[cfg(feature = "embedded_pthread")]
+const RUN_EMBEDDED_PTHREAD: bool = option_env!("RUN_EMBEDDED_PTHREAD").is_some();
+const PTHREAD_TEST_PATH: &str = "/tmp/pthread_cancel_small";
 const EMBEDDED_PTHREAD_ELF: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../pthread_cancel_small"
@@ -44,10 +40,6 @@ fn cstring(s: &str) -> Vec<u8> {
     v
 }
 
-#[cfg(feature = "embedded_pthread")]
-use user_lib::{close, write};
-
-#[cfg(feature = "embedded_pthread")]
 fn write_embedded_elf(path: &str, data: &[u8]) -> isize {
     let path_c = cstring(path);
     let path_str = unsafe { core::str::from_utf8_unchecked(&path_c) };
@@ -82,8 +74,8 @@ fn main() -> i32 {
 
     println!("\n=== rCore initcode ===");
 
-    #[cfg(feature = "embedded_pthread")]
     if RUN_EMBEDDED_PTHREAD {
+        println!("[initcode] RUN_EMBEDDED_PTHREAD enabled, writing {}", PTHREAD_TEST_PATH);
         let _ = write_embedded_elf(PTHREAD_TEST_PATH, EMBEDDED_PTHREAD_ELF);
         let _ = run_single_binary(PTHREAD_TEST_PATH);
         shutdown();
