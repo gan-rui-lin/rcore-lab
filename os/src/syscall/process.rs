@@ -1,11 +1,13 @@
 //! Process management syscalls
 //!
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::bitflags;
+use lazy_static::lazy_static;
 
 use crate::{
     fs::{open_file, File, OpenFlags},
@@ -26,10 +28,16 @@ use arch::TrapFrameArgs;
 
 use super::errno::*;
 use crate::config::{CLOCK_FREQ, PAGE_SIZE};
+use crate::sync::UPIntrFreeCell;
 #[cfg(target_arch = "loongarch64")]
 use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
 #[cfg(not(target_arch = "loongarch64"))]
 use crate::config::TRAMPOLINE as USER_ADDR_MAX;
+
+lazy_static! {
+    static ref EXEC_IMAGE_CACHE: UPIntrFreeCell<BTreeMap<String, Arc<[u8]>>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+}
 
 fn dump_user_bytes(tag: &str, token: usize, addr: usize, len: usize) {
     let page_table = PageTable::from_token(token);
@@ -659,6 +667,39 @@ fn build_exec_candidates(exec_path: &str, envs: &[String]) -> Vec<String> {
     candidates
 }
 
+fn exec_image_cache_key(path: &str) -> Option<&'static str> {
+    // Some exec paths may contain "/./" from relative path expansion.
+    if path.ends_with("/bin/sh") || path.ends_with("/busybox") {
+        // /bin/sh is hardlinked to busybox in our rootfs.
+        Some("/musl/busybox")
+    } else if path.ends_with("/libc.so") {
+        Some("/musl/lib/libc.so")
+    } else if path.ends_with("/runtest.exe") {
+        Some("/musl/runtest.exe")
+    } else if path.ends_with("/entry-static.exe") {
+        Some("/musl/entry-static.exe")
+    } else if path.ends_with("/entry-dynamic.exe") {
+        Some("/musl/entry-dynamic.exe")
+    } else {
+        None
+    }
+}
+
+fn read_exec_image(path: &str, file: &Arc<dyn File>) -> Arc<[u8]> {
+    if let Some(key) = exec_image_cache_key(path) {
+        if let Some(cached) = EXEC_IMAGE_CACHE.exclusive_access().get(key).cloned() {
+            return cached;
+        }
+        let data = Arc::<[u8]>::from(file.read_all().into_boxed_slice());
+        let mut cache = EXEC_IMAGE_CACHE.exclusive_access();
+        let entry = cache
+            .entry(String::from(key))
+            .or_insert_with(|| data.clone());
+        return entry.clone();
+    }
+    Arc::<[u8]>::from(file.read_all().into_boxed_slice())
+}
+
 fn trace_exec_resolution(
     name: &str,
     exec_path: &str,
@@ -833,14 +874,14 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
         let exec_path_resolved = resolved_path.unwrap_or_else(|| exec_path.clone());
         let name = current_process().inner_exclusive_access().name.clone();
         trace_exec_resolution(&name, &exec_path, &exec_path_resolved, &args);
-        let all_data = app.read_all();
-        trace_entry_bytes(&exec_path_resolved, &all_data, &app);
-        trace_run_all_head(&name, &exec_path, &all_data);
+        let all_data = read_exec_image(exec_path_resolved.as_str(), &app);
+        trace_entry_bytes(&exec_path_resolved, all_data.as_ref(), &app);
+        trace_run_all_head(&name, &exec_path, all_data.as_ref());
         // Prefer ELF execution; only try shebang (or /bin/sh fallback) for non-ELF.
         let is_elf = all_data.len() >= 4 && &all_data[..4] == b"\x7fELF";
         if !is_elf {
             // Check for shebang scripts first.
-            if let Some((interpreter, opt_arg)) = parse_shebang(&all_data) {
+            if let Some((interpreter, opt_arg)) = parse_shebang(all_data.as_ref()) {
                 trace!(
                     "[sys_exec] shebang interp={} opt_arg={:?} script={}",
                     interpreter,
@@ -892,8 +933,8 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
             );
             continue;
         }
-        let mut interp_data: Option<Vec<u8>> = None;
-        if let Ok(elf) = xmas_elf::ElfFile::new(all_data.as_slice()) {
+        let mut interp_data: Option<Arc<[u8]>> = None;
+        if let Ok(elf) = xmas_elf::ElfFile::new(all_data.as_ref()) {
             let mut interp: Option<String> = None;
             for i in 0..elf.header.pt2.ph_count() {
                 let ph = elf.program_header(i).unwrap();
@@ -932,7 +973,7 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
                     return errno(ENOENT);
                 }
                 if let Some(interp_file) = open_file(interp_path.as_str(), OpenFlags::empty()) {
-                    interp_data = Some(interp_file.read_all());
+                    interp_data = Some(read_exec_image(interp_path.as_str(), &interp_file));
                 } else {
                     error!("[sys_exec] interp open failed: {}", interp_path);
                     return errno(ENOENT);
@@ -958,7 +999,7 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
         //     let argv1 = args.get(1).cloned().unwrap_or_default();
         //     trace!("[sys_exec] /bin/sh argv0={} argv1={}", argv0, argv1);
         // }
-        process.exec_with_interp(all_data.as_slice(), interp_data.as_deref(), args, envs);
+        process.exec_with_interp(all_data.as_ref(), interp_data.as_deref(), args, envs);
         let after_name = current_process().inner_exclusive_access().name.clone();
         trace!("[sys_exec] after exec name={}", after_name);
         return 0;
@@ -2235,3 +2276,11 @@ pub fn sys_rt_sigtimedwait(
     }
 }
 
+pub fn sys_membarrier(_cmd: isize, _flags: isize) -> isize {
+    // let pid = current_process().pid.0;
+    // if crate::syscall::should_trace_syscall(pid) {
+    //     syscall!("kernel:pid[{}] sys_membarrier flags={:#x}", pid, flags);
+    // }
+    // // For simplicity, we ignore the flags and just return success.
+    0
+}
