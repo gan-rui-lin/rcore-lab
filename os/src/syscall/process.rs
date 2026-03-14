@@ -1910,14 +1910,14 @@ pub fn sys_sigreturn() -> isize {
             pid,
             ucontext_ptr,
             saved.sepc,
-            ucontext.uc_mcontext.gregs[0],
-            ucontext.uc_sigmask[0]
+            ucontext.user_pc(),
+            ucontext.signal_mask_word0()
         );
         let mut restored = saved;
-        restored.restore_from_ucontext_gregs(&ucontext.uc_mcontext.gregs);
+        ucontext.restore_trap_context(&mut restored);
         *inner.get_trap_cx() = restored;
         // 从 ucontext 恢复信号掩码（per-thread）
-        let mut new_mask = user_mask_to_flags(ucontext.uc_sigmask[0]);
+        let mut new_mask = user_mask_to_flags(ucontext.signal_mask_word0());
         new_mask.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
         inner.signal_mask = new_mask;
         return_pc = restored.sepc;
