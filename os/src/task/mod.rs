@@ -17,7 +17,9 @@ mod tls;
 #[allow(unused_imports)]
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, PageTable, VirtAddr};
-use arch::{shutdown, TrapContext, TrapFrameArgs, FpRegs, MContext};
+use arch::{shutdown, TrapContext, TrapFrameArgs};
+#[cfg(target_arch = "riscv64")]
+use arch::{FpRegs, MContext};
 #[cfg(target_arch = "loongarch64")]
 use crate::config::PAGE_SIZE;
 #[cfg(target_arch = "loongarch64")]
@@ -25,6 +27,7 @@ use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
 #[cfg(not(target_arch = "loongarch64"))]
 use crate::config::TRAMPOLINE as USER_ADDR_MAX;
 use crate::timer::remove_timer;
+#[cfg(target_arch = "riscv64")]
 /// Alias for backward compatibility within this module.
 type RiscvFpRegs = FpRegs;
 use alloc::sync::Arc;
@@ -89,6 +92,17 @@ pub struct StackT {
     pub ss_size: usize,
 }
 
+#[cfg(target_arch = "loongarch64")]
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct LoongArchMContext {
+    pub pc: usize,
+    pub gregs: [usize; 32],
+    pub flags: u32,
+    pub _pad: u32,
+}
+
+#[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct UserContext {
@@ -99,8 +113,20 @@ pub struct UserContext {
     pub uc_mcontext: MContext,
 }
 
+#[cfg(target_arch = "loongarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UserContext {
+    pub uc_flags: usize,
+    pub uc_link: usize,
+    pub uc_stack: StackT,
+    pub uc_sigmask: [u64; LINUX_SIGSET_WORDS],
+    pub uc_mcontext: LoongArchMContext,
+}
+
 const USER_UCONTEXT_SIZE: usize = core::mem::size_of::<UserContext>();
 
+#[cfg(target_arch = "riscv64")]
 impl UserContext {
     fn from_trap(trap_cx: &TrapContext, sigmask: SignalFlags) -> Self {
         let mut gregs = [0usize; 32];
@@ -126,6 +152,57 @@ impl UserContext {
                 },
             },
         }
+    }
+
+    pub fn signal_mask_word0(&self) -> u64 {
+        self.uc_sigmask[0]
+    }
+
+    pub fn user_pc(&self) -> usize {
+        self.uc_mcontext.gregs[0]
+    }
+
+    pub fn restore_trap_context(&self, trap_cx: &mut TrapContext) {
+        trap_cx.restore_from_ucontext_gregs(&self.uc_mcontext.gregs);
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+impl UserContext {
+    fn from_trap(trap_cx: &TrapContext, sigmask: SignalFlags) -> Self {
+        let mut user_sigset = [0u64; LINUX_SIGSET_WORDS];
+        user_sigset[0] = signal::flags_to_user_mask(sigmask);
+        Self {
+            uc_flags: 0,
+            uc_link: 0,
+            uc_stack: StackT {
+                ss_sp: 0,
+                ss_flags: 0,
+                _pad: 0,
+                ss_size: 0,
+            },
+            uc_sigmask: user_sigset,
+            uc_mcontext: LoongArchMContext {
+                pc: trap_cx.sepc,
+                gregs: trap_cx.x,
+                flags: 0,
+                _pad: 0,
+            },
+        }
+    }
+
+    pub fn signal_mask_word0(&self) -> u64 {
+        self.uc_sigmask[0]
+    }
+
+    pub fn user_pc(&self) -> usize {
+        self.uc_mcontext.pc
+    }
+
+    pub fn restore_trap_context(&self, trap_cx: &mut TrapContext) {
+        trap_cx.sepc = self.uc_mcontext.pc;
+        trap_cx.x = self.uc_mcontext.gregs;
+        trap_cx.x[0] = 0;
     }
 }
 
