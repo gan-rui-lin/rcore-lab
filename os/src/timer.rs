@@ -80,3 +80,7 @@ pub fn check_timer() {
         }
     }
 }
+
+pub fn timer_len() -> usize {
+    TIMERS.exclusive_access().len()
+}

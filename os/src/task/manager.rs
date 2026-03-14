@@ -38,6 +38,10 @@ impl TaskManager {
     pub fn ready_snapshot(&self) -> Vec<Arc<TaskControlBlock>> {
         self.ready_queue.iter().cloned().collect()
     }
+
+    pub fn ready_len(&self) -> usize {
+        self.ready_queue.len()
+    }
 }
 
 lazy_static! {
@@ -92,4 +96,67 @@ pub fn remove_from_pid2process(pid: usize) {
 
 pub fn ready_queue_snapshot() -> Vec<Arc<TaskControlBlock>> {
     TASK_MANAGER.exclusive_access().ready_snapshot()
+}
+
+pub fn ready_queue_len() -> usize {
+    TASK_MANAGER.exclusive_access().ready_len()
+}
+
+pub fn pid2process_len() -> usize {
+    PID2PCB.exclusive_access().len()
+}
+
+pub fn pid2process_aggregate(
+) -> (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) {
+    let map = PID2PCB.exclusive_access();
+    let total_processes = map.len();
+    let mut sampled_processes = 0usize;
+    let mut skipped_processes = 0usize;
+    let mut total_children = 0usize;
+    let mut total_tasks = 0usize;
+    let total_exited_threads = 0usize;
+    let mut max_children = 0usize;
+    let mut max_children_pid = 0usize;
+    let total_mutex_waiters = 0usize;
+    let total_sem_waiters = 0usize;
+    let total_cond_waiters = 0usize;
+    for (pid, process) in map.iter() {
+        if let Some(inner) = process.try_inner_exclusive_access() {
+            sampled_processes += 1;
+            let child_len = inner.children.len();
+            total_children += child_len;
+            total_tasks += inner.tasks.iter().filter(|t| t.is_some()).count();
+            if child_len > max_children {
+                max_children = child_len;
+                max_children_pid = *pid;
+            }
+        } else {
+            skipped_processes += 1;
+        }
+    }
+    (
+        total_processes,
+        sampled_processes,
+        skipped_processes,
+        total_children,
+        total_tasks,
+        total_exited_threads,
+        max_children_pid,
+        max_children,
+        total_mutex_waiters,
+        total_sem_waiters,
+        total_cond_waiters,
+    )
 }
