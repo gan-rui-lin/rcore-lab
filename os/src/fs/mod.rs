@@ -290,7 +290,11 @@ pub fn ensure_busybox_links() {
         ensure_hardlink("/lib/ld-musl-riscv64-sf.so.1", MUSL_LOADER);
         ensure_hardlink("/lib/ld-musl-riscv64.so.1", MUSL_LOADER);
         #[cfg(target_arch = "loongarch64")]
-        ensure_hardlink("/lib64/ld-linux-loongarch-lp64d.so.1", MUSL_LOADER);
+        {
+            // Keep both glibc-style and musl-style LoongArch interpreter names.
+            ensure_hardlink("/lib64/ld-linux-loongarch-lp64d.so.1", MUSL_LOADER);
+            ensure_hardlink("/lib64/ld-musl-loongarch-lp64d.so.1", MUSL_LOADER);
+        }
     } else if open_file(GLIBC_LOADER, OpenFlags::empty()).is_some() {
         ensure_hardlink("/lib/ld-linux-riscv64-lp64d.so.1", GLIBC_LOADER);
     } else {

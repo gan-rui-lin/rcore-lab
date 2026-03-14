@@ -1136,7 +1136,40 @@ pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
         .saturating_mul(1_000_000)
         .saturating_add(req.tv_nsec / 1_000);
     let target = get_time_us().saturating_add(sleep_us);
+
+    let has_unmasked_pending_signal = || -> bool {
+        let process = current_process();
+        let process_inner = process.inner_exclusive_access();
+        let task = match current_task() {
+            Some(task) => task,
+            None => return false,
+        };
+        let task_inner = task.inner_exclusive_access();
+        let pending = (process_inner.signal_pending | task_inner.signal_pending) & !task_inner.signal_mask;
+        let cancel_signals = SignalFlags::SIG32 | SignalFlags::SIG33;
+        let pending = pending & cancel_signals;
+        !pending.is_empty()
+    };
+
     while get_time_us() < target {
+        if has_unmasked_pending_signal() {
+            if !rem.is_null() {
+                let now = get_time_us();
+                let remain_us = target.saturating_sub(now);
+                let remain = TimeSpec {
+                    tv_sec: remain_us / 1_000_000,
+                    tv_nsec: (remain_us % 1_000_000) * 1_000,
+                };
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        (&remain as *const TimeSpec) as *const u8,
+                        core::mem::size_of::<TimeSpec>(),
+                    )
+                };
+                let _ = copy_to_user(token, rem as *mut u8, bytes);
+            }
+            return errno(EINTR);
+        }
         suspend_current_and_run_next();
     }
     if !rem.is_null() {
@@ -1150,6 +1183,20 @@ pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
         let _ = copy_to_user(token, rem as *mut u8, bytes);
     }
     0
+}
+
+pub fn sys_clock_nanosleep(
+    _clock_id: usize,
+    _flags: usize,
+    req: *const TimeSpec,
+    rem: *mut TimeSpec,
+) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_clock_nanosleep", pid);
+    }
+    // libc pthread paths only need relative sleep behavior here.
+    sys_nanosleep(req, rem)
 }
 
 pub fn sys_times(tms: *mut Tms) -> isize {
@@ -1279,8 +1326,15 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
     const MAP_ANON: usize = 0x20;
 
     let pid = current_process().pid.0;
+    let proc_name = current_process().inner_exclusive_access().name.clone();
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_mmap", pid);
+    }
+    if proc_name == "entry-dynamic.exe" && (flags & MAP_ANON) == 0 && fd != usize::MAX {
+        info!(
+            "[mmap-file] pid={} start={:#x} len={:#x} prot={:#x} flags={:#x} fd={} off={:#x}",
+            pid, start, len, prot, flags, fd, offset
+        );
     }
 
     let mut len = len;
@@ -1714,12 +1768,13 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
     }
     if let Some(task) = inner.tasks[tid].as_ref() {
         let mut task_inner = task.inner_exclusive_access();
-        if signum == 33 {
+        if signum == 32 || signum == 33 {
             let target_tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
             let tp = task_inner.get_trap_cx()[TrapFrameArgs::TLS];
             info!(
-                "[tkill] pid={} target_tid={} tp={:#x} mask={:?} pending_before={:?}",
+                "[tkill] pid={} signum={} target_tid={} tp={:#x} mask={:?} pending_before={:?}",
                 pid_now,
+                signum,
                 target_tid,
                 tp,
                 task_inner.signal_mask,
@@ -1727,10 +1782,11 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
             );
         }
         task_inner.signal_pending |= flag;
-        if signum == 33 {
+        if signum == 32 || signum == 33 {
             info!(
-                "[tkill] pid={} target_tid={} pending_after={:?}",
+                "[tkill] pid={} signum={} target_tid={} pending_after={:?}",
                 pid_now,
+                signum,
                 task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
                 task_inner.signal_pending
             );
@@ -1744,6 +1800,27 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
         }
     }
     0
+}
+
+pub fn sys_tgkill(tgid: isize, tid: isize, signum: i32) -> isize {
+    let pid_now = current_process().pid.0 as isize;
+    if crate::syscall::should_trace_syscall(pid_now as usize) {
+        syscall!(
+            "kernel:pid[{}] sys_tgkill tgid={} tid={} signum={}",
+            pid_now,
+            tgid,
+            tid,
+            signum
+        );
+    }
+    if tgid <= 0 {
+        return errno(EINVAL);
+    }
+    // pthread_cancel uses tgid=pid of current process.
+    if tgid != pid_now {
+        return errno(ESRCH);
+    }
+    sys_tkill(tid, signum)
 }
 
 pub fn sys_sigaction(
@@ -1783,7 +1860,7 @@ pub fn sys_sigaction(
             Ok(v) => v,
             Err(err) => return err,
         };
-        if signum == 33 || signum == crate::task::SIGCHLD as i32 {
+        if signum == 32 || signum == 33 || signum == crate::task::SIGCHLD as i32 {
             info!(
                 "[sigaction] pid={} signum={} handler={:#x} flags={:#x} restorer={:#x} mask={:?}",
                 pid,
@@ -1976,13 +2053,14 @@ pub fn sys_sigreturn() -> isize {
         inner.signal_mask.remove(SignalFlags::SIG33);
     }
 
-    if current_sig == 33 {
+    if current_sig == 32 || current_sig == 33 {
         let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
         let tp = inner.get_trap_cx()[TrapFrameArgs::TLS];
         info!(
-            "[sigreturn] pid={} tid={} sig33 tp={:#x} saved_pc={:#x} return_pc={:#x} mask={:?}",
+            "[sigreturn] pid={} tid={} sig{} tp={:#x} saved_pc={:#x} return_pc={:#x} mask={:?}",
             pid,
             tid,
+            current_sig,
             tp,
             saved_pc,
             return_pc,

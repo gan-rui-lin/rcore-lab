@@ -387,12 +387,14 @@ pub fn trap_handler() -> ! {
             // Ensure pending signals are handled even if we preempt from user mode.
             if let Some(task) = current_task() {
                 let task_inner = task.inner_exclusive_access();
-                if task_inner.signal_pending.contains(SignalFlags::SIG33) {
+                if task_inner.signal_pending.contains(SignalFlags::SIG32)
+                    || task_inner.signal_pending.contains(SignalFlags::SIG33)
+                {
                     let pid = current_process().pid.0;
                     let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
                     let tp = task_inner.get_trap_cx()[TrapFrameArgs::TLS];
                     info!(
-                        "[trap-timer] pid={} tid={} sig33 pending tp={:#x} mask={:?}",
+                        "[trap-timer] pid={} tid={} sig32/33 pending tp={:#x} mask={:?}",
                         pid,
                         tid,
                         tp,
@@ -440,12 +442,14 @@ pub fn trap_handler() -> ! {
     // Before returning to user, check for pending signals.
     if let Some(task) = current_task() {
         let task_inner = task.inner_exclusive_access();
-        if task_inner.signal_pending.contains(SignalFlags::SIG33) {
+        if task_inner.signal_pending.contains(SignalFlags::SIG32)
+            || task_inner.signal_pending.contains(SignalFlags::SIG33)
+        {
             let pid = current_process().pid.0;
             let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
             let tp = task_inner.get_trap_cx()[TrapFrameArgs::TLS];
             info!(
-                "[trap] pid={} tid={} sig33 pending tp={:#x} mask={:?}",
+                "[trap] pid={} tid={} sig32/33 pending tp={:#x} mask={:?}",
                 pid,
                 tid,
                 tp,
@@ -483,6 +487,15 @@ pub fn task_entry() {
             loongArch64::register::estat::Trap::Exception(
                 loongArch64::register::estat::Exception::Syscall,
             ) => TrapType::UserEnvCall,
+            loongArch64::register::estat::Trap::Exception(
+                loongArch64::register::estat::Exception::AddressNotAligned,
+            ) => {
+                // Keep parity with arch-side trap classification: emulate
+                // supported unaligned loads/stores and advance sepc.
+                unsafe { arch::unaligned::emulate_load_store_insn(trap_cx) };
+                // Exception is fully handled in-place; re-enter user directly.
+                continue;
+            }
             loongArch64::register::estat::Trap::Interrupt(_) => {
                 let irq_num = estat.is().trailing_zeros() as usize;
                 if irq_num == 11 {
@@ -506,6 +519,12 @@ pub fn task_entry() {
             )
             | loongArch64::register::estat::Trap::Exception(
                 loongArch64::register::estat::Exception::FetchPageFault,
+            )
+            | loongArch64::register::estat::Trap::Exception(
+                loongArch64::register::estat::Exception::FetchInstructionAddressError,
+            )
+            | loongArch64::register::estat::Trap::Exception(
+                loongArch64::register::estat::Exception::MemoryAccessAddressError,
             ) => TrapType::LoadPageFault(loongArch64::register::badv::read().raw()),
             loongArch64::register::estat::Trap::Exception(
                 loongArch64::register::estat::Exception::InstructionNotExist,

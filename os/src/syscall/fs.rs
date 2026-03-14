@@ -346,6 +346,15 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         };
         resolve_path(&base, &raw_path)
     };
+    let proc_name = process.inner_exclusive_access().name.clone();
+    let trace_so_open = proc_name == "entry-dynamic.exe"
+        && (raw_path.contains(".so") || full_path.contains(".so"));
+    if trace_so_open {
+        info!(
+            "[openat-so] pid={} raw={} full={} flags={:#x}",
+            pid, raw_path, full_path, flags
+        );
+    }
     // let proc_name = process.inner_exclusive_access().name.clone();
     // if (proc_name == "busybox" || proc_name == "sh")
     //     && (raw_path.starts_with("./") || raw_path.contains("/basic/"))
@@ -384,8 +393,17 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
             None => return errno(EMFILE),
         };
         inner.fd_table[fd] = Some(inode);
+        if trace_so_open {
+            info!(
+                "[openat-so] pid={} open ok full={} -> fd={}",
+                pid, full_path, fd
+            );
+        }
         fd as isize
     } else {
+        if trace_so_open {
+            info!("[openat-so] pid={} open failed full={}", pid, full_path);
+        }
         errno(ENOENT)
     }
 }

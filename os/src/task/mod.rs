@@ -80,7 +80,9 @@ struct LinuxSigInfo {
     si_signo: i32,
     si_errno: i32,
     si_code: i32,
-    _pad: [u8; LINUX_SIGINFO_SIZE - 12],
+    // Keep 8-byte alignment for the payload union so si_pid is at +16.
+    _align_pad: i32,
+    _pad: [u8; LINUX_SIGINFO_SIZE - 16],
 }
 
 #[repr(C)]
@@ -125,6 +127,8 @@ pub struct UserContext {
 }
 
 const USER_UCONTEXT_SIZE: usize = core::mem::size_of::<UserContext>();
+// musl cancel_handler reads/writes uc_mcontext.gregs[0]/pc at ucontext+176.
+const _USER_UCONTEXT_LAYOUT_CHECK: [(); core::mem::offset_of!(UserContext, uc_mcontext)] = [(); 176];
 
 #[cfg(target_arch = "riscv64")]
 impl UserContext {
@@ -212,7 +216,8 @@ impl Default for LinuxSigInfo {
             si_signo: 0,
             si_errno: 0,
             si_code: 0,
-            _pad: [0u8; LINUX_SIGINFO_SIZE - 12],
+            _align_pad: 0,
+            _pad: [0u8; LINUX_SIGINFO_SIZE - 16],
         }
     }
 }
@@ -448,6 +453,7 @@ fn find_pending_signal(
 /// 设置用户态信号栈（UserContext + LinuxSigInfo + canary）
 fn setup_signal_stack(
     signum: usize,
+    sender_pid: usize,
     trap_cx: &mut TrapContext,
     saved_cx: &TrapContext,
     signal_mask_backup: SignalFlags,
@@ -474,6 +480,12 @@ fn setup_signal_stack(
         let info_ptr = user_sp;
         let mut siginfo = LinuxSigInfo::default();
         siginfo.si_signo = signum as i32;
+        // glibc sigcancel_handler expects SI_TKILL and si_pid in siginfo.
+        if signum == 32 || signum == 33 {
+            siginfo.si_code = -6; // SI_TKILL
+            let pid_bytes = (sender_pid as i32).to_le_bytes();
+            siginfo._pad[0..4].copy_from_slice(&pid_bytes); // si_pid at offset 16
+        }
         let siginfo_bytes = unsafe {
             core::slice::from_raw_parts(
                 (&siginfo as *const LinuxSigInfo) as *const u8,
@@ -547,23 +559,25 @@ pub fn handle_signals() {
 
     let pid = process.pid.0;
     let _tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-    if signum == 33 {
+    if signum == 32 || signum == 33 {
         let tp = task_inner.get_trap_cx()[TrapFrameArgs::TLS];
         info!(
-            "[handle_signals] pid={} tid={} sig33 tp={:#x} mask={:?} task_pending={:?} proc_pending={:?}",
+            "[handle_signals] pid={} tid={} sig{} tp={:#x} mask={:?} task_pending={:?} proc_pending={:?}",
             pid,
             _tid,
+            signum,
             tp,
             task_inner.signal_mask,
             task_pending,
             process_pending
         );
     }
-    if signum == 33 {
+    if signum == 32 || signum == 33 {
         info!(
-            "[handle_signals] pid={} tid={} sig33 mask={:?} task_pending={:?} proc_pending={:?}",
+            "[handle_signals] pid={} tid={} sig{} mask={:?} task_pending={:?} proc_pending={:?}",
             pid,
             _tid,
+            signum,
             task_inner.signal_mask,
             task_pending,
             process_pending
@@ -655,11 +669,12 @@ pub fn handle_signals() {
         );
         action.handler = 0;
     }
-    if signum == 33 {
+    if signum == 32 || signum == 33 {
         info!(
-            "[handle_signals] pid={} tid={} sig33 handler={:#x} flags={:#x} restorer={:#x}",
+            "[handle_signals] pid={} tid={} sig{} handler={:#x} flags={:#x} restorer={:#x}",
             pid,
             _tid,
+            signum,
             action.handler,
             action.flags,
             action.restorer()
@@ -766,10 +781,11 @@ pub fn handle_signals() {
     // 14. 设置信号栈
     let saved_cx = task_inner.signal_trap_cx.as_ref().unwrap();
     let token = process_inner.memory_set.token();
-    let need_siginfo = (action.flags & SA_SIGINFO) != 0 || signum == 33;
+    let need_siginfo = (action.flags & SA_SIGINFO) != 0 || signum == 32 || signum == 33;
 
     let ucontext_ptr = setup_signal_stack(
         signum,
+        pid,
         trap_cx,
         saved_cx,
         task_inner.signal_mask_backup,
