@@ -211,6 +211,7 @@ const SYSCALL_SHUTDOWN_SOCKET: usize = 210;
 const SYSCALL_SENDMSG: usize = 211;
 const SYSCALL_RECVMSG: usize = 212;
 const SYSCALL_ACCEPT4: usize = 242;
+const SYSCALL_MEMBARRIER: usize = 283;
 
 mod errno;
 mod fs;
@@ -511,11 +512,21 @@ pub fn should_trace_syscall(pid: usize) -> bool {
 
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
-    let process = current_process();
-    let pid = process.pid.0;
-    let name = process.inner_exclusive_access().name.clone();
-    if pid == 4 && syscall_id == 221 {
-        let cwd = process.inner_exclusive_access().cwd.clone();
+    // !Avoid holding Arc<ProcessControlBlock> across potentially non-returning
+    // syscalls (e.g. exit/exit_group), which can leak references.
+    let (pid, name, cwd_for_exec_trace) = {
+        let process = current_process();
+        let pid = process.pid.0;
+        let inner = process.inner_exclusive_access();
+        let name = inner.name.clone();
+        let cwd = if pid == 4 && syscall_id == 221 {
+            Some(inner.cwd.clone())
+        } else {
+            None
+        };
+        (pid, name, cwd)
+    };
+    if let Some(cwd) = cwd_for_exec_trace {
         trace!("[syscall] pid=4 entry name={} cwd={}", name, cwd);
     }
     let trace = should_trace_syscall(pid);
@@ -711,6 +722,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHUTDOWN_SOCKET => crate::net::syscall::sys_shutdown_socket(args[0], args[1] as i32),
         SYSCALL_SENDMSG => crate::net::syscall::sys_sendmsg(),
         SYSCALL_RECVMSG => crate::net::syscall::sys_recvmsg(),
+        SYSCALL_MEMBARRIER => sys_membarrier(args[0] as isize, args[1] as isize),
         _ => {
             known = false;
             error!(
