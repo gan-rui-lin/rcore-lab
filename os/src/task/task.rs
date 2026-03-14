@@ -2,8 +2,51 @@ use super::id::TaskUserRes;
 use super::{KernelStack, ProcessControlBlock, TaskContext, kstack_alloc};
 use arch::TrapContext;
 use crate::sync::UPIntrFreeCell;
+use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use crate::sync::UPIntrRefMut;
+
+pub fn live_task_count() -> usize {
+    super::pid2process_snapshot()
+        .iter()
+        .filter_map(|(_, process)| process.try_inner_exclusive_access())
+        .map(|inner| inner.tasks.iter().filter(|t| t.is_some()).count())
+        .sum()
+}
+
+pub fn live_task_pid_summary() -> (usize, usize, usize, usize, usize, usize) {
+    let mut pid_counts: BTreeMap<usize, usize> = BTreeMap::new();
+    for (pid, process) in super::pid2process_snapshot() {
+        if let Some(inner) = process.try_inner_exclusive_access() {
+            let count = inner.tasks.iter().filter(|t| t.is_some()).count();
+            if count > 0 {
+                pid_counts.insert(pid, count);
+            }
+        }
+    }
+    if pid_counts.is_empty() {
+        return (0, 0, 0, 0, 0, 0);
+    }
+    let total: usize = pid_counts.values().sum();
+    let unique_pids = pid_counts.len();
+    let mut top_pid = 0usize;
+    let mut top_count = 0usize;
+    let mut min_pid = usize::MAX;
+    let mut max_pid = 0usize;
+    for (pid, count) in pid_counts.iter() {
+        if *count > top_count {
+            top_count = *count;
+            top_pid = *pid;
+        }
+        if *pid < min_pid {
+            min_pid = *pid;
+        }
+        if *pid > max_pid {
+            max_pid = *pid;
+        }
+    }
+    (total, unique_pids, top_pid, top_count, min_pid, max_pid)
+}
 
 pub struct TaskControlBlock {
     pub process: Weak<ProcessControlBlock>,
