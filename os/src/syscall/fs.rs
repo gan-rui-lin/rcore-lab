@@ -45,8 +45,13 @@ use alloc::ffi::CString;
 use lwext4_rust::bindings::ext4_flink;
 
 const AT_FDCWD: isize = -100;
+const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 const AT_REMOVEDIR: u32 = 0x200;
+const AT_NO_AUTOMOUNT: u32 = 0x800;
 const AT_EMPTY_PATH: u32 = 0x1000;
+const AT_STATX_FORCE_SYNC: u32 = 0x2000;
+const AT_STATX_DONT_SYNC: u32 = 0x4000;
+const AT_STATX_SYNC_TYPE: u32 = AT_STATX_FORCE_SYNC | AT_STATX_DONT_SYNC;
 const UTIME_NOW: isize = 0x3fffffff;
 const UTIME_OMIT: isize = 0x3ffffffe;
 
@@ -862,7 +867,14 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: i32, _mask: u32, buf: *mu
         return errno(EINVAL);
     }
     let flags = flags as u32;
-    if flags & !AT_EMPTY_PATH != 0 {
+    // Accept the same flag family commonly used by musl/glibc stat wrappers.
+    // Unsupported semantic bits are ignored for now, but unknown bits are rejected.
+    let supported_flags = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE;
+    if flags & !supported_flags != 0 {
+        return errno(EINVAL);
+    }
+    if (flags & AT_STATX_SYNC_TYPE) == AT_STATX_SYNC_TYPE {
+        // AT_STATX_FORCE_SYNC and AT_STATX_DONT_SYNC are mutually exclusive.
         return errno(EINVAL);
     }
 
@@ -2221,4 +2233,3 @@ pub fn sys_set_robust_list(_head: usize, _len: usize) -> isize {
 pub fn sys_get_robust_list(_pid: usize, _head: *mut u8, _len: *mut u8) -> isize {
     0
 }
-
