@@ -423,6 +423,12 @@ pub fn sys_getppid() -> isize {
     }
 }
 
+/// setpgid(pid, pgid) - stub: always succeed
+/// LTP framework calls setpgid(0,0) to put test child in its own process group
+pub fn sys_setpgid(_pid: usize, _pgid: usize) -> isize {
+    0
+}
+
 pub fn sys_fork() -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {

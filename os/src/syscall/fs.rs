@@ -2233,3 +2233,25 @@ pub fn sys_set_robust_list(_head: usize, _len: usize) -> isize {
 pub fn sys_get_robust_list(_pid: usize, _head: *mut u8, _len: *mut u8) -> isize {
     0
 }
+
+/// sys_fchmodat (syscall 53) - stub: always succeed
+/// LTP framework uses chmod on /dev/shm files during initialization
+pub fn sys_fchmodat(_dirfd: isize, _path: *const u8, _mode: u32, _flags: u32) -> isize {
+    0
+}
+
+/// sys_fchmod (syscall 52) - stub: always succeed
+pub fn sys_fchmod(_fd: usize, _mode: u32) -> isize {
+    0
+}
+
+/// sys_fchownat (syscall 54) - stub: always succeed
+/// LTP framework uses chown on tmp directories during setup
+pub fn sys_fchownat(_dirfd: isize, _path: *const u8, _owner: u32, _group: u32, _flags: u32) -> isize {
+    0
+}
+
+/// sys_fchown (syscall 55) - stub: always succeed
+pub fn sys_fchown(_fd: usize, _owner: u32, _group: u32) -> isize {
+    0
+}

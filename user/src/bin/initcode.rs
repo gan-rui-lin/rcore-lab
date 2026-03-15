@@ -7,15 +7,15 @@ extern crate user_lib;
 extern crate alloc;
 
 use alloc::vec::Vec;
-use user_lib::{chdir, dup, execve, exit, fork, open, shutdown, wait, OpenFlags};
+use user_lib::{chdir, dup, execve, exit, fork, kill, mkdir, open, shutdown, sleep, wait, waitpid, OpenFlags};
 
 const ENABLE_SINGLE_ELF_SUITE: bool = false;
 const ENABLE_BASIC_TEST: bool = false;
 const ENABLE_BUSYBOX_TEST: bool = false;
 const ENABLE_LUA_TEST: bool = false;
-const ENABLE_LIBC_TEST: bool = true;
+const ENABLE_LIBC_TEST: bool = false;
 const ENABLE_DYNAMIC_TEST: bool = false;
-const ENABLE_LTP_TEST: bool = false;
+const ENABLE_LTP_TEST: bool = true;
 const ENABLE_IPERF_TEST: bool = false;
 const ENABLE_ALL_TESTS: bool = false;
 const ENABLE_FAT32_TESTS: bool = false;
@@ -270,8 +270,115 @@ fn test_basic() {
     run_testcode("/musl/basic_testcode.sh");
 }
 
+/// 每个 LTP 测试的超时时间（毫秒）
+const LTP_TIMEOUT_MS: usize = 30_000; // 30秒
+
 fn test_ltp() {
-    run_testcode("/musl/ltp_testcode.sh");
+    let _ = mkdir("/tmp\0");
+    let _ = mkdir("/dev\0");
+    let _ = mkdir("/dev/shm\0");
+    let _ = chdir("/musl\0");
+
+    println!("=== LTP Test Start ===");
+
+    const LTP_TESTS: &[&str] = &[
+        "brk01",
+    ];
+
+    let mut total = 0;
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut timed_out = 0;
+
+    for name in LTP_TESTS {
+        total += 1;
+        let mut path = Vec::new();
+        path.extend_from_slice(b"/musl/ltp/testcases/bin/");
+        path.extend_from_slice(name.as_bytes());
+        path.push(0);
+        let path_str = unsafe { core::str::from_utf8_unchecked(&path) };
+
+        let mut name_c = Vec::from(name.as_bytes());
+        name_c.push(0);
+
+        println!("[LTP] RUN  {}", name);
+
+        let test_pid = fork();
+        if test_pid == 0 {
+            // 测试子进程
+            let argv = [name_c.as_ptr(), core::ptr::null()];
+            let envp_path = b"PATH=/musl:/bin:/usr/bin\0";
+            let envp_tmpdir = b"TMPDIR=/tmp\0";
+            let envp_home = b"HOME=/tmp\0";
+            let envp_ltproot = b"LTPROOT=/musl/ltp\0";
+            let envp = [
+                envp_path.as_ptr(),
+                envp_tmpdir.as_ptr(),
+                envp_home.as_ptr(),
+                envp_ltproot.as_ptr(),
+                core::ptr::null(),
+            ];
+            let _ = execve(path_str, &argv, &envp);
+            println!("[LTP] EXEC_FAIL {}", name);
+            exit(-1);
+        } else if test_pid < 0 {
+            println!("[LTP] FORK_FAIL {}", name);
+            failed += 1;
+            continue;
+        }
+
+        // 父进程：fork 一个 watchdog 子进程做超时
+        let watchdog_pid = fork();
+        if watchdog_pid == 0 {
+            // watchdog 子进程：sleep 后退出
+            sleep(LTP_TIMEOUT_MS);
+            exit(0);
+        } else if watchdog_pid < 0 {
+            // watchdog fork 失败，回退到无超时等待
+            let mut status: i32 = 0;
+            let _ = waitpid(test_pid as usize, &mut status);
+            if status == 0 {
+                println!("[LTP] PASS {}", name);
+                passed += 1;
+            } else {
+                println!("[LTP] FAIL {} (status=0x{:x})", name, status);
+                failed += 1;
+            }
+            continue;
+        }
+
+        // 父进程：等待任意一个子进程先退出
+        let mut status: i32 = 0;
+        let finished_pid = wait(&mut status);
+
+        if finished_pid == test_pid {
+            // 测试先结束，杀掉 watchdog
+            let _ = kill(watchdog_pid as usize, 9);
+            let mut _ws: i32 = 0;
+            let _ = waitpid(watchdog_pid as usize, &mut _ws);
+            if status == 0 {
+                println!("[LTP] PASS {}", name);
+                passed += 1;
+            } else {
+                println!("[LTP] FAIL {} (status=0x{:x})", name, status);
+                failed += 1;
+            }
+        } else {
+            // watchdog 先结束 = 超时，杀掉测试进程
+            let _ = kill(test_pid as usize, 9);
+            let mut _ts: i32 = 0;
+            let _ = waitpid(test_pid as usize, &mut _ts);
+            println!("[LTP] TIMEOUT {} (>{}ms)", name, LTP_TIMEOUT_MS);
+            timed_out += 1;
+            failed += 1;
+        }
+    }
+
+    println!("=== LTP Test End ===");
+    println!(
+        "Total: {}, Passed: {}, Failed: {} (Timeout: {})",
+        total, passed, failed, timed_out
+    );
 }
 
 fn test_iperf() {

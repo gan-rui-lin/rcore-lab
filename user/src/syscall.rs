@@ -11,6 +11,7 @@ pub const SYSCALL_CLOSE: usize = 57;
 pub const SYSCALL_PIPE2: usize = 59;
 pub const SYSCALL_READ: usize = 63;
 pub const SYSCALL_WRITE: usize = 64;
+pub const SYSCALL_MKDIRAT: usize = 34;
 pub const SYSCALL_UNLINKAT: usize = 35;
 pub const SYSCALL_LINKAT: usize = 37;
 pub const SYSCALL_FSTAT: usize = 80;
@@ -360,4 +361,8 @@ pub fn sys_kill(pid: usize, signal: i32) -> isize {
 pub fn sys_shutdown() -> ! {
     syscall(SYSCALL_SHUTDOWN, [0, 0, 0]);
     panic!("sys_shutdown never returns!");
+}
+
+pub fn sys_mkdirat(dirfd: isize, path: &str, mode: u32) -> isize {
+    syscall(SYSCALL_MKDIRAT, [dirfd as usize, path.as_ptr() as usize, mode as usize])
 }
