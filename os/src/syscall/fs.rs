@@ -3,7 +3,10 @@ use crate::fs::{
     create_dir, make_pipe, open_file, path_is_dir, remove_path, DevNull, DevZero,
     OpenFlags, Stat, StatMode, PollEvents,
 };
-use crate::mm::{translated_byte_buffer, translated_str, translated_refmut, UserBuffer};
+use crate::mm::{
+    translated_byte_buffer, translated_byte_buffer_checked, translated_refmut, translated_str,
+    UserBuffer,
+};
 #[allow(unused_imports)] // for debug
 use core::sync::atomic::{AtomicUsize, Ordering};
 #[allow(unused_imports)] // for debug
@@ -273,7 +276,10 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
         let file = file.clone();
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
-        let written = file.write(UserBuffer::new(translated_byte_buffer(token, buf, len))) as isize;
+        let Some(buffers) = translated_byte_buffer_checked(token, buf, len, false) else {
+            return errno(EFAULT);
+        };
+        let written = file.write(UserBuffer::new(buffers)) as isize;
         // let name = process.inner_exclusive_access().name.clone();
         // if (name == "busybox" || name == "sh") && fd <= 2 && len > 0 {
         //     if written == 0 {
@@ -314,10 +320,16 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
         if !file.readable() {
             return errno(EBADF);
         }
+        if file.inode().map(|inode| inode.is_dir()).unwrap_or(false) {
+            return errno(EISDIR);
+        }
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
         trace!("kernel: sys_read .. file.read");
-        file.read(UserBuffer::new(translated_byte_buffer(token, buf, len))) as isize
+        let Some(buffers) = translated_byte_buffer_checked(token, buf, len, true) else {
+            return errno(EFAULT);
+        };
+        file.read(UserBuffer::new(buffers)) as isize
     } else {
         errno(EBADF)
     }
@@ -986,7 +998,7 @@ pub fn sys_dup3(oldfd: usize, newfd: usize) -> isize {
     }
     let limit = inner.rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize;
     if newfd >= limit {
-        return errno(EMFILE);
+        return errno(EBADF);
     }
     if newfd >= inner.fd_table.len() {
         inner.fd_table.resize_with(newfd + 1, || None);

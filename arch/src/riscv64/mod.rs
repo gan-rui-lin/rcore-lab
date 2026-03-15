@@ -41,7 +41,10 @@ pub use interrupt::{disable_interrupts, enable_interrupts, enable_supervisor_ext
 // ---------------------------------------------------------------------------
 pub use mm::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum, VPNRange, StepByOne};
 pub use mm::{PageTable, PageTableEntry, PTEFlags};
-pub use mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str};
+pub use mm::{
+    translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
+    translated_str,
+};
 pub use mm::{UserBuffer, UserBufferIterator};
 pub use mm::{PAGE_SIZE, PAGE_SIZE_BITS};
 pub use mm::activate_page_table;

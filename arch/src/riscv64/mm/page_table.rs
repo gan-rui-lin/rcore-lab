@@ -253,6 +253,50 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     v
 }
 
+/// Translate a user-space byte buffer only if all covered pages satisfy the
+/// requested access permission.
+pub fn translated_byte_buffer_checked(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    writable: bool,
+) -> Option<Vec<&'static mut [u8]>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let page_table = PageTable::from_token(token);
+    let mut start = ptr as usize;
+    let end = start.checked_add(len)?;
+    let mut v = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let pte = page_table.translate(vpn)?;
+        let flags = pte.flags();
+        if !pte.is_valid() || !flags.contains(PTEFlags::U) {
+            return None;
+        }
+        if writable {
+            if !pte.writable() {
+                return None;
+            }
+        } else if !pte.readable() {
+            return None;
+        }
+        let ppn = pte.ppn();
+        vpn.step();
+        let mut end_va: VirtAddr = vpn.into();
+        end_va = end_va.min(VirtAddr::from(end));
+        if end_va.page_offset() == 0 {
+            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
+        } else {
+            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+        }
+        start = end_va.into();
+    }
+    Some(v)
+}
+
 /// Translate a NUL-terminated user-space string into a `String`.
 pub fn translated_str(token: usize, ptr: *const u8) -> String {
     let page_table = PageTable::from_token(token);
