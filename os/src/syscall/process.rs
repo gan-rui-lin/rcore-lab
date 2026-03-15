@@ -1016,6 +1016,14 @@ pub fn sys_exec(path: *const u8, argv: *const usize, envp: *const usize) -> isiz
     sys_exec_internal(path, argv, envp, 0)
 }
 
+fn encode_wait_status(exit_code: i32) -> i32 {
+    if exit_code >= 0 {
+        (exit_code & 0xff) << 8
+    } else {
+        (-exit_code) & 0x7f
+    }
+}
+
 /// If there is not a child process whose pid is same as given, return -ECHILD.
 /// Else if there is a child process but it is still running, return -EAGAIN.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
@@ -1042,7 +1050,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
             let found_pid = child.getpid();
             let exit_code = child.inner_exclusive_access().exit_code;
             if !exit_code_ptr.is_null() {
-                let status = (exit_code & 0xff) << 8;
+                let status = encode_wait_status(exit_code);
                 *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
             }
             return found_pid as isize;

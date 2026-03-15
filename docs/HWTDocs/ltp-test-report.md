@@ -127,168 +127,193 @@ LTP 的 `fork_testrun()` 函数在 fork 子进程后会调用 `setpgid(0, 0)` �
 
 ---
 
-## 4. 测试结果
+## 4. 最新进展（2026-03-15）
 
-### 4.1 三轮测试对比
+### 4.1 统计口径修正
 
-| 轮次 | 修复内容 | PASS | 主要失败原因 |
-|------|---------|------|-------------|
-| Round 1 | 无修改，原始代码 | 2/92 | chmod ENOSYS (70+), chown ENOSYS (10+) |
-| Round 2 | +fchmodat, +fchownat, +/dev/shm | 4/60* | setpgid ENOSYS (50+) |
-| Round 3 | +setpgid | 13/25* | 各种具体测试问题 |
+当前 `initcode` 外层的 `[LTP] PASS ...` 仍然只是根据子进程退出码是否为 0 判断，因此**不能**直接代表该用例真实通过。
 
-*注: Round 2/3 因 chdir01 卡住导致未跑完全部用例
+LTP 在本环境下打印的：
 
-### 4.2 已验证 PASS 的测试用例（共 28 个）
-
-**进程管理类** (Round 3):
-- `getpid02`, `fork01`, `fork03`, `wait01`, `wait02`, `wait401`
-- `waitpid01`, `waitpid03`, `exit01`, `exit02`
-- `clone01`, `clone02`, `clone03`
-
-**基本 I/O 类** (单独验证):
-- `pipe01` — 管道读写
-- `read01` — 基本文件读取
-- `read02` — 读取错误处理 (EBADF)
-- `read04` — 数据正确性验证
-- `write01` — 基本文件写入
-- `write02` — 空写入 (NULL, 0)
-- `write03` — 写入失败检测
-- `write05` — 写入错误处理
-- `close01` — 关闭文件/管道/socket
-- `close02` — 关闭无效 fd (EBADF)
-- `dup01` — dup + fstat inode 验证
-- `dup02` — dup 无效 fd (EBADF)
-- `dup201`, `dup202`, `dup203` — dup2 各种场景
-- `open01` — 创建文件 + 打开目录
-- `lseek01` — lseek SEEK_SET/CUR/END
-
-### 4.3 已知失败的测试用例及原因分类
-
-#### 4.3.1 需要 /proc 文件系统（ENOENT）
-
-| 测试 | 缺失的文件 |
-|------|-----------|
-| `getpid01`, `getppid01`, `getppid02` | `/proc/sys/kernel/pid_max` |
-
-**修复建议**: 实现基本的 procfs，或在 initcode 中创建静态文件。
-
-#### 4.3.2 二进制文件缺失（EXEC_FAIL）
-
-| 测试 | 说明 |
-|------|------|
-| `fork02`, `waitpid02`, `mkdir01`, `chdir02`, `chdir03` | SD卡镜像中缺少对应二进制 |
-| `fstat01`, `unlink01`, `unlink02`, `kill01` | 同上 |
-
-**修复建议**: 重新编译 LTP 并将缺失的二进制文件打入 SD 卡镜像。
-
-#### 4.3.3 需要 mknod/mkfifo 系统调用（ENOSYS）
-
-| 测试 | 需要的系统调用 |
-|------|--------------|
-| `read03` | `mknod()` — 创建设备文件用于测试 |
-| `lseek02` | `mkfifo()` — 创建 FIFO 管道 |
-
-**修复建议**: 实现 `mknodat` 系统调用(编号33)。
-
-#### 4.3.4 需要 checkpoint 机制（futex + shared mmap）
-
-| 测试 | 说明 |
-|------|------|
-| `pipe02` | `tst_checkpoint_wait/wake` 超时 |
-| `fork04`, `execve05` | 需要 checkpoint 做进程间同步 |
-
-**根因**: LTP checkpoint 使用 `/dev/shm` 下的共享内存文件 + `futex` 系统调用做进程间同步。虽然 `futex` 已实现，但需要 `mmap(MAP_SHARED)` 对文件的支持。
-
-**修复建议**: 实现基于文件的 `mmap(MAP_SHARED)`。
-
-#### 4.3.5 需要多用户/权限模型
-
-| 测试 | 需要的功能 |
-|------|-----------|
-| `execve02`, `execve03` | `seteuid()`, `getpwnam("nobody")`, 权限检查 |
-| `mkdir02` | `setregid/setreuid`, SGID 继承 |
-| `chdir01` | `.mount_device`, `.all_filesystems`, root 权限 |
-
-**修复建议**: 这些测试需要较完整的用户/组权限系统，优先级较低。
-
-#### 4.3.6 brk 语义不兼容
-
-| 测试 | 问题 |
-|------|------|
-| `brk01`, `brk02` | 内核 syscall 214 映射到 xv6 风格的 `sbrk(increment)` 而非 Linux 标准的 `brk(addr)` |
-
-**根因**: Linux `brk(addr)` 设置程序 break 到指定地址并返回新的 break 地址；xv6 `sbrk(increment)` 增加/减少 break 并返回旧地址。LTP 测试使用 Linux 标准语义。
-
-**修复建议**: 重写 `sys_sbrk` 为标准 Linux `brk` 语义：
-```rust
-pub fn sys_brk(addr: usize) -> isize {
-    if addr == 0 {
-        return current_brk();  // 查询当前 brk
-    }
-    set_brk(addr);  // 设置新的 brk
-    return current_brk();  // 返回实际 brk 地址
-}
+```text
+Summary:
+passed   0
+failed   0
+broken   0
+...
 ```
 
-#### 4.3.7 symlink 未实现
+同样也不可靠。
 
-| 测试 | 问题 |
-|------|------|
-| `openat02` | `symlink()` 返回 ENOSYS |
-| `openat03` | `write()` 返回 0 (可能是文件系统问题) |
+本报告后续统计均以**测试正文中的 `TPASS` / `TFAIL` / `TBROK`** 为准。
 
-**修复建议**: 实现 `symlinkat` (syscall 36)。
+### 4.2 本轮新增修复
 
-#### 4.3.8 测试卡住（超时/阻塞）
+#### 4.2.1 `wait4()/waitpid()` 相关
 
-| 测试 | 问题分析 |
-|------|---------|
-| `chdir01` | 使用 guarded buffers (mmap+mprotect PROT_NONE)，可能在信号处理或 `.mount_device` 逻辑中卡住 |
-| `pipe2_01` | 可能在等待子进程中阻塞 |
+**问题**:
+- `wait401` 早期因为 `/proc/<pid>/stat` 缺失直接 `TBROK`
+- `/proc/<pid>/stat` 补上后，又会因为父进程在 `waitpid()` 中只是 yield、没有表现为睡眠态 `'S'` 而卡住
+- `sys_waitpid()` 写回用户态的 wait status 只按正常退出编码，信号退出场景编码不兼容 Linux
+
+**解决方案**:
+- 在 `procfs` 中补了最小动态 `/proc/<pid>/stat`
+- 在 `/proc/<pid>/stat` 中把“正在 `waitpid/wait4` 等待循环中的任务”视为睡眠态 `'S'`
+- 在 `sys_waitpid()` 中新增 wait status 编码逻辑，区分正常退出和信号退出
+
+**结果**:
+- `wait401` 已确认通过
+- `waitpid01` 有明显改善，但仍未完全通过
+  - `kill(getpid(), sig)` 路径大多正常
+  - `raise(sig)` 路径仍有大量 `WIFSIGNALED()` 判定失败
+  - `WCOREDUMP()` 对应的 core bit 也尚未补全
+
+#### 4.2.2 `read/write` 用户缓冲区校验
+
+**问题**:
+- `read02` / `write03` / `write05` 涉及 `PROT_NONE` 用户地址时，内核此前没有按页权限检查用户缓冲区
+- `read02` 中对目录 `read()` 的 errno 也不对，应该返回 `EISDIR`
+
+**解决方案**:
+- 在 `arch/src/riscv64/mm/page_table.rs` 增加带权限检查的 `translated_byte_buffer_checked()`
+- `sys_read()` 对目标缓冲区要求可写；`sys_write()` 对源缓冲区要求可读
+- `sys_read()` 对目录 inode 显式返回 `EISDIR`
+
+**结果**:
+- `read02` 已确认通过
+- `write03` 已确认通过
+- `write05` 部分修复
+  - `EBADF`、`EFAULT` 已正确
+  - pipe 写端对无读者场景仍未返回 `EPIPE`，该项还失败
+
+#### 4.2.3 `dup2()` errno 兼容性
+
+**问题**:
+- `dup201` 期望 `dup2(0, -1)` 和 `dup2(0, maxfd)` 返回 `EBADF`
+- 内核此前会把 `newfd >= RLIMIT_NOFILE` 误报为 `EMFILE`
+
+**解决方案**:
+- 调整 `sys_dup3()` 对非法 `newfd` 的返回值，改为 `EBADF`
+
+**结果**:
+- `dup201` 已确认通过
+
+### 4.3 当前累计进度
+
+以下统计基于“此前已逐个语义复测通过的 19 项”加上“本轮新修复后重新验证的失败项”得到。
+
+#### 已累计确认通过：23 / 30
+
+**进程管理类**:
+- `fork01`, `fork03`, `wait01`, `wait02`, `wait401`
+- `waitpid03`
+- `clone01`, `clone02`
+
+**基本 I/O 类**:
+- `pipe01`
+- `read01`, `read02`, `read04`
+- `write01`, `write02`, `write03`
+- `close01`, `close02`
+- `dup01`, `dup02`, `dup201`, `dup202`, `dup203`
+- `lseek01`
+
+说明:
+- 本轮新增确认通过的 4 个用例为：`wait401`、`read02`、`write03`、`dup201`
+
+#### 仍未通过：7 / 30
+
+- `getpid02`
+- `waitpid01`
+- `exit01`
+- `exit02`
+- `clone03`
+- `write05`
+- `open01`
+
+说明:
+- `exit01`、`exit02` 是上一轮已确认失败项，本轮未重新单独回归，但目前尚无修复
+
+### 4.4 仍待解决的问题与根因
+
+#### 4.4.1 `getpid02` / `clone03`
+
+**现象**:
+- 子进程把 pid 写入 `MAP_SHARED | MAP_ANONYMOUS` 内存后，父进程读到的值仍是 0 或错误值
+
+**根因**:
+- 当前匿名共享映射并没有真正实现跨 `fork()` / 非线程 `clone()` 的共享语义
+- `MemorySet::from_existed_user()` 仍按普通私有页复制
+
+**后续方案**:
+- 为匿名 `MAP_SHARED` 页建立共享物理页或共享映射元数据
+- 相关重点位置：
+  - `os/src/syscall/process.rs`
+  - `os/src/mm/memory_set.rs`
+
+#### 4.4.2 `waitpid01`
+
+**现象**:
+- `raise(sig)` 分支中大量出现 `WIFSIGNALED() not set in status (exited with 0)`
+- 触发 core dump 的信号场景里 `WCOREDUMP()` 也还不对
+
+**根因判断**:
+- 当前信号自发送路径仍不完整，`raise()` 与 `kill(getpid(), sig)` 的行为不一致
+- wait status 里的 core-dump bit 也尚未编码
+
+**后续方案**:
+- 继续排查 `raise()` 走到的 `tkill/tgkill/kill` 路径
+- 在 wait status 中补上 core-dump bit
+
+#### 4.4.3 `write05`
+
+**现象**:
+- 对关闭读端的 pipe 写入时，本应返回 `EPIPE`，目前却成功返回
+
+**根因判断**:
+- pipe 写端对“无读者”场景的错误处理还不完整
+- `SIGPIPE` 也可能没有正确送达
+
+**后续方案**:
+- 检查 `os/src/fs/pipe.rs` 的写路径
+- 对读端已关闭的 pipe 返回 `EPIPE`，并补发 `SIGPIPE`
+
+#### 4.4.4 `open01`
+
+**现象**:
+- `sticky bit is cleared unexpectedly`
+
+**根因**:
+- 文件创建模式 `_mode` 还没有在 VFS / stat 元数据中真正保存下来
+- 当前 `stat` 相关实现仍倾向于合成默认 mode
+
+**后续方案**:
+- 在文件创建时保存 mode bits
+- `stat/fstat/fstatat` 返回真实 mode，保留 `S_ISVTX`
+
+### 4.5 建议的下一步优先级
+
+1. 修 `write05`
+   - 影响范围小，回报高，预计可以再新增 1 个通过用例
+
+2. 修 `waitpid01`
+   - 已经完成一半，继续补 `raise()` 和 core-dump bit 后有机会转绿
+
+3. 修 `open01`
+   - 主要是 mode/sticky bit 元数据问题，属于 VFS 语义补全
+
+4. 攻 `MAP_SHARED | MAP_ANONYMOUS`
+   - 能同时带动 `getpid02` 和 `clone03`
+   - 但改动面最大，建议放在前三项之后
 
 ---
 
-## 5. 未实现的关键系统调用汇总
+## 5. 总结
 
-以下是 LTP 测试中遇到的所有返回 ENOSYS 的系统调用，按影响范围排序：
+本轮工作的重点已经从“补 stub 解锁 LTP 框架初始化”转到“修真实内核语义”。
 
-| 系统调用 | 编号 | 影响测试数 | 实现难度 | 说明 |
-|---------|------|-----------|---------|------|
-| ~~fchmodat~~ | 53 | ~70 | **已修复** (stub) | |
-| ~~fchownat~~ | 54 | ~10 | **已修复** (stub) | |
-| ~~setpgid~~ | 154 | ~80 | **已修复** (stub) | |
-| `mknodat` | 33 | 5+ | 中等 | 创建设备文件/FIFO |
-| `symlinkat` | 36 | 5+ | 中等 | 创建符号链接 |
-| `brk` (语义) | 214 | 2 | 中等 | 需改为 Linux 标准语义 |
-| `seteuid/setreuid` | 145/147 | 5+ | 高 | 多用户权限模型 |
-| `umask` | 166 | 3+ | 低 | 文件创建掩码 |
+最新累计结果是：
+- 已累计确认通过 23 / 30
+- 本轮新增修复 4 项：`wait401`、`read02`、`write03`、`dup201`
+- 当前剩余重点问题集中在：共享匿名映射、信号自发送/等待状态、pipe 的 `EPIPE`、文件 mode 元数据
 
----
-
-## 6. 建议的后续修复优先级
-
-### P0 — 高收益，低难度
-1. **创建 `/proc/sys/kernel/pid_max` 静态文件** — 解锁 getpid01, getppid01, getppid02
-2. **实现 `mknodat` (syscall 33)** — 解锁 read03, lseek02 等
-3. **补充 SD 卡镜像中缺失的 LTP 二进制** — 解锁 fork02, mkdir01 等约 9 个测试
-
-### P1 — 中等收益，中等难度
-4. **实现 Linux 标准 `brk` 语义** — 解锁 brk01, brk02
-5. **实现 `symlinkat` (syscall 36)** — 解锁 openat02 等
-6. **实现基于文件的 `mmap(MAP_SHARED)`** — 解锁 checkpoint 机制，解锁 pipe02, fork04, execve05
-
-### P2 — 低优先级，高难度
-7. **实现 procfs** — 完整的 /proc 文件系统支持
-8. **实现多用户权限模型** — seteuid, setregid, getpwnam 等
-9. **实现 mount_device / loopback** — 解锁 chdir01 等需要挂载设备的测试
-
----
-
-## 7. 总结
-
-通过本次 LTP 适配工作，共新增/修改 6 个文件，实现了 5 个系统调用 stub（fchmodat, fchmod, fchownat, fchown, setpgid），完成了 initcode 的 LTP 直测改造。
-
-当前已验证通过 **28 个 LTP 测试用例**，覆盖了进程管理（fork/wait/exit/clone）和基本 I/O（read/write/open/close/dup/pipe/lseek）两大核心功能区域。
-
-剩余失败用例的主要瓶颈为：缺少 procfs、brk 语义不兼容、缺少 symlink/mknod 系统调用、以及 LTP checkpoint 机制依赖的共享内存支持。这些问题都有明确的修复路径，可按优先级逐步解决。
+当前最重要的经验是：**不能再看 LTP 自己打印的 `Summary` 或 `initcode` 外层 `[LTP] PASS`，必须按 `TPASS/TFAIL/TBROK` 判定真实结果。**
