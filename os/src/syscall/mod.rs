@@ -36,6 +36,14 @@ const SYSCALL_FTRUNCATE: usize = 46;
 const SYSCALL_FACCESSAT: usize = 48;
 /// chdir syscall
 const SYSCALL_CHDIR: usize = 49;
+/// fchmod syscall
+const SYSCALL_FCHMOD: usize = 52;
+/// fchmodat syscall
+const SYSCALL_FCHMODAT: usize = 53;
+/// fchownat syscall
+const SYSCALL_FCHOWNAT: usize = 54;
+/// fchown syscall
+const SYSCALL_FCHOWN: usize = 55;
 /// openat syscall
 const SYSCALL_OPENAT: usize = 56;
 /// close syscall
@@ -130,6 +138,8 @@ const SYSCALL_SET_PRIORITY: usize = 140;
 const SYSCALL_TIMES: usize = 153;
 /// uname syscall
 const SYSCALL_UNAME: usize = 160;
+/// setpgid syscall
+const SYSCALL_SETPGID: usize = 154;
 /// getrlimit syscall
 const SYSCALL_GETRLIMIT: usize = 163;
 /// statfs syscall
@@ -585,6 +595,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4],
         ),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
+        SYSCALL_FCHMOD => sys_fchmod(args[0], args[1] as u32),
+        SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32),
+        SYSCALL_FCHOWNAT => sys_fchownat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32, args[4] as u32),
+        SYSCALL_FCHOWN => sys_fchown(args[0], args[1] as u32, args[2] as u32),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
@@ -693,6 +707,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *const RLimit,
             args[3] as *mut RLimit,
         ),
+        SYSCALL_SETPGID => sys_setpgid(args[0], args[1]),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),
