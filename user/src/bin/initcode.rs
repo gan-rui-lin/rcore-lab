@@ -282,7 +282,7 @@ fn test_ltp() {
     println!("=== LTP Test Start ===");
 
     const LTP_TESTS: &[&str] = &[
-        "brk01",
+        "lseek01",
     ];
 
     let mut total = 0;
