@@ -20,8 +20,6 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
             .ustack_base,
         true,
     ));
-    // add new task to scheduler
-    add_task(Arc::clone(&new_task));
     let new_task_inner = new_task.inner_exclusive_access();
     let new_task_res = new_task_inner.res.as_ref().unwrap();
     let new_task_tid = new_task_res.tid;
@@ -41,6 +39,8 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         user_trap_entry as usize,
     );
     new_task_trap_cx[TrapFrameArgs::ARG0] = arg;
+    // Queue the thread after its initial trap context is ready.
+    add_task(Arc::clone(&new_task));
     new_task_tid as isize
 }
 
