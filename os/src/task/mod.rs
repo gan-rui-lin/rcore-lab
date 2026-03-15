@@ -204,7 +204,20 @@ impl UserContext {
     }
 
     pub fn restore_trap_context(&self, trap_cx: &mut TrapContext) {
-        trap_cx.sepc = self.uc_mcontext.pc;
+        // Compatibility path: some libc variants patch gregs[0] as the
+        // return PC in signal handlers. Prefer explicit `pc`, but honor a
+        // non-zero divergent gregs[0] value when present.
+        let mut restored_pc = self.uc_mcontext.pc;
+        let gpr0_pc = self.uc_mcontext.gregs[0];
+        if gpr0_pc != 0 && gpr0_pc != restored_pc {
+            trace!(
+                "[sigreturn-compat] loongarch use gregs[0] as pc: pc={:#x} gpr0={:#x}",
+                restored_pc,
+                gpr0_pc
+            );
+            restored_pc = gpr0_pc;
+        }
+        trap_cx.sepc = restored_pc;
         trap_cx.x = self.uc_mcontext.gregs;
         trap_cx.x[0] = 0;
     }
@@ -572,20 +585,26 @@ pub fn handle_signals() {
             process_pending
         );
     }
-    if signum == 32 || signum == 33 {
-        info!(
-            "[handle_signals] pid={} tid={} sig{} mask={:?} task_pending={:?} proc_pending={:?}",
-            pid,
-            _tid,
-            signum,
-            task_inner.signal_mask,
-            task_pending,
-            process_pending
-        );
-    }
 
     // 5. 如果任务被阻塞，唤醒它
     if task_inner.task_status == TaskStatus::Blocked {
+        if signum == 32 || signum == 33 {
+            let trap_cx = task_inner.get_trap_cx();
+            info!(
+                "[signal-flow] route=blocked_wakeup pid={} tid={} sig{} from_process={} handling_sig={} sepc={:#x} sp={:#x} ra={:#x} mask={:?} task_pending={:?} proc_pending={:?}",
+                pid,
+                _tid,
+                signum,
+                from_process,
+                task_inner.handling_sig,
+                trap_cx.sepc,
+                trap_cx[TrapFrameArgs::SP],
+                trap_cx[TrapFrameArgs::RA],
+                task_inner.signal_mask,
+                task_pending,
+                process_pending
+            );
+        }
         futex_remove_waiter_any(&task);
         task_inner.task_status = TaskStatus::Ready;
         task_inner.interrupted_by_signal = true;
@@ -596,6 +615,15 @@ pub fn handle_signals() {
 
     // 7. 如果已经在处理其他信号，跳过（除了 SIGKILL）
     if task_inner.signal_trap_cx.is_some() && signum != signal::SIGKILL {
+        if signum == 32 || signum == 33 {
+            info!(
+                "[signal-flow] route=defer_nested pid={} tid={} sig{} handling_sig={} saved_ctx_present=true",
+                pid,
+                _tid,
+                signum,
+                task_inner.handling_sig
+            );
+        }
         return;
     }
 
@@ -742,6 +770,9 @@ pub fn handle_signals() {
     }
 
     // 13. 设置 trap context 调用用户态 handler
+    let old_pc = task_inner.get_trap_cx().sepc;
+    let old_sp = task_inner.get_trap_cx()[TrapFrameArgs::SP];
+    let old_ra = task_inner.get_trap_cx()[TrapFrameArgs::RA];
     let trap_cx = task_inner.get_trap_cx();
     trap_cx.sepc = action.handler;
     // LoongArch: no SA_RESTORER, always use kernel trampoline for sigreturn
@@ -794,6 +825,27 @@ pub fn handle_signals() {
     );
 
     task_inner.signal_ucontext_ptr = ucontext_ptr;
+    if signum == 32 || signum == 33 {
+        let trap_cx = task_inner.get_trap_cx();
+        info!(
+            "[signal-flow] route=deliver pid={} tid={} sig{} from_process={} handler={:#x} old_pc={:#x} new_pc={:#x} old_sp={:#x} new_sp={:#x} old_ra={:#x} new_ra={:#x} ucontext_ptr={:#x} need_siginfo={} mask_backup={:?} mask_now={:?}",
+            pid,
+            _tid,
+            signum,
+            from_process,
+            action.handler,
+            old_pc,
+            trap_cx.sepc,
+            old_sp,
+            trap_cx[TrapFrameArgs::SP],
+            old_ra,
+            trap_cx[TrapFrameArgs::RA],
+            ucontext_ptr,
+            need_siginfo,
+            task_inner.signal_mask_backup,
+            task_inner.signal_mask
+        );
+    }
 }
 
 pub fn debug_dump_tasks() {
