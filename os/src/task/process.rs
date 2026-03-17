@@ -1,9 +1,7 @@
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
 use super::{PidHandle, SignalAction, SignalActions, SignalFlags, TaskControlBlock, TlsArea, add_task, pid_alloc};
-use crate::config::USER_STACK_SIZE;
-#[cfg(target_arch = "loongarch64")]
-use crate::config::USER_MMAP_TOP;
+use crate::config::{USER_MMAP_TOP, USER_STACK_SIZE};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{KERNEL_SPACE, MemorySet, translated_byte_buffer, translated_ref, translated_refmut, translated_str};
 use crate::sync::{Condvar, Mutex, Semaphore, UPIntrFreeCell};
@@ -18,8 +16,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use crate::sync::UPIntrRefMut;
 
-#[allow(unused)]
-const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
 #[cfg(target_arch = "loongarch64")]
 const LOONGARCH_MIN_TCB_ADDR: usize = 0x7000_1000;
 
@@ -228,10 +224,7 @@ impl ProcessControlBlock {
                     cwd: String::from("/"),
                     heap_bottom,
                     program_brk: heap_bottom,
-                    #[cfg(target_arch = "loongarch64")]
                     mmap_base: USER_MMAP_TOP,
-                    #[cfg(not(target_arch = "loongarch64"))]
-                    mmap_base: DEFAULT_MMAP_BASE,
                     tls_area: tls_area.clone(),
                     rlimits: default_rlimits(),
                 })
@@ -388,14 +381,7 @@ impl ProcessControlBlock {
                     *action = SignalAction::default();
                 }
             }
-            #[cfg(target_arch = "loongarch64")]
-            {
-                inner.mmap_base = USER_MMAP_TOP;
-            }
-            #[cfg(not(target_arch = "loongarch64"))]
-            {
-                inner.mmap_base = core::cmp::max(DEFAULT_MMAP_BASE, user_stack_top);
-            }
+            inner.mmap_base = USER_MMAP_TOP;
             inner.tls_area = tls_area.clone();
         }
         let task = self.inner_exclusive_access().get_task(0);
