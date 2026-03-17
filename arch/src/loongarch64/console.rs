@@ -1,7 +1,7 @@
 /// Console backend for LoongArch64 via UART MMIO.
 
-const VIRT_ADDR_START: usize = 0x9000_0000_0000_0000;
-const UART_BASE: usize = 0x1fe0_01e0 | VIRT_ADDR_START;
+use super::consts::UART_BASE;
+
 const UART_THR: usize = UART_BASE + 0x0;
 const UART_RBR: usize = UART_BASE + 0x0;
 const UART_IER: usize = UART_BASE + 0x1;
