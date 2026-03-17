@@ -5,13 +5,16 @@
 /// Layout must match `switch.S` exactly:
 /// - offset  0: `ra` (return address — where execution resumes)
 /// - offset  8: `sp` (kernel stack pointer)
-/// - offset 16..112: `s0`..`s11` (callee-saved registers)
+/// - offset 16: `tp` (thread pointer)
+/// - offset 24..120: `s0`..`s11` (callee-saved registers)
 #[repr(C)]
 pub struct TaskContext {
     /// Return address after task switching.
     ra: usize,
     /// Stack pointer.
     sp: usize,
+    /// Thread pointer.
+    tp: usize,
     /// Callee-saved registers s0-s11.
     s: [usize; 12],
 }
@@ -22,6 +25,7 @@ impl TaskContext {
         Self {
             ra: 0,
             sp: 0,
+            tp: 0,
             s: [0; 12],
         }
     }
@@ -36,6 +40,7 @@ impl TaskContext {
         Self {
             ra: trap_return_addr,
             sp: kstack_ptr,
+            tp: 0,
             s: [0; 12],
         }
     }
