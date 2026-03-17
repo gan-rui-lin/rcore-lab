@@ -45,19 +45,32 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
 }
 
 pub fn sys_gettid() -> isize {
-    current_task()
-        .unwrap()
+    let task = current_task().unwrap();
+    let process = current_process();
+    let process_pid = process.pid.0 as isize;
+    let tid = task
         .inner_exclusive_access()
         .res
         .as_ref()
         .unwrap()
-        .tid as isize
+        .tid as isize;
+    if tid == 0 {
+        process_pid
+    } else {
+        tid
+    }
 }
 
 pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
     let task = current_task().unwrap();
+    let process = current_process();
     let mut task_inner = task.inner_exclusive_access();
-    let tid = task_inner.res.as_ref().unwrap().tid as i32;
+    let raw_tid = task_inner.res.as_ref().unwrap().tid as i32;
+    let tid = if raw_tid == 0 {
+        process.pid.0 as i32
+    } else {
+        raw_tid
+    };
     task_inner.clear_child_tid = tidptr as usize;
     drop(task_inner);
     // Linux set_tid_address: only saves the pointer for clear_child_tid on exit,
@@ -65,7 +78,7 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
     // Writing TID to a user pointer is CLONE_CHILD_SETTID's job in clone().
     info!(
         "[sys_set_tid_address] pid={} tid={} tidptr={:#x}",
-        current_process().pid.0, tid, tidptr as usize
+        process.pid.0, tid, tidptr as usize
     );
     tid as isize
 }

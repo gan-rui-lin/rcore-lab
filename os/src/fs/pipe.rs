@@ -2,12 +2,13 @@
 use super::{File, PollEvents};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
-use crate::task::suspend_current_and_run_next;
+use crate::task::{current_task, suspend_current_and_run_next, SignalFlags};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
 const DEFAULT_PIPE_CAPACITY: usize = 4096;
+const EPIPE_ERRNO: isize = -32;
 
 struct Pipe {
     buf: Vec<u8>,
@@ -153,6 +154,41 @@ impl File for PipeEnd {
             }
         }
         total
+    }
+
+    fn write_user_buffer(&self, user_buf: UserBuffer) -> Result<usize, isize> {
+        let mut total = 0usize;
+        for slice in user_buf.buffers.iter() {
+            let mut offset = 0usize;
+            while offset < slice.len() {
+                let mut pipe = self.pipe.exclusive_access();
+                if !pipe.read_open {
+                    if total == 0 {
+                        if let Some(task) = current_task() {
+                            let mut task_inner = task.inner_exclusive_access();
+                            task_inner.signal_pending |= SignalFlags::SIGPIPE;
+                        }
+                        return Err(EPIPE_ERRNO);
+                    }
+                    return Ok(total);
+                }
+                if pipe.len < pipe.capacity() {
+                    let n = pipe.write_from(&slice[offset..]);
+                    total += n;
+                    offset += n;
+                    if n == 0 {
+                        break;
+                    }
+                } else {
+                    if total > 0 {
+                        return Ok(total);
+                    }
+                    drop(pipe);
+                    suspend_current_and_run_next();
+                }
+            }
+        }
+        Ok(total)
     }
 
     fn poll(&self, events: PollEvents) -> PollEvents {

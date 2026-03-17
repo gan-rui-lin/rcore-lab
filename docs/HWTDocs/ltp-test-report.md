@@ -127,7 +127,7 @@ LTP 的 `fork_testrun()` 函数在 fork 子进程后会调用 `setpgid(0, 0)` �
 
 ---
 
-## 4. 最新进展（2026-03-15）
+## 4. 最新进展（2026-03-17）
 
 ### 4.1 统计口径修正
 
@@ -163,10 +163,7 @@ broken   0
 
 **结果**:
 - `wait401` 已确认通过
-- `waitpid01` 有明显改善，但仍未完全通过
-  - `kill(getpid(), sig)` 路径大多正常
-  - `raise(sig)` 路径仍有大量 `WIFSIGNALED()` 判定失败
-  - `WCOREDUMP()` 对应的 core bit 也尚未补全
+- `waitpid01` 已确认通过
 
 #### 4.2.2 `read/write` 用户缓冲区校验
 
@@ -182,9 +179,8 @@ broken   0
 **结果**:
 - `read02` 已确认通过
 - `write03` 已确认通过
-- `write05` 部分修复
-  - `EBADF`、`EFAULT` 已正确
-  - pipe 写端对无读者场景仍未返回 `EPIPE`，该项还失败
+- `write05` 已确认通过
+  - `EBADF`、`EFAULT`、`EPIPE` 均已对齐
 
 #### 4.2.3 `dup2()` errno 兼容性
 
@@ -198,122 +194,133 @@ broken   0
 **结果**:
 - `dup201` 已确认通过
 
+#### 4.2.4 `open01` mode / sticky bit 兼容
+
+**问题**:
+- `open01` 会检查新建文件的 mode，尤其是 sticky bit 是否被保留
+- 之前 `stat/fstat/fstatat` 返回的 mode 偏向“合成默认值”，导致 `sticky bit is cleared unexpectedly`
+
+**解决方案**:
+- 在 `openat(O_CREAT)` / `mkdirat()` 创建对象时记录路径对应的 mode
+- 在 `unlinkat()` 时同步清理该元数据
+- `stat_from_fd()` / `stat_from_path()` / `sys_fstat()` / `sys_fstatat()` 统一读取保存下来的 mode bits
+
+**结果**:
+- `open01` 已确认通过
+- `sticky bit` 和目录类型位都已对齐 LTP 预期
+
+#### 4.2.5 `MAP_SHARED` 跨 `fork/clone(SIGCHLD)` 共享语义
+
+**问题**:
+- `getpid02` / `clone03` 依赖 `MAP_SHARED | MAP_ANONYMOUS` 在父子进程间共享同一页
+- 之前 `MemorySet::from_existed_user()` 会给子进程重新分配页并拷贝内容，导致父进程看不到子进程写入的 pid
+
+**解决方案**:
+- 将 `MapArea` 的数据页持有方式改为 `Arc<FrameTracker>`，允许多个地址空间共享同一物理页
+- 为共享映射增加 `shared_frames` 标记
+- `sys_mmap()` 遇到 `MAP_SHARED` 时建立共享 framed area
+- `MemorySet::from_existed_user()` 遇到共享映射时直接复用父进程已有物理页，而不是重新分配并复制
+
+**结果**:
+- `getpid02` 已确认通过
+- `clone03` 已确认通过
+
+#### 4.2.6 LTP 框架常见 syscall 补齐
+
+**问题**:
+- 在回归 `getpid02` / `clone03` 时，LTP 运行框架仍会触发 `sched_getaffinity`、`setitimer`、`msync`
+- 这些 syscall 早先返回 `ENOSYS`，虽然未必直接让用例失败，但会污染日志并影响更多测例
+
+**解决方案**:
+- 增加最小兼容实现：
+  - `sched_getaffinity()` 返回单核 CPU mask
+  - `getitimer()` / `setitimer()` 提供最小成功路径与参数校验
+  - `msync()` 对常规有效输入直接返回成功
+
+**结果**:
+- `getpid02` / `clone03` 回归时已不再出现对应 `ENOSYS`
+- 为后续更多 LTP 用例继续扩展打掉了几处框架噪音
+
 ### 4.3 当前累计进度
 
 以下统计基于“此前已逐个语义复测通过的 19 项”加上“本轮新修复后重新验证的失败项”得到。
 
-#### 已累计确认通过：23 / 30
+#### 已累计确认通过：28 / 30
 
 **进程管理类**:
+- `getpid02`
 - `fork01`, `fork03`, `wait01`, `wait02`, `wait401`
-- `waitpid03`
-- `clone01`, `clone02`
+- `waitpid01`, `waitpid03`
+- `clone01`, `clone02`, `clone03`
 
 **基本 I/O 类**:
 - `pipe01`
 - `read01`, `read02`, `read04`
-- `write01`, `write02`, `write03`
+- `write01`, `write02`, `write03`, `write05`
 - `close01`, `close02`
 - `dup01`, `dup02`, `dup201`, `dup202`, `dup203`
+- `open01`
 - `lseek01`
 
 说明:
-- 本轮新增确认通过的 4 个用例为：`wait401`、`read02`、`write03`、`dup201`
+- 相比上一版报告，新增确认通过的 5 个失败项为：`waitpid01`、`write05`、`open01`、`getpid02`、`clone03`
+- 以上结论均按日志中的 `TPASS/TFAIL/TBROK` 复核
 
-#### 仍未通过：7 / 30
+#### 仍未通过：2 / 30
 
-- `getpid02`
-- `waitpid01`
 - `exit01`
 - `exit02`
-- `clone03`
-- `write05`
-- `open01`
 
 说明:
-- `exit01`、`exit02` 是上一轮已确认失败项，本轮未重新单独回归，但目前尚无修复
+- `exit01`、`exit02` 已重新回归，仍未通过
+- 两者当前都没有跑到测试主体，而是在 `execve()` 阶段被识别成“非 ELF 文件”并回退给 `/bin/sh`
 
 ### 4.4 仍待解决的问题与根因
 
-#### 4.4.1 `getpid02` / `clone03`
+#### 4.4.1 `exit01` / `exit02`
 
 **现象**:
-- 子进程把 pid 写入 `MAP_SHARED | MAP_ANONYMOUS` 内存后，父进程读到的值仍是 0 或错误值
-
-**根因**:
-- 当前匿名共享映射并没有真正实现跨 `fork()` / 非线程 `clone()` 的共享语义
-- `MemorySet::from_existed_user()` 仍按普通私有页复制
-
-**后续方案**:
-- 为匿名 `MAP_SHARED` 页建立共享物理页或共享映射元数据
-- 相关重点位置：
-  - `os/src/syscall/process.rs`
-  - `os/src/mm/memory_set.rs`
-
-#### 4.4.2 `waitpid01`
-
-**现象**:
-- `raise(sig)` 分支中大量出现 `WIFSIGNALED() not set in status (exited with 0)`
-- 触发 core dump 的信号场景里 `WCOREDUMP()` 也还不对
+- 两个用例都没有进入真正的 `exit()` 断言逻辑
+- `execve("/musl/ltp/testcases/bin/exit01")` / `execve(.../exit02)` 时，内核把目标识别为“非 ELF 且无 shebang”，随后回退到 `/bin/sh`
+- 最终表现分别为：
+  - `exit01`: `syntax error: unexpected "("`
+  - `exit02`: `root:x:0:0:root:/root:/bin/sh: not found`
+- 进一步加临时探针后发现：
+  - `exit01` 读到的是目录数据块，前几个目录项就是 `.` / `..`
+  - `exit02` 读到的是 `/etc/passwd` 的首行文本
 
 **根因判断**:
-- 当前信号自发送路径仍不完整，`raise()` 与 `kill(getpid(), sig)` 的行为不一致
-- wait status 里的 core-dump bit 也尚未编码
+- 当前更像是这两个目标文件在镜像中的读取/识别异常，而不是 `sys_exit()` / `wait()` 的语义本身不对
+- 问题点可能在：
+  - ext4 路径解析命中了错误 inode
+  - 文件内容读取错乱
+  - 镜像中的这两个条目本身异常或与预期二进制不一致
 
 **后续方案**:
-- 继续排查 `raise()` 走到的 `tkill/tgkill/kill` 路径
-- 在 wait status 中补上 core-dump bit
-
-#### 4.4.3 `write05`
-
-**现象**:
-- 对关闭读端的 pipe 写入时，本应返回 `EPIPE`，目前却成功返回
-
-**根因判断**:
-- pipe 写端对“无读者”场景的错误处理还不完整
-- `SIGPIPE` 也可能没有正确送达
-
-**后续方案**:
-- 检查 `os/src/fs/pipe.rs` 的写路径
-- 对读端已关闭的 pipe 返回 `EPIPE`，并补发 `SIGPIPE`
-
-#### 4.4.4 `open01`
-
-**现象**:
-- `sticky bit is cleared unexpectedly`
-
-**根因**:
-- 文件创建模式 `_mode` 还没有在 VFS / stat 元数据中真正保存下来
-- 当前 `stat` 相关实现仍倾向于合成默认 mode
-
-**后续方案**:
-- 在文件创建时保存 mode bits
-- `stat/fstat/fstatat` 返回真实 mode，保留 `S_ISVTX`
+- 在 `execve()` 失败路径打印这两个文件的前若干字节，确认到底读到了什么
+- 必要时进一步排查 ext4 目录项解析和 inode 读取逻辑
+- 在确认测试二进制本身能被正确读取后，再重新验证 `exit01` / `exit02` 是否还存在真实 `exit` 语义问题
 
 ### 4.5 建议的下一步优先级
 
-1. 修 `write05`
-   - 影响范围小，回报高，预计可以再新增 1 个通过用例
+1. 先定位 `exit01` / `exit02` 的文件读取异常
+   - 这是当前目标集剩余的唯一 blocker
 
-2. 修 `waitpid01`
-   - 已经完成一半，继续补 `raise()` 和 core-dump bit 后有机会转绿
+2. 顺手扩大一轮回归
+   - 可以优先再试更多依赖 `MAP_SHARED`、`msync`、`setitimer`、`sched_getaffinity` 的 LTP 用例
 
-3. 修 `open01`
-   - 主要是 mode/sticky bit 元数据问题，属于 VFS 语义补全
-
-4. 攻 `MAP_SHARED | MAP_ANONYMOUS`
-   - 能同时带动 `getpid02` 和 `clone03`
-   - 但改动面最大，建议放在前三项之后
+3. 如有必要，再追 ext4 目录项 / inode 读取
+   - 如果 `exit01` / `exit02` 读到的内容确实异常，这一层很可能是下一个核心战场
 
 ---
 
 ## 5. 总结
 
-本轮工作的重点已经从“补 stub 解锁 LTP 框架初始化”转到“修真实内核语义”。
+本轮工作的重点已经进一步从“补 stub 解锁 LTP 框架初始化”推进到“补关键内核语义并清理框架噪音”。
 
 最新累计结果是：
-- 已累计确认通过 23 / 30
-- 本轮新增修复 4 项：`wait401`、`read02`、`write03`、`dup201`
-- 当前剩余重点问题集中在：共享匿名映射、信号自发送/等待状态、pipe 的 `EPIPE`、文件 mode 元数据
+- 已累计确认通过 28 / 30
+- 这一阶段新增转绿的关键失败项为：`waitpid01`、`write05`、`open01`、`getpid02`、`clone03`
+- 当前剩余重点问题集中在：`exit01` / `exit02` 的可执行文件读取或识别异常
 
 当前最重要的经验是：**不能再看 LTP 自己打印的 `Summary` 或 `initcode` 外层 `[LTP] PASS`，必须按 `TPASS/TFAIL/TBROK` 判定真实结果。**

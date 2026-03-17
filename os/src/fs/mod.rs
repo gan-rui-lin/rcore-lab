@@ -23,6 +23,10 @@ pub trait File: Send + Sync {
     fn read(&self, buf: UserBuffer) -> usize;
     /// write to the file from buf, return the number of bytes written
     fn write(&self, buf: UserBuffer) -> usize;
+    /// write to the file from buf, returning either bytes written or errno
+    fn write_user_buffer(&self, buf: UserBuffer) -> Result<usize, isize> {
+        Ok(self.write(buf))
+    }
     /// read entire file content into a buffer
     fn read_all(&self) -> Vec<u8> {
         Vec::new()
