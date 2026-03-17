@@ -67,3 +67,12 @@ pub fn interrupts_enabled() -> bool {
     use loongArch64::register::prmd;
     prmd::read().pie()
 }
+
+/// Canonicalize a kernel text/function address.
+///
+/// LoongArch64 kernel code already runs in canonical high VA space, so this is
+/// an identity mapping kept for cross-arch API symmetry.
+#[inline]
+pub fn kernel_text_addr(addr: usize) -> usize {
+    addr
+}

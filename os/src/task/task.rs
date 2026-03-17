@@ -120,7 +120,7 @@ impl TaskControlBlock {
                     trap_cx_ppn,
                     task_cx: TaskContext::goto_trap_return(kstack_top, {
                         #[cfg(target_arch = "riscv64")]
-                        { crate::trap::do_trap_return as usize }
+                        { arch::kernel_text_addr(crate::trap::do_trap_return as usize) }
                         #[cfg(target_arch = "loongarch64")]
                         { crate::trap::task_entry as usize }
                     }),

@@ -673,8 +673,6 @@ impl ProcessControlBlock {
         child_inner.tasks.push(Some(Arc::clone(&task)));
         drop(child_inner);
         let mut task_inner = task.inner_exclusive_access();
-        let trap_cx = task_inner.get_trap_cx();
-        trap_cx.kernel_sp = task.kstack.get_top();
         // 子进程继承父进程的信号掩码（Linux 语义：fork 继承 signal_mask）
         task_inner.signal_mask = parent_signal_mask;
         drop(task_inner);

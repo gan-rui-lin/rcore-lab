@@ -183,7 +183,7 @@ pub extern "C" fn user_restore(context: *mut TrapFrame) {
                 st.d    $s7,  $sp, 11*8
                 st.d    $s8,  $sp, 12*8
 
-                csrwr    $sp, KSAVE_KSP   // SAVE kernel_sp to SAVEn(0)
+                csrwr    $sp, KSAVE_KSP   // save current kernel sp to SAVEn(0)
                 move     $sp, $a0         // TIPS: csrwr will write the old value to rd
                 csrwr    $a0, KSAVE_CTX   // SAVE user context addr to SAVEn(1)
 
