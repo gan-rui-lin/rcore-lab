@@ -66,8 +66,14 @@ impl Debug for PhysPageNum {
 
 impl From<usize> for PhysAddr {
     fn from(v: usize) -> Self {
-        let masked = v & ((1 << PA_WIDTH_SV39) - 1);
-        Self(masked & !VIRT_ADDR_START)
+        // Only strip the direct-map alias when the incoming address is in the
+        // high-half alias window. Keep normal physical addresses unchanged.
+        let stripped = if (v & VIRT_ADDR_START) == VIRT_ADDR_START {
+            v & !VIRT_ADDR_START
+        } else {
+            v
+        };
+        Self(stripped & ((1 << PA_WIDTH_SV39) - 1))
     }
 }
 impl From<usize> for PhysPageNum {
