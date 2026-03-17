@@ -181,7 +181,7 @@ fi
 # 运行QEMU
 echo "启动QEMU模拟器..."
 qemu-system-riscv64 -machine virt \
-    -kernel kernel-rv \
+    -kernel kernel-rv.bin \
   -m 128M \
   -nographic \
   -smp 1 \

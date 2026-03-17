@@ -24,8 +24,8 @@ use arch::{FpRegs, MContext};
 use crate::config::PAGE_SIZE;
 #[cfg(target_arch = "loongarch64")]
 use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
-#[cfg(not(target_arch = "loongarch64"))]
-use crate::config::TRAMPOLINE as USER_ADDR_MAX;
+#[cfg(target_arch = "riscv64")]
+const USER_ADDR_MAX: usize = 0x8_0000_0000;
 use crate::timer::remove_timer;
 #[cfg(target_arch = "riscv64")]
 /// Alias for backward compatibility within this module.
@@ -254,6 +254,7 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), ()> {
 
 pub fn suspend_current_and_run_next() {
     let task = take_current_task().unwrap();
+    task.kstack.check_guard();
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
     task_inner.task_status = TaskStatus::Ready;
@@ -265,6 +266,7 @@ pub fn suspend_current_and_run_next() {
 /// This function must be followed by a schedule
 pub fn block_current_task() -> *mut TaskContext {
     let task = take_current_task().unwrap();
+    task.kstack.check_guard();
     let mut task_inner = task.inner_exclusive_access();
     task_inner.task_status = TaskStatus::Blocked;
     &mut task_inner.task_cx as *mut TaskContext
@@ -277,6 +279,7 @@ pub fn block_current_and_run_next() {
 
 pub fn exit_current_and_run_next(exit_code: i32) {
     let task = take_current_task().unwrap();
+    task.kstack.check_guard();
     let mut task_inner = task.inner_exclusive_access();
     let process = task.process.upgrade().unwrap();
     let tid = task_inner.res.as_ref().unwrap().tid;
@@ -794,18 +797,25 @@ pub fn handle_signals() {
             );
         }
     }
-    // RISC-V and others: use sa_restorer if valid, otherwise no RA override
+    // RISC-V: use sa_restorer if valid; otherwise fallback to fixed SIG_RETURN_ADDR stub.
     #[cfg(not(target_arch = "loongarch64"))]
-    if action.restorer != 0 {
-        if action.restorer < USER_ADDR_MAX {
-            trap_cx[TrapFrameArgs::RA] = action.restorer;
+    {
+        if action.restorer != 0 {
+            if action.restorer < USER_ADDR_MAX {
+                trap_cx[TrapFrameArgs::RA] = action.restorer;
+            } else {
+                error!(
+                    "[signal] pid={} signum={} invalid restorer={:#x}, fallback to SIG_RETURN_ADDR",
+                    pid,
+                    signum,
+                    action.restorer
+                );
+                trap_cx[TrapFrameArgs::RA] =
+                    arch::SIG_RETURN_ADDR + arch::sigtrx::sigreturn_trampoline_offset();
+            }
         } else {
-            error!(
-                "[signal] pid={} signum={} invalid restorer={:#x}, ignoring",
-                pid,
-                signum,
-                action.restorer
-            );
+            trap_cx[TrapFrameArgs::RA] =
+                arch::SIG_RETURN_ADDR + arch::sigtrx::sigreturn_trampoline_offset();
         }
     }
 

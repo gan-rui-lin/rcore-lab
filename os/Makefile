@@ -47,7 +47,7 @@ TEST ?=
 
 build: env $(KERNEL_RV_BIN) fs-img 
 
-rv: env kernel-rv sbi-qemu
+rv: env kernel-rv $(KERNEL_RV_BIN) sbi-qemu
 la: env-la kernel-la
 all: rv la
 
