@@ -75,6 +75,16 @@ struct ArchInterfaceImpl;
 
 #[crate_interface::impl_interface]
 impl arch::api::ArchInterface for ArchInterfaceImpl {
+    fn init_allocator() {}
+
+    fn init_logging() {}
+
+    fn add_memory_region(_start: usize, _end: usize) {}
+
+    fn main(_hartid: usize) {}
+
+    fn prepare_drivers() {}
+
     fn kernel_interrupt(trap_type: arch::TrapType) {
         crate::trap::kernel_interrupt_dispatch(trap_type);
     }
@@ -88,5 +98,9 @@ impl arch::api::ArchInterface for ArchInterfaceImpl {
 
     fn frame_dealloc(ppn: usize) {
         crate::mm::frame_dealloc(arch::PhysPageNum(ppn));
+    }
+
+    fn kernel_page_table_token() -> usize {
+        crate::mm::kernel_page_table_token_if_ready()
     }
 }

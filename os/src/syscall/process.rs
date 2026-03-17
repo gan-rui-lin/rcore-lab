@@ -31,8 +31,8 @@ use crate::config::{CLOCK_FREQ, PAGE_SIZE};
 use crate::sync::UPIntrFreeCell;
 #[cfg(target_arch = "loongarch64")]
 use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
-#[cfg(not(target_arch = "loongarch64"))]
-use crate::config::TRAMPOLINE as USER_ADDR_MAX;
+#[cfg(target_arch = "riscv64")]
+const USER_ADDR_MAX: usize = 0x8_0000_0000;
 
 lazy_static! {
     static ref EXEC_IMAGE_CACHE: UPIntrFreeCell<BTreeMap<String, Arc<[u8]>>> =
@@ -530,7 +530,6 @@ pub fn sys_fork() -> isize {
     if clone_stack != 0 {
         trap_cx[TrapFrameArgs::SP] = clone_stack;
     }
-    trap_cx.kernel_sp = new_task.kstack.get_top();
     new_pid as isize
 }
 
@@ -628,7 +627,6 @@ pub fn sys_clone(
             dump_user_bytes("tp+0x0", token, tls_addr, 64);
         }
     }
-    new_trap_cx.kernel_sp = new_task.kstack.get_top();
     drop(new_task_inner);
     if clone_flags.contains(CloneFlags::CHILD_CLEARTID) && !ctid.is_null() {
         let mut inner = new_task.inner_exclusive_access();
