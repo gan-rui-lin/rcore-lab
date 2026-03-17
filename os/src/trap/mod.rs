@@ -29,6 +29,21 @@ pub use task_entry as user_trap_entry;
 const TIMER_SAMPLE_INTERVAL: u64 = 200;
 static TIMER_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(target_arch = "riscv64")]
+fn riscv_insn_len_at(user_token: usize, sepc: usize) -> usize {
+    let page_table = PageTable::from_token(user_token);
+    let read_byte = |va: usize| -> Option<u8> {
+        let pa = page_table.translate_va(VirtAddr::from(va))?;
+        Some(*pa.get_ref::<u8>())
+    };
+    let (b0, b1) = match (read_byte(sepc), read_byte(sepc.wrapping_add(1))) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return 2,
+    };
+    let insn16 = u16::from_le_bytes([b0, b1]);
+    if (insn16 & 0b11) == 0b11 { 4 } else { 2 }
+}
+
 // ---------------------------------------------------------------------------
 // Kernel-mode trap dispatch (called from ArchInterface::kernel_interrupt)
 // ---------------------------------------------------------------------------
@@ -315,8 +330,10 @@ pub fn do_trap_return() -> ! {
                 current_add_signal(SignalFlags::SIGILL);
             }
             arch::TrapType::Breakpoint => {
+                let user_token = current_user_token();
                 let trap_cx = current_trap_cx();
-                trap_cx.sepc += 2;
+                let step = riscv_insn_len_at(user_token, trap_cx.sepc);
+                trap_cx.sepc = trap_cx.sepc.wrapping_add(step);
             }
             _ => {
                 let trap_cx = current_trap_cx();

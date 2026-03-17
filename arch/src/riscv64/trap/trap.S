@@ -111,8 +111,9 @@ user_restore:
     sd ra, 8*17(sp)
 
     // a0 = &TrapContext
-    // Save kernel stack pointer as high-half alias so uservec can access it
-    // before switching satp back to kernel.
+    // Save kernel stack pointer as high-half alias in TrapContext slot 0.
+    // Rust `TrapContext` models slot 0 as x0, so this value is strictly
+    // transient and must be cleared in uservec before returning to Rust.
     li t1, 0xffffffc000000000
     or t1, sp, t1
     sd t1, 8*0(a0)
@@ -133,6 +134,7 @@ uservec:
 
     mv a0, sp
     ld sp, 0*8(a0)
+    // Clear transient slot-0 scratch to keep architectural x0 semantic.
     sd x0, 0*8(a0)
     // Switch back to kernel page table before returning into kernel Rust code.
     ld t0, 8*0(sp)

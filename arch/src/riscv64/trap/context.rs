@@ -13,6 +13,10 @@ use crate::TrapFrameArgs;
 #[derive(Debug, Copy, Clone)]
 pub struct TrapContext {
     /// General-purpose registers x0-x31.
+    ///
+    /// NOTE: RV `trap.S` temporarily uses `x[0]` as an internal kernel stack
+    /// scratch slot between `user_restore` and `uservec`, then clears it back
+    /// to zero in `uservec`. Rust code must treat `x[0]` as architectural x0.
     pub x: [usize; 32],
     /// Supervisor Status Register.
     pub sstatus: Sstatus,
@@ -103,6 +107,7 @@ impl TrapContext {
     pub fn restore_from_ucontext_gregs(&mut self, gregs: &[usize; 32]) {
         self.sepc = gregs[0];
         self.x[1..].copy_from_slice(&gregs[1..]);
+        self.x[0] = 0;
     }
 }
 
