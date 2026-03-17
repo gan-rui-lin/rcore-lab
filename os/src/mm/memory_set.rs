@@ -5,7 +5,6 @@ use super::{PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 #[allow(unused_imports)]
 use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, USER_STACK_SIZE};
-#[cfg(target_arch = "loongarch64")]
 use crate::config::USER_STACK_TOP;
 use crate::sync::UPIntrFreeCell;
 use alloc::collections::BTreeMap;
@@ -371,16 +370,8 @@ impl MemorySet {
     ) -> (usize, usize) {
         let max_end_va: VirtAddr = max_end_vpn.into();
         let heap_bottom: usize = max_end_va.into();
-        #[cfg(target_arch = "loongarch64")]
         let (user_stack_bottom, user_stack_top) =
             (USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_TOP);
-        #[cfg(not(target_arch = "loongarch64"))]
-        let (user_stack_bottom, user_stack_top) = {
-            #[allow(unused_mut)]
-            let mut bottom = heap_bottom + PAGE_SIZE;
-            let top = bottom + USER_STACK_SIZE;
-            (bottom, top)
-        };
         memory_set.push(
             MapArea::new(
                 user_stack_bottom.into(),
