@@ -22,10 +22,7 @@ use arch::{shutdown, TrapContext, TrapFrameArgs};
 use arch::{FpRegs, MContext};
 #[cfg(target_arch = "loongarch64")]
 use crate::config::PAGE_SIZE;
-#[cfg(target_arch = "loongarch64")]
 use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
-#[cfg(target_arch = "riscv64")]
-const USER_ADDR_MAX: usize = 0x8_0000_0000;
 use crate::timer::remove_timer;
 #[cfg(target_arch = "riscv64")]
 /// Alias for backward compatibility within this module.
