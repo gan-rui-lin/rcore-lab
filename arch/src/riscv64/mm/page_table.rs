@@ -86,6 +86,27 @@ fn dealloc_frame(ppn: PhysPageNum) {
     crate::api::ArchInterface::frame_dealloc(ppn.0);
 }
 
+/// Clone kernel root mappings into a freshly allocated user page-table root.
+///
+/// Returns early if kernel page table is not ready yet (token = 0).
+fn clone_kernel_root_mappings(dst_root: PhysPageNum) {
+    let kernel_token = ArchInterface::kernel_page_table_token();
+    if kernel_token == 0 {
+        warn!("kernel page table is not ready yet, skip cloning kernel root mappings");
+        return;
+    }
+    let kernel_root = PhysPageNum::from(kernel_token & ((1usize << 44) - 1));
+    let dst = dst_root.get_pte_array();
+    let src = kernel_root.get_pte_array();
+    // Keep user low half free (0..0x100) for process mappings, and only share
+    // kernel high-half mappings (0x100..0x1ff), consistent with rustoswhu.
+    for i in 0x100..512 {
+        if !dst[i].is_valid() && src[i].is_valid() {
+            dst[i] = src[i];
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PageTable
 // ---------------------------------------------------------------------------
@@ -117,6 +138,8 @@ impl PageTable {
         let root = alloc_frame();
         // Zero-fill the root page so every PTE starts as invalid.
         root.get_bytes_array().fill(0);
+        // Share kernel mappings so trap entry can run without trampoline mapping.
+        clone_kernel_root_mappings(root);
         PageTable {
             root_ppn: root,
             frames: vec![root],
@@ -176,6 +199,25 @@ impl PageTable {
         result
     }
 
+    /// Walk page-table entries and return the first valid leaf entry.
+    ///
+    /// The returned level is 0/1/2 for Sv39 L2/L1/L0 respectively.
+    fn find_leaf_pte(&self, vpn: VirtPageNum) -> Option<(PageTableEntry, usize)> {
+        let idxs = vpn.indexes();
+        let mut ppn = self.root_ppn;
+        for (level, idx) in idxs.iter().enumerate() {
+            let pte = ppn.get_pte_array()[*idx];
+            if !pte.is_valid() {
+                return None;
+            }
+            if level == 2 || pte.readable() || pte.writable() || pte.executable() {
+                return Some((pte, level));
+            }
+            ppn = pte.ppn();
+        }
+        None
+    }
+
     /// Map `vpn` to `ppn` with the given `flags`.
     #[allow(unused)]
     pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
@@ -207,16 +249,22 @@ impl PageTable {
 
     /// Translate `vpn` to a PTE (if mapped).
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
-        self.find_pte(vpn).map(|pte| *pte)
+        self.find_leaf_pte(vpn).map(|(pte, _)| pte)
     }
 
     /// Translate a virtual address to a physical address (if mapped).
     pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
-        self.find_pte(va.clone().floor()).map(|pte| {
-            let aligned_pa: PhysAddr = pte.ppn().into();
-            let offset = va.page_offset();
-            let aligned_pa_usize: usize = aligned_pa.into();
-            (aligned_pa_usize + offset).into()
+        let vpn = va.floor();
+        let va_usize: usize = va.into();
+        self.find_leaf_pte(vpn).map(|(pte, level)| {
+            let page_bits = match level {
+                0 => 30, // 1 GiB leaf at root
+                1 => 21, // 2 MiB leaf at middle level
+                _ => 12, // 4 KiB leaf at last level
+            };
+            let page_mask = (1usize << page_bits) - 1;
+            let pa_base = (pte.ppn().0 << 12) & !page_mask;
+            (pa_base | (va_usize & page_mask)).into()
         })
     }
 

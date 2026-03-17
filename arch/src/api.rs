@@ -12,6 +12,17 @@ use crate::TrapType;
 /// Trait that the kernel must implement to service arch-layer callbacks.
 #[crate_interface::def_interface]
 pub trait ArchInterface {
+    /// Init allocator in kernel.
+    fn init_allocator();
+    /// Init logging in kernel.
+    fn init_logging();
+    /// Add a memory region into frame allocator.
+    fn add_memory_region(start: usize, end: usize);
+    /// Kernel main entry.
+    fn main(hartid: usize);
+    /// Prepare platform drivers.
+    fn prepare_drivers();
+
     /// Dispatch a user-mode trap / interrupt to the kernel.
     ///
     /// Called from the architecture's trap entry after saving registers
@@ -28,4 +39,10 @@ pub trait ArchInterface {
     /// Free one physical page frame previously obtained from
     /// [`frame_alloc`](ArchInterface::frame_alloc).
     fn frame_dealloc(ppn: usize);
+
+    /// Return kernel page-table token if it is ready, otherwise 0.
+    ///
+    /// This allows arch page-table code to share kernel mappings into
+    /// per-process page tables without depending on kernel internals.
+    fn kernel_page_table_token() -> usize;
 }

@@ -1,62 +1,38 @@
-//! RISC-V trap handling — architecture layer.
+//! RISC-V trap handling -- architecture layer.
 //!
-//! This module provides the low-level trap setup, the `trap.S` trampoline
-//! code, and the `trap_return` path.  The **dispatch** logic (syscall
-//! routing, signal handling, scheduling) lives in the kernel crate's
-//! `os/src/trap/mod.rs` and is invoked via the `TrapContext.trap_handler`
-//! function pointer (for user-mode traps) or via the
-//! [`ArchInterface::kernel_interrupt`] callback (for kernel-mode traps).
+//! This implementation uses `kernelvec/uservec` with `sscratch` stack
+//! switching and does not depend on trampoline-page trap entry.
 
 mod context;
 
 use crate::api::ArchInterface;
 use crate::TrapType;
-use super::mm::address::PAGE_SIZE;
-use core::arch::{asm, global_asm};
+use core::arch::global_asm;
 use riscv::register::{
     mtvec::TrapMode,
     scause::{self, Exception, Interrupt, Trap},
-    sie, sscratch, sstatus, stval, stvec,
+    sie, sscratch, stval, stvec,
 };
 
 global_asm!(include_str!("trap.S"));
 
-/// The virtual address of the trampoline page (highest page in the VA space).
-pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
+extern "C" {
+    fn kernelvec();
+    fn user_restore(context: *mut u8, user_satp: usize);
+}
 
-// ---------------------------------------------------------------------------
-// Initialization
-// ---------------------------------------------------------------------------
-
-/// Initialize trap handling: point `stvec` at the kernel-mode trap entry.
+/// Initialize trap handling: point `stvec` at `kernelvec`.
 pub fn init() {
-    set_kernel_trap_entry();
-}
-
-/// Point `stvec` at `__alltraps_k` (via TRAMPOLINE offset) for traps
-/// taken while in supervisor mode.
-fn set_kernel_trap_entry() {
-    extern "C" {
-        fn __alltraps();
-        fn __alltraps_k();
-    }
-    let __alltraps_k_va = __alltraps_k as usize - __alltraps as usize + TRAMPOLINE;
+    let kernelvec_high = if (kernelvec as usize) >= crate::VIRT_ADDR_START {
+        kernelvec as usize
+    } else {
+        (kernelvec as usize) | crate::VIRT_ADDR_START
+    };
     unsafe {
-        stvec::write(__alltraps_k_va, TrapMode::Direct);
-        sscratch::write(trap_from_kernel as usize);
+        stvec::write(kernelvec_high, TrapMode::Direct);
+        sscratch::write(0);
     }
 }
-
-/// Point `stvec` at the TRAMPOLINE page for traps from user mode.
-fn set_user_trap_entry() {
-    unsafe {
-        stvec::write(TRAMPOLINE as usize, TrapMode::Direct);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Timer interrupt enable
-// ---------------------------------------------------------------------------
 
 /// Enable the supervisor timer interrupt (sets `sie.STIE`).
 pub fn enable_timer_interrupt() {
@@ -65,51 +41,27 @@ pub fn enable_timer_interrupt() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Return to user space
-// ---------------------------------------------------------------------------
-
-/// Return to user mode.
-///
-/// This is a **parameterised** entry point: the caller (the kernel) must
-/// supply the trap-context pointer and `satp` token, rather than the arch
-/// layer querying kernel task state directly.
-///
-/// # Arguments
-/// * `trap_cx_ptr` — virtual address of this task's `TrapContext` (in the
-///   trampoline page).
-/// * `user_satp` — `satp` token of the user address space.
-pub fn trap_return(trap_cx_ptr: usize, user_satp: usize) -> ! {
-    unsafe { sstatus::clear_sie(); }
-    set_user_trap_entry();
-    extern "C" {
-        fn __alltraps();
-        fn __restore();
-    }
-    let restore_va = __restore as usize - __alltraps as usize + TRAMPOLINE;
-    unsafe {
-        asm!(
-            "fence.i",
-            "jr {restore_va}",
-            restore_va = in(reg) restore_va,
-            in("a0") trap_cx_ptr,
-            in("a1") user_satp,
-            options(noreturn)
-        );
-    }
+/// Enter user mode and return once a trap from user mode occurs.
+pub fn run_user_task(context: &mut context::TrapContext, user_satp: usize) -> TrapType {
+    let restore_high = if (user_restore as usize) >= crate::VIRT_ADDR_START {
+        user_restore as usize
+    } else {
+        (user_restore as usize) | crate::VIRT_ADDR_START
+    };
+    let restore_fn: extern "C" fn(*mut u8, usize) = unsafe { core::mem::transmute(restore_high) };
+    restore_fn((context as *mut _) as *mut u8, user_satp);
+    classify_current_trap()
 }
 
-// ---------------------------------------------------------------------------
-// Kernel-mode trap handler
-// ---------------------------------------------------------------------------
+/// Deprecated compatibility entry. RISC-V now returns to user through
+/// `run_user_task` loop in kernel `task_entry`.
+pub fn trap_return(_trap_cx_ptr: usize, _user_satp: usize) -> ! {
+    panic!("trap_return() is obsolete on riscv64; use run_user_task loop")
+}
 
-/// Handle a trap taken while already in supervisor mode.
-///
-/// Classifies the hardware trap into a [`TrapType`] and dispatches it to
-/// the kernel via [`ArchInterface::kernel_interrupt`].  Traps that the
-/// kernel cannot handle cause a panic.
+/// Called from `trap.S` for traps taken while already in supervisor mode.
 #[no_mangle]
-fn trap_from_kernel(_trap_cx: &context::KernelTrapContext) {
+extern "C" fn trap_from_kernel(_trap_cx: &context::KernelTrapContext) {
     let scause = scause::read();
     let stval = stval::read();
 
@@ -118,6 +70,13 @@ fn trap_from_kernel(_trap_cx: &context::KernelTrapContext) {
         Trap::Interrupt(Interrupt::SupervisorTimer) => TrapType::Time,
         Trap::Exception(Exception::Breakpoint) => TrapType::Breakpoint,
         _ => {
+            error!(
+                "[rv-ktrap] unsupported kernel trap: bits={:#x} cause={:?} stval={:#x} sepc={:#x}",
+                scause.bits(),
+                scause.cause(),
+                stval,
+                _trap_cx.sepc
+            );
             panic!(
                 "Unsupported trap from kernel: {:?}, stval = {:#x}!",
                 scause.cause(),
@@ -126,11 +85,30 @@ fn trap_from_kernel(_trap_cx: &context::KernelTrapContext) {
         }
     };
 
-    crate::api::ArchInterface::kernel_interrupt(trap_type);
+    ArchInterface::kernel_interrupt(trap_type);
 }
 
-// ---------------------------------------------------------------------------
-// Re-exports
-// ---------------------------------------------------------------------------
+fn classify_current_trap() -> TrapType {
+    let scause = scause::read();
+    let stval = stval::read();
+    match scause.cause() {
+        Trap::Exception(Exception::UserEnvCall) => TrapType::UserEnvCall,
+        Trap::Exception(Exception::Breakpoint) => TrapType::Breakpoint,
+        Trap::Interrupt(Interrupt::SupervisorTimer) => TrapType::Time,
+        Trap::Interrupt(Interrupt::SupervisorExternal) => TrapType::SupervisorExternal,
+        Trap::Exception(Exception::StoreFault) | Trap::Exception(Exception::StorePageFault) => {
+            TrapType::StorePageFault(stval)
+        }
+        Trap::Exception(Exception::LoadFault) | Trap::Exception(Exception::LoadPageFault) => {
+            TrapType::LoadPageFault(stval)
+        }
+        Trap::Exception(Exception::InstructionFault)
+        | Trap::Exception(Exception::InstructionPageFault) => {
+            TrapType::InstructionPageFault(stval)
+        }
+        Trap::Exception(Exception::IllegalInstruction) => TrapType::IllegalInstruction(stval),
+        _ => TrapType::Unknown,
+    }
+}
 
 pub use context::TrapContext;

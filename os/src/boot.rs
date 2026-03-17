@@ -9,10 +9,27 @@
 #[cfg(target_arch = "riscv64")]
 #[no_mangle]
 pub fn rust_main() -> ! {
+    arch::switch_to_kernel_page_table();
+    unsafe {
+        core::arch::asm!(
+            "or sp, sp, {virt_base}",
+            virt_base = in(reg) arch::VIRT_ADDR_START
+        );
+    }
+    let entry_high = arch::kernel_text_addr(rust_main_high as usize);
+    let entry: fn() -> ! = unsafe { core::mem::transmute(entry_high) };
+    entry();
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+fn rust_main_high() -> ! {
     arch::clear_bss();
     crate::logging::init();
     crate::mm::init();
-    crate::mm::remap_test();
+    // Under the high-half kernel execution model, the legacy remap_test
+    // assumptions about section-level low-half mappings do not hold.
+    // Keep boot path moving and add a dedicated high-half sanity check later.
     arch::trap_init();
     arch::trap_enable_timer_interrupt();
     crate::timer::set_next_trigger();
