@@ -77,6 +77,18 @@ impl MemorySet {
             None,
         );
     }
+    /// Insert a framed user area whose pages stay shared across `fork()`.
+    pub fn insert_shared_framed_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) {
+        self.push(
+            MapArea::new(start_va, end_va, MapType::Framed, permission).with_shared_frames(),
+            None,
+        );
+    }
     /// remove a area
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some((idx, area)) = self
@@ -98,6 +110,11 @@ impl MemorySet {
             map_area.copy_data(&mut self.page_table, data);
         }
         self.areas.push(map_area);
+    }
+    fn push_shared_from(&mut self, area: &MapArea, src_page_table: &PageTable) {
+        let mut new_area = MapArea::from_another(area);
+        new_area.map_shared_from(&mut self.page_table, area, src_page_table);
+        self.areas.push(new_area);
     }
     /// Mention that trampoline is not collected by areas.
     #[cfg(not(target_arch = "loongarch64"))]
@@ -608,6 +625,12 @@ impl MemorySet {
                 area.vpn_range.get_start(),
                 area.vpn_range.get_end()
             );
+            if area.shares_frames() {
+                memory_set.push_shared_from(area, &user_space.page_table);
+                debug!("[kernel] clone shared area {} done", idx);
+                trace!("memory_set: clone shared area {} done", idx);
+                continue;
+            }
             let new_area = MapArea::from_another(area);
             memory_set.push(new_area, None);
             if area.map_perm.contains(MapPermission::U)
@@ -831,9 +854,10 @@ impl MemorySet {
 pub struct MapArea {
     start_va: VirtAddr,
     vpn_range: VPNRange,
-    data_frames: BTreeMap<VirtPageNum, FrameTracker>,
+    data_frames: BTreeMap<VirtPageNum, Arc<FrameTracker>>,
     map_type: MapType,
     map_perm: MapPermission,
+    shared_frames: bool,
 }
 
 impl MapArea {
@@ -851,6 +875,7 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type,
             map_perm,
+            shared_frames: false,
         }
     }
     pub fn from_another(another: &Self) -> Self {
@@ -860,7 +885,15 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type: another.map_type,
             map_perm: another.map_perm,
+            shared_frames: another.shared_frames,
         }
+    }
+    fn with_shared_frames(mut self) -> Self {
+        self.shared_frames = true;
+        self
+    }
+    fn shares_frames(&self) -> bool {
+        self.shared_frames
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
@@ -877,13 +910,35 @@ impl MapArea {
                 }
             }
             MapType::Framed => {
-                let frame = frame_alloc().unwrap();
+                let frame = Arc::new(frame_alloc().unwrap());
                 ppn = frame.ppn;
                 self.data_frames.insert(vpn, frame);
             }
         }
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
         page_table.map(vpn, ppn, pte_flags);
+    }
+    fn map_shared_from(
+        &mut self,
+        page_table: &mut PageTable,
+        parent: &Self,
+        src_page_table: &PageTable,
+    ) {
+        assert_eq!(self.map_type, MapType::Framed);
+        assert_eq!(parent.map_type, MapType::Framed);
+        for vpn in self.vpn_range {
+            let frame = parent
+                .data_frames
+                .get(&vpn)
+                .unwrap_or_else(|| panic!("shared map missing frame for vpn {:?}", vpn))
+                .clone();
+            let pte_flags = src_page_table
+                .translate(vpn)
+                .map(|pte| pte.flags())
+                .unwrap_or_else(|| PTEFlags::from_bits(self.map_perm.bits).unwrap());
+            page_table.map(vpn, frame.ppn, pte_flags);
+            self.data_frames.insert(vpn, frame);
+        }
     }
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         if self.map_type == MapType::Framed {

@@ -94,6 +94,10 @@ const SYSCALL_SET_ROBUST_LIST: usize = 99;
 const SYSCALL_GET_ROBUST_LIST: usize = 100;
 /// nanosleep syscall
 const SYSCALL_NANOSLEEP: usize = 101;
+/// getitimer syscall
+const SYSCALL_GETITIMER: usize = 102;
+/// setitimer syscall
+const SYSCALL_SETITIMER: usize = 103;
 /// yield syscall
 const SYSCALL_YIELD: usize = 124;
 /// thread_create syscall
@@ -124,6 +128,8 @@ const SYSCALL_CONDVAR_WAIT: usize = 473;
 const SYSCALL_KILL: usize = 129;
 /// tkill syscall
 const SYSCALL_TKILL: usize = 130;
+/// tgkill syscall
+const SYSCALL_TGKILL: usize = 131;
 /// sigaction syscall
 const SYSCALL_SIGACTION: usize = 134;
 /// sigprocmask syscall
@@ -148,6 +154,8 @@ const SYSCALL_STATFS: usize = 43;
 const SYSCALL_FSTATFS: usize = 44;
 /// clock_gettime syscall
 const SYSCALL_CLOCK_GETTIME: usize = 113;
+/// sched_getaffinity syscall
+const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 /// syslog syscall
 const SYSCALL_SYSLOG: usize = 116;
 /// gettime syscall
@@ -194,6 +202,8 @@ const SYSCALL_EXEC: usize = 221;
 const SYSCALL_MMAP: usize = 222;
 /// mprotect syscall
 const SYSCALL_MPROTECT: usize = 226;
+/// msync syscall
+const SYSCALL_MSYNC: usize = 227;
 /// waitpid syscall
 const SYSCALL_WAITPID: usize = 260;
 /// prlimit64 syscall
@@ -637,9 +647,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[5] as i32,
         ),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const TimeSpec, args[1] as *mut TimeSpec),
+        SYSCALL_GETITIMER => sys_getitimer(args[0] as isize, args[1] as *mut process::ITimerVal),
+        SYSCALL_SETITIMER => sys_setitimer(
+            args[0] as isize,
+            args[1] as *const process::ITimerVal,
+            args[2] as *mut process::ITimerVal,
+        ),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
         SYSCALL_TKILL => process::sys_tkill(args[0] as isize, args[1] as i32),
+        SYSCALL_TGKILL => process::sys_tgkill(args[0] as isize, args[1] as isize, args[2] as i32),
         SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
             args[0] as *const usize,
             args[1] as *mut usize,
@@ -711,11 +728,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),
+        SYSCALL_SCHED_GETAFFINITY => sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8),
         SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_GET_TIME => sys_get_time(args[0] as *mut TimeVal, args[1]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
+        SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2]),
         SYSCALL_SBRK => sys_sbrk(args[0] as isize),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),

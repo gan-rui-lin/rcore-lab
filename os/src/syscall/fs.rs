@@ -1,6 +1,6 @@
 //! File and filesystem-related syscalls
 use crate::fs::{
-    create_dir, make_pipe, open_file, path_is_dir, remove_path, DevNull, DevZero,
+    create_dir, make_pipe, open_file, path_exists, path_is_dir, remove_path, DevNull, DevZero,
     OpenFlags, Stat, StatMode, PollEvents,
 };
 use crate::mm::{
@@ -74,6 +74,8 @@ lazy_static! {
     static ref TIMESTAMPS: UPSafeCell<BTreeMap<usize, FileTimestamps>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
     static ref TS_NEXT_ID: UPSafeCell<usize> = unsafe { UPSafeCell::new(1) };
+    static ref PATH_MODES: UPSafeCell<BTreeMap<String, u32>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
 }
 
 #[allow(dead_code)]
@@ -105,6 +107,20 @@ fn ts_set(id: usize, ts: FileTimestamps) {
 fn ts_remove(id: usize) {
     let mut map = TIMESTAMPS.exclusive_access();
     map.remove(&id);
+}
+
+fn path_mode_get(path: &str) -> Option<u32> {
+    PATH_MODES.exclusive_access().get(path).copied()
+}
+
+fn path_mode_set(path: &str, mode: u32) {
+    PATH_MODES
+        .exclusive_access()
+        .insert(String::from(path), mode & 0o7777);
+}
+
+fn path_mode_remove(path: &str) {
+    PATH_MODES.exclusive_access().remove(path);
 }
 
 #[repr(C)]
@@ -279,7 +295,10 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
         let Some(buffers) = translated_byte_buffer_checked(token, buf, len, false) else {
             return errno(EFAULT);
         };
-        let written = file.write(UserBuffer::new(buffers)) as isize;
+        let written = match file.write_user_buffer(UserBuffer::new(buffers)) {
+            Ok(written) => written as isize,
+            Err(err) => return err,
+        };
         // let name = process.inner_exclusive_access().name.clone();
         // if (name == "busybox" || name == "sh") && fd <= 2 && len > 0 {
         //     if written == 0 {
@@ -371,6 +390,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     //     );
     // }
     let flags = OpenFlags::from_bits_truncate(flags);
+    let existed = path_exists(&full_path);
     if flags.contains(OpenFlags::DIRECTORY) && !path_is_dir(&full_path) {
         return errno(ENOTDIR);
     }
@@ -390,6 +410,9 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         return fd as isize;
     }
     if let Some(inode) = open_file(full_path.as_str(), flags) {
+        if flags.contains(OpenFlags::CREATE) && !existed {
+            path_mode_set(&full_path, _mode);
+        }
         let mut inner = process.inner_exclusive_access();
         let fd = match inner.alloc_fd() {
             Some(fd) => fd,
@@ -460,6 +483,7 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
         return errno(EEXIST);
     }
     if create_dir(&full_path) {
+        path_mode_set(&full_path, _mode);
         0
     } else {
         errno(EIO)
@@ -553,7 +577,7 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, _flags: u32) ->
             } else {
                 StatMode::FILE
             };
-            (mode.bits() | 0o777, inode.size())
+            (mode.bits() | path_mode_get(&full_path).unwrap_or(0o777), inode.size())
         } else {
             (StatMode::FILE.bits() | 0o666, 0)
         };
@@ -765,7 +789,7 @@ fn stat_from_fd(fd: usize) -> Result<Stat, isize> {
             } else {
                 StatMode::FILE
             };
-            (mode.bits() | 0o777, inode.size())
+            (mode.bits() | path_mode_get(path).unwrap_or(0o777), inode.size())
         } else {
             (StatMode::FILE.bits() | 0o666, 0)
         };
@@ -802,7 +826,7 @@ fn stat_from_path(full_path: &str) -> Result<Stat, isize> {
         } else {
             StatMode::FILE
         };
-        (mode.bits() | 0o777, inode.size())
+        (mode.bits() | path_mode_get(full_path).unwrap_or(0o777), inode.size())
     } else {
         (StatMode::FILE.bits() | 0o666, 0)
     };
@@ -844,7 +868,7 @@ pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
             } else {
                 StatMode::FILE
             };
-            (mode.bits() | 0o777, inode.size())
+            (mode.bits() | path_mode_get(path).unwrap_or(0o777), inode.size())
         } else {
             (StatMode::FILE.bits() | 0o666, 0)
         };
@@ -1111,6 +1135,7 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
         return errno(EISDIR);
     }
     if remove_path(&path, is_dir) {
+        path_mode_remove(&path);
         0
     } else {
         errno(EIO)
@@ -1628,7 +1653,15 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
         }
 
         let buffers = translated_byte_buffer(token, base as *const u8, len);
-        let written = file.write(UserBuffer::new(buffers));
+        let written = match file.write_user_buffer(UserBuffer::new(buffers)) {
+            Ok(written) => written,
+            Err(err) => {
+                if total_written > 0 {
+                    return total_written;
+                }
+                return err;
+            }
+        };
         total_written += written as isize;
     }
 

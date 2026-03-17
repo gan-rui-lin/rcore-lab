@@ -64,10 +64,17 @@ fn dump_user_bytes(tag: &str, token: usize, addr: usize, len: usize) {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct TimeVal {
     pub sec: usize,
     pub usec: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ITimerVal {
+    pub it_interval: TimeVal,
+    pub it_value: TimeVal,
 }
 
 #[repr(C)]
@@ -1020,7 +1027,12 @@ fn encode_wait_status(exit_code: i32) -> i32 {
     if exit_code >= 0 {
         (exit_code & 0xff) << 8
     } else {
-        (-exit_code) & 0x7f
+        let signum = (-exit_code) & 0x7f;
+        let core = match signum {
+            3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31 => 0x80,
+            _ => 0,
+        };
+        signum | core
     }
 }
 
@@ -1166,6 +1178,86 @@ pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
     0
 }
 
+pub fn sys_getitimer(which: isize, curr_value: *mut ITimerVal) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_getitimer which={}", pid, which);
+    }
+    if !(0..=2).contains(&which) {
+        return errno(EINVAL);
+    }
+    if curr_value.is_null() {
+        return errno(EFAULT);
+    }
+    let zero = ITimerVal::default();
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&zero as *const ITimerVal) as *const u8,
+            core::mem::size_of::<ITimerVal>(),
+        )
+    };
+    let token = current_user_token();
+    match copy_to_user(token, curr_value as *mut u8, bytes) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
+}
+
+pub fn sys_setitimer(which: isize, new_value: *const ITimerVal, old_value: *mut ITimerVal) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_setitimer which={}", pid, which);
+    }
+    if !(0..=2).contains(&which) {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
+    if let Err(err) = read_from_user::<ITimerVal>(token, new_value) {
+        return err;
+    }
+    if !old_value.is_null() {
+        let zero = ITimerVal::default();
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&zero as *const ITimerVal) as *const u8,
+                core::mem::size_of::<ITimerVal>(),
+            )
+        };
+        if let Err(err) = copy_to_user(token, old_value as *mut u8, bytes) {
+            return err;
+        }
+    }
+    0
+}
+
+pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: *mut u8) -> isize {
+    let pid_now = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid_now) {
+        syscall!(
+            "kernel:pid[{}] sys_sched_getaffinity pid={} cpusetsize={}",
+            pid_now,
+            pid,
+            cpusetsize
+        );
+    }
+    if cpusetsize == 0 {
+        return errno(EINVAL);
+    }
+    if mask.is_null() {
+        return errno(EFAULT);
+    }
+    if pid > 0 && pid2process(pid as usize).is_none() {
+        return errno(ESRCH);
+    }
+    let mut out = vec![0u8; cpusetsize];
+    out[0] = 1;
+    let token = current_user_token();
+    match copy_to_user(token, mask, &out) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
+}
+
 pub fn sys_times(tms: *mut Tms) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
@@ -1283,11 +1375,23 @@ pub fn sys_sysinfo(info: *mut SysInfo) -> isize {
     }
 }
 
+pub fn sys_msync(start: usize, len: usize, _flags: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_msync start={:#x} len={:#x}", pid, start, len);
+    }
+    if start == 0 || len == 0 {
+        return errno(EINVAL);
+    }
+    0
+}
+
 /// YOUR JOB: Implement mmap.
 pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: usize) -> isize {
     const PROT_READ: usize = 0x1;
     const PROT_WRITE: usize = 0x2;
     const PROT_EXEC: usize = 0x4;
+    const MAP_SHARED: usize = 0x01;
     const MAP_PRIVATE: usize = 0x02;
     const MAP_FIXED: usize = 0x10;
     const MAP_ANON: usize = 0x20;
@@ -1460,9 +1564,15 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
     }
 
     // 在进程的内存空间里插入一个新的映射区域，起始地址为 start，长度为 len，权限为 map_perm。
-    inner
-        .memory_set
-        .insert_framed_area(VirtAddr(start), VirtAddr(start + len), map_perm);
+    if (flags & MAP_SHARED) != 0 {
+        inner
+            .memory_set
+            .insert_shared_framed_area(VirtAddr(start), VirtAddr(start + len), map_perm);
+    } else {
+        inner
+            .memory_set
+            .insert_framed_area(VirtAddr(start), VirtAddr(start + len), map_perm);
+    }
     drop(inner);
 
     // 文件映射填充部分，在“不是匿名映射、而且有有效 fd”的情况下，把文件内容读进映射的页里。
@@ -1668,36 +1778,78 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
     if crate::syscall::should_trace_syscall(pid_now) {
         syscall!("kernel:pid[{}] sys_kill pid={} signum={}", pid_now, pid, signum);
     }
-    if signum <= 0 || signum > MAX_SIG as i32 {
-        return errno(EINVAL);
-    }
-    // bit (signum-1) 对应 signum：signal 1 → bit 0, signal 9 → bit 8
-    let flag = match 1u64.checked_shl((signum - 1) as u32) {
-        Some(bits) => SignalFlags::from_bits_truncate(bits),
-        None => return errno(EINVAL),
+    let flag = match signal_flag_from_signum(signum) {
+        Ok(flag) => flag,
+        Err(err) => return err,
     };
-    if flag.is_empty() {
-        return errno(EINVAL);
-    }
     let process = match pid2process(pid) {
         Some(process) => process,
         None => return errno(ESRCH),
     };
     let mut inner = process.inner_exclusive_access();
     inner.signal_pending |= flag;
-    // Wake blocked tasks so pending signals can be handled.
-    // 需要设置 interrupted_by_signal 并从 futex 队列移除，
-    // 否则 futex_wait 不会返回 EINTR。
     for task in inner.tasks.iter().filter_map(|t| t.as_ref()) {
-        let mut task_inner = task.inner_exclusive_access();
-        if task_inner.task_status == TaskStatus::Blocked {
-            futex_remove_waiter_any(task);
-            task_inner.interrupted_by_signal = true;
-            task_inner.task_status = TaskStatus::Ready;
-            drop(task_inner);
-            add_task(task.clone());
-        }
+        wake_task_for_signal(task);
     }
+    0
+}
+
+fn signal_flag_from_signum(signum: i32) -> Result<SignalFlags, isize> {
+    if signum <= 0 || signum > MAX_SIG as i32 {
+        return Err(errno(EINVAL));
+    }
+    let flag = match 1u64.checked_shl((signum - 1) as u32) {
+        Some(bits) => SignalFlags::from_bits_truncate(bits),
+        None => return Err(errno(EINVAL)),
+    };
+    if flag.is_empty() {
+        return Err(errno(EINVAL));
+    }
+    Ok(flag)
+}
+
+fn wake_task_for_signal(task: &Arc<TaskControlBlock>) {
+    let mut task_inner = task.inner_exclusive_access();
+    if task_inner.task_status == TaskStatus::Blocked {
+        futex_remove_waiter_any(task);
+        task_inner.interrupted_by_signal = true;
+        task_inner.task_status = TaskStatus::Ready;
+        drop(task_inner);
+        add_task(task.clone());
+    }
+}
+
+fn task_matches_linux_tid(
+    process_pid: usize,
+    task: &Arc<TaskControlBlock>,
+    target_tid: usize,
+) -> bool {
+    let task_inner = task.inner_exclusive_access();
+    let Some(res) = task_inner.res.as_ref() else {
+        return false;
+    };
+    let internal_tid = res.tid;
+    internal_tid == target_tid || (internal_tid == 0 && process_pid == target_tid)
+}
+
+fn send_signal_to_task_from_list(
+    target_tid: usize,
+    process_pid: usize,
+    tasks: &[Option<Arc<TaskControlBlock>>],
+    flag: SignalFlags,
+) -> isize {
+    let target = tasks
+        .iter()
+        .filter_map(|t| t.as_ref())
+        .find(|task| task_matches_linux_tid(process_pid, task, target_tid))
+        .cloned();
+    let Some(task) = target else {
+        return errno(ESRCH);
+    };
+    let mut task_inner = task.inner_exclusive_access();
+    task_inner.signal_pending |= flag;
+    drop(task_inner);
+    wake_task_for_signal(&task);
     0
 }
 
@@ -1709,55 +1861,55 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
     if tid <= 0 {
         return errno(EINVAL);
     }
-    if signum <= 0 || signum > MAX_SIG as i32 {
-        return errno(EINVAL);
-    }
-    // bit (signum-1) 对应 signum：signal 1 → bit 0, signal 33 → bit 32
-    let flag = match 1u64.checked_shl((signum - 1) as u32) {
-        Some(bits) => SignalFlags::from_bits_truncate(bits),
-        None => return errno(EINVAL),
+    let flag = match signal_flag_from_signum(signum) {
+        Ok(flag) => flag,
+        Err(err) => return err,
     };
-    if flag.is_empty() {
-        return errno(EINVAL);
+    let tid = tid as usize;
+    if let Some(process) = pid2process(tid) {
+        let process_pid = process.getpid();
+        let inner = process.inner_exclusive_access();
+        let ret = send_signal_to_task_from_list(tid, process_pid, &inner.tasks, flag);
+        drop(inner);
+        if ret == 0 {
+            return 0;
+        }
     }
     let process = current_process();
+    let process_pid = process.getpid();
     let inner = process.inner_exclusive_access();
-    let tid = tid as usize;
-    if tid >= inner.tasks.len() || inner.tasks[tid].is_none() {
-        return errno(ESRCH);
+    let ret = send_signal_to_task_from_list(tid, process_pid, &inner.tasks, flag);
+    drop(inner);
+    ret
+}
+
+pub fn sys_tgkill(tgid: isize, tid: isize, signum: i32) -> isize {
+    let pid_now = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid_now) {
+        syscall!(
+            "kernel:pid[{}] sys_tgkill tgid={} tid={} signum={}",
+            pid_now,
+            tgid,
+            tid,
+            signum
+        );
     }
-    if let Some(task) = inner.tasks[tid].as_ref() {
-        let mut task_inner = task.inner_exclusive_access();
-        if signum == 33 {
-            let target_tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-            let tp = task_inner.get_trap_cx()[TrapFrameArgs::TLS];
-            info!(
-                "[tkill] pid={} target_tid={} tp={:#x} mask={:?} pending_before={:?}",
-                pid_now,
-                target_tid,
-                tp,
-                task_inner.signal_mask,
-                task_inner.signal_pending
-            );
-        }
-        task_inner.signal_pending |= flag;
-        if signum == 33 {
-            info!(
-                "[tkill] pid={} target_tid={} pending_after={:?}",
-                pid_now,
-                task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
-                task_inner.signal_pending
-            );
-        }
-        if task_inner.task_status == TaskStatus::Blocked {
-            futex_remove_waiter_any(task);
-            task_inner.interrupted_by_signal = true;
-            task_inner.task_status = TaskStatus::Ready;
-            drop(task_inner);
-            add_task(task.clone());
-        }
+    if tgid <= 0 || tid <= 0 {
+        return errno(EINVAL);
     }
-    0
+    let flag = match signal_flag_from_signum(signum) {
+        Ok(flag) => flag,
+        Err(err) => return err,
+    };
+    let process = match pid2process(tgid as usize) {
+        Some(process) => process,
+        None => return errno(ESRCH),
+    };
+    let process_pid = process.getpid();
+    let inner = process.inner_exclusive_access();
+    let ret = send_signal_to_task_from_list(tid as usize, process_pid, &inner.tasks, flag);
+    drop(inner);
+    ret
 }
 
 pub fn sys_sigaction(
