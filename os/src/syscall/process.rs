@@ -27,12 +27,8 @@ use crate::{
 use arch::TrapFrameArgs;
 
 use super::errno::*;
-use crate::config::{CLOCK_FREQ, PAGE_SIZE};
+use crate::config::{CLOCK_FREQ, PAGE_SIZE, USER_STACK_TOP as USER_ADDR_MAX};
 use crate::sync::UPIntrFreeCell;
-#[cfg(target_arch = "loongarch64")]
-use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
-#[cfg(not(target_arch = "loongarch64"))]
-use crate::config::TRAMPOLINE as USER_ADDR_MAX;
 
 lazy_static! {
     static ref EXEC_IMAGE_CACHE: UPIntrFreeCell<BTreeMap<String, Arc<[u8]>>> =
