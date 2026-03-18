@@ -1,13 +1,13 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 //!
-//! Frame allocation is delegated to the kernel via [`crate::api::ArchInterface`]
+//! Frame allocation is delegated to the kernel via [`crate::pagetable`]
 //! callbacks, eliminating the direct dependency on `os::mm::frame_alloc` /
 //! `FrameTracker`.
 
 #![allow(missing_docs)]
 
 use super::address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
-use crate::api::ArchInterface;
+use crate::pagetable;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -77,25 +77,24 @@ impl PageTableEntry {
 
 /// Allocate one physical frame via the kernel callback.
 fn alloc_frame() -> PhysPageNum {
-    let ppn_raw = crate::api::ArchInterface::frame_alloc();
+    let ppn_raw = pagetable::frame_alloc_persist();
     PhysPageNum(ppn_raw)
 }
 
 /// Deallocate one physical frame via the kernel callback.
 fn dealloc_frame(ppn: PhysPageNum) {
-    crate::api::ArchInterface::frame_dealloc(ppn.0);
+    pagetable::frame_dealloc_persist(ppn.0);
 }
 
 /// Clone kernel root mappings into a freshly allocated user page-table root.
 ///
 /// Returns early if kernel page table is not ready yet (token = 0).
 fn clone_kernel_root_mappings(dst_root: PhysPageNum) {
-    let kernel_token = ArchInterface::kernel_page_table_token();
-    if kernel_token == 0 {
+    let Some(kernel_root_raw) = pagetable::kernel_root_ppn_if_ready((1usize << 44) - 1) else {
         warn!("kernel page table is not ready yet, skip cloning kernel root mappings");
         return;
-    }
-    let kernel_root = PhysPageNum::from(kernel_token & ((1usize << 44) - 1));
+    };
+    let kernel_root = PhysPageNum::from(kernel_root_raw);
     let dst = dst_root.get_pte_array();
     let src = kernel_root.get_pte_array();
     // Keep user low half free (0..0x100) for process mappings, and only share
