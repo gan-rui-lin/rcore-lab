@@ -22,6 +22,24 @@ use alloc::string::String;
 const TIMER_SAMPLE_INTERVAL: u64 = 200;
 static TIMER_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg_attr(target_arch = "riscv64", path = "user_trap_riscv64.rs")]
+#[cfg_attr(target_arch = "loongarch64", path = "user_trap_loongarch64.rs")]
+mod user_trap_arch;
+
+fn handle_user_syscall() {
+    let trap_cx = current_trap_cx();
+    trap_cx.sepc += 4;
+    let result = syscall(trap_cx[TrapFrameArgs::SYSCALL], trap_cx.args());
+    current_trap_cx()[TrapFrameArgs::RET] = result as usize;
+}
+
+fn handle_user_time_interrupt() {
+    set_next_trigger();
+    check_timer();
+    handle_signals();
+    suspend_current_and_run_next();
+}
+
 // ---------------------------------------------------------------------------
 // Kernel-mode trap dispatch (called from ArchInterface::kernel_interrupt)
 // ---------------------------------------------------------------------------
@@ -78,202 +96,34 @@ pub fn kernel_interrupt_dispatch(trap_type: arch::TrapType) {
 // control flow in a direct loop.
 // ---------------------------------------------------------------------------
 
-#[cfg(target_arch = "loongarch64")]
 pub fn user_trap_loop() -> ! {
-    use arch::TrapType;
-    loop {
-        let user_token = current_user_token();
-        let trap_type = arch::enter_user_and_trap(current_trap_cx(), user_token);
-        let trap_cx = current_trap_cx();
-
-        match trap_type {
-            TrapType::UserEnvCall => {
-                trap_cx.sepc += 4;
-                let result = syscall(trap_cx[TrapFrameArgs::SYSCALL], trap_cx.args());
-                let trap_cx = current_trap_cx();
-                trap_cx[TrapFrameArgs::RET] = result as usize;
-            }
-            TrapType::Time => {
-                set_next_trigger();
-                check_timer();
-                handle_signals();
-                suspend_current_and_run_next();
-            }
-            TrapType::StorePageFault(addr)
-            | TrapType::LoadPageFault(addr)
-            | TrapType::InstructionPageFault(addr) => {
-                let (pid, tid, name) = if let Some(task) = current_task() {
-                    let task_inner = task.inner_exclusive_access();
-                    let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-                    let name = task
-                        .process
-                        .upgrade()
-                        .map(|p| p.inner_exclusive_access().name.clone())
-                        .unwrap_or_else(|| String::from("<unknown>"));
-                    (current_process().pid.0, tid, name)
-                } else {
-                    (0, 0, String::from("<no-task>"))
-                };
-                let args = trap_cx.args();
-                error!(
-                    "[kernel] trap_handler: page fault addr={:#x} pid={} tid={} name={} sepc={:#x}",
-                    addr,
-                    pid,
-                    tid,
-                    name,
-                    trap_cx.sepc
-                );
-                error!(
-                    "[kernel] trap_handler: ra={:#x} sp={:#x} tp={:#x} syscall={:#x} args={:x?}",
-                    trap_cx[TrapFrameArgs::RA],
-                    trap_cx[TrapFrameArgs::SP],
-                    trap_cx[TrapFrameArgs::TLS],
-                    trap_cx[TrapFrameArgs::SYSCALL],
-                    args
-                );
-                let token = current_user_token();
-                let page_table = PageTable::from_token(token);
-                let fault_va = VirtAddr::from(addr as usize);
-                if let Some(pte) = page_table.translate(fault_va.floor()) {
-                    if pte.is_valid() {
-                        let offset = fault_va.page_offset();
-                        let end = core::cmp::min(offset + 8, PAGE_SIZE);
-                        let bytes = &pte.ppn().get_bytes_array()[offset..end];
-                        error!(
-                            "[kernel] trap_handler: fault pte ppn={:#x} flags={:?} bytes={:02x?}",
-                            pte.ppn().0,
-                            pte.flags(),
-                            bytes
-                        );
-                    } else {
-                        error!("[kernel] trap_handler: fault pte invalid flags={:?}", pte.flags());
-                    }
-                } else {
-                    error!("[kernel] trap_handler: fault pte unmapped");
-                }
-                let sepc_va = VirtAddr::from(trap_cx.sepc);
-                if let Some(pte) = page_table.translate(sepc_va.floor()) {
-                    if pte.is_valid() {
-                        let offset = sepc_va.page_offset();
-                        let end = core::cmp::min(offset + 8, PAGE_SIZE);
-                        let bytes = &pte.ppn().get_bytes_array()[offset..end];
-                        error!(
-                            "[kernel] trap_handler: sepc pte ppn={:#x} flags={:?} bytes={:02x?}",
-                            pte.ppn().0,
-                            pte.flags(),
-                            bytes
-                        );
-                    } else {
-                        error!("[kernel] trap_handler: sepc pte invalid flags={:?}", pte.flags());
-                    }
-                } else {
-                    error!("[kernel] trap_handler: sepc pte unmapped");
-                }
-                current_add_signal(SignalFlags::SIGSEGV);
-                // ! 暂时直接 shutdown，后续可以考虑杀死进程
-                // use arch::shutdown;
-                // shutdown();
-
-            }
-            TrapType::IllegalInstruction(addr) => {
-                let args = trap_cx.args();
-                error!(
-                    "[kernel] trap_handler: illegal instruction addr={:#x} sepc={:#x}",
-                    addr,
-                    trap_cx.sepc
-                );
-                error!(
-                    "[kernel] trap_handler: ra={:#x} sp={:#x} tp={:#x} syscall={:#x} args={:x?}",
-                    trap_cx[TrapFrameArgs::RA],
-                    trap_cx[TrapFrameArgs::SP],
-                    trap_cx[TrapFrameArgs::TLS],
-                    trap_cx[TrapFrameArgs::SYSCALL],
-                    args
-                );
-                current_add_signal(SignalFlags::SIGILL);
-            }
-            arch::TrapType::Unknown => {}
-            _ => warn!("[kernel] trap_handler: unknown trap at sepc={:#x}", trap_cx.sepc),
-        }
-        if current_task().is_some() {
-            handle_signals();
-        }
-        // loop back to re-enter user mode
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Return to user space
-// ---------------------------------------------------------------------------
-
-/// Enter user space and loop on user traps for the current task.
-#[cfg(target_arch = "riscv64")]
-pub fn user_trap_loop() -> ! {
-    fn riscv_insn_len_at(user_token: usize, sepc: usize) -> usize {
-        let page_table = PageTable::from_token(user_token);
-        let read_byte = |va: usize| -> Option<u8> {
-            let pa = page_table.translate_va(VirtAddr::from(va))?;
-            Some(*pa.get_ref::<u8>())
-        };
-        let (b0, b1) = match (read_byte(sepc), read_byte(sepc.wrapping_add(1))) {
-            (Some(a), Some(b)) => (a, b),
-            _ => return 2,
-        };
-        let insn16 = u16::from_le_bytes([b0, b1]);
-        if (insn16 & 0b11) == 0b11 { 4 } else { 2 }
-    }
-
     loop {
         let user_token = current_user_token();
         let trap_type = arch::enter_user_and_trap(current_trap_cx(), user_token);
 
         match trap_type {
             arch::TrapType::UserEnvCall => {
-                let trap_cx = current_trap_cx();
-                trap_cx.sepc += 4;
-                let result = syscall(trap_cx[TrapFrameArgs::SYSCALL], trap_cx.args());
-                trap_cx[TrapFrameArgs::RET] = result as usize;
+                handle_user_syscall();
             }
             arch::TrapType::Time => {
-                set_next_trigger();
-                check_timer();
-                handle_signals();
-                suspend_current_and_run_next();
+                handle_user_time_interrupt();
             }
             arch::TrapType::SupervisorExternal => {
-                crate::board::irq_handler();
+                user_trap_arch::handle_user_supervisor_external();
             }
             arch::TrapType::StorePageFault(addr)
             | arch::TrapType::LoadPageFault(addr)
             | arch::TrapType::InstructionPageFault(addr) => {
-                let trap_cx = current_trap_cx();
-                error!(
-                    "[kernel] trap_handler: page fault addr={:#x} sepc={:#x} ra={:#x} sp={:#x}",
-                    addr,
-                    trap_cx.sepc,
-                    trap_cx[TrapFrameArgs::RA],
-                    trap_cx[TrapFrameArgs::SP]
-                );
-                current_add_signal(SignalFlags::SIGSEGV);
+                user_trap_arch::handle_user_page_fault(addr);
             }
             arch::TrapType::IllegalInstruction(addr) => {
-                let trap_cx = current_trap_cx();
-                error!(
-                    "[kernel] trap_handler: illegal instruction addr={:#x} sepc={:#x}",
-                    addr,
-                    trap_cx.sepc
-                );
-                current_add_signal(SignalFlags::SIGILL);
+                user_trap_arch::handle_user_illegal_instruction(addr);
             }
             arch::TrapType::Breakpoint => {
-                let user_token = current_user_token();
-                let trap_cx = current_trap_cx();
-                let step = riscv_insn_len_at(user_token, trap_cx.sepc);
-                trap_cx.sepc = trap_cx.sepc.wrapping_add(step);
+                user_trap_arch::handle_user_breakpoint();
             }
-            _ => {
-                let trap_cx = current_trap_cx();
-                warn!("[kernel] trap_handler: unsupported trap {:?} sepc={:#x}", trap_type, trap_cx.sepc);
+            arch::TrapType::Unknown => {
+                user_trap_arch::handle_user_unknown_trap(trap_type);
             }
         }
         if current_task().is_some() {
