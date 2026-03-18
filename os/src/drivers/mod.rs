@@ -4,19 +4,20 @@ pub mod block;
 pub mod bus;
 
 /// Character device drivers (RISC-V only).
-#[cfg_attr(target_arch = "loongarch64", path = "chardev_stub.rs")]
+#[cfg(target_arch = "riscv64")]
 pub mod chardev;
 /// Input device drivers (RISC-V only).
-#[cfg_attr(target_arch = "loongarch64", path = "input_stub.rs")]
+#[cfg(target_arch = "riscv64")]
 pub mod input;
 /// Network device drivers (RISC-V only).
-#[cfg_attr(target_arch = "loongarch64", path = "net_stub.rs")]
+#[cfg(target_arch = "riscv64")]
 pub mod net;
 /// Platform-level interrupt controller (RISC-V only).
-#[cfg_attr(target_arch = "loongarch64", path = "plic_stub.rs")]
+#[cfg(target_arch = "riscv64")]
 pub mod plic;
 
 /// Global block device instance.
 pub use block::BLOCK_DEVICE;
 pub use bus::*;
+#[cfg(target_arch = "riscv64")]
 pub use input::*;
