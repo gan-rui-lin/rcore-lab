@@ -747,22 +747,9 @@ fn build_exec_candidates(exec_path: &str, envs: &[String]) -> Vec<String> {
     candidates
 }
 
-fn exec_image_cache_key(path: &str) -> Option<&'static str> {
-    // Some exec paths may contain "/./" from relative path expansion.
-    if path.ends_with("/bin/sh") || path.ends_with("/busybox") {
-        // /bin/sh is hardlinked to busybox in our rootfs.
-        Some("/musl/busybox")
-    } else if path.ends_with("/libc.so") {
-        Some("/musl/lib/libc.so")
-    } else if path.ends_with("/runtest.exe") {
-        Some("/musl/runtest.exe")
-    } else if path.ends_with("/entry-static.exe") {
-        Some("/musl/entry-static.exe")
-    } else if path.ends_with("/entry-dynamic.exe") {
-        Some("/musl/entry-dynamic.exe")
-    } else {
-        None
-    }
+fn exec_image_cache_key(_path: &str) -> Option<&'static str> {
+    // Strict mode: disable cross-path cache aliasing to avoid mixing musl/glibc images.
+    None
 }
 
 fn read_exec_image(path: &str, file: &Arc<dyn File>) -> Arc<[u8]> {
@@ -806,7 +793,7 @@ fn trace_exec_resolution(
 }
 
 fn trace_entry_bytes(exec_path_resolved: &str, all_data: &[u8], app: &Arc<dyn File>) {
-    if exec_path_resolved != "/bin/sh" && exec_path_resolved != "/musl/busybox" {
+    if exec_path_resolved != "/bin/sh" && exec_path_resolved != "/musl/busybox" && exec_path_resolved != "/glibc/busybox" {
         return;
     }
     if let Ok(elf) = xmas_elf::ElfFile::new(all_data) {
@@ -914,13 +901,8 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
         if exec_path == "/bin/sh" {
             // 应该已经提前做了硬链接
             if open_file("/bin/sh", OpenFlags::empty()).is_none() {
-                if open_file("/musl/busybox", OpenFlags::empty()).is_some() {
-                    info!("[sys_exec] pid={} exec /bin/sh fallback to /musl/busybox", current_process().pid.0);
-                    exec_path = String::from("/musl/busybox");
-                } else {
-                    error!("[sys_exec] pid={} exec /bin/sh fallback busybox also not found", current_process().pid.0);
-                    return errno(ENOENT);
-                }
+                error!("[sys_exec] pid={} exec /bin/sh missing (strict mode, no fallback)", current_process().pid.0);
+                return errno(ENOENT);
             } else {
                 trace!("[sys_exec] /bin/sh ready");
             }
@@ -1029,24 +1011,10 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
                     break;
                 }
             }
-            if let Some(mut interp_path) = interp {
+            if let Some(interp_path) = interp {
                 if open_file(interp_path.as_str(), OpenFlags::empty()).is_none() {
-                    // Fallback: try musl/glibc loader for known interpreter paths
-                    let musl_loader = "/musl/lib/libc.so";
-                    let glibc_loader = "/glibc/lib/ld-linux-riscv64-lp64d.so.1";
-                    if interp_path == "/lib/ld-linux-riscv64-lp64d.so.1"
-                        || interp_path.contains("ld-musl-riscv64")
-                        || interp_path == "/lib64/ld-linux-loongarch-lp64d.so.1"
-                        || interp_path.contains("ld-musl-loongarch")
-                    {
-                        if open_file(musl_loader, OpenFlags::empty()).is_some() {
-                            info!("[sys_exec] interp {} not found, fallback to musl loader: {}", interp_path, musl_loader);
-                            interp_path = String::from(musl_loader);
-                        } else if open_file(glibc_loader, OpenFlags::empty()).is_some() {
-                            info!("[sys_exec] interp {} not found, fallback to glibc loader: {}", interp_path, glibc_loader);
-                            interp_path = String::from(glibc_loader);
-                        }
-                    }
+                    trace!("[sys_exec] interp not found (strict mode): {}", interp_path);
+                    return errno(ENOENT);
                 }
                 if open_file(interp_path.as_str(), OpenFlags::empty()).is_none() {
                     trace!("[sys_exec] interp not found: {}", interp_path);

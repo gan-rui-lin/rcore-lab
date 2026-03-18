@@ -6,24 +6,31 @@ extern crate user_lib;
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::vec::Vec;
-use user_lib::{chdir, close, dup, execve, exit, fork, open, shutdown, wait, write, OpenFlags};
+use user_lib::{
+    chdir, close, dup, execve, exit, fork, link, open, shutdown, unlink, wait, write, OpenFlags,
+};
 
-const ENABLE_SINGLE_ELF_SUITE: bool = false;
-const ENABLE_BASIC_TEST: bool = false;
-const ENABLE_BUSYBOX_TEST: bool = false;
-const ENABLE_LUA_TEST: bool = false;
-const ENABLE_LIBC_TEST: bool = true;
-const ENABLE_DYNAMIC_TEST: bool = false;
-const ENABLE_LTP_TEST: bool = false;
-const ENABLE_IPERF_TEST: bool = false;
-const ENABLE_ALL_TESTS: bool = false;
-const ENABLE_FAT32_TESTS: bool = false;
+const ENABLE_ALL_TESTS: bool = true;
 const SINGLE_TEST: Option<&str> = option_env!("SINGLE_TEST");
 
-const BUSYBOX: &str = "/musl/busybox\0";
 const SH: &[u8] = b"sh\0";
-const PATH_ENV: &[u8] = b"PATH=/bin:/musl:/usr/bin\0";
+const PATH_ENV: &[u8] = b"PATH=/bin:/usr/bin:/musl:/glibc\0";
+const TEST_LIBC_ROOTS: [&str; 2] = ["/musl", "/glibc"];
+const TEST_SUITES: [&str; 1] = [
+    "basic",
+    // "busybox",
+    // "cyclictest",
+    // "iozone",
+    // "iperf",
+    // "libcbench",
+    // "libctest",
+    // "lmbench",
+    // "ltp",
+    // "lua",
+    // "netperf",
+];
 #[allow(dead_code)]
 const RUN_EMBEDDED_PTHREAD: bool = option_env!("RUN_EMBEDDED_PTHREAD").is_some();
 const PTHREAD_TEST_PATH: &str = "/tmp/pthread_cancel_small";
@@ -66,6 +73,107 @@ fn write_embedded_elf(path: &str, data: &[u8]) -> isize {
     0
 }
 
+fn file_exists(path: &str) -> bool {
+    let p = cstring(path);
+    let p_str = unsafe { core::str::from_utf8_unchecked(&p) };
+    let fd = open(p_str, OpenFlags::RDONLY);
+    if fd >= 0 {
+        let _ = close(fd as usize);
+        true
+    } else {
+        false
+    }
+}
+
+fn force_link(link_path: &str, target_path: &str) {
+    if !file_exists(target_path) {
+        println!(
+            "[initcode] skip relink {} -> {} (target missing)",
+            link_path, target_path
+        );
+        return;
+    }
+    let link_c = cstring(link_path);
+    let link_name = unsafe { core::str::from_utf8_unchecked(&link_c) };
+    let target_c = cstring(target_path);
+    let target = unsafe { core::str::from_utf8_unchecked(&target_c) };
+
+    let _ = unlink(link_name);
+    let ret = link(target, link_name);
+    if ret == 0 {
+        println!("[initcode] relink {} -> {}", link_path, target_path);
+    } else {
+        println!(
+            "[initcode] relink failed {} -> {} (ret={})",
+            link_path, target_path, ret
+        );
+    }
+}
+
+fn select_busybox_for_root(root: &str) -> Option<&'static str> {
+    match root {
+        "/musl" => {
+            if file_exists("/musl/busybox") {
+                Some("/musl/busybox")
+            } else {
+                None
+            }
+        }
+        "/glibc" => {
+            if file_exists("/glibc/busybox") {
+                Some("/glibc/busybox")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn activate_runtime_profile(root: &str) -> bool {
+    let Some(busybox_path) = select_busybox_for_root(root) else {
+        println!("[initcode] profile {} busybox missing", root);
+        return false;
+    };
+
+    force_link("/bin/sh", busybox_path);
+    force_link("/bin/basename", busybox_path);
+    force_link("/bin/ls", busybox_path);
+    force_link("/bin/sleep", busybox_path);
+    force_link("/usr/bin/basename", busybox_path);
+    force_link("/usr/bin/ls", busybox_path);
+    force_link("/usr/bin/sleep", busybox_path);
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        if root == "/glibc" {
+            force_link(
+                "/lib/ld-linux-riscv64-lp64d.so.1",
+                "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
+            );
+        } else {
+            force_link("/lib/ld-linux-riscv64-lp64d.so.1", "/musl/lib/libc.so");
+            force_link("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so");
+            force_link("/lib/ld-musl-riscv64-sf.so.1", "/musl/lib/libc.so");
+        }
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    {
+        if root == "/glibc" {
+            force_link(
+                "/lib64/ld-linux-loongarch-lp64d.so.1",
+                "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+            );
+        } else {
+            force_link("/lib64/ld-linux-loongarch-lp64d.so.1", "/musl/lib/libc.so");
+            force_link("/lib64/ld-musl-loongarch-lp64d.so.1", "/musl/lib/libc.so");
+        }
+    }
+
+    true
+}
+
 #[no_mangle]
 fn main() -> i32 {
     let _ = open("console\0", OpenFlags::RDWR);
@@ -82,38 +190,11 @@ fn main() -> i32 {
     }
 
     if let Some(test_path) = SINGLE_TEST {
-        let _ = run_single_binary(test_path);
+        run_selector(test_path);
     } else if ENABLE_ALL_TESTS {
-        test_all_tests();
-    } else if ENABLE_SINGLE_ELF_SUITE {
-        run_single_elf_suite();
+        run_all_suites();
     } else {
-        if ENABLE_DYNAMIC_TEST {
-            test_dynamic();
-        }
-        if ENABLE_BASIC_TEST {
-            test_basic();
-        }
-        if ENABLE_BUSYBOX_TEST {
-            test_busybox();
-        }
-        if ENABLE_LUA_TEST {
-            test_lua();
-        }
-        if ENABLE_LIBC_TEST {
-            test_libc();
-        }
-        if ENABLE_LTP_TEST {
-            test_ltp();
-        }
-
-        if ENABLE_IPERF_TEST {
-            test_iperf();
-        }
-
-        if ENABLE_FAT32_TESTS {
-            test_fat32_suite();
-        }
+        run_selector("musl-libctest");
     }
 
     println!("\n=== All tests completed ===");
@@ -222,193 +303,129 @@ fn run_single_elf_suite() {
     println!("==========================================\n");
 }
 
-fn run_testcode(script_name: &str) {
-    println!("=== Running {} ===", script_name);
+fn run_testcode(script_path: &str, root: &str) -> i32 {
+    println!("=== Running {} ===", script_path);
+
+    if !file_exists(script_path) {
+        println!("=== Skipped {} (not found) ===\n", script_path);
+        return 0;
+    }
+
+    let Some(busybox_path) = select_busybox_for_root(root) else {
+        println!("=== Skipped {} (busybox not found) ===\n", script_path);
+        return -1;
+    };
 
     let pid = fork();
     if pid < 0 {
         println!("Fork failed!");
-        return;
+        return -1;
     }
 
     if pid == 0 {
-        let _ = chdir("/musl/\0");
-        let script = cstring(script_name);
+        if root == "/glibc" {
+            let _ = chdir("/glibc/\0");
+        } else {
+            let _ = chdir("/musl/\0");
+        }
+        let script = cstring(script_path);
+        let busybox = cstring(busybox_path);
         let argv = [SH.as_ptr(), script.as_ptr(), core::ptr::null()];
         let envp = [PATH_ENV.as_ptr(), core::ptr::null()];
-        let ret = execve(BUSYBOX, &argv, &envp);
-        println!("Exec {} failed (ret={})!", script_name, ret);
+        let ret = execve(
+            unsafe { core::str::from_utf8_unchecked(&busybox) },
+            &argv,
+            &envp,
+        );
+        println!("Exec {} failed (ret={})!", script_path, ret);
         exit(-1);
     } else {
         let mut status: i32 = 0;
         let _ = wait(&mut status);
-        println!("=== {} completed (status=0x{:x}) ===\n", script_name, status);
+        println!("=== {} completed (status=0x{:x}) ===\n", script_path, status);
+        status
     }
 }
 
-fn test_busybox() {
-    run_testcode("/musl/busybox_testcode.sh");
+fn run_suite(root: &str, suite: &str) -> i32 {
+    if !activate_runtime_profile(root) {
+        println!("=== Skipped {} / {} (profile activate failed) ===\n", root, suite);
+        return -1;
+    }
+    let script = format!("{}/{}_testcode.sh", root, suite);
+    run_testcode(script.as_str(), root)
 }
 
-fn test_lua() {
-    run_testcode("/musl/lua_testcode.sh");
-}
-
-fn test_libc() {
-    run_testcode("/musl/libctest_testcode.sh");
-}
-
-fn test_basic() {
-    run_testcode("/musl/basic_testcode.sh");
-}
-
-fn test_ltp() {
-    run_testcode("/musl/ltp_testcode.sh");
-}
-
-fn test_iperf() {
-    run_testcode("/musl/iperf_testcode.sh");
-}
-
-fn test_dynamic() {
-    run_testcode("/musl/run-dynamic.sh");
-}
-
-fn test_all_tests() {
+fn run_all_suites() {
     println!("\n==========================================");
-    println!("   Running ALL Test Suites");
+    println!("   Running ALL Test Suites (musl + glibc)");
     println!("==========================================\n");
 
-    let test_scripts = [
-        "/musl/basic_testcode.sh",
-        "/musl/busybox_testcode.sh",
-        "/musl/lua_testcode.sh",
-        "/musl/libctest_testcode.sh",
-        "/musl/iozone_testcode.sh",
-        "/musl/unixbench_testcode.sh",
-        "/musl/iperf_testcode.sh",
-        "/musl/libcbench_testcode.sh",
-        "/musl/lmbench_testcode.sh",
-        "/musl/netperf_testcode.sh",
-        "/musl/cyclictest_testcode.sh",
-        "/musl/ltp_testcode.sh",
-    ];
+    for root in TEST_LIBC_ROOTS {
+        println!("\n########## Running {} suites ##########", root);
+        for suite in TEST_SUITES {
+            // println!("\n[{}] Running {} / {}", total, root, suite);
+            // println!("------------------------------------------");
+            let _status = run_suite(root, suite);
 
-    let mut total = 0;
-    let mut passed = 0;
-    let mut failed = 0;
-
-    for (idx, script) in test_scripts.iter().enumerate() {
-        total += 1;
-        println!("\n[{}/{}] Running test: {}", idx + 1, test_scripts.len(), script);
-        println!("------------------------------------------");
-
-        let pid = fork();
-        if pid < 0 {
-            println!("ERROR: Fork failed for {}", script);
-            failed += 1;
-            continue;
+            // println!("------------------------------------------");
         }
+    }
 
-        if pid == 0 {
-            let _ = chdir("/musl/\0");
-            let script_c = cstring(script);
-            let argv = [SH.as_ptr(), script_c.as_ptr(), core::ptr::null()];
-            let envp = [PATH_ENV.as_ptr(), core::ptr::null()];
-            let ret = execve(BUSYBOX, &argv, &envp);
-            println!("ERROR: Failed to exec {} (ret={})", script, ret);
-            exit(-1);
+
+}
+
+fn run_selector(selector: &str) {
+    if selector.starts_with('/') {
+        if selector.starts_with("/musl/") {
+            let _ = activate_runtime_profile("/musl");
+        } else if selector.starts_with("/glibc/") {
+            let _ = activate_runtime_profile("/glibc");
+        }
+        let _ = run_single_binary(selector);
+        return;
+    }
+
+    if selector == "all" {
+        run_all_suites();
+        return;
+    }
+
+    if selector == "single-elf" {
+        run_single_elf_suite();
+        return;
+    }
+
+    if selector == "musl" || selector == "glibc" {
+        let root = if selector == "musl" { "/musl" } else { "/glibc" };
+        for suite in TEST_SUITES {
+            let _ = run_suite(root, suite);
+        }
+        return;
+    }
+
+    if let Some((libc_name, suite)) = selector.split_once('-') {
+        let root = if libc_name == "musl" {
+            Some("/musl")
+        } else if libc_name == "glibc" {
+            Some("/glibc")
         } else {
-            let mut status: i32 = 0;
-            let _ = wait(&mut status);
-            if status == 0 {
-                println!("✓ Test PASSED: {}", script);
-                passed += 1;
-            } else {
-                println!("✗ Test FAILED: {} (status=0x{:x})", script, status);
-                failed += 1;
+            None
+        };
+        if let Some(root) = root {
+            let _ = run_suite(root, suite);
+            return;
+        }
+    }
+
+    for suite in TEST_SUITES {
+        if selector == suite {
+            for root in TEST_LIBC_ROOTS {
+                let _ = run_suite(root, suite);
             }
+            return;
         }
-
-        println!("------------------------------------------");
     }
 
-    println!("\n==========================================");
-    println!("   Test Suite Summary");
-    println!("==========================================");
-    println!("Total:  {} tests", total);
-    println!("Passed: {} tests", passed);
-    println!("Failed: {} tests", failed);
-    println!("==========================================\n");
-}
-
-fn test_fat32_suite(){
-       let tests = [
-        "brk",
-        "chdir",
-        "clone",
-        "close",
-        "dup",
-        "dup2",
-        "execve",
-        "exit",
-        "fork",
-        "fstat",
-        "getcwd",
-        "getdents",
-        "getpid",
-        "getppid",
-        "gettimeofday",
-        "mkdir_",
-        "mmap",
-        "mount",
-        "munmap",
-        "open",
-        "openat",
-        "pipe",
-        "read",
-        "sleep",
-        "chdir",
-        // "test_echo",
-        "mkdir_",
-        "times",
-        "umount",
-        "uname",
-        "unlink",
-        "wait",
-        "waitpid",
-        "write",
-        "yield",
-    ];
-
-    let mut total = 0;
-    let mut passed = 0;
-    let mut failed = 0;
-
-    println!("\n==========================================");
-    println!("   Running Single-ELF Suite (/musl/basic)");
-    println!("==========================================\n");
-
-    for (_idx, path) in tests.iter().enumerate() {
-        total += 1;
-        // println!("\n[{}/{}] Running test: {}", idx + 1, tests.len(), path);
-        // println!("------------------------------------------");
-        let status = run_single_binary(path);
-        if status == 0 {
-            passed += 1;
-            // println!("✓ Test PASSED: {}", path);
-        } else {
-            failed += 1;
-            // println!("✗ Test FAILED: {} (status=0x{:x})", path, status);
-        }
-        // println!("------------------------------------------");
-    }
-
-    println!("\n==========================================");
-    println!("   Single-ELF Suite Summary");
-    println!("==========================================");
-    println!("Total:  {} tests", total);
-    println!("Passed: {} tests", passed);
-    println!("Failed: {} tests", failed);
-    println!("==========================================\n");
+    let _ = run_single_binary(selector);
 }
