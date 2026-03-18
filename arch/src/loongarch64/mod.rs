@@ -54,6 +54,20 @@ pub type TrapContext = TrapFrame;
 pub type TaskContext = KContext;
 pub use kcontext::context_switch as __switch;
 
+#[inline]
+pub unsafe fn switch_to_task(
+    idle_task_cx_ptr: *mut TaskContext,
+    next_task_cx_ptr: *const TaskContext,
+    pt_token: usize,
+) {
+    context_switch_pt(idle_task_cx_ptr, next_task_cx_ptr, pt_token);
+}
+
+#[inline]
+pub unsafe fn switch_to_idle(switched_task_cx_ptr: *mut TaskContext, idle_task_cx_ptr: *mut TaskContext) {
+    context_switch(switched_task_cx_ptr, idle_task_cx_ptr);
+}
+
 // ---------------------------------------------------------------------------
 // Stubs / compat
 // ---------------------------------------------------------------------------
