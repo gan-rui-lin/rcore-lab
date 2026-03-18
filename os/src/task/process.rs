@@ -6,7 +6,7 @@ use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{KERNEL_SPACE, MemorySet, translated_byte_buffer, translated_ref, translated_refmut, translated_str};
 use crate::sync::{Condvar, Mutex, Semaphore, UPIntrFreeCell};
 use arch::{TrapContext, TrapFrameArgs};
-use crate::trap::user_trap_entry;
+use crate::trap::user_trap_loop;
 use xmas_elf::ElfFile;
 use xmas_elf::sections::{SectionData, ShType};
 use xmas_elf::symbol_table::Entry;
@@ -241,7 +241,7 @@ impl ProcessControlBlock {
             ustack_top,
             KERNEL_SPACE.exclusive_access().token(),
             kstack_top,
-            user_trap_entry as usize,
+            user_trap_loop as usize,
         );
 
         if gp != 0 {
@@ -568,7 +568,7 @@ impl ProcessControlBlock {
             user_sp,  // sp should point to argc
             KERNEL_SPACE.exclusive_access().token(),
             task.kstack.get_top(),
-            user_trap_entry as usize,
+            user_trap_loop as usize,
         );
         trap_cx[TrapFrameArgs::ARG0] = argc;
         trap_cx[TrapFrameArgs::ARG1] = argv_base;

@@ -4,7 +4,7 @@ use crate::{
     syscall::errno::{errno, EAGAIN, ECHILD},
     task::{TaskControlBlock, add_task, current_process, current_task},
 };
-use crate::trap::user_trap_entry;
+use crate::trap::user_trap_loop;
 use alloc::sync::Arc;
 
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
@@ -36,7 +36,7 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         new_task_res.ustack_top(),
         kernel_token(),
         new_task.kstack.get_top(),
-        user_trap_entry as usize,
+        user_trap_loop as usize,
     );
     new_task_trap_cx[TrapFrameArgs::ARG0] = arg;
     // Queue the thread after its initial trap context is ready.
