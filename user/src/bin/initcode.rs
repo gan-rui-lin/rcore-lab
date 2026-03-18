@@ -18,18 +18,18 @@ const SINGLE_TEST: Option<&str> = option_env!("SINGLE_TEST");
 const SH: &[u8] = b"sh\0";
 const PATH_ENV: &[u8] = b"PATH=/bin:/usr/bin:/musl:/glibc\0";
 const TEST_LIBC_ROOTS: [&str; 2] = ["/musl", "/glibc"];
-const TEST_SUITES: [&str; 1] = [
+const TEST_SUITES: [&str; 11] = [
     "basic",
-    // "busybox",
-    // "cyclictest",
-    // "iozone",
-    // "iperf",
-    // "libcbench",
-    // "libctest",
-    // "lmbench",
-    // "ltp",
-    // "lua",
-    // "netperf",
+    "busybox",
+    "cyclictest",
+    "iozone",
+    "iperf",
+    "libcbench",
+    "libctest",
+    "lmbench",
+    "ltp",
+    "lua",
+    "netperf",
 ];
 #[allow(dead_code)]
 const RUN_EMBEDDED_PTHREAD: bool = option_env!("RUN_EMBEDDED_PTHREAD").is_some();
@@ -87,10 +87,10 @@ fn file_exists(path: &str) -> bool {
 
 fn force_link(link_path: &str, target_path: &str) {
     if !file_exists(target_path) {
-        println!(
-            "[initcode] skip relink {} -> {} (target missing)",
-            link_path, target_path
-        );
+        // println!(
+        //     "[initcode] skip relink {} -> {} (target missing)",
+        //     link_path, target_path
+        // );
         return;
     }
     let link_c = cstring(link_path);
@@ -99,15 +99,15 @@ fn force_link(link_path: &str, target_path: &str) {
     let target = unsafe { core::str::from_utf8_unchecked(&target_c) };
 
     let _ = unlink(link_name);
-    let ret = link(target, link_name);
-    if ret == 0 {
-        println!("[initcode] relink {} -> {}", link_path, target_path);
-    } else {
-        println!(
-            "[initcode] relink failed {} -> {} (ret={})",
-            link_path, target_path, ret
-        );
-    }
+    let _ret = link(target, link_name);
+    // if ret == 0 {
+    //     println!("[initcode] relink {} -> {}", link_path, target_path);
+    // } else {
+    //     println!(
+    //         "[initcode] relink failed {} -> {} (ret={})",
+    //         link_path, target_path, ret
+    //     );
+    // }
 }
 
 fn select_busybox_for_root(root: &str) -> Option<&'static str> {
