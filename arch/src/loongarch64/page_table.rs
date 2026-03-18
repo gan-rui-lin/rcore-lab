@@ -7,7 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::consts::{VIRT_ADDR_START, PAGE_SIZE, PAGE_SIZE_BITS};
-use crate::api::ArchInterface;
+use crate::pagetable;
 
 // ---------------------------------------------------------------------------
 // Frame allocation via crate_interface (decoupled from kernel crate)
@@ -15,13 +15,13 @@ use crate::api::ArchInterface;
 
 /// Allocate a single physical page frame through the kernel callback.
 fn arch_frame_alloc() -> PhysPageNum {
-    let ppn_raw = crate::api::ArchInterface::frame_alloc();
+    let ppn_raw = pagetable::frame_alloc_persist();
     PhysPageNum(ppn_raw)
 }
 
 /// Deallocate a single physical page frame through the kernel callback.
 fn arch_frame_dealloc(ppn: PhysPageNum) {
-    crate::api::ArchInterface::frame_dealloc(ppn.0);
+    pagetable::frame_dealloc_persist(ppn.0);
 }
 
 bitflags::bitflags! {
