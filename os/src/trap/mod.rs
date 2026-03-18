@@ -22,21 +22,6 @@ use alloc::string::String;
 const TIMER_SAMPLE_INTERVAL: u64 = 200;
 static TIMER_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(target_arch = "riscv64")]
-fn riscv_insn_len_at(user_token: usize, sepc: usize) -> usize {
-    let page_table = PageTable::from_token(user_token);
-    let read_byte = |va: usize| -> Option<u8> {
-        let pa = page_table.translate_va(VirtAddr::from(va))?;
-        Some(*pa.get_ref::<u8>())
-    };
-    let (b0, b1) = match (read_byte(sepc), read_byte(sepc.wrapping_add(1))) {
-        (Some(a), Some(b)) => (a, b),
-        _ => return 2,
-    };
-    let insn16 = u16::from_le_bytes([b0, b1]);
-    if (insn16 & 0b11) == 0b11 { 4 } else { 2 }
-}
-
 // ---------------------------------------------------------------------------
 // Kernel-mode trap dispatch (called from ArchInterface::kernel_interrupt)
 // ---------------------------------------------------------------------------
@@ -49,7 +34,6 @@ fn riscv_insn_len_at(user_token: usize, sepc: usize) -> usize {
 pub fn kernel_interrupt_dispatch(trap_type: arch::TrapType) {
     match trap_type {
         arch::TrapType::SupervisorExternal => {
-            #[cfg(target_arch = "riscv64")]
             crate::board::irq_handler();
         }
         arch::TrapType::Time => {
@@ -225,6 +209,20 @@ pub fn user_trap_loop() -> ! {
 /// Enter user space and loop on user traps for the current task.
 #[cfg(target_arch = "riscv64")]
 pub fn user_trap_loop() -> ! {
+    fn riscv_insn_len_at(user_token: usize, sepc: usize) -> usize {
+        let page_table = PageTable::from_token(user_token);
+        let read_byte = |va: usize| -> Option<u8> {
+            let pa = page_table.translate_va(VirtAddr::from(va))?;
+            Some(*pa.get_ref::<u8>())
+        };
+        let (b0, b1) = match (read_byte(sepc), read_byte(sepc.wrapping_add(1))) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return 2,
+        };
+        let insn16 = u16::from_le_bytes([b0, b1]);
+        if (insn16 & 0b11) == 0b11 { 4 } else { 2 }
+    }
+
     loop {
         let user_token = current_user_token();
         let trap_type = arch::enter_user_and_trap(current_trap_cx(), user_token);
