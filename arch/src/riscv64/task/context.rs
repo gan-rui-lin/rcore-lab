@@ -30,15 +30,15 @@ impl TaskContext {
         }
     }
 
-    /// Create a task context that will jump to `trap_return` when
-    /// switched to for the first time.
+    /// Create a task context that will jump to the kernel user-trap loop
+    /// when switched to for the first time.
     ///
     /// `kstack_ptr` is the top of this task's kernel stack.
-    /// `trap_return_addr` is the address of the arch-level `trap_return`
-    /// function (typically `trap_return as usize`).
-    pub fn goto_trap_return(kstack_ptr: usize, trap_return_addr: usize) -> Self {
+    /// `entry_addr` is the address of the per-task entry routine
+    /// (typically `crate::trap::user_trap_loop` in the kernel crate).
+    pub fn for_user_trap_loop(kstack_ptr: usize, entry_addr: usize) -> Self {
         Self {
-            ra: trap_return_addr,
+            ra: entry_addr,
             sp: kstack_ptr,
             tp: 0,
             s: [0; 12],

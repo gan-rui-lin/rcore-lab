@@ -4,7 +4,7 @@
 //!   - All inline / global assembly for trap entry and return
 //!   - Hardware trap classification (`loongarch64_trap_handler`)
 //!   - IRQ / TLB initialisation
-//!   - The parameterised `trap_return` that the kernel calls
+//!   - User-entry helper (`enter_user_and_trap`)
 //!
 //! The high-level dispatch (`trap_handler() -> !`) that used to live here
 //! has been moved to the kernel crate.  The arch layer now calls back into
@@ -215,15 +215,13 @@ pub fn disable_irq() {
 pub fn enable_external_irq() {}
 
 // ---------------------------------------------------------------------------
-// Run user task (enter userspace, return on trap)
+// Enter userspace and return on the next trap
 // ---------------------------------------------------------------------------
 
-pub fn run_user_task(cx: &mut TrapFrame) -> Option<()> {
+pub fn enter_user_and_trap(cx: &mut TrapFrame, user_token: usize) -> TrapType {
+    super::page_table::activate_page_table(user_token);
     user_restore(cx);
-    match loongarch64_trap_handler(cx) {
-        TrapType::UserEnvCall => Some(()),
-        _ => None,
-    }
+    loongarch64_trap_handler(cx)
 }
 
 // ---------------------------------------------------------------------------
@@ -483,17 +481,4 @@ pub unsafe fn set_kernel_user_rw_trap() {
 
 pub unsafe fn set_kernel_trap() {
     eentry::set_eentry(trap_vector_base as usize);
-}
-
-// ---------------------------------------------------------------------------
-// trap_return -- parameterised version
-//
-// The kernel supplies the trap-context virtual address and the user page
-// table token.  This removes the dependency on `current_trap_cx_user_va`
-// and `current_user_token` which live in the kernel crate.
-// ---------------------------------------------------------------------------
-
-/// Stub: LoongArch64 does not use trap_return; user return is handled by task_entry.
-pub fn trap_return(_trap_cx_ptr: usize, _user_satp: usize) -> ! {
-    panic!("trap_return() should not be called on loongarch64; user return is handled by task_entry");
 }

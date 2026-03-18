@@ -77,8 +77,7 @@ pub use timer::{get_time, get_time_ms, get_time_us, set_next_trigger};
 pub use trap::TrapContext;
 pub use trap::init as trap_init;
 pub use trap::enable_timer_interrupt as trap_enable_timer_interrupt;
-pub use trap::run_user_task;
-pub use trap::trap_return;
+pub use trap::enter_user_and_trap;
 
 /// Fixed virtual base where the RISC-V signal-return trampoline page is mapped.
 pub const SIG_RETURN_ADDR: usize = 0xFFFF_FFC1_0000_0000;

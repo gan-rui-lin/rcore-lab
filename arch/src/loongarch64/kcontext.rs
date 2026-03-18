@@ -37,10 +37,10 @@ impl KContext {
         Self::blank()
     }
 
-    pub fn goto_trap_return(kstack_top: usize, trap_return_addr: usize) -> Self {
+    pub fn for_user_trap_loop(kstack_top: usize, entry_addr: usize) -> Self {
         let mut cx = Self::blank();
         cx.ksp = kstack_top;
-        cx.kpc = trap_return_addr;
+        cx.kpc = entry_addr;
         cx
     }
 }

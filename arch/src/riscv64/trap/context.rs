@@ -7,7 +7,7 @@ use crate::TrapFrameArgs;
 
 /// User-mode trap context.
 ///
-/// Saved by `kernelvec/uservec` (in `trap.S`) and restored by `user_restore`.
+/// Saved by `kernelvec/uservec` (in `trap.S`) and restored by `riscv_user_enter`.
 /// The layout must match the assembly exactly.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -15,7 +15,7 @@ pub struct TrapContext {
     /// General-purpose registers x0-x31.
     ///
     /// NOTE: RV `trap.S` temporarily uses `x[0]` as an internal kernel stack
-    /// scratch slot between `user_restore` and `uservec`, then clears it back
+    /// scratch slot between `riscv_user_enter` and `uservec`, then clears it back
     /// to zero in `uservec`. Rust code must treat `x[0]` as architectural x0.
     pub x: [usize; 32],
     /// Supervisor Status Register.
