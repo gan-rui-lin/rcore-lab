@@ -165,6 +165,38 @@ impl ProcessControlBlock {
         *translated_refmut(token, (base + 8) as *mut usize) = base;
         base
     }
+
+    #[cfg(target_arch = "loongarch64")]
+    fn alloc_minimal_tcb_if_needed(memory_set: &mut MemorySet, tls_area: &Option<TlsArea>) -> Option<usize> {
+        if tls_area.is_none() {
+            Some(Self::alloc_minimal_tcb(memory_set))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    fn alloc_minimal_tcb_if_needed(_memory_set: &mut MemorySet, _tls_area: &Option<TlsArea>) -> Option<usize> {
+        None
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    fn fallback_tcb_addr_if_no_tls(
+        _token: usize,
+        _ustack_top: usize,
+        minimal_tcb: Option<usize>,
+    ) -> Option<usize> {
+        minimal_tcb
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    fn fallback_tcb_addr_if_no_tls(token: usize, ustack_top: usize, _minimal_tcb: Option<usize>) -> Option<usize> {
+        let tcb_addr = ustack_top - 16;
+        *translated_refmut(token, tcb_addr as *mut usize) = 0;
+        *translated_refmut(token, (tcb_addr + 8) as *mut usize) = tcb_addr;
+        Some(tcb_addr)
+    }
+
     pub fn inner_exclusive_access(&self) -> UPIntrRefMut<'_, ProcessControlBlockInner> {
         self.inner.exclusive_access()
     }
@@ -189,12 +221,7 @@ impl ProcessControlBlock {
         let tls_area = tls_info.map(|info| {
             TlsArea::new(&info, &mut memory_set, elf_data)
         });
-        #[cfg(target_arch = "loongarch64")]
-        let minimal_tcb = if tls_area.is_none() {
-            Some(Self::alloc_minimal_tcb(&mut memory_set))
-        } else {
-            None
-        };
+        let minimal_tcb = Self::alloc_minimal_tcb_if_needed(&mut memory_set, &tls_area);
 
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
@@ -247,23 +274,8 @@ impl ProcessControlBlock {
             trap_cx_value[TrapFrameArgs::TLS] = tls.tp_value;
             info!("[kernel] TLS initialized: tp = {:#x}", tls.tp_value);
         } else {
-            let tcb_addr = {
-                #[cfg(not(target_arch = "loongarch64"))]
-                {
-                    // Even without PT_TLS, allocate a minimal TCB near top of user stack.
-                    let tcb_addr = ustack_top - 16; // 16 bytes TCB
-                    let token = process.inner_exclusive_access().memory_set.token();
-
-                    // Initialize minimal TCB.
-                    *translated_refmut(token, tcb_addr as *mut usize) = 0;
-                    *translated_refmut(token, (tcb_addr + 8) as *mut usize) = tcb_addr;
-                    tcb_addr
-                }
-                #[cfg(target_arch = "loongarch64")]
-                {
-                    minimal_tcb.unwrap_or(0)
-                }
-            };
+            let token = process.inner_exclusive_access().memory_set.token();
+            let tcb_addr = Self::fallback_tcb_addr_if_no_tls(token, ustack_top, minimal_tcb).unwrap_or(0);
             trap_cx_value[TrapFrameArgs::TLS] = tcb_addr;
             info!(
                 "[kernel] Minimal TCB initialized (no PT_TLS): tp = {:#x}",
@@ -336,12 +348,7 @@ impl ProcessControlBlock {
             TlsArea::new(&info, &mut memory_set, elf_data)
         });
 
-        #[cfg(target_arch = "loongarch64")]
-        let minimal_tcb = if tls_area.is_none() {
-            Some(Self::alloc_minimal_tcb(&mut memory_set))
-        } else {
-            None
-        };
+        let minimal_tcb = Self::alloc_minimal_tcb_if_needed(&mut memory_set, &tls_area);
 
         let new_token = memory_set.token();
         if exec_name == "sh" || exec_name == "busybox" {
@@ -432,15 +439,8 @@ impl ProcessControlBlock {
             {
                 user_sp = user_sp.saturating_sub(16);
                 user_sp &= !0xf;
-                let tcb_addr = user_sp;
-                *translated_refmut(new_token, tcb_addr as *mut usize) = 0;
-                *translated_refmut(new_token, (tcb_addr + 8) as *mut usize) = tcb_addr;
-                Some(tcb_addr)
             }
-            #[cfg(target_arch = "loongarch64")]
-            {
-                minimal_tcb
-            }
+            Self::fallback_tcb_addr_if_no_tls(new_token, user_sp, minimal_tcb)
         } else {
             None
         };

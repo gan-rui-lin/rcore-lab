@@ -8,25 +8,21 @@ mod manager;
 mod process;
 mod processor;
 mod signal;
-mod switch;
 #[allow(clippy::module_inception)]
 #[allow(rustdoc::private_intra_doc_links)]
 mod task;
 mod futex;
 mod tls;
+#[cfg_attr(all(debug_assertions, target_arch = "riscv64"), path = "initproc_embed_riscv64_debug.rs")]
+#[cfg_attr(all(not(debug_assertions), target_arch = "riscv64"), path = "initproc_embed_riscv64_release.rs")]
+#[cfg_attr(target_arch = "loongarch64", path = "initproc_embed_loongarch64.rs")]
+mod initproc_embed;
 #[allow(unused_imports)]
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, PageTable, VirtAddr};
 use arch::{shutdown, TrapContext, TrapFrameArgs};
-#[cfg(target_arch = "riscv64")]
-use arch::{FpRegs, MContext};
-#[cfg(target_arch = "loongarch64")]
-use crate::config::PAGE_SIZE;
 use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
 use crate::timer::remove_timer;
-#[cfg(target_arch = "riscv64")]
-/// Alias for backward compatibility within this module.
-type RiscvFpRegs = FpRegs;
 use alloc::sync::Arc;
 use lazy_static::*;
 #[allow(unused_imports)]
@@ -34,8 +30,6 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use manager::fetch_task;
 use process::ProcessControlBlock;
-#[cfg(target_arch = "riscv64")]
-use switch::__switch;
 
 pub use action::{SignalAction, SignalActions, SA_SIGINFO, SA_RESETHAND};
 pub use auxv::AuxvInfo;
@@ -71,6 +65,11 @@ static DEBUG_DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LINUX_SIGINFO_SIZE: usize = 128;
 const LINUX_SIGSET_WORDS: usize = 16; // 128 bytes / 8
 
+#[cfg_attr(target_arch = "riscv64", path = "user_context_riscv64.rs")]
+#[cfg_attr(target_arch = "loongarch64", path = "user_context_loongarch64.rs")]
+mod user_context;
+pub use user_context::UserContext;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LinuxSigInfo {
@@ -91,134 +90,9 @@ pub struct StackT {
     pub ss_size: usize,
 }
 
-#[cfg(target_arch = "loongarch64")]
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-pub struct LoongArchMContext {
-    pub pc: usize,
-    pub gregs: [usize; 32],
-    pub flags: u32,
-    pub _pad: u32,
-}
-
-#[cfg(target_arch = "riscv64")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct UserContext {
-    pub uc_flags: usize,
-    pub uc_link: usize,
-    pub uc_stack: StackT,
-    pub uc_sigmask: [u64; LINUX_SIGSET_WORDS],
-    pub uc_mcontext: MContext,
-}
-
-#[cfg(target_arch = "loongarch64")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct UserContext {
-    pub uc_flags: usize,
-    pub uc_link: usize,
-    pub uc_stack: StackT,
-    pub uc_sigmask: [u64; LINUX_SIGSET_WORDS],
-    pub uc_mcontext: LoongArchMContext,
-}
-
 const USER_UCONTEXT_SIZE: usize = core::mem::size_of::<UserContext>();
 // musl cancel_handler reads/writes uc_mcontext.gregs[0]/pc at ucontext+176.
 const _USER_UCONTEXT_LAYOUT_CHECK: [(); core::mem::offset_of!(UserContext, uc_mcontext)] = [(); 176];
-
-#[cfg(target_arch = "riscv64")]
-impl UserContext {
-    fn from_trap(trap_cx: &TrapContext, sigmask: SignalFlags) -> Self {
-        let mut gregs = [0usize; 32];
-        trap_cx.write_ucontext_gregs(&mut gregs);
-        let mut user_sigset = [0u64; LINUX_SIGSET_WORDS];
-        user_sigset[0] = signal::flags_to_user_mask(sigmask);
-        Self {
-            uc_flags: 0,
-            uc_link: 0,
-            uc_stack: StackT {
-                ss_sp: 0,
-                ss_flags: 0,
-                _pad: 0,
-                ss_size: 0,
-            },
-            uc_sigmask: user_sigset,
-            uc_mcontext: MContext {
-                gregs,
-                fpregs: RiscvFpRegs {
-                    f: [0u64; 32],
-                    fcsr: 0,
-                    _pad: 0,
-                },
-            },
-        }
-    }
-
-    pub fn signal_mask_word0(&self) -> u64 {
-        self.uc_sigmask[0]
-    }
-
-    pub fn user_pc(&self) -> usize {
-        self.uc_mcontext.gregs[0]
-    }
-
-    pub fn restore_trap_context(&self, trap_cx: &mut TrapContext) {
-        trap_cx.restore_from_ucontext_gregs(&self.uc_mcontext.gregs);
-    }
-}
-
-#[cfg(target_arch = "loongarch64")]
-impl UserContext {
-    fn from_trap(trap_cx: &TrapContext, sigmask: SignalFlags) -> Self {
-        let mut user_sigset = [0u64; LINUX_SIGSET_WORDS];
-        user_sigset[0] = signal::flags_to_user_mask(sigmask);
-        Self {
-            uc_flags: 0,
-            uc_link: 0,
-            uc_stack: StackT {
-                ss_sp: 0,
-                ss_flags: 0,
-                _pad: 0,
-                ss_size: 0,
-            },
-            uc_sigmask: user_sigset,
-            uc_mcontext: LoongArchMContext {
-                pc: trap_cx.sepc,
-                gregs: trap_cx.x,
-                flags: 0,
-                _pad: 0,
-            },
-        }
-    }
-
-    pub fn signal_mask_word0(&self) -> u64 {
-        self.uc_sigmask[0]
-    }
-
-    pub fn user_pc(&self) -> usize {
-        self.uc_mcontext.pc
-    }
-
-    pub fn restore_trap_context(&self, trap_cx: &mut TrapContext) {
-        // Compatibility path: some libc variants patch gregs[0] as the
-        // return PC in signal handlers. Prefer explicit `pc`, but honor a
-        // non-zero divergent gregs[0] value when present.
-        let mut restored_pc = self.uc_mcontext.pc;
-        let gpr0_pc = self.uc_mcontext.gregs[0];
-        if gpr0_pc != 0 && gpr0_pc != restored_pc {
-            trace!(
-                "[sigreturn-compat] loongarch use gregs[0] as pc: pc={:#x} gpr0={:#x}",
-                restored_pc,
-                gpr0_pc
-            );
-            restored_pc = gpr0_pc;
-        }
-        trap_cx.sepc = restored_pc;
-        trap_cx.x = self.uc_mcontext.gregs;
-        trap_cx.x[0] = 0;
-    }
-}
 
 impl Default for LinuxSigInfo {
     fn default() -> Self {
@@ -402,21 +276,7 @@ lazy_static! {
     };
 }
 
-#[cfg(all(debug_assertions, target_arch = "riscv64"))]
-const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../user/target/riscv64gc-unknown-none-elf/debug/initcode"
-));
-#[cfg(all(not(debug_assertions), target_arch = "riscv64"))]
-const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../user/target/riscv64gc-unknown-none-elf/release/initcode"
-));
-#[cfg(target_arch = "loongarch64")]
-const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../user/build/elf/initcode.elf"
-));
+const INITPROC_EMBED: &[u8] = initproc_embed::INITPROC_EMBED;
 
 pub fn add_initproc() {
     let _initproc = INITPROC.clone();
@@ -779,7 +639,7 @@ pub fn handle_signals() {
     #[cfg(target_arch = "loongarch64")]
     {
         if let Some(res) = task_inner.res.as_ref() {
-            let tramp_base = res.ustack_base().saturating_sub(PAGE_SIZE);
+            let tramp_base = res.ustack_base().saturating_sub(crate::config::PAGE_SIZE);
             let tramp_offset = arch::sigtrx::sigreturn_trampoline_offset();
             let tramp = tramp_base + tramp_offset;
             trap_cx[TrapFrameArgs::RA] = tramp;

@@ -66,6 +66,20 @@ pub use signal::{FpRegs, RiscvFpRegs, MContext};
 // ---------------------------------------------------------------------------
 pub use task::{TaskContext, __switch};
 
+#[inline]
+pub unsafe fn switch_to_task(
+    idle_task_cx_ptr: *mut TaskContext,
+    next_task_cx_ptr: *const TaskContext,
+    _pt_token: usize,
+) {
+    __switch(idle_task_cx_ptr, next_task_cx_ptr);
+}
+
+#[inline]
+pub unsafe fn switch_to_idle(switched_task_cx_ptr: *mut TaskContext, idle_task_cx_ptr: *mut TaskContext) {
+    __switch(switched_task_cx_ptr, idle_task_cx_ptr);
+}
+
 // ---------------------------------------------------------------------------
 // Timer
 // ---------------------------------------------------------------------------
