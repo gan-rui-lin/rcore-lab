@@ -26,6 +26,7 @@ extern crate log;
 extern crate bitflags;
 
 pub mod api;
+pub mod pagetable;
 
 // ---------------------------------------------------------------------------
 // Shared types used by both architectures and the kernel
