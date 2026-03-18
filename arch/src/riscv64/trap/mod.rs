@@ -18,7 +18,7 @@ global_asm!(include_str!("trap.S"));
 
 extern "C" {
     fn kernelvec();
-    fn user_restore(context: *mut u8, user_satp: usize);
+    fn riscv_user_enter(context: *mut u8, user_satp: usize);
 }
 
 /// Initialize trap handling: point `stvec` at `kernelvec`.
@@ -42,26 +42,20 @@ pub fn enable_timer_interrupt() {
 }
 
 /// Enter user mode and return once a trap from user mode occurs.
-pub fn run_user_task(context: &mut context::TrapContext, user_satp: usize) -> TrapType {
-    let restore_high = if (user_restore as usize) >= crate::VIRT_ADDR_START {
-        user_restore as usize
+pub fn enter_user_and_trap(context: &mut context::TrapContext, user_satp: usize) -> TrapType {
+    let enter_high = if (riscv_user_enter as usize) >= crate::VIRT_ADDR_START {
+        riscv_user_enter as usize
     } else {
-        (user_restore as usize) | crate::VIRT_ADDR_START
+        (riscv_user_enter as usize) | crate::VIRT_ADDR_START
     };
-    let restore_fn: extern "C" fn(*mut u8, usize) = unsafe { core::mem::transmute(restore_high) };
-    restore_fn((context as *mut _) as *mut u8, user_satp);
+    let enter_fn: extern "C" fn(*mut u8, usize) = unsafe { core::mem::transmute(enter_high) };
+    enter_fn((context as *mut _) as *mut u8, user_satp);
     classify_current_trap()
-}
-
-/// Deprecated compatibility entry. RISC-V now returns to user through
-/// `run_user_task` loop in kernel `task_entry`.
-pub fn trap_return(_trap_cx_ptr: usize, _user_satp: usize) -> ! {
-    panic!("trap_return() is obsolete on riscv64; use run_user_task loop")
 }
 
 /// Called from `trap.S` for traps taken while already in supervisor mode.
 #[no_mangle]
-extern "C" fn trap_from_kernel(_trap_cx: &context::KernelTrapContext) {
+extern "C" fn kernel_trap_dispatch(_trap_cx: &context::KernelTrapContext) {
     let scause = scause::read();
     let stval = stval::read();
 

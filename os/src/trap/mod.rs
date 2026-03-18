@@ -1,6 +1,6 @@
 //! Trap handling for the kernel.
 //!
-//! User-mode traps are handled in `do_trap_return()` loops (arch-specific).
+//! User-mode traps are handled in `user_trap_loop()` (arch-specific).
 //! Kernel-mode traps are dispatched
 //! through `ArchInterface::kernel_interrupt` → `kernel_interrupt_dispatch`.
 
@@ -9,7 +9,7 @@
 
 use crate::syscall::syscall;
 use crate::task::{
-    current_add_signal, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
+    current_add_signal, current_process, current_task, current_trap_cx,
     current_user_token, handle_signals, suspend_current_and_run_next, SignalFlags,
 };
 use crate::mm::{PageTable, VirtAddr};
@@ -18,13 +18,6 @@ use crate::timer::{check_timer, set_next_trigger};
 use arch::TrapFrameArgs;
 use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::string::String;
-
-#[cfg(target_arch = "riscv64")]
-pub fn user_trap_entry() -> ! {
-    panic!("user_trap_entry() is obsolete on riscv64")
-}
-#[cfg(target_arch = "loongarch64")]
-pub use task_entry as user_trap_entry;
 
 const TIMER_SAMPLE_INTERVAL: u64 = 200;
 static TIMER_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -97,71 +90,17 @@ pub fn kernel_interrupt_dispatch(trap_type: arch::TrapType) {
 //
 // On LoongArch64 the kernel enters user mode via a loop: restore user
 // registers -> ertn -> (user runs) -> trap -> user_vec returns here.
-// This replaces the RISC-V approach of calling `trap_return()` which
-// jumps to the trampoline page.
+// This avoids the old trampoline-style return path and keeps the kernel
+// control flow in a direct loop.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "loongarch64")]
-pub fn task_entry() {
+pub fn user_trap_loop() -> ! {
     use arch::TrapType;
     loop {
         let user_token = current_user_token();
-        arch::activate_page_table(user_token);
-        // user_restore enters user mode; user_vec returns here after trap
-        let trap_cx_ptr = current_trap_cx() as *mut arch::TrapContext;
-        arch::user_restore(trap_cx_ptr);
-
-        // Handle the trap
+        let trap_type = arch::enter_user_and_trap(current_trap_cx(), user_token);
         let trap_cx = current_trap_cx();
-        let estat = loongArch64::register::estat::read();
-        let trap_type = match estat.cause() {
-            loongArch64::register::estat::Trap::Exception(
-                loongArch64::register::estat::Exception::Syscall,
-            ) => TrapType::UserEnvCall,
-            loongArch64::register::estat::Trap::Exception(
-                loongArch64::register::estat::Exception::AddressNotAligned,
-            ) => {
-                // Keep parity with arch-side trap classification: emulate
-                // supported unaligned loads/stores and advance sepc.
-                unsafe { arch::unaligned::emulate_load_store_insn(trap_cx) };
-                // Exception is fully handled in-place; re-enter user directly.
-                continue;
-            }
-            loongArch64::register::estat::Trap::Interrupt(_) => {
-                let irq_num = estat.is().trailing_zeros() as usize;
-                if irq_num == 11 {
-                    loongArch64::register::ticlr::clear_timer_interrupt();
-                    TrapType::Time
-                } else {
-                    TrapType::Unknown
-                }
-            }
-            loongArch64::register::estat::Trap::Exception(
-                loongArch64::register::estat::Exception::StorePageFault,
-            )
-            | loongArch64::register::estat::Trap::Exception(
-                loongArch64::register::estat::Exception::PagePrivilegeIllegal,
-            )
-            | loongArch64::register::estat::Trap::Exception(
-                loongArch64::register::estat::Exception::PageModifyFault,
-            ) => TrapType::StorePageFault(loongArch64::register::badv::read().raw()),
-            loongArch64::register::estat::Trap::Exception(
-                loongArch64::register::estat::Exception::LoadPageFault,
-            )
-            | loongArch64::register::estat::Trap::Exception(
-                loongArch64::register::estat::Exception::FetchPageFault,
-            )
-            | loongArch64::register::estat::Trap::Exception(
-                loongArch64::register::estat::Exception::FetchInstructionAddressError,
-            )
-            | loongArch64::register::estat::Trap::Exception(
-                loongArch64::register::estat::Exception::MemoryAccessAddressError,
-            ) => TrapType::LoadPageFault(loongArch64::register::badv::read().raw()),
-            loongArch64::register::estat::Trap::Exception(
-                loongArch64::register::estat::Exception::InstructionNotExist,
-            ) => TrapType::IllegalInstruction(loongArch64::register::badv::read().raw()),
-            _ => TrapType::Unknown,
-        };
 
         match trap_type {
             TrapType::UserEnvCall => {
@@ -269,9 +208,8 @@ pub fn task_entry() {
                 );
                 current_add_signal(SignalFlags::SIGILL);
             }
-            _ => {
-                warn!("[kernel] trap_handler: unknown trap at sepc={:#x}", trap_cx.sepc);
-            }
+            arch::TrapType::Unknown => {}
+            _ => warn!("[kernel] trap_handler: unknown trap at sepc={:#x}", trap_cx.sepc),
         }
         if current_task().is_some() {
             handle_signals();
@@ -284,12 +222,12 @@ pub fn task_entry() {
 // Return to user space
 // ---------------------------------------------------------------------------
 
-/// Return to user space via the architecture-specific `trap_return`.
+/// Enter user space and loop on user traps for the current task.
 #[cfg(target_arch = "riscv64")]
-pub fn do_trap_return() -> ! {
+pub fn user_trap_loop() -> ! {
     loop {
         let user_token = current_user_token();
-        let trap_type = arch::run_user_task(current_trap_cx(), user_token);
+        let trap_type = arch::enter_user_and_trap(current_trap_cx(), user_token);
 
         match trap_type {
             arch::TrapType::UserEnvCall => {
@@ -344,13 +282,6 @@ pub fn do_trap_return() -> ! {
             handle_signals();
         }
     }
-}
-
-#[cfg(target_arch = "loongarch64")]
-pub fn do_trap_return() -> ! {
-    let trap_cx_ptr = current_trap_cx_user_va();
-    let user_satp = current_user_token();
-    arch::trap_return(trap_cx_ptr, user_satp);
 }
 
 /// Debug helper for GDB: translate a user virtual address to physical address.
