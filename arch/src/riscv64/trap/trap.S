@@ -47,20 +47,6 @@
 .endm
 
 // -----------------------------------------------------------------------------
-// Compatibility trampoline stub
-// -----------------------------------------------------------------------------
-.section .text.trampoline
-.globl strampoline
-.globl __alltraps
-.globl __restore
-.align 2
-strampoline:
-__alltraps:
-    j kernelvec
-__restore:
-    j user_restore
-
-// -----------------------------------------------------------------------------
 // Unified trap vector: kernelvec/uservec + sscratch stack switch
 // -----------------------------------------------------------------------------
 .section .text
@@ -76,14 +62,14 @@ kernelvec:
     csrw sscratch, x0
 
     mv a0, sp
-    call trap_from_kernel
+    call kernel_trap_dispatch
 
     LOAD_GENERAL_REGS
     sret
 
-.globl user_restore
+.globl riscv_user_enter
 .align 2
-user_restore:
+riscv_user_enter:
     // Critical section: avoid taking S-mode interrupts before sret,
     // otherwise kernelvec may misclassify and clobber TrapContext.
     csrci sstatus, 2
