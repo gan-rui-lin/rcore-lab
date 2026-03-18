@@ -261,45 +261,78 @@ fn ensure_hardlink(linkpath: &str, target: &str) {
 #[cfg(feature = "ext4")]
 /// Create common BusyBox hardlinks on ext4 (e.g. /bin/sh) to keep scripts working.
 pub fn ensure_busybox_links() {
-    const BUSYBOX_PATH: &str = "/musl/busybox";
-    if open_file(BUSYBOX_PATH, OpenFlags::empty()).is_none() {
-        error!("[ext4] busybox not found at {}", BUSYBOX_PATH);
+    let has_musl_busybox = open_file("/musl/busybox", OpenFlags::empty()).is_some();
+    let has_glibc_busybox = open_file("/glibc/busybox", OpenFlags::empty()).is_some();
+
+    if !has_musl_busybox && !has_glibc_busybox {
+        error!("[ext4] busybox not found at /musl/busybox and /glibc/busybox");
         return;
     }
-    debug!("[ext4] ensure busybox links from {}", BUSYBOX_PATH);
+
+    debug!(
+        "[ext4] ensure busybox links strict mode: musl={} glibc={}",
+        has_musl_busybox,
+        has_glibc_busybox
+    );
+
     create_dir("/bin");
     create_dir("/usr");
     create_dir("/usr/bin");
     create_dir("/lib");
     #[cfg(target_arch = "loongarch64")]
     create_dir("/lib64");
-    ensure_hardlink("/bin/sh", BUSYBOX_PATH);
-    ensure_hardlink("/bin/basename", BUSYBOX_PATH);
-    ensure_hardlink("/bin/ls", BUSYBOX_PATH);
-    ensure_hardlink("/bin/sleep", BUSYBOX_PATH);
-    ensure_hardlink("/usr/bin/basename", BUSYBOX_PATH);
-    ensure_hardlink("/usr/bin/ls", BUSYBOX_PATH);
-    ensure_hardlink("/usr/bin/sleep", BUSYBOX_PATH);
-    ensure_hardlink("/musl/basename", BUSYBOX_PATH);
-    ensure_hardlink("/musl/sleep", BUSYBOX_PATH);
-    const GLIBC_LOADER: &str = "/glibc/lib/ld-linux-riscv64-lp64d.so.1";
-    const MUSL_LOADER: &str = "/musl/lib/libc.so";
-    if open_file(MUSL_LOADER, OpenFlags::empty()).is_some() {
-        ensure_hardlink("/lib/ld-linux-riscv64-lp64d.so.1", MUSL_LOADER);
-        // Also create musl-specific interpreter links (soft-float and hard-float variants)
-        ensure_hardlink("/lib/ld-musl-riscv64-sf.so.1", MUSL_LOADER);
-        ensure_hardlink("/lib/ld-musl-riscv64.so.1", MUSL_LOADER);
+
+    if has_musl_busybox {
+        ensure_hardlink("/musl/basename", "/musl/busybox");
+        ensure_hardlink("/musl/sleep", "/musl/busybox");
+    }
+
+    if has_glibc_busybox {
+        ensure_hardlink("/glibc/basename", "/glibc/busybox");
+        ensure_hardlink("/glibc/sleep", "/glibc/busybox");
+    }
+
+    if open_file("/musl/lib/libc.so", OpenFlags::empty()).is_some() {
+        ensure_hardlink("/lib/ld-musl-riscv64-sf.so.1", "/musl/lib/libc.so");
+        ensure_hardlink("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so");
         #[cfg(target_arch = "loongarch64")]
         {
-            // Keep both glibc-style and musl-style LoongArch interpreter names.
-            ensure_hardlink("/lib64/ld-linux-loongarch-lp64d.so.1", MUSL_LOADER);
-            ensure_hardlink("/lib64/ld-musl-loongarch-lp64d.so.1", MUSL_LOADER);
+            ensure_hardlink("/lib64/ld-musl-loongarch-lp64d.so.1", "/musl/lib/libc.so");
         }
-    } else if open_file(GLIBC_LOADER, OpenFlags::empty()).is_some() {
-        ensure_hardlink("/lib/ld-linux-riscv64-lp64d.so.1", GLIBC_LOADER);
-    } else {
-        error!("[ext4] missing loader at {} and {}", MUSL_LOADER, GLIBC_LOADER);
     }
+
+    #[cfg(target_arch = "riscv64")]
+    if open_file("/glibc/lib/ld-linux-riscv64-lp64d.so.1", OpenFlags::empty()).is_some() {
+        ensure_hardlink("/lib/ld-linux-riscv64-lp64d.so.1", "/glibc/lib/ld-linux-riscv64-lp64d.so.1");
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    if open_file("/glibc/lib/ld-linux-loongarch-lp64d.so.1", OpenFlags::empty()).is_some() {
+        ensure_hardlink("/lib64/ld-linux-loongarch-lp64d.so.1", "/glibc/lib/ld-linux-loongarch-lp64d.so.1");
+    }
+
+    if open_file("/bin/sh", OpenFlags::empty()).is_none() {
+        if has_musl_busybox && !has_glibc_busybox {
+            ensure_hardlink("/bin/sh", "/musl/busybox");
+            ensure_hardlink("/bin/basename", "/musl/busybox");
+            ensure_hardlink("/bin/ls", "/musl/busybox");
+            ensure_hardlink("/bin/sleep", "/musl/busybox");
+            ensure_hardlink("/usr/bin/basename", "/musl/busybox");
+            ensure_hardlink("/usr/bin/ls", "/musl/busybox");
+            ensure_hardlink("/usr/bin/sleep", "/musl/busybox");
+        } else if has_glibc_busybox && !has_musl_busybox {
+            ensure_hardlink("/bin/sh", "/glibc/busybox");
+            ensure_hardlink("/bin/basename", "/glibc/busybox");
+            ensure_hardlink("/bin/ls", "/glibc/busybox");
+            ensure_hardlink("/bin/sleep", "/glibc/busybox");
+            ensure_hardlink("/usr/bin/basename", "/glibc/busybox");
+            ensure_hardlink("/usr/bin/ls", "/glibc/busybox");
+            ensure_hardlink("/usr/bin/sleep", "/glibc/busybox");
+        } else {
+            warn!("[ext4] both /musl/busybox and /glibc/busybox exist, skip creating /bin/sh in strict mode");
+        }
+    }
+
     if open_file("/bin/sh", OpenFlags::empty()).is_some() {
         debug!("[ext4] /bin/sh ready");
     } else {

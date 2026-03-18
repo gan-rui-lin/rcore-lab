@@ -38,6 +38,7 @@ fn rdev_for_path(path: &str) -> u64 {
 use alloc::collections::BTreeMap;
 use crate::sync::UPSafeCell;
 use lazy_static::lazy_static;
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 #[cfg(feature = "ext4")]
 use alloc::ffi::CString;
@@ -72,6 +73,8 @@ lazy_static! {
         unsafe { UPSafeCell::new(BTreeMap::new()) };
     static ref TS_NEXT_ID: UPSafeCell<usize> = unsafe { UPSafeCell::new(1) };
 }
+
+static GETRANDOM_STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
 #[allow(dead_code)]
 fn ts_alloc_id() -> usize {
@@ -438,6 +441,107 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, _mode: u32, _flags: u32) -> 
     } else {
         errno(ENOENT)
     }
+}
+
+pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsize: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_readlinkat", pid);
+    }
+    if path.is_null() || buf.is_null() {
+        return errno(EFAULT);
+    }
+    if bufsize == 0 {
+        return errno(EINVAL);
+    }
+
+    let token = current_user_token();
+    let raw_path = translated_str(token, path);
+    if raw_path.is_empty() {
+        return errno(ENOENT);
+    }
+    let full_path = if raw_path.starts_with('/') {
+        normalize_path(&raw_path)
+    } else {
+        let base = match dirfd_base(dirfd) {
+            Ok(base) => base,
+            Err(err) => return err,
+        };
+        resolve_path(&base, &raw_path)
+    };
+
+    // Minimal procfs compatibility for busybox/glibc probes.
+    // If /proc/<pid>/exe (or /proc/self/exe) is requested, return a stable executable path.
+    let process = current_process();
+    let process_name = process.inner_exclusive_access().name.clone();
+    let self_exe = full_path == "/proc/self/exe"
+        || full_path == format!("/proc/{}/exe", process.pid.0);
+
+    let target = if self_exe {
+        if process_name == "busybox" || process_name == "sh" {
+            String::from("/bin/sh")
+        } else {
+            format!("/{}", process_name)
+        }
+    } else {
+        // Generic fs symlink read is not available yet in current VFS abstraction.
+        return errno(ENOENT);
+    };
+
+    let bytes = target.as_bytes();
+    let write_len = bytes.len().min(bufsize);
+    let slices = translated_byte_buffer(token, buf, write_len);
+    let mut off = 0usize;
+    for slice in slices {
+        if off >= write_len {
+            break;
+        }
+        let n = slice.len().min(write_len - off);
+        slice[..n].copy_from_slice(&bytes[off..off + n]);
+        off += n;
+    }
+    off as isize
+}
+
+pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_getrandom", pid);
+    }
+    if buf.is_null() {
+        return errno(EFAULT);
+    }
+    // Linux: unsupported flag bits => EINVAL.
+    const GRND_NONBLOCK: u32 = 0x0001;
+    const GRND_RANDOM: u32 = 0x0002;
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM) != 0 {
+        return errno(EINVAL);
+    }
+    if len == 0 {
+        return 0;
+    }
+
+    let token = current_user_token();
+    let slices = translated_byte_buffer(token, buf, len);
+    let mut state = GETRANDOM_STATE
+        .load(AtomicOrdering::Relaxed)
+        .wrapping_add(get_time_us() as u64)
+        .wrapping_add((pid as u64) << 32)
+        .wrapping_add(len as u64);
+
+    let mut written = 0usize;
+    for slice in slices {
+        for byte in slice.iter_mut() {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let x = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            *byte = (x & 0xff) as u8;
+            written += 1;
+        }
+    }
+    GETRANDOM_STATE.store(state, AtomicOrdering::Relaxed);
+    written as isize
 }
 
 pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
@@ -1663,7 +1767,7 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 ///
 /// # Arguments
 /// * `fd` - file descriptor
-/// * `cmd` - command (F_GETFL, F_SETFL, F_GETFD, F_SETFD, F_DUPFD)
+/// * `cmd` - command (F_GETFL, F_SETFL, F_GETFD, F_SETFD, F_DUPFD, F_DUPFD_CLOEXEC)
 /// * `arg` - command-specific argument
 ///
 /// # Returns
@@ -1676,6 +1780,7 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     }
 
     const F_DUPFD: i32 = 0;
+    const F_DUPFD_CLOEXEC: i32 = 1030;
     const F_GETFD: i32 = 1;
     const F_SETFD: i32 = 2;
     const F_GETFL: i32 = 3;
@@ -1703,7 +1808,7 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     //     );
     // }
     match cmd {
-        F_DUPFD => {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
             // Duplicate fd to the lowest numbered available fd >= arg
             let new_fd = if arg < inner.fd_table.len() {
                 let mut found = None;
