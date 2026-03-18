@@ -14,6 +14,7 @@ TARGET_DIR := target/$(TARGET)/$(MODE)
 BUILD_DIR := build
 PY := python3
 RUST_TOOLCHAIN ?= +nightly-2024-08-01
+CARGO_OFFLINE_ARG := $(if $(OFFLINE),--offline,)
 
 ifeq ($(MODE), release)
 	MODE_ARG := --release
@@ -43,7 +44,7 @@ ELFS := $(patsubst $(APP_DIR)/%.rs, $(TARGET_DIR)/%, $(APPS))
 binary:
 	@echo $(ELFS)
 	@if [ ${CHAPTER} -gt 3 ]; then \
-		cargo $(RUST_TOOLCHAIN) build $(MODE_ARG) --target $(TARGET) ;\
+		cargo $(RUST_TOOLCHAIN) build $(MODE_ARG) $(CARGO_OFFLINE_ARG) --target $(TARGET) ;\
 	else \
 		ARCH=$(ARCH) CHAPTER=$(CHAPTER) MODE=$(MODE) RUST_TOOLCHAIN=$(RUST_TOOLCHAIN) python3 build.py ;\
 	fi

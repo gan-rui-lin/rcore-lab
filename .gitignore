@@ -38,3 +38,4 @@ kernel-la
 kernel-rv
 kernel-qemu
 *.bin
+*.elf
