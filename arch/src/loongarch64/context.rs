@@ -42,13 +42,7 @@ impl TrapFrame {
     }
 
     /// Init the trap context of an application.
-    pub fn app_init_context(
-        entry: usize,
-        sp: usize,
-        _kernel_satp: usize,
-        _kernel_sp: usize,
-        _trap_handler: usize,
-    ) -> Self {
+    pub fn app_init_context(entry: usize, sp: usize) -> Self {
         let mut cx = Self::new();
         cx.sepc = entry;
         cx.set_sp(sp);

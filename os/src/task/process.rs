@@ -3,10 +3,9 @@ use super::manager::insert_into_pid2process;
 use super::{PidHandle, SignalAction, SignalActions, SignalFlags, TaskControlBlock, TlsArea, add_task, pid_alloc};
 use crate::config::{USER_MMAP_TOP, USER_STACK_SIZE};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{KERNEL_SPACE, MemorySet, translated_byte_buffer, translated_ref, translated_refmut, translated_str};
+use crate::mm::{MemorySet, translated_byte_buffer, translated_ref, translated_refmut, translated_str};
 use crate::sync::{Condvar, Mutex, Semaphore, UPIntrFreeCell};
 use arch::{TrapContext, TrapFrameArgs};
-use crate::trap::user_trap_loop;
 use xmas_elf::ElfFile;
 use xmas_elf::sections::{SectionData, ShType};
 use xmas_elf::symbol_table::Entry;
@@ -234,14 +233,10 @@ impl ProcessControlBlock {
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         let ustack_top = user_stack_top;
-        let kstack_top = task.kstack.get_top();
         drop(task_inner);
         let mut trap_cx_value = TrapContext::app_init_context(
             entry_point,
             ustack_top,
-            KERNEL_SPACE.exclusive_access().token(),
-            kstack_top,
-            user_trap_loop as usize,
         );
 
         if gp != 0 {
@@ -566,9 +561,6 @@ impl ProcessControlBlock {
         let mut trap_cx = TrapContext::app_init_context(
             entry_point,
             user_sp,  // sp should point to argc
-            KERNEL_SPACE.exclusive_access().token(),
-            task.kstack.get_top(),
-            user_trap_loop as usize,
         );
         trap_cx[TrapFrameArgs::ARG0] = argc;
         trap_cx[TrapFrameArgs::ARG1] = argv_base;
