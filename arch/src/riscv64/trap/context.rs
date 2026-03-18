@@ -66,15 +66,7 @@ impl TrapContext {
     }
 
     /// Construct the initial trap context for a user application.
-    ///
-    /// Extra args are kept for API compatibility and ignored.
-    pub fn app_init_context(
-        entry: usize,
-        sp: usize,
-        _kernel_satp: usize,
-        _kernel_sp: usize,
-        _trap_handler: usize,
-    ) -> Self {
+    pub fn app_init_context(entry: usize, sp: usize) -> Self {
         let mut sstatus = sstatus::read();
         // Return to User mode after `sret`.
         sstatus.set_spp(SPP::User);
