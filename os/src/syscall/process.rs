@@ -977,6 +977,23 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
                 continue;
             }
             // Non-ELF without shebang: fall back to /bin/sh (execlp-like behavior).
+            // // Guard against recursive /bin/sh -> /bin/sh fallback loops.
+            // if exec_path == "/bin/sh" || exec_path_resolved == "/bin/sh" {
+            //     warn!(
+            //         "[sys_exec] non-ELF /bin/sh without shebang, stop recursive fallback for {}",
+            //         exec_path_resolved
+            //     );
+            //     return errno(ENOEXEC);
+            // }
+            // if args.get(0).map(|s| s.as_str()) == Some("sh")
+            //     && args.get(1).map(|s| s.as_str()) == Some("/bin/sh")
+            // {
+            //     warn!(
+            //         "[sys_exec] detected recursive sh argv chain for {}, abort fallback",
+            //         exec_path_resolved
+            //     );
+            //     return errno(ENOEXEC);
+            // }
             if depth >= MAX_SHEBANG_DEPTH {
                 return errno(ELOOP);
             }

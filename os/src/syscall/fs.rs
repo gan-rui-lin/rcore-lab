@@ -3,7 +3,7 @@ use crate::fs::{
     create_dir, make_pipe, open_file, path_is_dir, remove_path, DevNull, DevZero,
     OpenFlags, Stat, StatMode, PollEvents,
 };
-use crate::mm::{translated_byte_buffer, translated_str, translated_refmut, UserBuffer};
+use crate::mm::{translated_byte_buffer, translated_ref, translated_str, translated_refmut, UserBuffer};
 #[allow(unused_imports)] // for debug
 use core::sync::atomic::{AtomicUsize, Ordering};
 #[allow(unused_imports)] // for debug
@@ -2141,56 +2141,110 @@ pub fn sys_fstatfs(fd: usize, buf: *mut StatFs) -> isize {
 /// 2. Proper handling of file offset updates
 /// 3. Support for splice/pipe operations
 pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut isize, count: usize) -> isize {
-    use super::errno::*;
+    if count == 0 {
+        return 0;
+    }
 
     let process = current_process();
-    let (_in_file, _out_file) = {
+    let (in_file, out_file) = {
         let inner = process.inner_exclusive_access();
-        // Validate file descriptors
         if in_fd >= inner.fd_table.len() || out_fd >= inner.fd_table.len() {
             return errno(EBADF);
         }
-
         let Some(in_file) = &inner.fd_table[in_fd] else {
             return errno(EBADF);
         };
-
         let Some(out_file) = &inner.fd_table[out_fd] else {
             return errno(EBADF);
         };
-
-        // Check permissions
-        if !in_file.readable() {
+        if !in_file.readable() || !out_file.writable() {
             return errno(EBADF);
         }
-        if !out_file.writable() {
-            return errno(EBADF);
-        }
-
         (in_file.clone(), out_file.clone())
     };
 
-    // Validate offset parameter if provided
-    if !offset.is_null() {
-        use crate::mm::translated_refmut;
+    let in_inode = in_file.inode();
+    let out_inode = out_file.inode();
+
+    // Linux semantics: offset!=NULL requires a seekable input fd.
+    if !offset.is_null() && in_inode.is_none() {
+        return errno(ESPIPE);
+    }
+
+    let mut src_off = if offset.is_null() {
+        in_file.get_offset().unwrap_or(0)
+    } else {
         let token = current_user_token();
         let offset_ref = translated_refmut(token, offset);
         if *offset_ref < 0 {
             return errno(EINVAL);
         }
+        *offset_ref as usize
+    };
+
+    let mut out_off = out_file.get_offset().unwrap_or(0);
+    let mut transferred = 0usize;
+    const SENDFILE_CHUNK: usize = 16 * 1024;
+
+    while transferred < count {
+        let want = core::cmp::min(SENDFILE_CHUNK, count - transferred);
+        let mut kbuf = alloc::vec![0u8; want];
+
+        let nread = if let Some(inode) = &in_inode {
+            inode.read_at(src_off, &mut kbuf)
+        } else {
+            let read_buf = unsafe {
+                UserBuffer::new(alloc::vec![core::slice::from_raw_parts_mut(
+                    kbuf.as_mut_ptr(),
+                    want,
+                )])
+            };
+            in_file.read(read_buf)
+        };
+
+        if nread == 0 {
+            break;
+        }
+
+        let nwritten = if let Some(inode) = &out_inode {
+            inode.write_at(out_off, &kbuf[..nread])
+        } else {
+            let write_buf = unsafe {
+                UserBuffer::new(alloc::vec![core::slice::from_raw_parts_mut(
+                    kbuf.as_mut_ptr(),
+                    nread,
+                )])
+            };
+            out_file.write(write_buf)
+        };
+
+        if nwritten == 0 {
+            break;
+        }
+
+        src_off = src_off.saturating_add(nwritten);
+        out_off = out_off.saturating_add(nwritten);
+        transferred += nwritten;
+
+        // partial write: return current progress to match typical sendfile behavior
+        if nwritten < nread {
+            break;
+        }
     }
 
-    // For now, return ENOSYS (not fully implemented)
-    // A complete implementation would require kernel buffer management
-    // to efficiently transfer data without going through user space
-    debug!(
-        "[sys_sendfile] in_fd={} out_fd={} count={} (not fully implemented)",
-        in_fd, out_fd, count
-    );
+    if !offset.is_null() {
+        let token = current_user_token();
+        let offset_ref = translated_refmut(token, offset);
+        *offset_ref = src_off as isize;
+    } else if in_inode.is_some() {
+        in_file.set_offset(src_off);
+    }
 
-    // Return 0 to indicate no bytes transferred (but not an error)
-    // Applications can fall back to read/write loops
-    errno(ENOSYS)
+    if out_inode.is_some() {
+        out_file.set_offset(out_off);
+    }
+
+    transferred as isize
 }
 
 
@@ -2205,7 +2259,7 @@ pub struct PollFd {
     revents: PollEvents,
 }
 
-pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: i32) -> isize {
+pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: *const TimeSpec) -> isize {
     if fds.is_null() {
         return errno(EFAULT);
     }
@@ -2213,10 +2267,18 @@ pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: i32) -> isize {
     let token = current_user_token();
 
     let mut poll_fds: Vec<&mut PollFd> = Vec::new();
-    let deadline = if timeout > 0 {
-        Some(get_time_ms().saturating_add(timeout as usize))
-    } else {
+    let deadline = if timeout.is_null() {
         None
+    } else {
+        let spec = *translated_ref(token, timeout);
+        if spec.tv_nsec >= 1_000_000_000 {
+            return errno(EINVAL);
+        }
+        let timeout_ms = spec
+            .tv_sec
+            .saturating_mul(1000)
+            .saturating_add(spec.tv_nsec / 1_000_000);
+        Some(get_time_ms().saturating_add(timeout_ms))
     };
 
     for i in 0..nfds {
@@ -2255,7 +2317,7 @@ pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: i32) -> isize {
                 ret += 1;
             }
         }
-        if ret != 0 || timeout == 0 {
+        if ret != 0 {
             return ret;
         }
         if let Some(deadline) = deadline {
