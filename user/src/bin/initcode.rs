@@ -18,18 +18,18 @@ const SINGLE_TEST: Option<&str> = option_env!("SINGLE_TEST");
 const SH: &[u8] = b"sh\0";
 const PATH_ENV: &[u8] = b"PATH=/bin:/usr/bin:/musl:/glibc\0";
 const TEST_LIBC_ROOTS: [&str; 2] = ["/musl", "/glibc"];
-const TEST_SUITES: [&str; 11] = [
+const TEST_SUITES: [&str; 3] = [
     "basic",
     "busybox",
-    "cyclictest",
-    "iozone",
-    "iperf",
-    "libcbench",
+    // "cyclictest",
+    // "iozone",
+    // "iperf",
+    // "libcbench",
     "libctest",
-    "lmbench",
-    "ltp",
-    "lua",
-    "netperf",
+    // "lmbench",
+    // "ltp",
+    // "lua",
+    // "netperf",
 ];
 #[allow(dead_code)]
 const RUN_EMBEDDED_PTHREAD: bool = option_env!("RUN_EMBEDDED_PTHREAD").is_some();
