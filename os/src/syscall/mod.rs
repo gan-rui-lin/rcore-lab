@@ -726,7 +726,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SBRK => sys_sbrk(args[0] as isize),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
-        SYSCALL_POLL => sys_ppoll(args[0] as *mut PollFd, args[1], args[2] as i32),
+        SYSCALL_POLL => sys_ppoll(args[0] as *mut PollFd, args[1], args[2] as *const TimeSpec),
         SYSCALL_SHUTDOWN => sys_shutdown(),
         // ---- Network syscalls ----
         SYSCALL_SOCKET => crate::net::syscall::sys_socket(args[0], args[1], args[2]),
