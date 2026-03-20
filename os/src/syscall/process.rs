@@ -37,6 +37,9 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new([ITimerVal::default(); 3]) };
     static ref UMASK_STATE: UPIntrFreeCell<usize> =
         unsafe { UPIntrFreeCell::new(0o022) };
+    /// Per-process ITIMER_REAL: pid → (deadline_us, interval_us). deadline=0 means disarmed.
+    static ref ITIMER_REAL_MAP: UPIntrFreeCell<BTreeMap<usize, (u64, u64)>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
 }
 
 fn dump_user_bytes(tag: &str, token: usize, addr: usize, len: usize) {
@@ -1327,6 +1330,7 @@ pub fn sys_setitimer(which: isize, new_value: *const ITimerVal, old_value: *mut 
     if !valid_itimerval(&new_itv) {
         return errno(EINVAL);
     }
+    // Return old value
     let old_itv = {
         let mut timers = ITIMER_STATE.exclusive_access();
         let old = timers[idx];
@@ -1344,7 +1348,49 @@ pub fn sys_setitimer(which: isize, new_value: *const ITimerVal, old_value: *mut 
             return err;
         }
     }
+    // Arm/disarm the real ITIMER_REAL timer (per-process)
+    if which == ITIMER_REAL {
+        let value_us = new_itv.it_value.tv_sec as u64 * 1_000_000
+            + new_itv.it_value.tv_usec as u64;
+        let interval_us = new_itv.it_interval.tv_sec as u64 * 1_000_000
+            + new_itv.it_interval.tv_usec as u64;
+        let mut map = ITIMER_REAL_MAP.exclusive_access();
+        if value_us == 0 {
+            map.remove(&pid);
+        } else {
+            let now = get_time_us() as u64;
+            map.insert(pid, (now + value_us, interval_us));
+        }
+    }
     0
+}
+
+/// Called from timer interrupt to check and deliver SIGALRM for ITIMER_REAL.
+pub fn check_itimer_real() {
+    let mut map = ITIMER_REAL_MAP.exclusive_access();
+    if map.is_empty() {
+        return;
+    }
+    let now = get_time_us() as u64;
+    let mut expired: Vec<(usize, u64)> = Vec::new();
+    for (&pid, &(deadline, interval)) in map.iter() {
+        if now >= deadline {
+            expired.push((pid, interval));
+        }
+    }
+    for (pid, interval) in expired {
+        // Deliver SIGALRM
+        if let Some(process) = pid2process(pid) {
+            let mut inner = process.inner_exclusive_access();
+            inner.signal_pending |= SignalFlags::SIGALRM;
+        }
+        // Reschedule or disarm
+        if interval > 0 {
+            map.insert(pid, (now + interval, interval));
+        } else {
+            map.remove(&pid);
+        }
+    }
 }
 
 pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {

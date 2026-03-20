@@ -234,7 +234,7 @@ const SYSCALL_MEMBARRIER: usize = 283;
 mod errno;
 mod fs;
 mod ipc;
-mod process;
+pub(crate) mod process;
 mod sync;
 mod thread;
 
