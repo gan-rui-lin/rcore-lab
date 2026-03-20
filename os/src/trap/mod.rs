@@ -36,6 +36,7 @@ fn handle_user_syscall() {
 fn handle_user_time_interrupt() {
     set_next_trigger();
     check_timer();
+    crate::syscall::process::check_itimer_real();
     handle_signals();
     suspend_current_and_run_next();
 }
