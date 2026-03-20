@@ -597,83 +597,66 @@ pub fn sys_close(fd: usize) -> isize {
 }
 
 /// fstatat: stat by path, relative to dirfd.
-/// ! 暂时未使用 flags 参数
-pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, _flags: u32) -> isize {
+pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_fstatat", pid);
     }
-    if path.is_null() {
+    if path.is_null() || st.is_null() {
         return errno(EFAULT);
     }
-    let token = current_user_token();
-    let raw_path = translated_str(token, path);
-    if raw_path.is_empty() {
+    // Linux fstatat/newfstatat accepts these flags; reject unknown bits.
+    let supported_flags = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT;
+    if flags & !supported_flags != 0 {
         return errno(EINVAL);
     }
-    let base = if raw_path.starts_with('/') {
-        String::new()
+
+    let token = current_user_token();
+    let raw_path = translated_str(token, path);
+
+    let stat = if raw_path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return errno(ENOENT);
+        }
+        if dirfd == AT_FDCWD {
+            let cwd = current_process().inner_exclusive_access().cwd.clone();
+            match stat_from_path(&cwd) {
+                Ok(stat) => stat,
+                Err(err) => return err,
+            }
+        } else if dirfd < 0 {
+            return errno(EBADF);
+        } else {
+            match stat_from_fd(dirfd as usize) {
+                Ok(stat) => stat,
+                Err(err) => return err,
+            }
+        }
     } else {
-        match dirfd_base(dirfd) {
-            Ok(base) => base,
+        let full_path = if raw_path.starts_with('/') {
+            normalize_path(&raw_path)
+        } else {
+            let base = match dirfd_base(dirfd) {
+                Ok(base) => base,
+                Err(err) => return err,
+            };
+            resolve_path(&base, &raw_path)
+        };
+
+        // Check for path traversal through non-directory (e.g. /dev/null/invalid)
+        let comps: Vec<&str> = full_path.split('/').filter(|s| !s.is_empty()).collect();
+        for i in 0..comps.len().saturating_sub(1) {
+            let partial = format!("/{}", comps[..=i].join("/"));
+            if is_char_device(&partial) {
+                return errno(ENOTDIR);
+            }
+        }
+        match stat_from_path(&full_path) {
+            Ok(stat) => stat,
             Err(err) => return err,
         }
     };
-    let full_path = if raw_path.starts_with('/') {
-        normalize_path(&raw_path)
-    } else {
-        resolve_path(&base, &raw_path)
-    };
-    // trace!(
-    //     "[sys_fstatat] pid={} dirfd={} flags={:#x} path={} full={}",
-    //     pid,
-    //     dirfd,
-    //     flags,
-    //     raw_path,
-    //     full_path
-    // );
 
-    // Check for path traversal through non-directory (e.g. /dev/null/invalid)
-    let comps: Vec<&str> = full_path.split('/').filter(|s| !s.is_empty()).collect();
-    for i in 0..comps.len().saturating_sub(1) {
-        let partial = format!("/{}", comps[..=i].join("/"));
-        if is_char_device(&partial) {
-            return errno(ENOTDIR);
-        }
-    }
-
-    let mut stat = Stat::default();
-    // Handle character devices specially
-    if is_char_device(&full_path) {
-        stat.mode = StatMode::CHR.bits() | 0o666;
-        stat.nlink = 1;
-        stat.rdev = rdev_for_path(&full_path);
-    } else {
-        let open_flags = if path_is_dir(&full_path) {
-            OpenFlags::DIRECTORY
-        } else {
-            OpenFlags::empty()
-        };
-        let Some(file) = open_file(full_path.as_str(), open_flags) else {
-            return errno(ENOENT);
-        };
-        let (mode_bits, size) = if let Some(inode) = file.inode() {
-            let mode = if inode.is_dir() {
-                StatMode::DIR
-            } else {
-                StatMode::FILE
-            };
-            (mode.bits() | 0o777, inode.size())
-        } else {
-            (StatMode::FILE.bits() | 0o666, 0)
-        };
-        stat.mode = mode_bits;
-        stat.nlink = 1;
-        stat.size = size as i64;
-        stat.blksize = 512;
-        stat.blocks = ((size + 511) / 512) as i64;
-    }
-    fill_stat_timestamps(&mut stat, None);
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&stat as *const Stat) as *const u8,

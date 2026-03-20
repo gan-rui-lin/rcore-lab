@@ -661,7 +661,7 @@ pub fn handle_signals() {
             if action.restorer < USER_ADDR_MAX {
                 trap_cx[TrapFrameArgs::RA] = action.restorer;
             } else {
-                error!(
+                warn!(
                     "[signal] pid={} signum={} invalid restorer={:#x}, fallback to SIG_RETURN_ADDR",
                     pid,
                     signum,
