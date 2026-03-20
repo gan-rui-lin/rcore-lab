@@ -1164,7 +1164,9 @@ pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
         return errno(EFAULT);
     }
     match clock_id {
-        0 | 1 => {
+        // CLOCK_REALTIME/CLOCK_MONOTONIC and common glibc probes.
+        // We currently map them to the same wall-clock source.
+        0 | 1 | 4 | 5 | 6 | 7 | 8 | 9 | 11 => {
             let us = get_time_us();
             let spec = TimeSpec {
                 tv_sec: us / 1_000_000,
