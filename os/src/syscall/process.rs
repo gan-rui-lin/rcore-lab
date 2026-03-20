@@ -1234,6 +1234,32 @@ pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
     }
 }
 
+pub fn sys_clock_getres(clock_id: usize, res: *mut TimeSpec) -> isize {
+    if res.is_null() {
+        return 0;
+    }
+    match clock_id {
+        0 | 1 | 4 | 5 | 6 | 7 | 8 | 9 | 11 => {
+            let spec = TimeSpec {
+                tv_sec: 0,
+                tv_nsec: 1000, // 1µs resolution
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&spec as *const TimeSpec) as *const u8,
+                    core::mem::size_of::<TimeSpec>(),
+                )
+            };
+            let token = current_user_token();
+            match copy_to_user(token, res as *mut u8, bytes) {
+                Ok(_) => 0,
+                Err(err) => err,
+            }
+        }
+        _ => errno(EINVAL),
+    }
+}
+
 const ITIMER_REAL: isize = 0;
 const ITIMER_VIRTUAL: isize = 1;
 const ITIMER_PROF: isize = 2;
