@@ -1,7 +1,7 @@
 //! QEMU virt board constants for RISC-V 64.
 
-/// Timer clock frequency (Hz) — QEMU virt default.
-pub const CLOCK_FREQ: usize = 12_500_000;
+/// Timer clock frequency (Hz) — QEMU virt: aclint-mtimer @ 10MHz.
+pub const CLOCK_FREQ: usize = 10_000_000;
 
 /// Upper bound of physical memory available to the kernel.
 pub const MEMORY_END: usize = 0x8800_0000;

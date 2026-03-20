@@ -562,6 +562,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1] as i32, args[2]),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as isize),
+        // fsync/fdatasync: no page cache to flush, return success
+        82 | 83 => 0,
             SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut StatFs),
             SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut StatFs),
         SYSCALL_FACCESSAT => sys_faccessat(
@@ -688,6 +690,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *mut usize,
             args[3],
         ),
+        // sched_setaffinity/getaffinity: single CPU, succeed silently
+        122 | 123 => 0,
+        // sigaltstack: stub for glibc compatibility
+        132 => 0,
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),
         SYSCALL_GETTID => sys_gettid(),
@@ -744,8 +750,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),
+        // clock_getres
+        114 => sys_clock_getres(args[0], args[1] as *mut TimeSpec),
         SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_GET_TIME => sys_get_time(args[0] as *mut TimeVal, args[1]),
+        // msync: no real page cache, return success
+        227 => 0,
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
