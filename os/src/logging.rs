@@ -69,7 +69,7 @@ pub fn init() {
         Some("INFO") => (LevelFilter::Info, 30),
         Some("DEBUG") => (LevelFilter::Debug, 40),
         Some("TRACE") => (LevelFilter::Trace, 50),
-        Some(_) => (LevelFilter::Off, 30),
+        Some(_) => (LevelFilter::Info, 30),
         None => (LevelFilter::Off, 0),
     };
 
