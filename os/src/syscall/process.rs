@@ -33,6 +33,10 @@ use crate::sync::UPIntrFreeCell;
 lazy_static! {
     static ref EXEC_IMAGE_CACHE: UPIntrFreeCell<BTreeMap<String, Arc<[u8]>>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref ITIMER_STATE: UPIntrFreeCell<[ITimerVal; 3]> =
+        unsafe { UPIntrFreeCell::new([ITimerVal::default(); 3]) };
+    static ref UMASK_STATE: UPIntrFreeCell<usize> =
+        unsafe { UPIntrFreeCell::new(0o022) };
 }
 
 fn dump_user_bytes(tag: &str, token: usize, addr: usize, len: usize) {
@@ -75,11 +79,53 @@ pub struct TimeSpec {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct TimeValI64 {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ITimerVal {
+    pub it_interval: TimeValI64,
+    pub it_value: TimeValI64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Tms {
     pub tms_utime: i64,
     pub tms_stime: i64,
     pub tms_cutime: i64,
     pub tms_cstime: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RUsageTimeVal {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RUsage {
+    pub ru_utime: RUsageTimeVal,
+    pub ru_stime: RUsageTimeVal,
+    pub ru_maxrss: i64,
+    pub ru_ixrss: i64,
+    pub ru_idrss: i64,
+    pub ru_isrss: i64,
+    pub ru_minflt: i64,
+    pub ru_majflt: i64,
+    pub ru_nswap: i64,
+    pub ru_inblock: i64,
+    pub ru_oublock: i64,
+    pub ru_msgsnd: i64,
+    pub ru_msgrcv: i64,
+    pub ru_nsignals: i64,
+    pub ru_nvcsw: i64,
+    pub ru_nivcsw: i64,
 }
 
 #[repr(C)]
@@ -1188,6 +1234,93 @@ pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
     }
 }
 
+const ITIMER_REAL: isize = 0;
+const ITIMER_VIRTUAL: isize = 1;
+const ITIMER_PROF: isize = 2;
+
+fn itimer_index(which: isize) -> Result<usize, isize> {
+    match which {
+        ITIMER_REAL => Ok(0),
+        ITIMER_VIRTUAL => Ok(1),
+        ITIMER_PROF => Ok(2),
+        _ => Err(errno(EINVAL)),
+    }
+}
+
+fn valid_timeval64(tv: &TimeValI64) -> bool {
+    tv.tv_sec >= 0 && (0..1_000_000).contains(&tv.tv_usec)
+}
+
+fn valid_itimerval(tv: &ITimerVal) -> bool {
+    valid_timeval64(&tv.it_interval) && valid_timeval64(&tv.it_value)
+}
+
+pub fn sys_getitimer(which: isize, curr_value: *mut ITimerVal) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_getitimer", pid);
+    }
+    if curr_value.is_null() {
+        return errno(EFAULT);
+    }
+    let idx = match itimer_index(which) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let val = ITIMER_STATE.exclusive_access()[idx];
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&val as *const ITimerVal) as *const u8,
+            core::mem::size_of::<ITimerVal>(),
+        )
+    };
+    let token = current_user_token();
+    match copy_to_user(token, curr_value as *mut u8, bytes) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
+}
+
+pub fn sys_setitimer(which: isize, new_value: *const ITimerVal, old_value: *mut ITimerVal) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_setitimer", pid);
+    }
+    if new_value.is_null() {
+        return errno(EFAULT);
+    }
+    let idx = match itimer_index(which) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let token = current_user_token();
+    let new_itv = match read_from_user(token, new_value) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !valid_itimerval(&new_itv) {
+        return errno(EINVAL);
+    }
+    let old_itv = {
+        let mut timers = ITIMER_STATE.exclusive_access();
+        let old = timers[idx];
+        timers[idx] = new_itv;
+        old
+    };
+    if !old_value.is_null() {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&old_itv as *const ITimerVal) as *const u8,
+                core::mem::size_of::<ITimerVal>(),
+            )
+        };
+        if let Err(err) = copy_to_user(token, old_value as *mut u8, bytes) {
+            return err;
+        }
+    }
+    0
+}
+
 pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
@@ -1314,6 +1447,33 @@ pub fn sys_times(tms: *mut Tms) -> isize {
         }
     }
     ticks as isize
+}
+
+pub fn sys_getrusage(who: isize, usage: *mut RUsage) -> isize {
+    if usage.is_null() {
+        return errno(EFAULT);
+    }
+    // Linux accepts RUSAGE_SELF(0), RUSAGE_CHILDREN(-1), RUSAGE_THREAD(1).
+    if who != 0 && who != -1 && who != 1 {
+        return errno(EINVAL);
+    }
+    let us = get_time_us() as i64;
+    let mut ru = RUsage::default();
+    ru.ru_utime = RUsageTimeVal {
+        tv_sec: us / 1_000_000,
+        tv_usec: us % 1_000_000,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&ru as *const RUsage) as *const u8,
+            core::mem::size_of::<RUsage>(),
+        )
+    };
+    let token = current_user_token();
+    match copy_to_user(token, usage as *mut u8, bytes) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
 }
 
 pub fn sys_uname(uts: *mut UtsName) -> isize {
@@ -2196,6 +2356,18 @@ pub fn sys_getgid() -> isize {
 pub fn sys_getegid() -> isize {
     syscall!("kernel:pid[{}] sys_getegid", current_process().pid.0);
     0
+}
+
+pub fn sys_umask(mask: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_umask", pid);
+    }
+    let new_mask = mask & 0o777;
+    let mut state = UMASK_STATE.exclusive_access();
+    let old = *state;
+    *state = new_mask;
+    old as isize
 }
 
 pub fn sys_getrlimit(resource: usize, rlim: *mut RLimit) -> isize {

@@ -62,6 +62,8 @@ const SYSCALL_PWRITE64: usize = 68;
 const SYSCALL_SENDFILE: usize = 71;
 /// readlinkat syscall
 const SYSCALL_READLINKAT: usize = 78;
+/// pselect6 syscall
+const SYSCALL_PSELECT6: usize = 72;
 /// ppoll syscall
 const SYSCALL_POLL: usize = 73;
 /// fstatat syscall
@@ -90,6 +92,10 @@ const SYSCALL_SET_ROBUST_LIST: usize = 99;
 const SYSCALL_GET_ROBUST_LIST: usize = 100;
 /// nanosleep syscall
 const SYSCALL_NANOSLEEP: usize = 101;
+/// getitimer syscall
+const SYSCALL_GETITIMER: usize = 102;
+/// setitimer syscall
+const SYSCALL_SETITIMER: usize = 103;
 /// clock_nanosleep syscall
 const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 /// yield syscall
@@ -140,6 +146,10 @@ const SYSCALL_TIMES: usize = 153;
 const SYSCALL_UNAME: usize = 160;
 /// getrlimit syscall
 const SYSCALL_GETRLIMIT: usize = 163;
+/// getrusage syscall
+const SYSCALL_GETRUSAGE: usize = 165;
+/// umask syscall
+const SYSCALL_UMASK: usize = 166;
 /// statfs syscall
 const SYSCALL_STATFS: usize = 43;
 /// fstatfs syscall
@@ -602,6 +612,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_PWRITE64 => sys_pwrite64(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut isize, args[3]),
+        SYSCALL_PSELECT6 => sys_pselect6(
+            args[0],
+            args[1] as *mut usize,
+            args[2] as *mut usize,
+            args[3] as *mut usize,
+            args[4] as *const TimeSpec,
+            args[5],
+        ),
         SYSCALL_READLINKAT => sys_readlinkat(
             args[0] as isize,
             args[1] as *const u8,
@@ -635,6 +653,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *const TimeSpec,
             args[4] as *mut i32,
             args[5] as i32,
+        ),
+        SYSCALL_GETITIMER => sys_getitimer(args[0] as isize, args[1] as *mut ITimerVal),
+        SYSCALL_SETITIMER => sys_setitimer(
+            args[0] as isize,
+            args[1] as *const ITimerVal,
+            args[2] as *mut ITimerVal,
         ),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const TimeSpec, args[1] as *mut TimeSpec),
         SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(
@@ -684,6 +708,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut RLimit),
+        SYSCALL_GETRUSAGE => sys_getrusage(args[0] as isize, args[1] as *mut RUsage),
+        SYSCALL_UMASK => sys_umask(args[0]),
         SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut process::SysInfo),
         SYSCALL_MSGGET => sys_msgget(args[0] as i32, args[1] as i32),
         SYSCALL_MSGSND => sys_msgsnd(args[0] as i32, args[1], args[2], args[3] as i32),

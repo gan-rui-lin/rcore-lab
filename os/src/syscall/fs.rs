@@ -14,6 +14,7 @@ use super::process::TimeSpec;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 /// Check if a path is a character device.
@@ -2240,6 +2241,228 @@ pub struct PollFd {
     events: PollEvents,
     /// returned events
     revents: PollEvents,
+}
+
+fn read_user_bytes(token: usize, src: *const u8, len: usize) -> Result<Vec<u8>, isize> {
+    if src.is_null() {
+        return Err(errno(EFAULT));
+    }
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = vec![0u8; len];
+    let mut offset = 0usize;
+    let slices = translated_byte_buffer(token, src, len);
+    for slice in slices {
+        let n = slice.len().min(len - offset);
+        out[offset..offset + n].copy_from_slice(&slice[..n]);
+        offset += n;
+        if offset >= len {
+            break;
+        }
+    }
+    if offset < len {
+        return Err(errno(EFAULT));
+    }
+    Ok(out)
+}
+
+#[inline]
+fn fdset_len_bytes(nfds: usize) -> usize {
+    let bits_per_word = core::mem::size_of::<usize>() * 8;
+    nfds
+        .saturating_add(bits_per_word - 1)
+        / bits_per_word
+        * core::mem::size_of::<usize>()
+}
+
+#[inline]
+fn fdset_test(set: &[u8], fd: usize) -> bool {
+    let bits_per_word = core::mem::size_of::<usize>() * 8;
+    let word_size = core::mem::size_of::<usize>();
+    let word_idx = fd / bits_per_word;
+    let bit = fd % bits_per_word;
+    let off = word_idx * word_size;
+    if off + word_size > set.len() {
+        return false;
+    }
+    let mut raw = [0u8; core::mem::size_of::<usize>()];
+    raw.copy_from_slice(&set[off..off + word_size]);
+    let word = usize::from_ne_bytes(raw);
+    (word & (1usize << bit)) != 0
+}
+
+#[inline]
+fn fdset_set(set: &mut [u8], fd: usize) {
+    let bits_per_word = core::mem::size_of::<usize>() * 8;
+    let word_size = core::mem::size_of::<usize>();
+    let word_idx = fd / bits_per_word;
+    let bit = fd % bits_per_word;
+    let off = word_idx * word_size;
+    if off + word_size > set.len() {
+        return;
+    }
+    let mut raw = [0u8; core::mem::size_of::<usize>()];
+    raw.copy_from_slice(&set[off..off + word_size]);
+    let mut word = usize::from_ne_bytes(raw);
+    word |= 1usize << bit;
+    set[off..off + word_size].copy_from_slice(&word.to_ne_bytes());
+}
+
+pub fn sys_pselect6(
+    nfds: usize,
+    readfds: *mut usize,
+    writefds: *mut usize,
+    exceptfds: *mut usize,
+    timeout: *const TimeSpec,
+    _sigmask: usize,
+) -> isize {
+    let token = current_user_token();
+    let fdset_len = fdset_len_bytes(nfds);
+
+    let in_read = if readfds.is_null() {
+        None
+    } else {
+        match read_user_bytes(token, readfds as *const u8, fdset_len) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    };
+    let in_write = if writefds.is_null() {
+        None
+    } else {
+        match read_user_bytes(token, writefds as *const u8, fdset_len) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    };
+    let in_except = if exceptfds.is_null() {
+        None
+    } else {
+        match read_user_bytes(token, exceptfds as *const u8, fdset_len) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    };
+
+    let deadline = if timeout.is_null() {
+        None
+    } else {
+        let raw = match read_user_bytes(
+            token,
+            timeout as *const u8,
+            core::mem::size_of::<TimeSpec>(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let spec = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const TimeSpec) };
+        if spec.tv_nsec >= 1_000_000_000 {
+            return errno(EINVAL);
+        }
+        let timeout_ms = spec
+            .tv_sec
+            .saturating_mul(1000)
+            .saturating_add(spec.tv_nsec / 1_000_000);
+        Some(get_time_ms().saturating_add(timeout_ms))
+    };
+
+    loop {
+        let mut out_read = vec![0u8; fdset_len];
+        let mut out_write = vec![0u8; fdset_len];
+        let mut out_except = vec![0u8; fdset_len];
+        let mut ready_count = 0isize;
+
+        for fd in 0..nfds {
+            let watch_read = in_read
+                .as_ref()
+                .map(|set| fdset_test(set.as_slice(), fd))
+                .unwrap_or(false);
+            let watch_write = in_write
+                .as_ref()
+                .map(|set| fdset_test(set.as_slice(), fd))
+                .unwrap_or(false);
+            let watch_except = in_except
+                .as_ref()
+                .map(|set| fdset_test(set.as_slice(), fd))
+                .unwrap_or(false);
+            if !watch_read && !watch_write && !watch_except {
+                continue;
+            }
+
+            let file = {
+                let process = current_process();
+                let inner = process.inner_exclusive_access();
+                if fd >= inner.fd_table.len() {
+                    return errno(EBADF);
+                }
+                let Some(file) = &inner.fd_table[fd] else {
+                    return errno(EBADF);
+                };
+                file.clone()
+            };
+
+            let ready = file.poll(
+                PollEvents::POLLIN
+                    | PollEvents::POLLOUT
+                    | PollEvents::POLLPRI
+                    | PollEvents::POLLERR
+                    | PollEvents::POLLHUP,
+            );
+
+            let mut fd_ready = false;
+            if watch_read && ready.intersects(PollEvents::POLLIN | PollEvents::POLLHUP | PollEvents::POLLERR) {
+                fdset_set(out_read.as_mut_slice(), fd);
+                fd_ready = true;
+            }
+            if watch_write && ready.intersects(PollEvents::POLLOUT | PollEvents::POLLERR) {
+                fdset_set(out_write.as_mut_slice(), fd);
+                fd_ready = true;
+            }
+            if watch_except && ready.contains(PollEvents::POLLPRI) {
+                fdset_set(out_except.as_mut_slice(), fd);
+                fd_ready = true;
+            }
+            if fd_ready {
+                ready_count += 1;
+            }
+        }
+
+        if ready_count > 0 {
+            if !readfds.is_null() {
+                if let Err(e) = copy_to_user(token, readfds as *mut u8, out_read.as_slice()) {
+                    return e;
+                }
+            }
+            if !writefds.is_null() {
+                if let Err(e) = copy_to_user(token, writefds as *mut u8, out_write.as_slice()) {
+                    return e;
+                }
+            }
+            if !exceptfds.is_null() {
+                if let Err(e) = copy_to_user(token, exceptfds as *mut u8, out_except.as_slice()) {
+                    return e;
+                }
+            }
+            return ready_count;
+        }
+
+        if let Some(deadline) = deadline {
+            if get_time_ms() >= deadline {
+                if !readfds.is_null() && fdset_len > 0 {
+                    let _ = copy_to_user(token, readfds as *mut u8, out_read.as_slice());
+                }
+                if !writefds.is_null() && fdset_len > 0 {
+                    let _ = copy_to_user(token, writefds as *mut u8, out_write.as_slice());
+                }
+                if !exceptfds.is_null() && fdset_len > 0 {
+                    let _ = copy_to_user(token, exceptfds as *mut u8, out_except.as_slice());
+                }
+                return 0;
+            }
+        }
+        suspend_current_and_run_next();
+    }
 }
 
 pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: *const TimeSpec) -> isize {
