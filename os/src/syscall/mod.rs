@@ -251,7 +251,7 @@ use sync::*;
 use thread::*;
 
 use crate::fs::Stat;
-#[allow(unused_imports)] // debug: for current_trap_cx in syscall() 
+#[allow(unused_imports)] // debug: for current_trap_cx in syscall()
 use crate::task::{current_process, current_task, current_trap_cx, RLimit, SignalAction};
 
 const fn parse_trace_pid(value: &str) -> Option<usize> {
@@ -566,8 +566,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1] as i32, args[2]),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as isize),
-            SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut StatFs),
-            SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut StatFs),
+        SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut StatFs),
+        SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut StatFs),
         SYSCALL_FACCESSAT => sys_faccessat(
             args[0] as isize,
             args[1] as *const u8,
@@ -608,8 +608,19 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
         SYSCALL_FCHMOD => sys_fchmod(args[0], args[1] as u32),
-        SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32),
-        SYSCALL_FCHOWNAT => sys_fchownat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32, args[4] as u32),
+        SYSCALL_FCHMODAT => sys_fchmodat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as u32,
+            args[3] as u32,
+        ),
+        SYSCALL_FCHOWNAT => sys_fchownat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as u32,
+            args[3] as u32,
+            args[4] as u32,
+        ),
         SYSCALL_FCHOWN => sys_fchown(args[0], args[1] as u32, args[2] as u32),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as isize, args[2]),
@@ -620,7 +631,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_PWRITE64 => sys_pwrite64(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut isize, args[3]),
-        SYSCALL_FSTATAT => sys_fstatat(args[0] as isize, args[1] as *const u8, args[2] as *mut Stat, args[3] as u32),
+        SYSCALL_FSTATAT => sys_fstatat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *mut Stat,
+            args[3] as u32,
+        ),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut Stat),
         SYSCALL_STATX => sys_statx(
             args[0] as isize,
@@ -639,7 +655,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
         SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
-        SYSCALL_GET_ROBUST_LIST => sys_get_robust_list(args[0], args[1] as *mut u8, args[2] as *mut u8),
+        SYSCALL_GET_ROBUST_LIST => {
+            sys_get_robust_list(args[0], args[1] as *mut u8, args[2] as *mut u8)
+        }
         SYSCALL_FUTEX => sys_futex(
             args[0] as *mut i32,
             args[1] as u32,
@@ -699,7 +717,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut process::SysInfo),
         SYSCALL_MSGGET => sys_msgget(args[0] as i32, args[1] as i32),
         SYSCALL_MSGSND => sys_msgsnd(args[0] as i32, args[1], args[2], args[3] as i32),
-        SYSCALL_MSGRCV => sys_msgrcv(args[0] as i32, args[1], args[2], args[3] as isize, args[4] as i32),
+        SYSCALL_MSGRCV => sys_msgrcv(
+            args[0] as i32,
+            args[1],
+            args[2],
+            args[3] as isize,
+            args[4] as i32,
+        ),
         SYSCALL_MSGCTL => sys_msgctl(args[0] as i32, args[1] as i32, args[2]),
         SYSCALL_SHMGET => sys_shmget(args[0] as i32, args[1], args[2] as i32),
         SYSCALL_SHMAT => sys_shmat(args[0] as i32, args[1], args[2] as i32),
@@ -710,10 +734,26 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         //   LoongArch:  clone(flags, stack, ptid, ctid, tls)
         SYSCALL_FORK => {
             #[cfg(target_arch = "riscv64")]
-            { sys_clone(args[0], args[1] as *const u8, args[2] as *mut i32, args[3] as *mut i32, args[4] as *mut i32) }
+            {
+                sys_clone(
+                    args[0],
+                    args[1] as *const u8,
+                    args[2] as *mut i32,
+                    args[3] as *mut i32,
+                    args[4] as *mut i32,
+                )
+            }
             #[cfg(target_arch = "loongarch64")]
-            { sys_clone(args[0], args[1] as *const u8, args[2] as *mut i32, args[4] as *mut i32, args[3] as *mut i32) }
-        },
+            {
+                sys_clone(
+                    args[0],
+                    args[1] as *const u8,
+                    args[2] as *mut i32,
+                    args[4] as *mut i32,
+                    args[3] as *mut i32,
+                )
+            }
+        }
         SYSCALL_EXEC => sys_exec(
             args[0] as *const u8,
             args[1] as *const usize,
@@ -731,7 +771,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0], args[1] as *mut TimeSpec),
-        SYSCALL_SCHED_GETAFFINITY => sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8),
+        SYSCALL_SCHED_GETAFFINITY => {
+            sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8)
+        }
         SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_GET_TIME => sys_get_time(args[0] as *mut TimeVal, args[1]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
@@ -748,15 +790,49 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SOCKETPAIR => crate::net::syscall::sys_socketpair(),
         SYSCALL_BIND => crate::net::syscall::sys_bind(args[0], args[1] as *const u8, args[2]),
         SYSCALL_LISTEN => crate::net::syscall::sys_listen(args[0], args[1]),
-        SYSCALL_ACCEPT | SYSCALL_ACCEPT4 => crate::net::syscall::sys_accept(args[0], args[1] as *mut u8, args[2] as *mut u32),
+        SYSCALL_ACCEPT | SYSCALL_ACCEPT4 => {
+            crate::net::syscall::sys_accept(args[0], args[1] as *mut u8, args[2] as *mut u32)
+        }
         SYSCALL_CONNECT => crate::net::syscall::sys_connect(args[0], args[1] as *const u8, args[2]),
-        SYSCALL_GETSOCKNAME => crate::net::syscall::sys_getsockname(args[0], args[1] as *mut u8, args[2] as *mut u32),
-        SYSCALL_GETPEERNAME => crate::net::syscall::sys_getpeername(args[0], args[1] as *mut u8, args[2] as *mut u32),
-        SYSCALL_SENDTO => crate::net::syscall::sys_sendto(args[0], args[1] as *const u8, args[2], args[3], args[4] as *const u8, args[5]),
-        SYSCALL_RECVFROM => crate::net::syscall::sys_recvfrom(args[0], args[1] as *mut u8, args[2], args[3], args[4] as *mut u8, args[5] as *mut u32),
-        SYSCALL_SETSOCKOPT => crate::net::syscall::sys_setsockopt(args[0], args[1], args[2], args[3] as *const u8, args[4]),
-        SYSCALL_GETSOCKOPT => crate::net::syscall::sys_getsockopt(args[0], args[1], args[2], args[3] as *mut u8, args[4] as *mut u32),
-        SYSCALL_SHUTDOWN_SOCKET => crate::net::syscall::sys_shutdown_socket(args[0], args[1] as i32),
+        SYSCALL_GETSOCKNAME => {
+            crate::net::syscall::sys_getsockname(args[0], args[1] as *mut u8, args[2] as *mut u32)
+        }
+        SYSCALL_GETPEERNAME => {
+            crate::net::syscall::sys_getpeername(args[0], args[1] as *mut u8, args[2] as *mut u32)
+        }
+        SYSCALL_SENDTO => crate::net::syscall::sys_sendto(
+            args[0],
+            args[1] as *const u8,
+            args[2],
+            args[3],
+            args[4] as *const u8,
+            args[5],
+        ),
+        SYSCALL_RECVFROM => crate::net::syscall::sys_recvfrom(
+            args[0],
+            args[1] as *mut u8,
+            args[2],
+            args[3],
+            args[4] as *mut u8,
+            args[5] as *mut u32,
+        ),
+        SYSCALL_SETSOCKOPT => crate::net::syscall::sys_setsockopt(
+            args[0],
+            args[1],
+            args[2],
+            args[3] as *const u8,
+            args[4],
+        ),
+        SYSCALL_GETSOCKOPT => crate::net::syscall::sys_getsockopt(
+            args[0],
+            args[1],
+            args[2],
+            args[3] as *mut u8,
+            args[4] as *mut u32,
+        ),
+        SYSCALL_SHUTDOWN_SOCKET => {
+            crate::net::syscall::sys_shutdown_socket(args[0], args[1] as i32)
+        }
         SYSCALL_SENDMSG => crate::net::syscall::sys_sendmsg(),
         SYSCALL_RECVMSG => crate::net::syscall::sys_recvmsg(),
         SYSCALL_MEMBARRIER => sys_membarrier(args[0] as isize, args[1] as isize),
@@ -770,7 +846,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
                 syscall_name(syscall_id)
             );
             -ENOSYS
-        },
+        }
     };
     // if pid == 4 && syscall_id == SYSCALL_EXEC {
     //     trace!("[syscall] pid=4 exec ret={}", ret);

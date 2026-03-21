@@ -1,6 +1,6 @@
 //!Stdin & Stdout
-use super::PollEvents;
 use super::File;
+use super::PollEvents;
 use crate::mm::UserBuffer;
 /// Read a character from the SBI console, returning the raw usize value.
 /// 0 means no character available.
@@ -13,10 +13,30 @@ fn console_getchar() -> usize {
 use crate::task::suspend_current_and_run_next;
 
 /// /dev/null device: reads return 0 (EOF), writes succeed silently
-pub struct DevNull;
+pub struct DevNull {
+    readable: bool,
+    writable: bool,
+}
 
 /// /dev/zero device: reads return zero bytes, writes succeed silently
-pub struct DevZero;
+pub struct DevZero {
+    readable: bool,
+    writable: bool,
+}
+
+impl DevNull {
+    /// Create a `/dev/null` handle with the requested access mode.
+    pub fn new(readable: bool, writable: bool) -> Self {
+        Self { readable, writable }
+    }
+}
+
+impl DevZero {
+    /// Create a `/dev/zero` handle with the requested access mode.
+    pub fn new(readable: bool, writable: bool) -> Self {
+        Self { readable, writable }
+    }
+}
 
 /// stdin file for getting chars from console
 pub struct Stdin;
@@ -62,8 +82,7 @@ impl File for Stdin {
             if console_getchar() == usize::MAX {
                 // no char available, suspend and run next task
                 suspend_current_and_run_next();
-            }
-            else {
+            } else {
                 // char available, put it back to console buffer and return POLLIN
                 // since we have no way to put back the char to console buffer, we just return POLLIN and let the caller read it again.
                 break;
@@ -100,15 +119,27 @@ impl File for Stdout {
 }
 
 impl File for DevNull {
-    fn readable(&self) -> bool { true }
-    fn writable(&self) -> bool { true }
-    fn read(&self, _user_buf: UserBuffer) -> usize { 0 }
-    fn write(&self, user_buf: UserBuffer) -> usize { user_buf.len() }
+    fn readable(&self) -> bool {
+        self.readable
+    }
+    fn writable(&self) -> bool {
+        self.writable
+    }
+    fn read(&self, _user_buf: UserBuffer) -> usize {
+        0
+    }
+    fn write(&self, user_buf: UserBuffer) -> usize {
+        user_buf.len()
+    }
 }
 
 impl File for DevZero {
-    fn readable(&self) -> bool { true }
-    fn writable(&self) -> bool { true }
+    fn readable(&self) -> bool {
+        self.readable
+    }
+    fn writable(&self) -> bool {
+        self.writable
+    }
     fn read(&self, mut user_buf: UserBuffer) -> usize {
         let mut total = 0;
         for buffer in user_buf.buffers.iter_mut() {
@@ -117,5 +148,7 @@ impl File for DevZero {
         }
         total
     }
-    fn write(&self, user_buf: UserBuffer) -> usize { user_buf.len() }
+    fn write(&self, user_buf: UserBuffer) -> usize {
+        user_buf.len()
+    }
 }

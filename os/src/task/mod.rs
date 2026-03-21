@@ -3,6 +3,7 @@
 mod action;
 mod auxv;
 mod context;
+mod futex;
 mod id;
 mod manager;
 mod process;
@@ -12,59 +13,60 @@ mod switch;
 #[allow(clippy::module_inception)]
 #[allow(rustdoc::private_intra_doc_links)]
 mod task;
-mod futex;
 mod tls;
+#[cfg(target_arch = "loongarch64")]
+use crate::config::PAGE_SIZE;
+#[cfg(not(target_arch = "loongarch64"))]
+use crate::config::TRAMPOLINE as USER_ADDR_MAX;
+#[cfg(target_arch = "loongarch64")]
+use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
 #[allow(unused_imports)]
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, PageTable, VirtAddr};
+use crate::timer::remove_timer;
 use arch::{shutdown, TrapContext, TrapFrameArgs};
 #[cfg(target_arch = "riscv64")]
 use arch::{FpRegs, MContext};
-#[cfg(target_arch = "loongarch64")]
-use crate::config::PAGE_SIZE;
-#[cfg(target_arch = "loongarch64")]
-use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
-#[cfg(not(target_arch = "loongarch64"))]
-use crate::config::TRAMPOLINE as USER_ADDR_MAX;
-use crate::timer::remove_timer;
 #[cfg(target_arch = "riscv64")]
 /// Alias for backward compatibility within this module.
 type RiscvFpRegs = FpRegs;
 use alloc::sync::Arc;
-use lazy_static::*;
 #[allow(unused_imports)]
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use lazy_static::*;
 use manager::fetch_task;
 use process::ProcessControlBlock;
 #[cfg(target_arch = "riscv64")]
 use switch::__switch;
 
-pub use action::{SignalAction, SignalActions, SA_SIGINFO, SA_RESETHAND};
+pub use action::{SignalAction, SignalActions, SA_RESETHAND, SA_SIGINFO};
 pub use auxv::AuxvInfo;
 pub use context::TaskContext;
-pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
+pub use futex::{
+    futex_remove_waiter, futex_remove_waiter_any, futex_requeue, futex_wait, futex_wait_bitset,
+    futex_wake, futex_wake_bitset, FutexKey,
+};
+pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
 pub use manager::{
-    add_task, pid2process, pid2process_snapshot, ready_queue_snapshot, remove_from_pid2process,
-    remove_task, wakeup_task, pid2process_len, ready_queue_len, pid2process_aggregate,
+    add_task, pid2process, pid2process_aggregate, pid2process_len, pid2process_snapshot,
+    ready_queue_len, ready_queue_snapshot, remove_from_pid2process, remove_task, wakeup_task,
+};
+pub use process::{
+    IntervalTimerState, RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY,
 };
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
     current_user_token, run_tasks, schedule, take_current_task,
 };
-pub use process::{IntervalTimerState, RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY};
 pub use signal::{
-    SignalFlags, SigNumber, MAX_SIG, flags_to_user_mask, user_mask_to_flags,
-    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE,
-    SIGKILL, SIGUSR1, SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM,
-    SIGSTKFLT, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU,
-    SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGWINCH, SIGIO,
-    SIGPWR, SIGSYS,
+    flags_to_user_mask, user_mask_to_flags, SigNumber, SignalFlags, MAX_SIG, SIGABRT, SIGALRM,
+    SIGBUS, SIGCHLD, SIGCONT, SIGFPE, SIGHUP, SIGILL, SIGINT, SIGIO, SIGKILL, SIGPIPE, SIGPROF,
+    SIGPWR, SIGQUIT, SIGSEGV, SIGSTKFLT, SIGSTOP, SIGSYS, SIGTERM, SIGTRAP, SIGTSTP, SIGTTIN,
+    SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGVTALRM, SIGWINCH, SIGXCPU, SIGXFSZ,
 };
-pub use task::{TaskControlBlock, TaskControlBlockInner, TaskStatus, live_task_count, live_task_pid_summary};
-pub use futex::{
-    FutexKey, futex_requeue, futex_remove_waiter, futex_remove_waiter_any, futex_wait,
-    futex_wait_bitset, futex_wake, futex_wake_bitset,
+pub use task::{
+    live_task_count, live_task_pid_summary, TaskControlBlock, TaskControlBlockInner, TaskStatus,
 };
 pub use tls::{TlsArea, TlsInfo};
 
@@ -271,10 +273,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     let name = process.inner_exclusive_access().name.clone();
     info!(
         "[exit] pid={} tid={} name={} code={}",
-        pid,
-        tid,
-        name,
-        exit_code
+        pid, tid, name, exit_code
     );
     let clear_child_tid = task_inner.clear_child_tid;
     // Linux processes clear_child_tid for ALL threads, including the main thread (tid=0).
@@ -282,9 +281,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     if clear_child_tid != 0 {
         info!(
             "[exit] pid={} tid={} clear_child_tid={:#x}",
-            pid,
-            tid,
-            clear_child_tid
+            pid, tid, clear_child_tid
         );
         let token = process.inner_exclusive_access().memory_set.token();
         let page_table = PageTable::from_token(token);
@@ -312,9 +309,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         } else {
             warn!(
                 "[exit] pid={} tid={} clear_child_tid addr={:#x} not mapped",
-                pid,
-                tid,
-                clear_child_tid
+                pid, tid, clear_child_tid
             );
         }
     }
@@ -645,11 +640,7 @@ pub fn handle_signals() {
     if signum == 33 {
         info!(
             "[handle_signals] pid={} tid={} sig33 mask={:?} task_pending={:?} proc_pending={:?}",
-            pid,
-            _tid,
-            task_inner.signal_mask,
-            task_pending,
-            process_pending
+            pid, _tid, task_inner.signal_mask, task_pending, process_pending
         );
     }
 
@@ -684,7 +675,10 @@ pub fn handle_signals() {
     }
 
     if signum == signal::SIGKILL {
-        warn!("[signal] pid={} name={} killed by SIGKILL", pid, process_inner.name);
+        warn!(
+            "[signal] pid={} name={} killed by SIGKILL",
+            pid, process_inner.name
+        );
         // SIGKILL 必须终止进程内所有线程，不仅仅是当前线程
         // 向其他线程也注入 SIGKILL，确保它们在下次调度时退出
         for other_task in process_inner.tasks.iter().filter_map(|t| t.as_ref()) {
@@ -718,8 +712,7 @@ pub fn handle_signals() {
         if invalid {
             warn!(
                 "[signal] pid={} sigchld invalid handler={:#x}, resetting to default",
-                pid,
-                action.handler
+                pid, action.handler
             );
             action = SignalAction::default();
             process_inner.signal_actions.table[signum] = action;
@@ -732,9 +725,7 @@ pub fn handle_signals() {
     if action.handler >= USER_ADDR_MAX && action.handler > 1 {
         error!(
             "[signal] pid={} signum={} invalid handler={:#x}, falling back to SIG_DFL",
-            pid,
-            signum,
-            action.handler
+            pid, signum, action.handler
         );
         action.handler = 0;
     }
@@ -765,10 +756,7 @@ pub fn handle_signals() {
         match signum {
             // 默认忽略的信号
             signal::SIGCHLD | signal::SIGURG | signal::SIGWINCH => {
-                debug!(
-                    "[signal] pid={} signum={} default=ignore",
-                    pid, signum
-                );
+                debug!("[signal] pid={} signum={} default=ignore", pid, signum);
                 return;
             }
             // SIGCONT: 恢复被停止的进程（目前简单忽略）
@@ -778,10 +766,7 @@ pub fn handle_signals() {
             }
             // 默认停止的信号
             signal::SIGTSTP | signal::SIGTTIN | signal::SIGTTOU => {
-                debug!(
-                    "[signal] pid={} signum={} default=stop",
-                    pid, signum
-                );
+                debug!("[signal] pid={} signum={} default=stop", pid, signum);
                 drop(task_inner);
                 drop(process_inner);
                 block_current_and_run_next();
@@ -839,9 +824,7 @@ pub fn handle_signals() {
         } else {
             error!(
                 "[signal] pid={} signum={} invalid restorer={:#x}, ignoring",
-                pid,
-                signum,
-                action.restorer
+                pid, signum, action.restorer
             );
         }
     }
@@ -870,7 +853,11 @@ pub fn debug_dump_tasks() {
     }
     let processes = pid2process_snapshot();
     let ready = ready_queue_snapshot();
-    info!("[debug] process count={} ready_queue={}", processes.len(), ready.len());
+    info!(
+        "[debug] process count={} ready_queue={}",
+        processes.len(),
+        ready.len()
+    );
     for (idx, task) in ready.iter().enumerate() {
         let pid = task.process.upgrade().map(|p| p.getpid()).unwrap_or(0);
         if let Some(task_inner) = task.try_inner_exclusive_access() {
@@ -946,5 +933,4 @@ pub fn block_and_yield() {
     process_inner.signal_pending.remove(SignalFlags::SIGCONT);
     drop(process_inner);
     block_current_and_run_next();
-
 }

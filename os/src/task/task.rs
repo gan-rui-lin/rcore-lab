@@ -1,10 +1,10 @@
 use super::id::TaskUserRes;
-use super::{KernelStack, ProcessControlBlock, TaskContext, kstack_alloc};
-use arch::TrapContext;
+use super::{kstack_alloc, KernelStack, ProcessControlBlock, TaskContext};
 use crate::sync::UPIntrFreeCell;
+use crate::sync::UPIntrRefMut;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
-use crate::sync::UPIntrRefMut;
+use arch::TrapContext;
 
 pub fn live_task_count() -> usize {
     super::pid2process_snapshot()
@@ -106,7 +106,11 @@ impl TaskControlBlockInner {
 }
 
 impl TaskControlBlock {
-    pub fn new(process: Arc<ProcessControlBlock>, ustack_base: usize, alloc_user_res: bool) -> Self {
+    pub fn new(
+        process: Arc<ProcessControlBlock>,
+        ustack_base: usize,
+        alloc_user_res: bool,
+    ) -> Self {
         let res = TaskUserRes::new(Arc::clone(&process), ustack_base, alloc_user_res);
         let trap_cx_ppn = res.trap_cx_ppn();
         let kstack = kstack_alloc();
@@ -120,9 +124,13 @@ impl TaskControlBlock {
                     trap_cx_ppn,
                     task_cx: TaskContext::goto_trap_return(kstack_top, {
                         #[cfg(target_arch = "riscv64")]
-                        { crate::trap::do_trap_return as usize }
+                        {
+                            crate::trap::do_trap_return as usize
+                        }
                         #[cfg(target_arch = "loongarch64")]
-                        { crate::trap::task_entry as usize }
+                        {
+                            crate::trap::task_entry as usize
+                        }
                     }),
                     task_status: TaskStatus::Ready,
                     exit_code: None,

@@ -364,5 +364,8 @@ pub fn sys_shutdown() -> ! {
 }
 
 pub fn sys_mkdirat(dirfd: isize, path: &str, mode: u32) -> isize {
-    syscall(SYSCALL_MKDIRAT, [dirfd as usize, path.as_ptr() as usize, mode as usize])
+    syscall(
+        SYSCALL_MKDIRAT,
+        [dirfd as usize, path.as_ptr() as usize, mode as usize],
+    )
 }

@@ -1,5 +1,3 @@
-
-
 //! Cached Block Device Wrapper
 //!
 //! This module provides a caching layer for any BlockDevice implementation.
@@ -123,8 +121,7 @@ impl CacheManager {
             block_id,
             Arc::clone(&self.device),
         )));
-        self.queue
-            .push_front((block_id, Arc::clone(&cached_block)));
+        self.queue.push_front((block_id, Arc::clone(&cached_block)));
         cached_block
     }
 

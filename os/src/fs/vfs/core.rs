@@ -1,10 +1,10 @@
 use crate::sync::UPIntrFreeCell;
-use lazy_static::lazy_static;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
+use lazy_static::lazy_static;
 
 #[cfg(feature = "ext4")]
 use super::ext4::Ext4Fs;
@@ -216,7 +216,8 @@ impl Vfs {
 }
 
 lazy_static! {
-    pub(crate) static ref ROOT_VFS: UPIntrFreeCell<Vfs> = unsafe { UPIntrFreeCell::new(Vfs::new()) };
+    pub(crate) static ref ROOT_VFS: UPIntrFreeCell<Vfs> =
+        unsafe { UPIntrFreeCell::new(Vfs::new()) };
 }
 
 struct NullInode;

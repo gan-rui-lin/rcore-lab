@@ -2,8 +2,8 @@
 //!
 use alloc::collections::BTreeMap;
 use alloc::format;
-use alloc::sync::Arc;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::bitflags;
@@ -12,17 +12,16 @@ use lazy_static::lazy_static;
 use crate::{
     fs::{open_file, File, OpenFlags},
     mm::{
-        translated_byte_buffer, translated_byte_buffer_checked, translated_ref,
-        translated_refmut, translated_str, MapPermission, PageTable, VirtAddr,
+        translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
+        translated_str, MapPermission, MmapMeta, PageTable, ProtectError, VirtAddr,
     },
     task::{
         add_task, current_process, current_task, current_trap_cx, current_user_token,
-        exit_current_and_run_next, futex_requeue, futex_remove_waiter, futex_remove_waiter_any,
-        futex_wait, futex_wait_bitset, futex_wake, futex_wake_bitset, pid2process,
-        suspend_current_and_run_next,
-        FutexKey, IntervalTimerState, RLimit, RLIMIT_NLIMITS, SignalAction, SignalFlags, TaskControlBlock,
-        TaskStatus, UserContext, flags_to_user_mask, user_mask_to_flags,
-        MAX_SIG, SIGKILL, SIGSTOP,
+        exit_current_and_run_next, flags_to_user_mask, futex_remove_waiter,
+        futex_remove_waiter_any, futex_requeue, futex_wait, futex_wait_bitset, futex_wake,
+        futex_wake_bitset, pid2process, suspend_current_and_run_next, user_mask_to_flags, FutexKey,
+        IntervalTimerState, RLimit, SignalAction, SignalFlags, TaskControlBlock, TaskStatus,
+        UserContext, MAX_SIG, RLIMIT_NLIMITS, SIGKILL, SIGSTOP,
     },
     timer::{add_timer, get_time, get_time_ms, get_time_us, remove_timer},
 };
@@ -30,12 +29,12 @@ use crate::{
 use arch::TrapFrameArgs;
 
 use super::errno::*;
-use crate::config::{CLOCK_FREQ, PAGE_SIZE};
-use crate::sync::UPIntrFreeCell;
-#[cfg(target_arch = "loongarch64")]
-use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
 #[cfg(not(target_arch = "loongarch64"))]
 use crate::config::TRAMPOLINE as USER_ADDR_MAX;
+#[cfg(target_arch = "loongarch64")]
+use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
+use crate::config::{CLOCK_FREQ, PAGE_SIZE};
+use crate::sync::UPIntrFreeCell;
 
 lazy_static! {
     static ref EXEC_IMAGE_CACHE: UPIntrFreeCell<BTreeMap<String, Arc<[u8]>>> =
@@ -58,7 +57,12 @@ fn dump_user_bytes(tag: &str, token: usize, addr: usize, len: usize) {
             }
         }
         if any {
-            info!("[clone-tls] {} {:#x}: {:02x?}", tag, cur, &line[..(line_end - cur)]);
+            info!(
+                "[clone-tls] {} {:#x}: {:02x?}",
+                tag,
+                cur,
+                &line[..(line_end - cur)]
+            );
         } else {
             info!("[clone-tls] {} {:#x}: <unmapped>", tag, cur);
         }
@@ -268,20 +272,15 @@ pub fn sys_futex(
     let pid = if private { current_process().pid.0 } else { 0 };
     let key = FutexKey::new(pa, pid);
     let name = current_process().inner_exclusive_access().name.clone();
-    if matches!(cmd, FutexCmd::FUTEX_WAIT | FutexCmd::FUTEX_WAIT_BITSET) && name == "entry-static.exe" {
+    if matches!(cmd, FutexCmd::FUTEX_WAIT | FutexCmd::FUTEX_WAIT_BITSET)
+        && name == "entry-static.exe"
+    {
         let tid = current_task()
             .and_then(|task| task.inner_exclusive_access().res.as_ref().map(|r| r.tid))
             .unwrap_or(0);
         info!(
             "[sys_futex] pid={} tid={} name={} cmd={:?} uaddr1={:#x} pa={:#x} private={} val={}",
-            pid_now,
-            tid,
-            name,
-            cmd,
-            uaddr1 as usize,
-            pa.0,
-            private,
-            val
+            pid_now, tid, name, cmd, uaddr1 as usize, pa.0, private, val
         );
     }
     trace!(
@@ -422,7 +421,12 @@ pub fn sys_futex(
                 return errno(EINVAL);
             }
             let woke = futex_wake_bitset(key, val as usize, val3) as isize;
-            trace!("[sys_futex] pid={} wake_bitset n={} bitset={:#x}", pid_now, woke, val3);
+            trace!(
+                "[sys_futex] pid={} wake_bitset n={} bitset={:#x}",
+                pid_now,
+                woke,
+                val3
+            );
             woke
         }
         _ => errno(ENOSYS),
@@ -586,10 +590,7 @@ pub fn sys_clone(
             let tls_addr = tls as usize;
             info!(
                 "[clone-tls] pid={} tid={} tls={:#x} stack={:#x}",
-                pid,
-                new_task_tid,
-                tls_addr,
-                stack as usize
+                pid, new_task_tid, tls_addr, stack as usize
             );
             let base = tls_addr.saturating_sub(256);
             dump_user_bytes("tp-0x100", token, base, 128);
@@ -604,9 +605,7 @@ pub fn sys_clone(
         inner.clear_child_tid = ctid as usize;
         info!(
             "[clone] pid={} tid={} child_cleartid={:#x}",
-            pid,
-            new_task_tid,
-            ctid as usize
+            pid, new_task_tid, ctid as usize
         );
     }
 
@@ -659,7 +658,10 @@ fn parse_shebang(data: &[u8]) -> Option<(String, Option<String>)> {
     }
 
     // Find the end of first line
-    let line_end = data.iter().position(|&b| b == b'\n' || b == b'\r').unwrap_or(data.len());
+    let line_end = data
+        .iter()
+        .position(|&b| b == b'\n' || b == b'\r')
+        .unwrap_or(data.len());
     if line_end <= 2 {
         return None;
     }
@@ -752,12 +754,7 @@ fn read_exec_image(path: &str, file: &Arc<dyn File>) -> Arc<[u8]> {
     Arc::<[u8]>::from(file.read_all().into_boxed_slice())
 }
 
-fn trace_exec_resolution(
-    name: &str,
-    exec_path: &str,
-    exec_path_resolved: &str,
-    args: &[String],
-) {
+fn trace_exec_resolution(name: &str, exec_path: &str, exec_path_resolved: &str, args: &[String]) {
     if name == "busybox"
         && (exec_path.contains("run-all.sh")
             || exec_path.contains("/basic/")
@@ -805,8 +802,7 @@ fn trace_entry_bytes(exec_path_resolved: &str, all_data: &[u8], app: &Arc<dyn Fi
                     };
                     let entry_bytes = &all_data[file_off..end];
                     trace!("[sys_exec] {} entry bytes={:02x?}", label, entry_bytes);
-                    if exec_path_resolved == "/musl/busybox"
-                        && entry_bytes.iter().all(|b| *b == 0)
+                    if exec_path_resolved == "/musl/busybox" && entry_bytes.iter().all(|b| *b == 0)
                     {
                         let head_len = all_data.len().min(16);
                         trace!(
@@ -839,11 +835,20 @@ fn trace_run_all_head(name: &str, exec_path: &str, all_data: &[u8]) {
     if name == "busybox" && exec_path.contains("run-all.sh") {
         let head_len = all_data.len().min(16);
         let head = &all_data[..head_len];
-        trace!("[sys_exec] run-all.sh head={:02x?} len={}", head, all_data.len());
+        trace!(
+            "[sys_exec] run-all.sh head={:02x?} len={}",
+            head,
+            all_data.len()
+        );
     }
 }
 
-fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, depth: usize) -> isize {
+fn sys_exec_internal(
+    path: *const u8,
+    argv: *const usize,
+    envp: *const usize,
+    depth: usize,
+) -> isize {
     if path.is_null() {
         return errno(EFAULT);
     }
@@ -887,16 +892,21 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
             // 应该已经提前做了硬链接
             if open_file("/bin/sh", OpenFlags::empty()).is_none() {
                 if open_file("/musl/busybox", OpenFlags::empty()).is_some() {
-                    info!("[sys_exec] pid={} exec /bin/sh fallback to /musl/busybox", current_process().pid.0);
+                    info!(
+                        "[sys_exec] pid={} exec /bin/sh fallback to /musl/busybox",
+                        current_process().pid.0
+                    );
                     exec_path = String::from("/musl/busybox");
                 } else {
-                    error!("[sys_exec] pid={} exec /bin/sh fallback busybox also not found", current_process().pid.0);
+                    error!(
+                        "[sys_exec] pid={} exec /bin/sh fallback busybox also not found",
+                        current_process().pid.0
+                    );
                     return errno(ENOENT);
                 }
             } else {
                 trace!("[sys_exec] /bin/sh ready");
             }
-
         }
         let mut resolved_path = None;
         let mut app = None;
@@ -1014,7 +1024,9 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
                     let interp_start = ph.offset() as usize;
                     let interp_end = interp_start + ph.file_size() as usize;
                     if interp_end <= all_data.len() {
-                        if let Ok(interp_str) = core::str::from_utf8(&all_data[interp_start..interp_end]) {
+                        if let Ok(interp_str) =
+                            core::str::from_utf8(&all_data[interp_start..interp_end])
+                        {
                             interp = Some(String::from(interp_str.trim_end_matches('\0')));
                         }
                     }
@@ -1032,10 +1044,16 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
                         || interp_path.contains("ld-musl-loongarch")
                     {
                         if open_file(musl_loader, OpenFlags::empty()).is_some() {
-                            info!("[sys_exec] interp {} not found, fallback to musl loader: {}", interp_path, musl_loader);
+                            info!(
+                                "[sys_exec] interp {} not found, fallback to musl loader: {}",
+                                interp_path, musl_loader
+                            );
                             interp_path = String::from(musl_loader);
                         } else if open_file(glibc_loader, OpenFlags::empty()).is_some() {
-                            info!("[sys_exec] interp {} not found, fallback to glibc loader: {}", interp_path, glibc_loader);
+                            info!(
+                                "[sys_exec] interp {} not found, fallback to glibc loader: {}",
+                                interp_path, glibc_loader
+                            );
                             interp_path = String::from(glibc_loader);
                         }
                     }
@@ -1102,7 +1120,11 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
         let _trace_pid = process.getpid();
-        if !inner.children.iter().any(|p| pid == -1 || pid as usize == p.getpid()) {
+        if !inner
+            .children
+            .iter()
+            .any(|p| pid == -1 || pid as usize == p.getpid())
+        {
             return errno(ECHILD);
         }
         let pair = inner.children.iter().enumerate().find(|(_, p)| {
@@ -1296,7 +1318,11 @@ pub fn sys_getitimer(which: isize, curr_value: *mut ITimerVal) -> isize {
     }
 }
 
-pub fn sys_setitimer(which: isize, new_value: *const ITimerVal, old_value: *mut ITimerVal) -> isize {
+pub fn sys_setitimer(
+    which: isize,
+    new_value: *const ITimerVal,
+    old_value: *mut ITimerVal,
+) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_setitimer which={}", pid, which);
@@ -1479,7 +1505,12 @@ pub fn sys_sysinfo(info: *mut SysInfo) -> isize {
 pub fn sys_msync(start: usize, len: usize, _flags: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_msync start={:#x} len={:#x}", pid, start, len);
+        syscall!(
+            "kernel:pid[{}] sys_msync start={:#x} len={:#x}",
+            pid,
+            start,
+            len
+        );
     }
     if start == 0 || len == 0 {
         return errno(EINVAL);
@@ -1488,7 +1519,14 @@ pub fn sys_msync(start: usize, len: usize, _flags: usize) -> isize {
 }
 
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: usize) -> isize {
+pub fn sys_mmap(
+    start: usize,
+    len: usize,
+    prot: usize,
+    flags: usize,
+    fd: usize,
+    offset: usize,
+) -> isize {
     const PROT_READ: usize = 0x1;
     const PROT_WRITE: usize = 0x2;
     const PROT_EXEC: usize = 0x4;
@@ -1496,6 +1534,7 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
     const MAP_PRIVATE: usize = 0x02;
     const MAP_FIXED: usize = 0x10;
     const MAP_ANON: usize = 0x20;
+    const MAP_TYPE_MASK: usize = MAP_SHARED | MAP_PRIVATE;
 
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
@@ -1589,9 +1628,43 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
     }
     // 获取页对齐的长度，如果 len 已经是页大小的整数倍，则保持不变；否则向上调整到下一个页边界。
     let len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    if (flags & MAP_TYPE_MASK) == 0 || (flags & MAP_TYPE_MASK) == MAP_TYPE_MASK {
+        return errno(EINVAL);
+    }
+    if (prot & !(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0 {
+        return errno(EINVAL);
+    }
+
+    let is_shared = (flags & MAP_SHARED) != 0;
+    let is_anon = (flags & MAP_ANON) != 0;
+    let process = current_process();
+
+    let file_info = if !is_anon {
+        if offset % PAGE_SIZE != 0 {
+            return errno(EINVAL);
+        }
+        let inner = process.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return errno(EBADF);
+        }
+        let Some(file) = inner.fd_table[fd].as_ref() else {
+            return errno(EBADF);
+        };
+        if map_perm.contains(MapPermission::R) && !file.readable() {
+            return errno(EACCES);
+        }
+        if is_shared && map_perm.contains(MapPermission::W) && !file.writable() {
+            return errno(EACCES);
+        }
+        let writable = file.writable();
+        let inode = file.inode();
+        drop(inner);
+        Some((inode, writable))
+    } else {
+        None
+    };
 
     // 获取 mmap 的起始地址，如果是固定映射且提供了非零的起始地址，则使用该地址；否则根据当前进程的 mmap_base 来分配一个合适的地址，并更新 mmap_base。
-    let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let req_start = start;
     let is_fixed = (flags & MAP_FIXED) != 0 && req_start != 0;
@@ -1657,7 +1730,11 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
                 .overlap_ranges(VirtAddr(start), VirtAddr(start + len));
             for (idx, (r_start, r_end)) in ranges.into_iter().enumerate() {
                 trace!(
-                    "[sys_mmap] pid={} overlap[{}]=[{:#x},{:#x})", pid, idx, r_start.0, r_end.0
+                    "[sys_mmap] pid={} overlap[{}]=[{:#x},{:#x})",
+                    pid,
+                    idx,
+                    r_start.0,
+                    r_end.0
                 );
             }
         }
@@ -1665,34 +1742,24 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
     }
 
     // 在进程的内存空间里插入一个新的映射区域，起始地址为 start，长度为 len，权限为 map_perm。
-    if (flags & MAP_SHARED) != 0 {
-        inner
-            .memory_set
-            .insert_shared_framed_area(VirtAddr(start), VirtAddr(start + len), map_perm);
-    } else {
-        inner
-            .memory_set
-            .insert_framed_area(VirtAddr(start), VirtAddr(start + len), map_perm);
-    }
+    inner.memory_set.insert_mmap_area(
+        VirtAddr(start),
+        VirtAddr(start + len),
+        map_perm,
+        MmapMeta {
+            shared: is_shared,
+            file_backed: !is_anon,
+            file_writable: file_info
+                .as_ref()
+                .map(|(_, writable)| *writable)
+                .unwrap_or(true),
+        },
+    );
     drop(inner);
 
     // 文件映射填充部分，在“不是匿名映射、而且有有效 fd”的情况下，把文件内容读进映射的页里。
     // TODO: 懒分配/写时复制等优化
-    if (flags & MAP_ANON) == 0 && fd != usize::MAX {
-        // offset 参数必须是页大小的整数倍，否则返回 -EINVAL。
-        if offset % PAGE_SIZE != 0 {
-            return errno(EINVAL);
-        }
-        let inode = {
-            let inner = process.inner_exclusive_access();
-            if fd < inner.fd_table.len() {
-                inner.fd_table[fd]
-                    .as_ref()
-                    .and_then(|file| file.inode())
-            } else {
-                None
-            }
-        };
+    if let Some((inode, _)) = file_info {
         if let Some(inode) = inode {
             let token = current_user_token();
             let slices = translated_byte_buffer(token, start as *const u8, len);
@@ -1719,6 +1786,7 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     if start % PAGE_SIZE != 0 || len == 0 {
         return errno(EINVAL);
     }
+    let len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     // if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
@@ -1750,7 +1818,7 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     // }
     inner
         .memory_set
-        .remove_area_with_start_vpn(VirtAddr(start).floor());
+        .unmap_range(VirtAddr(start), VirtAddr(start + len));
     // if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
     //     let after = inner
     //         .memory_set
@@ -1877,7 +1945,12 @@ pub fn sys_set_priority(_prio: isize) -> isize {
 pub fn sys_kill(pid: usize, signum: i32) -> isize {
     let pid_now = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid_now) {
-        syscall!("kernel:pid[{}] sys_kill pid={} signum={}", pid_now, pid, signum);
+        syscall!(
+            "kernel:pid[{}] sys_kill pid={} signum={}",
+            pid_now,
+            pid,
+            signum
+        );
     }
     let flag = match signal_flag_from_signum(signum) {
         Ok(flag) => flag,
@@ -1957,7 +2030,12 @@ fn send_signal_to_task_from_list(
 pub fn sys_tkill(tid: isize, signum: i32) -> isize {
     let pid_now = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid_now) {
-        syscall!("kernel:pid[{}] sys_tkill tid={} signum={}", pid_now, tid, signum);
+        syscall!(
+            "kernel:pid[{}] sys_tkill tid={} signum={}",
+            pid_now,
+            tid,
+            signum
+        );
     }
     if tid <= 0 {
         return errno(EINVAL);
@@ -2063,9 +2141,7 @@ pub fn sys_sigaction(
             if new_action.handler >= USER_ADDR_MAX && new_action.handler > 1 {
                 warn!(
                     "[sigaction] pid={} signum={} handler out of range: {:#x}",
-                    pid,
-                    signum,
-                    new_action.handler
+                    pid, signum, new_action.handler
                 );
             }
         }
@@ -2120,9 +2196,9 @@ pub fn sys_sigprocmask(
         let mut new_flags = user_mask_to_flags(user_mask as u64);
         new_flags.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
         match how {
-            0 => task_inner.signal_mask |= new_flags,    // SIG_BLOCK
-            1 => task_inner.signal_mask &= !new_flags,   // SIG_UNBLOCK
-            2 => task_inner.signal_mask = new_flags,     // SIG_SETMASK
+            0 => task_inner.signal_mask |= new_flags,  // SIG_BLOCK
+            1 => task_inner.signal_mask &= !new_flags, // SIG_UNBLOCK
+            2 => task_inner.signal_mask = new_flags,   // SIG_SETMASK
             _ => return errno(EINVAL),
         }
         task_inner
@@ -2248,12 +2324,7 @@ pub fn sys_sigreturn() -> isize {
         let tp = inner.get_trap_cx()[TrapFrameArgs::TLS];
         info!(
             "[sigreturn] pid={} tid={} sig33 tp={:#x} saved_pc={:#x} return_pc={:#x} mask={:?}",
-            pid,
-            tid,
-            tp,
-            saved_pc,
-            return_pc,
-            inner.signal_mask
+            pid, tid, tp, saved_pc, return_pc, inner.signal_mask
         );
     }
 
@@ -2385,9 +2456,7 @@ pub fn sys_exit_group(exit_code: i32) -> ! {
 }
 
 pub fn sys_shutdown() -> ! {
-    trace!(
-        "kernel:pid[{}] sys_shutdown",
-        current_process().pid.0);
+    trace!("kernel:pid[{}] sys_shutdown", current_process().pid.0);
     arch::shutdown();
 }
 
@@ -2404,8 +2473,13 @@ pub fn sys_shutdown() -> ! {
 pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_mprotect addr=0x{:x} len=0x{:x} prot=0x{:x}",
-               pid, addr, len, prot);
+        syscall!(
+            "kernel:pid[{}] sys_mprotect addr=0x{:x} len=0x{:x} prot=0x{:x}",
+            pid,
+            addr,
+            len,
+            prot
+        );
     }
 
     const PROT_READ: usize = 0x1;
@@ -2421,6 +2495,12 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 
     if len == 0 {
         return 0;
+    }
+    if addr == 0 {
+        return errno(ENOMEM);
+    }
+    if (prot & !(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0 {
+        return errno(EINVAL);
     }
 
     // Convert prot flags to MapPermission
@@ -2440,19 +2520,19 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 
     // Round up length to page boundary
     let page_count = (len + PAGE_SIZE - 1) / PAGE_SIZE;
-    let end_addr = addr + page_count * PAGE_SIZE;
+    let Some(end_addr) = addr.checked_add(page_count * PAGE_SIZE) else {
+        return errno(ENOMEM);
+    };
 
     // Change protection for the memory region
-    let result = inner.memory_set.change_protection(
-        VirtAddr(addr),
-        VirtAddr(end_addr),
-        map_perm,
-    );
+    let result = inner
+        .memory_set
+        .change_protection(VirtAddr(addr), VirtAddr(end_addr), map_perm);
 
-    if result {
-        0
-    } else {
-        errno(EINVAL)
+    match result {
+        Ok(()) => 0,
+        Err(ProtectError::Unmapped) => errno(ENOMEM),
+        Err(ProtectError::AccessDenied) => errno(EACCES),
     }
 }
 
@@ -2535,7 +2615,6 @@ pub fn sys_rt_sigtimedwait(
 
         if let Some(dl) = deadline {
             if get_time_us() >= dl {
-
                 return errno(EAGAIN);
             }
         }

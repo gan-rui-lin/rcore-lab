@@ -30,10 +30,7 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
     ) = crate::task::pid2process_aggregate();
     println!(
         "[kernel] alloc_error diag: pid2pcb_len={} ready_queue_len={} timer_len={} live_tasks={}",
-        proc_len,
-        ready_len,
-        timer_len,
-        live_tasks
+        proc_len, ready_len, timer_len, live_tasks
     );
     println!(
         "[kernel] alloc_error diag2: map_len={} sampled={} skipped={} total_children={} total_tasks={} total_exited_threads={} max_children_pid={} max_children={}",
@@ -48,9 +45,7 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
     );
     println!(
         "[kernel] alloc_error diag3: mutex_waiters={} sem_waiters={} cond_waiters={}",
-        total_mutex_waiters,
-        total_sem_waiters,
-        total_cond_waiters
+        total_mutex_waiters, total_sem_waiters, total_cond_waiters
     );
     println!(
         "[kernel] alloc_error diag4: tracked_tasks={} unique_task_pids={} top_pid={} top_pid_count={} min_pid={} max_pid={}",

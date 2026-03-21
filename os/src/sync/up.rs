@@ -1,8 +1,8 @@
 //! Uniprocessor interior mutability primitives
+use arch::{disable_interrupts, enable_interrupts, interrupts_enabled};
 use core::cell::{RefCell, RefMut, UnsafeCell};
 use core::ops::{Deref, DerefMut};
 use lazy_static::lazy_static;
-use arch::{disable_interrupts, enable_interrupts, interrupts_enabled};
 
 /// Wrap a static data structure inside it so that we are
 /// able to access it without any `unsafe`.

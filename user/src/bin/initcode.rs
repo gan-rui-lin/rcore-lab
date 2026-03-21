@@ -7,7 +7,9 @@ extern crate user_lib;
 extern crate alloc;
 
 use alloc::vec::Vec;
-use user_lib::{chdir, dup, execve, exit, fork, kill, mkdir, open, shutdown, sleep, wait, waitpid, OpenFlags};
+use user_lib::{
+    chdir, dup, execve, exit, fork, kill, mkdir, open, shutdown, sleep, wait, waitpid, OpenFlags,
+};
 
 const ENABLE_SINGLE_ELF_SUITE: bool = false;
 const ENABLE_BASIC_TEST: bool = false;
@@ -251,7 +253,10 @@ fn run_testcode(script_name: &str) {
     } else {
         let mut status: i32 = 0;
         let _ = wait(&mut status);
-        println!("=== {} completed (status=0x{:x}) ===\n", script_name, status);
+        println!(
+            "=== {} completed (status=0x{:x}) ===\n",
+            script_name, status
+        );
     }
 }
 
@@ -334,13 +339,15 @@ fn test_ltp() {
         "dup203",
         "open01",
         "lseek01",
+        // Memory management
+        "mmap01",
+        "munmap01",
+        "mprotect01",
+        "mprotect02",
+        "mprotect03",
     ];
 
-    const LTP_TESTS_CLONE_REPRO: &[&str] = &[
-        "clone01",
-        "clone02",
-        "clone03",
-    ];
+    const LTP_TESTS_CLONE_REPRO: &[&str] = &["clone01", "clone02", "clone03"];
 
     const LTP_TESTS_BATCH_REPRO: &[&str] = &[
         "waitpid01",
@@ -363,11 +370,7 @@ fn test_ltp() {
         None => ("stable", LTP_TESTS_STABLE),
     };
 
-    println!(
-        "[LTP] profile={} tests={}",
-        profile_name,
-        ltp_tests.len()
-    );
+    println!("[LTP] profile={} tests={}", profile_name, ltp_tests.len());
 
     let mut total = 0;
     let mut passed = 0;
@@ -533,7 +536,12 @@ fn test_all_tests() {
 
     for (idx, script) in test_scripts.iter().enumerate() {
         total += 1;
-        println!("\n[{}/{}] Running test: {}", idx + 1, test_scripts.len(), script);
+        println!(
+            "\n[{}/{}] Running test: {}",
+            idx + 1,
+            test_scripts.len(),
+            script
+        );
         println!("------------------------------------------");
 
         let pid = fork();
@@ -575,8 +583,8 @@ fn test_all_tests() {
     println!("==========================================\n");
 }
 
-fn test_fat32_suite(){
-       let tests = [
+fn test_fat32_suite() {
+    let tests = [
         "brk",
         "chdir",
         "clone",

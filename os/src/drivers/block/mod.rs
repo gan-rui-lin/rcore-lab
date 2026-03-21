@@ -1,14 +1,14 @@
+mod cached_block_device;
 #[cfg(target_arch = "riscv64")]
 mod virtio_blk;
 #[cfg(target_arch = "loongarch64")]
 mod virtio_blk_pci;
-mod cached_block_device;
 
+pub use cached_block_device::{CacheStats, CachedBlockDevice};
 #[cfg(target_arch = "riscv64")]
 pub use virtio_blk::VirtIOBlock;
 #[cfg(target_arch = "loongarch64")]
 pub use virtio_blk_pci::VirtIOPCIBlock;
-pub use cached_block_device::{CachedBlockDevice, CacheStats};
 
 use crate::board::BlockDeviceImpl;
 use alloc::sync::Arc;

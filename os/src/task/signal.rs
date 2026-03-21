@@ -114,7 +114,6 @@ bitflags! {
     }
 }
 
-
 impl SignalFlags {
     pub fn check_error(&self) -> Option<(i32, &'static str)> {
         if self.contains(Self::SIGINT) {

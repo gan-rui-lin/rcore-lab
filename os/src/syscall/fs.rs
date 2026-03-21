@@ -1,30 +1,38 @@
 //! File and filesystem-related syscalls
+use super::errno::*;
+use super::process::TimeSpec;
 use crate::fs::{
     create_dir, make_pipe, open_file, path_exists, path_is_dir, remove_path, DevNull, DevZero,
-    OpenFlags, Stat, StatMode, PollEvents,
+    OpenFlags, PollEvents, Stat, StatMode,
 };
 use crate::mm::{
     translated_byte_buffer, translated_byte_buffer_checked, translated_refmut, translated_str,
     UserBuffer,
 };
 #[allow(unused_imports)] // for debug
-use core::sync::atomic::{AtomicUsize, Ordering};
-#[allow(unused_imports)] // for debug
-use crate::task::{current_process, current_task, current_user_token, suspend_current_and_run_next};
+use crate::task::{
+    current_process, current_task, current_user_token, suspend_current_and_run_next,
+};
 use crate::timer::{get_time_ms, get_time_us};
-use super::errno::*;
-use super::process::TimeSpec;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+#[allow(unused_imports)] // for debug
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Check if a path is a character device.
 fn is_char_device(path: &str) -> bool {
     matches!(
         path,
-        "/dev/null" | "/dev/zero" | "/dev/tty" | "/dev/urandom" | "/dev/random"
-            | "/dev/rtc" | "/dev/rtc0" | "/dev/misc/rtc"
+        "/dev/null"
+            | "/dev/zero"
+            | "/dev/tty"
+            | "/dev/urandom"
+            | "/dev/random"
+            | "/dev/rtc"
+            | "/dev/rtc0"
+            | "/dev/misc/rtc"
     )
 }
 
@@ -38,8 +46,8 @@ fn rdev_for_path(path: &str) -> u64 {
     }
 }
 
-use alloc::collections::BTreeMap;
 use crate::sync::UPSafeCell;
+use alloc::collections::BTreeMap;
 use lazy_static::lazy_static;
 
 #[cfg(feature = "ext4")]
@@ -399,9 +407,10 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         return errno(ENOTDIR);
     }
     // Special device files
+    let (readable, writable) = flags.read_write();
     let dev_file: Option<Arc<dyn crate::fs::File + Send + Sync>> = match full_path.as_str() {
-        "/dev/null" => Some(Arc::new(DevNull)),
-        "/dev/zero" => Some(Arc::new(DevZero)),
+        "/dev/null" => Some(Arc::new(DevNull::new(readable, writable))),
+        "/dev/zero" => Some(Arc::new(DevZero::new(readable, writable))),
         _ => None,
     };
     if let Some(file) = dev_file {
@@ -581,7 +590,10 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, _flags: u32) ->
             } else {
                 StatMode::FILE
             };
-            (mode.bits() | path_mode_get(&full_path).unwrap_or(0o777), inode.size())
+            (
+                mode.bits() | path_mode_get(&full_path).unwrap_or(0o777),
+                inode.size(),
+            )
         } else {
             (StatMode::FILE.bits() | 0o666, 0)
         };
@@ -620,7 +632,9 @@ fn read_times_from_user(token: usize, times: *const TimeSpec) -> Option<(TimeSpe
     }
     let ts0 = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const TimeSpec) };
     let ts1 = unsafe {
-        core::ptr::read_unaligned(data.as_ptr().add(core::mem::size_of::<TimeSpec>()) as *const TimeSpec)
+        core::ptr::read_unaligned(
+            data.as_ptr().add(core::mem::size_of::<TimeSpec>()) as *const TimeSpec
+        )
     };
     Some((ts0, ts1))
 }
@@ -690,12 +704,7 @@ fn apply_utimensat_to_fd(fd: usize, times: *const TimeSpec, token: usize) -> isi
 /// utimensat - update file timestamps.
 ///
 /// When path is NULL, operates on dirfd (implements futimens).
-pub fn sys_utimensat(
-    dirfd: isize,
-    path: *const u8,
-    times: *const TimeSpec,
-    _flags: u32,
-) -> isize {
+pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const TimeSpec, _flags: u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_utimensat dirfd={}", pid, dirfd);
@@ -730,9 +739,7 @@ pub fn sys_utimensat(
             return errno(ENOTDIR);
         }
     }
-    if is_char_device(&full_path)
-        || open_file(full_path.as_str(), OpenFlags::empty()).is_some()
-    {
+    if is_char_device(&full_path) || open_file(full_path.as_str(), OpenFlags::empty()).is_some() {
         0
     } else {
         errno(ENOENT)
@@ -793,7 +800,10 @@ fn stat_from_fd(fd: usize) -> Result<Stat, isize> {
             } else {
                 StatMode::FILE
             };
-            (mode.bits() | path_mode_get(path).unwrap_or(0o777), inode.size())
+            (
+                mode.bits() | path_mode_get(path).unwrap_or(0o777),
+                inode.size(),
+            )
         } else {
             (StatMode::FILE.bits() | 0o666, 0)
         };
@@ -830,7 +840,10 @@ fn stat_from_path(full_path: &str) -> Result<Stat, isize> {
         } else {
             StatMode::FILE
         };
-        (mode.bits() | path_mode_get(full_path).unwrap_or(0o777), inode.size())
+        (
+            mode.bits() | path_mode_get(full_path).unwrap_or(0o777),
+            inode.size(),
+        )
     } else {
         (StatMode::FILE.bits() | 0o666, 0)
     };
@@ -872,7 +885,10 @@ pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
             } else {
                 StatMode::FILE
             };
-            (mode.bits() | path_mode_get(path).unwrap_or(0o777), inode.size())
+            (
+                mode.bits() | path_mode_get(path).unwrap_or(0o777),
+                inode.size(),
+            )
         } else {
             (StatMode::FILE.bits() | 0o666, 0)
         };
@@ -909,7 +925,8 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: i32, _mask: u32, buf: *mu
     let flags = flags as u32;
     // Accept the same flag family commonly used by musl/glibc stat wrappers.
     // Unsupported semantic bits are ignored for now, but unknown bits are rejected.
-    let supported_flags = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE;
+    let supported_flags =
+        AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE;
     if flags & !supported_flags != 0 {
         return errno(EINVAL);
     }
@@ -963,7 +980,11 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: i32, _mask: u32, buf: *mu
     stx.stx_mode = stat.mode as u16;
     stx.stx_ino = stat.ino;
     stx.stx_size = if stat.size < 0 { 0 } else { stat.size as u64 };
-    stx.stx_blocks = if stat.blocks < 0 { 0 } else { stat.blocks as u64 };
+    stx.stx_blocks = if stat.blocks < 0 {
+        0
+    } else {
+        stat.blocks as u64
+    };
     stx.stx_atime = StatxTimestamp {
         tv_sec: stat.atime_sec,
         tv_nsec: stat.atime_nsec as u32,
@@ -985,7 +1006,10 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: i32, _mask: u32, buf: *mu
     stx.stx_rdev_minor = rdev_minor;
 
     let bytes = unsafe {
-        core::slice::from_raw_parts((&stx as *const Statx) as *const u8, core::mem::size_of::<Statx>())
+        core::slice::from_raw_parts(
+            (&stx as *const Statx) as *const u8,
+            core::mem::size_of::<Statx>(),
+        )
     };
     match copy_to_user(token, buf as *mut u8, bytes) {
         Ok(_) => 0,
@@ -1223,7 +1247,10 @@ pub fn sys_renameat2(
         }
     }
 
-    let new_file = match open_file(new_path.as_str(), OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY) {
+    let new_file = match open_file(
+        new_path.as_str(),
+        OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY,
+    ) {
         Some(file) => file,
         None => return errno(ENOENT),
     };
@@ -1450,7 +1477,13 @@ pub fn sys_umount2(_target: *const u8, _flags: u32) -> isize {
 pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_lseek fd={} offset={} whence={}", pid, fd, offset, whence);
+        syscall!(
+            "kernel:pid[{}] sys_lseek fd={} offset={} whence={}",
+            pid,
+            fd,
+            offset,
+            whence
+        );
     }
 
     const SEEK_SET: usize = 0;
@@ -1559,12 +1592,24 @@ pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
         }
 
         let base = usize::from_le_bytes([
-            iov_data[0], iov_data[1], iov_data[2], iov_data[3],
-            iov_data[4], iov_data[5], iov_data[6], iov_data[7],
+            iov_data[0],
+            iov_data[1],
+            iov_data[2],
+            iov_data[3],
+            iov_data[4],
+            iov_data[5],
+            iov_data[6],
+            iov_data[7],
         ]);
         let len = usize::from_le_bytes([
-            iov_data[8], iov_data[9], iov_data[10], iov_data[11],
-            iov_data[12], iov_data[13], iov_data[14], iov_data[15],
+            iov_data[8],
+            iov_data[9],
+            iov_data[10],
+            iov_data[11],
+            iov_data[12],
+            iov_data[13],
+            iov_data[14],
+            iov_data[15],
         ]);
 
         if base == 0 || len == 0 {
@@ -1644,12 +1689,24 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
         }
 
         let base = usize::from_le_bytes([
-            iov_data[0], iov_data[1], iov_data[2], iov_data[3],
-            iov_data[4], iov_data[5], iov_data[6], iov_data[7],
+            iov_data[0],
+            iov_data[1],
+            iov_data[2],
+            iov_data[3],
+            iov_data[4],
+            iov_data[5],
+            iov_data[6],
+            iov_data[7],
         ]);
         let len = usize::from_le_bytes([
-            iov_data[8], iov_data[9], iov_data[10], iov_data[11],
-            iov_data[12], iov_data[13], iov_data[14], iov_data[15],
+            iov_data[8],
+            iov_data[9],
+            iov_data[10],
+            iov_data[11],
+            iov_data[12],
+            iov_data[13],
+            iov_data[14],
+            iov_data[15],
         ]);
 
         if base == 0 || len == 0 {
@@ -1703,7 +1760,13 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_fcntl fd={} cmd={} arg={}", pid, fd, cmd, arg);
+        syscall!(
+            "kernel:pid[{}] sys_fcntl fd={} cmd={} arg={}",
+            pid,
+            fd,
+            cmd,
+            arg
+        );
     }
 
     const F_DUPFD: i32 = 0;
@@ -1809,14 +1872,14 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
     use crate::mm::translated_refmut;
 
     // Common ioctl request codes
-    const TCGETS: usize = 0x5401;      // Get terminal attributes
-    const TCSETS: usize = 0x5402;      // Set terminal attributes
-    const TIOCGPGRP: usize = 0x540F;   // Get process group
-    const TIOCSPGRP: usize = 0x5410;   // Set process group
-    const TIOCGWINSZ: usize = 0x5413;  // Get window size
-    const TIOCSWINSZ: usize = 0x5414;  // Set window size
-    const FIONREAD: usize = 0x541B;    // Get number of bytes available
-    const FIONBIO: usize = 0x5421;     // Set/clear non-blocking I/O
+    const TCGETS: usize = 0x5401; // Get terminal attributes
+    const TCSETS: usize = 0x5402; // Set terminal attributes
+    const TIOCGPGRP: usize = 0x540F; // Get process group
+    const TIOCSPGRP: usize = 0x5410; // Set process group
+    const TIOCGWINSZ: usize = 0x5413; // Get window size
+    const TIOCSWINSZ: usize = 0x5414; // Set window size
+    const FIONREAD: usize = 0x541B; // Get number of bytes available
+    const FIONBIO: usize = 0x5421; // Set/clear non-blocking I/O
 
     let process = current_process();
     let file = {
@@ -1857,10 +1920,10 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
             }
             let token = current_user_token();
             let winsize = translated_refmut(token, arg as *mut [u16; 4]);
-            winsize[0] = 24;  // ws_row
-            winsize[1] = 80;  // ws_col
-            winsize[2] = 0;   // ws_xpixel
-            winsize[3] = 0;   // ws_ypixel
+            winsize[0] = 24; // ws_row
+            winsize[1] = 80; // ws_col
+            winsize[2] = 0; // ws_xpixel
+            winsize[3] = 0; // ws_ypixel
             0
         }
         TIOCSWINSZ => {
@@ -2119,7 +2182,6 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut isize, count: usiz
     errno(ENOSYS)
 }
 
-
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 pub struct PollFd {
@@ -2197,7 +2259,13 @@ pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: i32) -> isize {
 pub fn sys_pread64(fd: usize, buf: *const u8, count: usize, offset: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_pread64 fd={} count={} offset={}", pid, fd, count, offset);
+        syscall!(
+            "kernel:pid[{}] sys_pread64 fd={} count={} offset={}",
+            pid,
+            fd,
+            count,
+            offset
+        );
     }
     let token = current_user_token();
     let process = current_process();
@@ -2237,7 +2305,13 @@ pub fn sys_pread64(fd: usize, buf: *const u8, count: usize, offset: usize) -> is
 pub fn sys_pwrite64(fd: usize, buf: *const u8, count: usize, offset: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_pwrite64 fd={} count={} offset={}", pid, fd, count, offset);
+        syscall!(
+            "kernel:pid[{}] sys_pwrite64 fd={} count={} offset={}",
+            pid,
+            fd,
+            count,
+            offset
+        );
     }
     let token = current_user_token();
     let process = current_process();
@@ -2296,7 +2370,13 @@ pub fn sys_fchmod(_fd: usize, _mode: u32) -> isize {
 
 /// sys_fchownat (syscall 54) - stub: always succeed
 /// LTP framework uses chown on tmp directories during setup
-pub fn sys_fchownat(_dirfd: isize, _path: *const u8, _owner: u32, _group: u32, _flags: u32) -> isize {
+pub fn sys_fchownat(
+    _dirfd: isize,
+    _path: *const u8,
+    _owner: u32,
+    _group: u32,
+    _flags: u32,
+) -> isize {
     0
 }
 

@@ -63,14 +63,14 @@ impl TlsArea {
     /// Layout (RISC-V musl TLS_ABOVE_TP):
     ///   [pthread_reserve] [GAP_ABOVE_TP=16] [.tdata] [.tbss]
     ///                                        ^-- tp points here
-    pub fn new(
-        tls_info: &TlsInfo,
-        memory_set: &mut MemorySet,
-        elf_data: &[u8],
-    ) -> Self {
+    pub fn new(tls_info: &TlsInfo, memory_set: &mut MemorySet, elf_data: &[u8]) -> Self {
         use crate::mm::translated_refmut;
 
-        let align = if tls_info.align > 0 { tls_info.align } else { 8 };
+        let align = if tls_info.align > 0 {
+            tls_info.align
+        } else {
+            8
+        };
 
         // Place TLS at a fixed virtual address
         let tls_base = 0x7000_0000;

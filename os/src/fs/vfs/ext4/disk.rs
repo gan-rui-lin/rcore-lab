@@ -50,7 +50,8 @@ impl Ext4Disk {
             );
         }
         let read_size = if self.offset == 0 && buf.len() >= BLOCK_SIZE {
-            self.device.read_block(self.block_id, &mut buf[..BLOCK_SIZE]);
+            self.device
+                .read_block(self.block_id, &mut buf[..BLOCK_SIZE]);
             self.block_id += 1;
             BLOCK_SIZE
         } else {

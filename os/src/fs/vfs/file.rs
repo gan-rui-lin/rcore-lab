@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
-use super::core::{normalize_path, VfsInode, VfsNodeKind, ROOT_VFS};
 use super::super::{File, OpenFlags};
+use super::core::{normalize_path, VfsInode, VfsNodeKind, ROOT_VFS};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use alloc::string::String;
@@ -31,12 +31,7 @@ impl VfsFile {
             writable,
             path,
             ts_id: NEXT_TS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-            inner: unsafe {
-                UPIntrFreeCell::new(VfsFileInner {
-                    offset: 0,
-                    inode,
-                })
-            },
+            inner: unsafe { UPIntrFreeCell::new(VfsFileInner { offset: 0, inode }) },
         }
     }
 

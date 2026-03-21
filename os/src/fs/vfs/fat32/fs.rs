@@ -22,7 +22,9 @@ pub(in crate::fs::vfs) fn fat32_root() -> Result<Arc<dyn VfsInode>, Error<Fat32I
     Ok(Arc::new(Fat32Inode::new_dir(String::from("/"), fs)))
 }
 
-fn fat32_locate(device: &Arc<dyn BlockDevice>) -> Result<(usize, Option<u64>), Error<Fat32IoError>> {
+fn fat32_locate(
+    device: &Arc<dyn BlockDevice>,
+) -> Result<(usize, Option<u64>), Error<Fat32IoError>> {
     let sector0 = read_sector(device, 0);
     if let Some(total_bytes) = fat32_total_bytes(&sector0) {
         return Ok((0, Some(total_bytes)));

@@ -12,14 +12,30 @@ pub enum SocketType {
 pub mod syscall {
     use super::ENOSYS;
 
-    pub fn sys_socket(_domain: usize, _ty: usize, _protocol: usize) -> isize { -ENOSYS }
-    pub fn sys_socketpair() -> isize { -ENOSYS }
-    pub fn sys_bind(_fd: usize, _addr: *const u8, _len: usize) -> isize { -ENOSYS }
-    pub fn sys_listen(_fd: usize, _backlog: usize) -> isize { -ENOSYS }
-    pub fn sys_accept(_fd: usize, _addr: *mut u8, _len: *mut u32) -> isize { -ENOSYS }
-    pub fn sys_connect(_fd: usize, _addr: *const u8, _len: usize) -> isize { -ENOSYS }
-    pub fn sys_getsockname(_fd: usize, _addr: *mut u8, _len: *mut u32) -> isize { -ENOSYS }
-    pub fn sys_getpeername(_fd: usize, _addr: *mut u8, _len: *mut u32) -> isize { -ENOSYS }
+    pub fn sys_socket(_domain: usize, _ty: usize, _protocol: usize) -> isize {
+        -ENOSYS
+    }
+    pub fn sys_socketpair() -> isize {
+        -ENOSYS
+    }
+    pub fn sys_bind(_fd: usize, _addr: *const u8, _len: usize) -> isize {
+        -ENOSYS
+    }
+    pub fn sys_listen(_fd: usize, _backlog: usize) -> isize {
+        -ENOSYS
+    }
+    pub fn sys_accept(_fd: usize, _addr: *mut u8, _len: *mut u32) -> isize {
+        -ENOSYS
+    }
+    pub fn sys_connect(_fd: usize, _addr: *const u8, _len: usize) -> isize {
+        -ENOSYS
+    }
+    pub fn sys_getsockname(_fd: usize, _addr: *mut u8, _len: *mut u32) -> isize {
+        -ENOSYS
+    }
+    pub fn sys_getpeername(_fd: usize, _addr: *mut u8, _len: *mut u32) -> isize {
+        -ENOSYS
+    }
     pub fn sys_sendto(
         _fd: usize,
         _buf: *const u8,
@@ -58,7 +74,13 @@ pub mod syscall {
     ) -> isize {
         -ENOSYS
     }
-    pub fn sys_shutdown_socket(_fd: usize, _how: i32) -> isize { -ENOSYS }
-    pub fn sys_sendmsg() -> isize { -ENOSYS }
-    pub fn sys_recvmsg() -> isize { -ENOSYS }
+    pub fn sys_shutdown_socket(_fd: usize, _how: i32) -> isize {
+        -ENOSYS
+    }
+    pub fn sys_sendmsg() -> isize {
+        -ENOSYS
+    }
+    pub fn sys_recvmsg() -> isize {
+        -ENOSYS
+    }
 }
