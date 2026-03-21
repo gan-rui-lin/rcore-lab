@@ -52,7 +52,7 @@ pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
     current_user_token, run_tasks, schedule, take_current_task,
 };
-pub use process::{RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY};
+pub use process::{IntervalTimerState, RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY};
 pub use signal::{
     SignalFlags, SigNumber, MAX_SIG, flags_to_user_mask, user_mask_to_flags,
     SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE,
@@ -231,7 +231,11 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), ()> {
             break;
         }
     }
-    Ok(())
+    if offset == data.len() {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 pub fn suspend_current_and_run_next() {
@@ -408,6 +412,85 @@ pub fn current_add_signal(signal: SignalFlags) {
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
     process_inner.signal_pending |= signal;
+}
+
+fn wake_process_for_signal(process: &Arc<ProcessControlBlock>) {
+    let inner = process.inner_exclusive_access();
+    for task in inner.tasks.iter().filter_map(|t| t.as_ref()) {
+        let mut task_inner = task.inner_exclusive_access();
+        if task_inner.task_status == TaskStatus::Blocked {
+            futex_remove_waiter_any(task);
+            task_inner.interrupted_by_signal = true;
+            task_inner.task_status = TaskStatus::Ready;
+            drop(task_inner);
+            add_task(task.clone());
+        }
+    }
+}
+
+fn itimer_signal(which: usize) -> SignalFlags {
+    match which {
+        0 => SignalFlags::SIGALRM,
+        1 => SignalFlags::SIGVTALRM,
+        2 => SignalFlags::SIGPROF,
+        _ => SignalFlags::empty(),
+    }
+}
+
+fn tick_timer_state(state: &mut IntervalTimerState, delta_us: usize) -> bool {
+    if state.remaining_us == 0 {
+        return false;
+    }
+    if state.remaining_us > delta_us {
+        state.remaining_us -= delta_us;
+        return false;
+    }
+    if state.interval_us > 0 {
+        state.remaining_us = state.interval_us;
+    } else {
+        state.remaining_us = 0;
+    }
+    true
+}
+
+pub fn process_interval_timers(on_user_tick: bool) {
+    const TIMER_TICK_US: usize = 10_000;
+
+    for (_pid, process) in pid2process_snapshot() {
+        let should_signal = {
+            let mut inner = process.inner_exclusive_access();
+            tick_timer_state(&mut inner.itimers[0], TIMER_TICK_US)
+        };
+        if should_signal {
+            let mut inner = process.inner_exclusive_access();
+            inner.signal_pending |= SignalFlags::SIGALRM;
+            drop(inner);
+            wake_process_for_signal(&process);
+        }
+    }
+
+    if !on_user_tick {
+        return;
+    }
+
+    let Some(process) = current_task().and_then(|task| task.process.upgrade()) else {
+        return;
+    };
+    let mut pending = SignalFlags::empty();
+    {
+        let mut inner = process.inner_exclusive_access();
+        for which in [1usize, 2usize] {
+            if tick_timer_state(&mut inner.itimers[which], TIMER_TICK_US) {
+                pending |= itimer_signal(which);
+            }
+        }
+        if !pending.is_empty() {
+            inner.signal_pending |= pending;
+        }
+    }
+    if !pending.is_empty() {
+        wake_process_for_signal(&process);
+    }
 }
 
 /// 查找第一个待处理的信号

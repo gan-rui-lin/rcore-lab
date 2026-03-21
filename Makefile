@@ -11,18 +11,18 @@ fmt:
 	cd easy-fs; cargo fmt; cd ../easy-fs-fuse cargo fmt; cd ../os ; cargo fmt; cd ../user; cargo fmt; cd ..
 
 rv:
-	@make -C os LOG=$(LOG) rv
+	@make -C os LOG=$(LOG) OFFLINE=$(OFFLINE) rv
 	@cp os/kernel-rv kernel-rv
 	@cp os/sbi-qemu sbi-qemu
 
 la:
-	@make -C os LOG=$(LOG) la
+	@make -C os LOG=$(LOG) OFFLINE=$(OFFLINE) la
 	@cp os/kernel-la kernel-la
 
 all: rv la
 
 debug:
-	@make -C os MODE=debug LOG=$(LOG) rv
+	@make -C os MODE=debug LOG=$(LOG) OFFLINE=$(OFFLINE) rv
 	@cp os/kernel-rv kernel-rv
 	@cp os/sbi-qemu sbi-qemu
 

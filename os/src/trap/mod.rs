@@ -10,7 +10,8 @@
 use crate::syscall::syscall;
 use crate::task::{
     current_add_signal, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
-    current_user_token, handle_signals, suspend_current_and_run_next, SignalFlags,
+    current_user_token, handle_signals, process_interval_timers, suspend_current_and_run_next,
+    SignalFlags,
 };
 use crate::mm::{PageTable, VirtAddr};
 use crate::config::PAGE_SIZE;
@@ -50,6 +51,7 @@ pub fn kernel_interrupt_dispatch(trap_type: arch::TrapType) {
         arch::TrapType::Time => {
             set_next_trigger();
             check_timer();
+            process_interval_timers(false);
 
             let count = TIMER_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
             if count % TIMER_SAMPLE_INTERVAL == 0 {
@@ -383,6 +385,7 @@ pub fn trap_handler() -> ! {
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             set_next_trigger();
             check_timer();
+            process_interval_timers(true);
 
             // Ensure pending signals are handled even if we preempt from user mode.
             if let Some(task) = current_task() {
@@ -523,6 +526,7 @@ pub fn task_entry() {
             TrapType::Time => {
                 set_next_trigger();
                 check_timer();
+                process_interval_timers(true);
                 handle_signals();
                 suspend_current_and_run_next();
             }

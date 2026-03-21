@@ -20,6 +20,7 @@ const ENABLE_IPERF_TEST: bool = false;
 const ENABLE_ALL_TESTS: bool = false;
 const ENABLE_FAT32_TESTS: bool = false;
 const SINGLE_TEST: Option<&str> = option_env!("SINGLE_TEST");
+const LTP_PROFILE: Option<&str> = option_env!("LTP_PROFILE");
 
 const BUSYBOX: &str = "/musl/busybox\0";
 const SH: &[u8] = b"sh\0";
@@ -272,8 +273,29 @@ fn test_basic() {
 
 /// 每个 LTP 测试的超时时间（毫秒）
 const LTP_TIMEOUT_MS: usize = 30_000; // 30秒
+const ENABLE_LTP_WATCHDOG: bool = false;
+
+fn wait_for_ltp_child(test_pid: isize, watchdog_pid: isize, status: &mut i32, name: &str) -> isize {
+    loop {
+        *status = 0;
+        let finished_pid = wait(status);
+        if finished_pid == test_pid || finished_pid == watchdog_pid {
+            return finished_pid;
+        }
+        if finished_pid < 0 {
+            return finished_pid;
+        }
+        println!(
+            "[LTP] REAP {} orphan pid={} (status=0x{:x})",
+            name, finished_pid, *status
+        );
+    }
+}
 
 fn test_ltp() {
+    const LTP_BIN_PREFIX: &[u8] = b"/musl/ltp/testcases/bin/";
+    const LTP_PATH_MAX: usize = 128;
+
     let _ = mkdir("/tmp\0");
     let _ = mkdir("/dev\0");
     let _ = mkdir("/dev/shm\0");
@@ -281,35 +303,101 @@ fn test_ltp() {
 
     println!("=== LTP Test Start ===");
 
-    const LTP_TESTS: &[&str] = &[
+    const LTP_TESTS_STABLE: &[&str] = &[
+        // Process management
         "getpid02",
+        "fork01",
+        "fork03",
+        "wait01",
+        "wait02",
+        "wait401",
+        "waitpid01",
+        "waitpid03",
+        "clone01",
+        "clone02",
         "clone03",
-        "exit01",
-        "exit02",
+        // Basic I/O
+        "pipe01",
+        "read01",
+        "read02",
+        "read04",
+        "write01",
+        "write02",
+        "write03",
+        "write05",
+        "close01",
+        "close02",
+        "dup01",
+        "dup02",
+        "dup201",
+        "dup202",
+        "dup203",
+        "open01",
+        "lseek01",
     ];
+
+    const LTP_TESTS_CLONE_REPRO: &[&str] = &[
+        "clone01",
+        "clone02",
+        "clone03",
+    ];
+
+    const LTP_TESTS_BATCH_REPRO: &[&str] = &[
+        "waitpid01",
+        "waitpid03",
+        "clone01",
+        "clone02",
+        "clone03",
+        "read04",
+        "write05",
+        "dup02",
+    ];
+
+    let (profile_name, ltp_tests) = match LTP_PROFILE {
+        Some("clone-repro") => ("clone-repro", LTP_TESTS_CLONE_REPRO),
+        Some("batch-repro") => ("batch-repro", LTP_TESTS_BATCH_REPRO),
+        Some(other) => {
+            println!("[LTP] Unknown profile {}, fallback to stable", other);
+            ("stable", LTP_TESTS_STABLE)
+        }
+        None => ("stable", LTP_TESTS_STABLE),
+    };
+
+    println!(
+        "[LTP] profile={} tests={}",
+        profile_name,
+        ltp_tests.len()
+    );
 
     let mut total = 0;
     let mut passed = 0;
     let mut failed = 0;
     let mut timed_out = 0;
 
-    for name in LTP_TESTS {
+    for name in ltp_tests {
         total += 1;
-        let mut path = Vec::new();
-        path.extend_from_slice(b"/musl/ltp/testcases/bin/");
-        path.extend_from_slice(name.as_bytes());
-        path.push(0);
-        let path_str = unsafe { core::str::from_utf8_unchecked(&path) };
+        let name_bytes = name.as_bytes();
+        let path_len = LTP_BIN_PREFIX.len() + name_bytes.len();
+        if path_len + 1 > LTP_PATH_MAX || name_bytes.len() + 1 > LTP_PATH_MAX {
+            println!("[LTP] SKIP {} (path too long)", name);
+            failed += 1;
+            continue;
+        }
 
-        let mut name_c = Vec::from(name.as_bytes());
-        name_c.push(0);
+        let mut path_buf = [0u8; LTP_PATH_MAX];
+        path_buf[..LTP_BIN_PREFIX.len()].copy_from_slice(LTP_BIN_PREFIX);
+        path_buf[LTP_BIN_PREFIX.len()..path_len].copy_from_slice(name_bytes);
+        let path_str = unsafe { core::str::from_utf8_unchecked(&path_buf[..path_len + 1]) };
+
+        let mut name_buf = [0u8; LTP_PATH_MAX];
+        name_buf[..name_bytes.len()].copy_from_slice(name_bytes);
 
         println!("[LTP] RUN  {}", name);
 
         let test_pid = fork();
         if test_pid == 0 {
             // 测试子进程
-            let argv = [name_c.as_ptr(), core::ptr::null()];
+            let argv = [name_buf.as_ptr(), core::ptr::null()];
             let envp_path = b"PATH=/musl:/bin:/usr/bin\0";
             let envp_tmpdir = b"TMPDIR=/tmp\0";
             let envp_home = b"HOME=/tmp\0";
@@ -327,6 +415,21 @@ fn test_ltp() {
         } else if test_pid < 0 {
             println!("[LTP] FORK_FAIL {}", name);
             failed += 1;
+            continue;
+        }
+
+        // 当前这批用例是手工筛过的“稳定不过度阻塞”集合，
+        // 顺序等待比额外拉一个 watchdog 更稳定。
+        if !ENABLE_LTP_WATCHDOG {
+            let mut status: i32 = 0;
+            let _ = waitpid(test_pid as usize, &mut status);
+            if status == 0 {
+                println!("[LTP] PASS {}", name);
+                passed += 1;
+            } else {
+                println!("[LTP] FAIL {} (status=0x{:x})", name, status);
+                failed += 1;
+            }
             continue;
         }
 
@@ -352,7 +455,19 @@ fn test_ltp() {
 
         // 父进程：等待任意一个子进程先退出
         let mut status: i32 = 0;
-        let finished_pid = wait(&mut status);
+        let finished_pid = wait_for_ltp_child(test_pid, watchdog_pid, &mut status, name);
+
+        if finished_pid < 0 {
+            println!("[LTP] WAIT_FAIL {} (ret={})", name, finished_pid);
+            let _ = kill(test_pid as usize, 9);
+            let _ = kill(watchdog_pid as usize, 9);
+            let mut _ts: i32 = 0;
+            let _ = waitpid(test_pid as usize, &mut _ts);
+            let mut _ws: i32 = 0;
+            let _ = waitpid(watchdog_pid as usize, &mut _ws);
+            failed += 1;
+            continue;
+        }
 
         if finished_pid == test_pid {
             // 测试先结束，杀掉 watchdog

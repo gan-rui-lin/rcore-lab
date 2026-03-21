@@ -11,13 +11,16 @@ use lazy_static::lazy_static;
 
 use crate::{
     fs::{open_file, File, OpenFlags},
-    mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission, PageTable, VirtAddr},
+    mm::{
+        translated_byte_buffer, translated_byte_buffer_checked, translated_ref,
+        translated_refmut, translated_str, MapPermission, PageTable, VirtAddr,
+    },
     task::{
         add_task, current_process, current_task, current_trap_cx, current_user_token,
         exit_current_and_run_next, futex_requeue, futex_remove_waiter, futex_remove_waiter_any,
         futex_wait, futex_wait_bitset, futex_wake, futex_wake_bitset, pid2process,
         suspend_current_and_run_next,
-        FutexKey, RLimit, RLIMIT_NLIMITS, SignalAction, SignalFlags, TaskControlBlock,
+        FutexKey, IntervalTimerState, RLimit, RLIMIT_NLIMITS, SignalAction, SignalFlags, TaskControlBlock,
         TaskStatus, UserContext, flags_to_user_mask, user_mask_to_flags,
         MAX_SIG, SIGKILL, SIGSTOP,
     },
@@ -122,6 +125,33 @@ pub struct UtsName {
     pub domainname: [u8; 65],
 }
 
+fn timeval_to_us(tv: TimeVal) -> usize {
+    tv.sec
+        .saturating_mul(1_000_000)
+        .saturating_add(tv.usec.min(999_999))
+}
+
+fn us_to_timeval(us: usize) -> TimeVal {
+    TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    }
+}
+
+fn itimer_state_to_user(state: IntervalTimerState) -> ITimerVal {
+    ITimerVal {
+        it_interval: us_to_timeval(state.interval_us),
+        it_value: us_to_timeval(state.remaining_us),
+    }
+}
+
+fn itimer_state_from_user(timer: ITimerVal) -> IntervalTimerState {
+    IntervalTimerState {
+        interval_us: timeval_to_us(timer.it_interval),
+        remaining_us: timeval_to_us(timer.it_value),
+    }
+}
+
 bitflags! {
     struct FutexCmd: u32 {
         const FUTEX_WAIT = 0;
@@ -173,7 +203,8 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
         return Err(errno(EFAULT));
     }
     let mut offset = 0usize;
-    let slices = translated_byte_buffer(token, dst, data.len());
+    let slices = translated_byte_buffer_checked(token, dst, data.len(), true)
+        .ok_or_else(|| errno(EFAULT))?;
     for slice in slices {
         let len = slice.len().min(data.len() - offset);
         slice[..len].copy_from_slice(&data[offset..offset + len]);
@@ -182,7 +213,11 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
             break;
         }
     }
-    Ok(())
+    if offset == data.len() {
+        Ok(())
+    } else {
+        Err(errno(EFAULT))
+    }
 }
 
 fn read_from_user<T: Copy>(token: usize, src: *const T) -> Result<T, isize> {
@@ -191,7 +226,8 @@ fn read_from_user<T: Copy>(token: usize, src: *const T) -> Result<T, isize> {
     }
     let size = core::mem::size_of::<T>();
     let mut data = vec![0u8; size];
-    let slices = translated_byte_buffer(token, src as *const u8, size);
+    let slices = translated_byte_buffer_checked(token, src as *const u8, size, false)
+        .ok_or_else(|| errno(EFAULT))?;
     let mut offset = 0usize;
     for slice in slices {
         let len = slice.len().min(size - offset);
@@ -200,6 +236,9 @@ fn read_from_user<T: Copy>(token: usize, src: *const T) -> Result<T, isize> {
         if offset >= size {
             break;
         }
+    }
+    if offset != size {
+        return Err(errno(EFAULT));
     }
     let value = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const T) };
     Ok(value)
@@ -893,6 +932,26 @@ fn sys_exec_internal(path: *const u8, argv: *const usize, envp: *const usize, de
         // Prefer ELF execution; only try shebang (or /bin/sh fallback) for non-ELF.
         let is_elf = all_data.len() >= 4 && &all_data[..4] == b"\x7fELF";
         if !is_elf {
+            if exec_path_resolved.starts_with("/musl/ltp/testcases/bin/") {
+                let head_len = all_data.len().min(32);
+                warn!(
+                    "[sys_exec] non-ELF sample path={} len={} head={:02x?}",
+                    exec_path_resolved,
+                    all_data.len(),
+                    &all_data[..head_len]
+                );
+                if let Some(inode) = app.inode() {
+                    let mut sample = [0u8; 32];
+                    let n = inode.read_at(0, &mut sample);
+                    warn!(
+                        "[sys_exec] inode kind={:?} size={} read0_n={} read0={:02x?}",
+                        inode.kind(),
+                        inode.size(),
+                        n,
+                        &sample[..n.min(sample.len())]
+                    );
+                }
+            }
             // Check for shebang scripts first.
             if let Some((interpreter, opt_arg)) = parse_shebang(all_data.as_ref()) {
                 trace!(
@@ -1125,11 +1184,41 @@ pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
         return errno(EFAULT);
     }
     match clock_id {
-        0 | 1 => {
+        0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 => {
             let us = get_time_us();
             let spec = TimeSpec {
                 tv_sec: us / 1_000_000,
                 tv_nsec: (us % 1_000_000) * 1_000,
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&spec as *const TimeSpec) as *const u8,
+                    core::mem::size_of::<TimeSpec>(),
+                )
+            };
+            let token = current_user_token();
+            match copy_to_user(token, ts as *mut u8, bytes) {
+                Ok(_) => 0,
+                Err(err) => err,
+            }
+        }
+        _ => errno(EINVAL),
+    }
+}
+
+pub fn sys_clock_getres(clock_id: usize, ts: *mut TimeSpec) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_clock_getres", pid);
+    }
+    if ts.is_null() {
+        return errno(EFAULT);
+    }
+    match clock_id {
+        0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 => {
+            let spec = TimeSpec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000,
             };
             let bytes = unsafe {
                 core::slice::from_raw_parts(
@@ -1189,10 +1278,14 @@ pub fn sys_getitimer(which: isize, curr_value: *mut ITimerVal) -> isize {
     if curr_value.is_null() {
         return errno(EFAULT);
     }
-    let zero = ITimerVal::default();
+    let timer = {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        itimer_state_to_user(inner.itimers[which as usize])
+    };
     let bytes = unsafe {
         core::slice::from_raw_parts(
-            (&zero as *const ITimerVal) as *const u8,
+            (&timer as *const ITimerVal) as *const u8,
             core::mem::size_of::<ITimerVal>(),
         )
     };
@@ -1212,14 +1305,22 @@ pub fn sys_setitimer(which: isize, new_value: *const ITimerVal, old_value: *mut 
         return errno(EINVAL);
     }
     let token = current_user_token();
-    if let Err(err) = read_from_user::<ITimerVal>(token, new_value) {
-        return err;
-    }
+    let new_timer = match read_from_user::<ITimerVal>(token, new_value) {
+        Ok(timer) => timer,
+        Err(err) => return err,
+    };
+    let new_state = itimer_state_from_user(new_timer);
+    let old_timer = {
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        let old_timer = itimer_state_to_user(inner.itimers[which as usize]);
+        inner.itimers[which as usize] = new_state;
+        old_timer
+    };
     if !old_value.is_null() {
-        let zero = ITimerVal::default();
         let bytes = unsafe {
             core::slice::from_raw_parts(
-                (&zero as *const ITimerVal) as *const u8,
+                (&old_timer as *const ITimerVal) as *const u8,
                 core::mem::size_of::<ITimerVal>(),
             )
         };
@@ -1253,7 +1354,7 @@ pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: *mut u8) -> is
     out[0] = 1;
     let token = current_user_token();
     match copy_to_user(token, mask, &out) {
-        Ok(_) => 0,
+        Ok(_) => cpusetsize as isize,
         Err(err) => err,
     }
 }

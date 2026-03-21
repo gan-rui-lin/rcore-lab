@@ -19,6 +19,7 @@ NET_DUMP_OBJ=""
 NET_MODE="user"
 TAP_IFNAME="tap0"
 BRIDGE_NAME="br0"
+SNAPSHOT_MODE="${QEMU_SNAPSHOT:-1}"
 
 # 显示用法信息
 usage() {
@@ -32,6 +33,7 @@ usage() {
     echo "  --netmode MODE     网络模式 (user/tap), 默认: $NET_MODE"
     echo "  --tap-ifname NAME  tap 模式网卡名, 默认: $TAP_IFNAME"
     echo "  --bridge NAME      bridge 模式桥接名(需预先创建), 默认: $BRIDGE_NAME"
+    echo "  --persist          关闭 QEMU snapshot，允许写回基础镜像"
     echo "  -h, --help         显示此帮助信息"
     echo ""
     echo "示例:"
@@ -69,6 +71,10 @@ while [[ $# -gt 0 ]]; do
         --bridge)
             BRIDGE_NAME="$2"
             shift 2
+            ;;
+        --persist)
+            SNAPSHOT_MODE="0"
+            shift
             ;;
         --netdump)
             NET_DUMP_FILE="$2"
@@ -144,6 +150,14 @@ if [[ -n "$NET_DUMP_FILE" ]]; then
     echo "NET 抓包: ${NET_DUMP_FILE}"
 fi
 
+QEMU_SNAPSHOT_FLAG=""
+if [[ "$SNAPSHOT_MODE" == "1" ]]; then
+    QEMU_SNAPSHOT_FLAG="-snapshot"
+    echo "磁盘写回: 关闭 (QEMU snapshot)"
+else
+    echo "磁盘写回: 开启 (直接写回镜像)"
+fi
+
 # 执行构建
 echo "===================================="
 if [[ "$BUILD_TYPE" == "debug" ]]; then
@@ -192,6 +206,7 @@ qemu-system-riscv64 -machine virt \
   -nographic \
   -smp 1 \
   -bios default \
+  $QEMU_SNAPSHOT_FLAG \
   -drive file="$IMAGE_FILE",if=none,format=raw,id=x0 \
   -device $VIRTIO_BLK_OPTS \
   -device virtio-net-device,netdev=net,bus=virtio-mmio-bus.1 \
