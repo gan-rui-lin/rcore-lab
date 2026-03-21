@@ -29,9 +29,6 @@ use crate::{
 use arch::TrapFrameArgs;
 
 use super::errno::*;
-#[cfg(not(target_arch = "loongarch64"))]
-use crate::config::TRAMPOLINE as USER_ADDR_MAX;
-#[cfg(target_arch = "loongarch64")]
 use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
 use crate::config::{CLOCK_FREQ, PAGE_SIZE};
 use crate::sync::UPIntrFreeCell;
@@ -1142,7 +1139,7 @@ fn sys_exec_internal(
                     break;
                 }
             }
-            if let Some(interp_path) = interp {
+            if let Some(mut interp_path) = interp {
                 if open_file(interp_path.as_str(), OpenFlags::empty()).is_none() {
                     // Fallback: try musl/glibc loader for known interpreter paths
                     let musl_loader = "/musl/lib/libc.so";

@@ -10,8 +10,9 @@ OBJCOPY := rust-objcopy --binary-architecture=riscv64
 endif
 MODE := release
 APP_DIR := src/bin
-TARGET_DIR := target/$(TARGET)/$(MODE)
-BUILD_DIR := build
+CARGO_TARGET_DIR ?= target-user
+TARGET_DIR := $(CARGO_TARGET_DIR)/$(TARGET)/$(MODE)
+BUILD_DIR := build-user
 PY := python3
 RUST_TOOLCHAIN ?= +nightly-2024-08-01
 CARGO_OFFLINE_ARG := $(if $(OFFLINE),--offline,)
@@ -44,9 +45,9 @@ ELFS := $(patsubst $(APP_DIR)/%.rs, $(TARGET_DIR)/%, $(APPS))
 binary:
 	@echo $(ELFS)
 	@if [ ${CHAPTER} -gt 3 ]; then \
-		cargo $(RUST_TOOLCHAIN) build $(MODE_ARG) $(CARGO_OFFLINE_ARG) --target $(TARGET) ;\
+		CARGO_TARGET_DIR=$(CARGO_TARGET_DIR) cargo $(RUST_TOOLCHAIN) build $(MODE_ARG) $(CARGO_OFFLINE_ARG) --target $(TARGET) ;\
 	else \
-		ARCH=$(ARCH) CHAPTER=$(CHAPTER) MODE=$(MODE) RUST_TOOLCHAIN=$(RUST_TOOLCHAIN) python3 build.py ;\
+		ARCH=$(ARCH) CHAPTER=$(CHAPTER) MODE=$(MODE) RUST_TOOLCHAIN=$(RUST_TOOLCHAIN) CARGO_TARGET_DIR=$(CARGO_TARGET_DIR) BUILD_DIR=$(BUILD_DIR) python3 build.py ;\
 	fi
 	@$(foreach elf, $(ELFS), \
 		$(OBJCOPY) $(elf) --strip-all -O binary $(patsubst $(TARGET_DIR)/%, $(TARGET_DIR)/%.bin, $(elf)); \
@@ -69,7 +70,7 @@ build: clean pre binary
 	@$(foreach t, $(ELFS), cp $(t).elf $(BUILD_DIR)/elf/;)
 
 clean:
-	@cargo clean
+	@CARGO_TARGET_DIR=$(CARGO_TARGET_DIR) cargo clean
 	@rm -rf $(BUILD_DIR)
 
 all: build

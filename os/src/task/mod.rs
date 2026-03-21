@@ -15,9 +15,6 @@ mod task;
 mod tls;
 #[cfg(target_arch = "loongarch64")]
 use crate::config::PAGE_SIZE;
-#[cfg(not(target_arch = "loongarch64"))]
-use crate::config::TRAMPOLINE as USER_ADDR_MAX;
-#[cfg(target_arch = "loongarch64")]
 use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
 #[cfg_attr(
     all(debug_assertions, target_arch = "riscv64"),
@@ -33,15 +30,10 @@ mod initproc_embed;
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, PageTable, VirtAddr};
 use crate::timer::remove_timer;
-use arch::{shutdown, TrapContext, TrapFrameArgs};
-#[cfg(target_arch = "riscv64")]
-use arch::{FpRegs, MContext};
-#[cfg(target_arch = "riscv64")]
-/// Alias for backward compatibility within this module.
-type RiscvFpRegs = FpRegs;
 use alloc::sync::Arc;
 #[allow(unused_imports)]
 use alloc::vec::Vec;
+use arch::{shutdown, TrapContext, TrapFrameArgs};
 use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::*;
 use manager::fetch_task;

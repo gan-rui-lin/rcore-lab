@@ -40,3 +40,6 @@ kernel-qemu
 *.bin
 *.elf
 ltp-full/
+user/build-user/
+user/target-user/
+user/__pycache__/
