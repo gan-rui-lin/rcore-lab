@@ -9,7 +9,6 @@ mod manager;
 mod process;
 mod processor;
 mod signal;
-mod switch;
 #[allow(clippy::module_inception)]
 #[allow(rustdoc::private_intra_doc_links)]
 mod task;
@@ -20,6 +19,16 @@ use crate::config::PAGE_SIZE;
 use crate::config::TRAMPOLINE as USER_ADDR_MAX;
 #[cfg(target_arch = "loongarch64")]
 use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
+#[cfg_attr(
+    all(debug_assertions, target_arch = "riscv64"),
+    path = "initproc_embed_riscv64_debug.rs"
+)]
+#[cfg_attr(
+    all(not(debug_assertions), target_arch = "riscv64"),
+    path = "initproc_embed_riscv64_release.rs"
+)]
+#[cfg_attr(target_arch = "loongarch64", path = "initproc_embed_loongarch64.rs")]
+mod initproc_embed;
 #[allow(unused_imports)]
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, PageTable, VirtAddr};
@@ -37,8 +46,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::*;
 use manager::fetch_task;
 use process::ProcessControlBlock;
-#[cfg(target_arch = "riscv64")]
-use switch::__switch;
 
 pub use action::{SignalAction, SignalActions, SA_RESETHAND, SA_SIGINFO};
 pub use auxv::AuxvInfo;
@@ -76,13 +83,20 @@ static DEBUG_DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LINUX_SIGINFO_SIZE: usize = 128;
 const LINUX_SIGSET_WORDS: usize = 16; // 128 bytes / 8
 
+#[cfg_attr(target_arch = "riscv64", path = "user_context_riscv64.rs")]
+#[cfg_attr(target_arch = "loongarch64", path = "user_context_loongarch64.rs")]
+mod user_context;
+pub use user_context::UserContext;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LinuxSigInfo {
     si_signo: i32,
     si_errno: i32,
     si_code: i32,
-    _pad: [u8; LINUX_SIGINFO_SIZE - 12],
+    // Keep 8-byte alignment for the payload union so si_pid is at +16.
+    _align_pad: i32,
+    _pad: [u8; LINUX_SIGINFO_SIZE - 16],
 }
 
 #[repr(C)]
@@ -94,119 +108,10 @@ pub struct StackT {
     pub ss_size: usize,
 }
 
-#[cfg(target_arch = "loongarch64")]
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-pub struct LoongArchMContext {
-    pub pc: usize,
-    pub gregs: [usize; 32],
-    pub flags: u32,
-    pub _pad: u32,
-}
-
-#[cfg(target_arch = "riscv64")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct UserContext {
-    pub uc_flags: usize,
-    pub uc_link: usize,
-    pub uc_stack: StackT,
-    pub uc_sigmask: [u64; LINUX_SIGSET_WORDS],
-    pub uc_mcontext: MContext,
-}
-
-#[cfg(target_arch = "loongarch64")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct UserContext {
-    pub uc_flags: usize,
-    pub uc_link: usize,
-    pub uc_stack: StackT,
-    pub uc_sigmask: [u64; LINUX_SIGSET_WORDS],
-    pub uc_mcontext: LoongArchMContext,
-}
-
 const USER_UCONTEXT_SIZE: usize = core::mem::size_of::<UserContext>();
-
-#[cfg(target_arch = "riscv64")]
-impl UserContext {
-    fn from_trap(trap_cx: &TrapContext, sigmask: SignalFlags) -> Self {
-        let mut gregs = [0usize; 32];
-        trap_cx.write_ucontext_gregs(&mut gregs);
-        let mut user_sigset = [0u64; LINUX_SIGSET_WORDS];
-        user_sigset[0] = signal::flags_to_user_mask(sigmask);
-        Self {
-            uc_flags: 0,
-            uc_link: 0,
-            uc_stack: StackT {
-                ss_sp: 0,
-                ss_flags: 0,
-                _pad: 0,
-                ss_size: 0,
-            },
-            uc_sigmask: user_sigset,
-            uc_mcontext: MContext {
-                gregs,
-                fpregs: RiscvFpRegs {
-                    f: [0u64; 32],
-                    fcsr: 0,
-                    _pad: 0,
-                },
-            },
-        }
-    }
-
-    pub fn signal_mask_word0(&self) -> u64 {
-        self.uc_sigmask[0]
-    }
-
-    pub fn user_pc(&self) -> usize {
-        self.uc_mcontext.gregs[0]
-    }
-
-    pub fn restore_trap_context(&self, trap_cx: &mut TrapContext) {
-        trap_cx.restore_from_ucontext_gregs(&self.uc_mcontext.gregs);
-    }
-}
-
-#[cfg(target_arch = "loongarch64")]
-impl UserContext {
-    fn from_trap(trap_cx: &TrapContext, sigmask: SignalFlags) -> Self {
-        let mut user_sigset = [0u64; LINUX_SIGSET_WORDS];
-        user_sigset[0] = signal::flags_to_user_mask(sigmask);
-        Self {
-            uc_flags: 0,
-            uc_link: 0,
-            uc_stack: StackT {
-                ss_sp: 0,
-                ss_flags: 0,
-                _pad: 0,
-                ss_size: 0,
-            },
-            uc_sigmask: user_sigset,
-            uc_mcontext: LoongArchMContext {
-                pc: trap_cx.sepc,
-                gregs: trap_cx.x,
-                flags: 0,
-                _pad: 0,
-            },
-        }
-    }
-
-    pub fn signal_mask_word0(&self) -> u64 {
-        self.uc_sigmask[0]
-    }
-
-    pub fn user_pc(&self) -> usize {
-        self.uc_mcontext.pc
-    }
-
-    pub fn restore_trap_context(&self, trap_cx: &mut TrapContext) {
-        trap_cx.sepc = self.uc_mcontext.pc;
-        trap_cx.x = self.uc_mcontext.gregs;
-        trap_cx.x[0] = 0;
-    }
-}
+// musl cancel_handler reads/writes uc_mcontext.gregs[0]/pc at ucontext+176.
+const _USER_UCONTEXT_LAYOUT_CHECK: [(); core::mem::offset_of!(UserContext, uc_mcontext)] =
+    [(); 176];
 
 impl Default for LinuxSigInfo {
     fn default() -> Self {
@@ -214,7 +119,8 @@ impl Default for LinuxSigInfo {
             si_signo: 0,
             si_errno: 0,
             si_code: 0,
-            _pad: [0u8; LINUX_SIGINFO_SIZE - 12],
+            _align_pad: 0,
+            _pad: [0u8; LINUX_SIGINFO_SIZE - 16],
         }
     }
 }
@@ -242,6 +148,7 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), ()> {
 
 pub fn suspend_current_and_run_next() {
     let task = take_current_task().unwrap();
+    task.kstack.check_guard();
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
     task_inner.task_status = TaskStatus::Ready;
@@ -253,6 +160,7 @@ pub fn suspend_current_and_run_next() {
 /// This function must be followed by a schedule
 pub fn block_current_task() -> *mut TaskContext {
     let task = take_current_task().unwrap();
+    task.kstack.check_guard();
     let mut task_inner = task.inner_exclusive_access();
     task_inner.task_status = TaskStatus::Blocked;
     &mut task_inner.task_cx as *mut TaskContext
@@ -265,6 +173,7 @@ pub fn block_current_and_run_next() {
 
 pub fn exit_current_and_run_next(exit_code: i32) {
     let task = take_current_task().unwrap();
+    task.kstack.check_guard();
     let mut task_inner = task.inner_exclusive_access();
     let process = task.process.upgrade().unwrap();
     let tid = task_inner.res.as_ref().unwrap().tid;
@@ -383,21 +292,7 @@ lazy_static! {
     };
 }
 
-#[cfg(all(debug_assertions, target_arch = "riscv64"))]
-const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../user/target/riscv64gc-unknown-none-elf/debug/initcode"
-));
-#[cfg(all(not(debug_assertions), target_arch = "riscv64"))]
-const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../user/target/riscv64gc-unknown-none-elf/release/initcode"
-));
-#[cfg(target_arch = "loongarch64")]
-const INITPROC_EMBED: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../user/build/elf/initcode.elf"
-));
+const INITPROC_EMBED: &[u8] = initproc_embed::INITPROC_EMBED;
 
 pub fn add_initproc() {
     let _initproc = INITPROC.clone();
@@ -526,6 +421,7 @@ fn find_pending_signal(
 /// 设置用户态信号栈（UserContext + LinuxSigInfo + canary）
 fn setup_signal_stack(
     signum: usize,
+    sender_pid: usize,
     trap_cx: &mut TrapContext,
     saved_cx: &TrapContext,
     signal_mask_backup: SignalFlags,
@@ -552,6 +448,12 @@ fn setup_signal_stack(
         let info_ptr = user_sp;
         let mut siginfo = LinuxSigInfo::default();
         siginfo.si_signo = signum as i32;
+        // glibc sigcancel_handler expects SI_TKILL and si_pid in siginfo.
+        if signum == 32 || signum == 33 {
+            siginfo.si_code = -6; // SI_TKILL
+            let pid_bytes = (sender_pid as i32).to_le_bytes();
+            siginfo._pad[0..4].copy_from_slice(&pid_bytes); // si_pid at offset 16
+        }
         let siginfo_bytes = unsafe {
             core::slice::from_raw_parts(
                 (&siginfo as *const LinuxSigInfo) as *const u8,
@@ -625,27 +527,38 @@ pub fn handle_signals() {
 
     let pid = process.pid.0;
     let _tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-    if signum == 33 {
+    if signum == 32 || signum == 33 {
         let tp = task_inner.get_trap_cx()[TrapFrameArgs::TLS];
         info!(
-            "[handle_signals] pid={} tid={} sig33 tp={:#x} mask={:?} task_pending={:?} proc_pending={:?}",
+            "[handle_signals] pid={} tid={} sig{} tp={:#x} mask={:?} task_pending={:?} proc_pending={:?}",
             pid,
             _tid,
+            signum,
             tp,
             task_inner.signal_mask,
             task_pending,
             process_pending
         );
     }
-    if signum == 33 {
-        info!(
-            "[handle_signals] pid={} tid={} sig33 mask={:?} task_pending={:?} proc_pending={:?}",
-            pid, _tid, task_inner.signal_mask, task_pending, process_pending
-        );
-    }
-
     // 5. 如果任务被阻塞，唤醒它
     if task_inner.task_status == TaskStatus::Blocked {
+        if signum == 32 || signum == 33 {
+            let trap_cx = task_inner.get_trap_cx();
+            info!(
+                "[signal-flow] route=blocked_wakeup pid={} tid={} sig{} from_process={} handling_sig={} sepc={:#x} sp={:#x} ra={:#x} mask={:?} task_pending={:?} proc_pending={:?}",
+                pid,
+                _tid,
+                signum,
+                from_process,
+                task_inner.handling_sig,
+                trap_cx.sepc,
+                trap_cx[TrapFrameArgs::SP],
+                trap_cx[TrapFrameArgs::RA],
+                task_inner.signal_mask,
+                task_pending,
+                process_pending
+            );
+        }
         futex_remove_waiter_any(&task);
         task_inner.task_status = TaskStatus::Ready;
         task_inner.interrupted_by_signal = true;
@@ -656,6 +569,15 @@ pub fn handle_signals() {
 
     // 7. 如果已经在处理其他信号，跳过（除了 SIGKILL）
     if task_inner.signal_trap_cx.is_some() && signum != signal::SIGKILL {
+        if signum == 32 || signum == 33 {
+            info!(
+                "[signal-flow] route=defer_nested pid={} tid={} sig{} handling_sig={} saved_ctx_present=true",
+                pid,
+                _tid,
+                signum,
+                task_inner.handling_sig
+            );
+        }
         return;
     }
 
@@ -729,11 +651,12 @@ pub fn handle_signals() {
         );
         action.handler = 0;
     }
-    if signum == 33 {
+    if signum == 32 || signum == 33 {
         info!(
-            "[handle_signals] pid={} tid={} sig33 handler={:#x} flags={:#x} restorer={:#x}",
+            "[handle_signals] pid={} tid={} sig{} handler={:#x} flags={:#x} restorer={:#x}",
             pid,
             _tid,
+            signum,
             action.handler,
             action.flags,
             action.restorer()
@@ -795,13 +718,16 @@ pub fn handle_signals() {
     }
 
     // 13. 设置 trap context 调用用户态 handler
+    let old_pc = task_inner.get_trap_cx().sepc;
+    let old_sp = task_inner.get_trap_cx()[TrapFrameArgs::SP];
+    let old_ra = task_inner.get_trap_cx()[TrapFrameArgs::RA];
     let trap_cx = task_inner.get_trap_cx();
     trap_cx.sepc = action.handler;
     // LoongArch: no SA_RESTORER, always use kernel trampoline for sigreturn
     #[cfg(target_arch = "loongarch64")]
     {
         if let Some(res) = task_inner.res.as_ref() {
-            let tramp_base = res.ustack_base().saturating_sub(PAGE_SIZE);
+            let tramp_base = res.ustack_base().saturating_sub(crate::config::PAGE_SIZE);
             let tramp_offset = arch::sigtrx::sigreturn_trampoline_offset();
             let tramp = tramp_base + tramp_offset;
             trap_cx[TrapFrameArgs::RA] = tramp;
@@ -816,26 +742,34 @@ pub fn handle_signals() {
             );
         }
     }
-    // RISC-V and others: use sa_restorer if valid, otherwise no RA override
+    // RISC-V: use sa_restorer if valid; otherwise fallback to fixed SIG_RETURN_ADDR stub.
     #[cfg(not(target_arch = "loongarch64"))]
-    if action.restorer != 0 {
-        if action.restorer < USER_ADDR_MAX {
-            trap_cx[TrapFrameArgs::RA] = action.restorer;
+    {
+        if action.restorer != 0 {
+            if action.restorer < USER_ADDR_MAX {
+                trap_cx[TrapFrameArgs::RA] = action.restorer;
+            } else {
+                error!(
+                    "[signal] pid={} signum={} invalid restorer={:#x}, fallback to SIG_RETURN_ADDR",
+                    pid, signum, action.restorer
+                );
+                trap_cx[TrapFrameArgs::RA] =
+                    arch::SIG_RETURN_ADDR + arch::sigtrx::sigreturn_trampoline_offset();
+            }
         } else {
-            error!(
-                "[signal] pid={} signum={} invalid restorer={:#x}, ignoring",
-                pid, signum, action.restorer
-            );
+            trap_cx[TrapFrameArgs::RA] =
+                arch::SIG_RETURN_ADDR + arch::sigtrx::sigreturn_trampoline_offset();
         }
     }
 
     // 14. 设置信号栈
     let saved_cx = task_inner.signal_trap_cx.as_ref().unwrap();
     let token = process_inner.memory_set.token();
-    let need_siginfo = (action.flags & SA_SIGINFO) != 0 || signum == 33;
+    let need_siginfo = (action.flags & SA_SIGINFO) != 0 || signum == 32 || signum == 33;
 
     let ucontext_ptr = setup_signal_stack(
         signum,
+        pid,
         trap_cx,
         saved_cx,
         task_inner.signal_mask_backup,
@@ -844,6 +778,27 @@ pub fn handle_signals() {
     );
 
     task_inner.signal_ucontext_ptr = ucontext_ptr;
+    if signum == 32 || signum == 33 {
+        let trap_cx = task_inner.get_trap_cx();
+        info!(
+            "[signal-flow] route=deliver pid={} tid={} sig{} from_process={} handler={:#x} old_pc={:#x} new_pc={:#x} old_sp={:#x} new_sp={:#x} old_ra={:#x} new_ra={:#x} ucontext_ptr={:#x} need_siginfo={} mask_backup={:?} mask_now={:?}",
+            pid,
+            _tid,
+            signum,
+            from_process,
+            action.handler,
+            old_pc,
+            trap_cx.sepc,
+            old_sp,
+            trap_cx[TrapFrameArgs::SP],
+            old_ra,
+            trap_cx[TrapFrameArgs::RA],
+            ucontext_ptr,
+            need_siginfo,
+            task_inner.signal_mask_backup,
+            task_inner.signal_mask
+        );
+    }
 }
 
 pub fn debug_dump_tasks() {

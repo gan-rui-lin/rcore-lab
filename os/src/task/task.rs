@@ -122,16 +122,10 @@ impl TaskControlBlock {
                 UPIntrFreeCell::new(TaskControlBlockInner {
                     res: Some(res),
                     trap_cx_ppn,
-                    task_cx: TaskContext::goto_trap_return(kstack_top, {
-                        #[cfg(target_arch = "riscv64")]
-                        {
-                            crate::trap::do_trap_return as usize
-                        }
-                        #[cfg(target_arch = "loongarch64")]
-                        {
-                            crate::trap::task_entry as usize
-                        }
-                    }),
+                    task_cx: TaskContext::for_user_trap_loop(
+                        kstack_top,
+                        arch::kernel_text_addr(crate::trap::user_trap_loop as usize),
+                    ),
                     task_status: TaskStatus::Ready,
                     exit_code: None,
                     signal_trap_cx: None,

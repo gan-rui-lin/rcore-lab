@@ -1,12 +1,7 @@
 //! Task pid and user resource implementation.
 
 use super::ProcessControlBlock;
-#[cfg(not(target_arch = "loongarch64"))]
-use crate::config::TRAMPOLINE;
-use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
-#[cfg(not(target_arch = "loongarch64"))]
-use crate::mm::KERNEL_SPACE;
-#[cfg(target_arch = "loongarch64")]
+use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, USER_STACK_SIZE};
 use crate::mm::{frame_alloc, FrameTracker};
 use crate::mm::{MapPermission, PhysPageNum, VirtAddr};
 use crate::sync::UPIntrFreeCell;
@@ -14,6 +9,7 @@ use crate::sync::UPIntrFreeCell;
 use alloc::vec;
 use alloc::{
     sync::{Arc, Weak},
+    vec,
     vec::Vec,
 };
 use lazy_static::*;
@@ -60,13 +56,10 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(RecycleAllocator::new_with_start(1)) };
 }
 
-#[cfg(not(target_arch = "loongarch64"))]
-lazy_static! {
-    static ref KSTACK_ALLOCATOR: UPIntrFreeCell<RecycleAllocator> =
-        unsafe { UPIntrFreeCell::new(RecycleAllocator::new()) };
-}
-
 pub const IDLE_PID: usize = 0;
+const KSTACK_GUARD_WORDS: usize = 4;
+const KSTACK_GUARD_MAGIC: u128 = 0xDEAD_BEEF_DEAD_BEEF_DEAD_BEEF_DEAD_BEEF;
+const KSTACK_FILL_MAGIC: u128 = 0xA5A5_A5A5_A5A5_A5A5_A5A5_A5A5_A5A5_A5A5;
 
 pub struct PidHandle(pub usize);
 
@@ -80,62 +73,37 @@ impl Drop for PidHandle {
     }
 }
 
-/// Return (bottom, top) of a kernel stack in kernel space.
-#[cfg(not(target_arch = "loongarch64"))]
-pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
-    let top = TRAMPOLINE - kstack_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
-    let bottom = top - KERNEL_STACK_SIZE;
-    (bottom, top)
-}
-
 /// Kernel stack for a process(task)
-#[cfg(not(target_arch = "loongarch64"))]
-pub struct KernelStack(pub usize);
-
-/// Kernel stack for a process(task) on LoongArch64.
-#[cfg(target_arch = "loongarch64")]
 pub struct KernelStack {
     inner: Arc<Vec<u128>>,
 }
 
 /// allocate a new kernel stack
-#[cfg(not(target_arch = "loongarch64"))]
 pub fn kstack_alloc() -> KernelStack {
-    let kstack_id = KSTACK_ALLOCATOR.exclusive_access().alloc();
-    let (kstack_bottom, kstack_top) = kernel_stack_position(kstack_id);
-    KERNEL_SPACE.exclusive_access().insert_framed_area(
-        kstack_bottom.into(),
-        kstack_top.into(),
-        MapPermission::R | MapPermission::W,
-    );
-    KernelStack(kstack_id)
-}
-
-/// allocate a new kernel stack (LoongArch64, DMW direct-mapped)
-#[cfg(target_arch = "loongarch64")]
-pub fn kstack_alloc() -> KernelStack {
+    let mut words = vec![KSTACK_FILL_MAGIC; KERNEL_STACK_SIZE / core::mem::size_of::<u128>()];
+    for (i, slot) in words.iter_mut().take(KSTACK_GUARD_WORDS).enumerate() {
+        *slot = KSTACK_GUARD_MAGIC ^ (i as u128);
+    }
     KernelStack {
-        inner: Arc::new(vec![
-            0u128;
-            KERNEL_STACK_SIZE / core::mem::size_of::<u128>()
-        ]),
+        inner: Arc::new(words),
     }
 }
 
-#[cfg(not(target_arch = "loongarch64"))]
-impl Drop for KernelStack {
-    fn drop(&mut self) {
-        let (kernel_stack_bottom, _) = kernel_stack_position(self.0);
-        let kernel_stack_bottom_va: VirtAddr = kernel_stack_bottom.into();
-        KERNEL_SPACE
-            .exclusive_access()
-            .remove_area_with_start_vpn(kernel_stack_bottom_va.into());
-        KSTACK_ALLOCATOR.exclusive_access().dealloc(self.0);
-    }
-}
-
-#[cfg(not(target_arch = "loongarch64"))]
 impl KernelStack {
+    #[inline]
+    pub fn check_guard(&self) {
+        for (i, slot) in self.inner.iter().take(KSTACK_GUARD_WORDS).enumerate() {
+            let expected = KSTACK_GUARD_MAGIC ^ (i as u128);
+            assert!(
+                *slot == expected,
+                "kernel stack overflow detected: guard[{}]={:#x}, expected={:#x}",
+                i,
+                *slot,
+                expected
+            );
+        }
+    }
+
     /// Push a variable of type T into the top of the KernelStack and return its raw pointer
     #[allow(unused)]
     pub fn push_on_top<T>(&self, value: T) -> *mut T
@@ -149,29 +117,6 @@ impl KernelStack {
         }
         ptr_mut
     }
-    /// Get the top of the KernelStack
-    pub fn get_top(&self) -> usize {
-        let (_, kernel_stack_top) = kernel_stack_position(self.0);
-        kernel_stack_top
-    }
-}
-
-#[cfg(target_arch = "loongarch64")]
-impl KernelStack {
-    /// Push a variable of type T into the top of the KernelStack and return its raw pointer
-    #[allow(unused)]
-    pub fn push_on_top<T>(&self, value: T) -> *mut T
-    where
-        T: Sized,
-    {
-        let kernel_stack_top = self.get_top();
-        let ptr_mut = (kernel_stack_top - core::mem::size_of::<T>()) as *mut T;
-        unsafe {
-            *ptr_mut = value;
-        }
-        ptr_mut
-    }
-
     /// Get the top of the KernelStack
     pub fn get_top(&self) -> usize {
         self.inner.as_ptr() as usize + KERNEL_STACK_SIZE
@@ -182,13 +127,7 @@ pub struct TaskUserRes {
     pub tid: usize,
     pub ustack_base: usize,
     pub process: Weak<ProcessControlBlock>,
-    #[cfg(target_arch = "loongarch64")]
     trap_cx_frame: Option<FrameTracker>,
-}
-
-#[allow(unused)]
-fn trap_cx_bottom_from_tid(tid: usize) -> usize {
-    TRAP_CONTEXT_BASE - tid * PAGE_SIZE
 }
 
 fn ustack_bottom_from_tid(ustack_base: usize, tid: usize) -> usize {
@@ -206,7 +145,6 @@ impl TaskUserRes {
             tid,
             ustack_base,
             process: Arc::downgrade(&process),
-            #[cfg(target_arch = "loongarch64")]
             trap_cx_frame: None,
         };
         task_user_res.alloc_trap_cx();
@@ -245,31 +183,11 @@ impl TaskUserRes {
         }
     }
 
-    #[cfg(target_arch = "loongarch64")]
     fn alloc_trap_cx(&mut self) {
-        let frame = frame_alloc().expect("alloc trap_cx frame");
-        self.trap_cx_frame = Some(frame);
-    }
-
-    #[cfg(not(target_arch = "loongarch64"))]
-    fn alloc_trap_cx(&mut self) {
-        let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.inner_exclusive_access();
-        let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
-        let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        if let Some(pte) = process_inner
-            .memory_set
-            .translate(VirtAddr::from(trap_cx_bottom).floor())
-        {
-            if pte.is_valid() {
-                return;
-            }
+        if self.trap_cx_frame.is_none() {
+            let frame = frame_alloc().expect("alloc trap_cx frame");
+            self.trap_cx_frame = Some(frame);
         }
-        process_inner.memory_set.insert_framed_area(
-            trap_cx_bottom.into(),
-            trap_cx_top.into(),
-            MapPermission::R | MapPermission::W,
-        );
     }
 
     fn dealloc_user_res(&self) {
@@ -279,13 +197,6 @@ impl TaskUserRes {
         process_inner
             .memory_set
             .remove_area_with_start_vpn(ustack_bottom_va.into());
-        #[cfg(not(target_arch = "loongarch64"))]
-        {
-            let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_tid(self.tid).into();
-            process_inner
-                .memory_set
-                .remove_area_with_start_vpn(trap_cx_bottom_va.into());
-        }
     }
 
     #[allow(unused)]
@@ -304,34 +215,15 @@ impl TaskUserRes {
         process_inner.dealloc_tid(self.tid);
     }
 
-    #[cfg(target_arch = "loongarch64")]
     pub fn trap_cx_user_va(&self) -> usize {
         0
     }
 
-    #[cfg(not(target_arch = "loongarch64"))]
-    pub fn trap_cx_user_va(&self) -> usize {
-        trap_cx_bottom_from_tid(self.tid)
-    }
-
-    #[cfg(target_arch = "loongarch64")]
     pub fn trap_cx_ppn(&self) -> PhysPageNum {
         self.trap_cx_frame
             .as_ref()
             .expect("trap_cx_frame not allocated")
             .ppn
-    }
-
-    #[cfg(not(target_arch = "loongarch64"))]
-    pub fn trap_cx_ppn(&self) -> PhysPageNum {
-        let process = self.process.upgrade().unwrap();
-        let process_inner = process.inner_exclusive_access();
-        let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_tid(self.tid).into();
-        process_inner
-            .memory_set
-            .translate(trap_cx_bottom_va.into())
-            .unwrap()
-            .ppn()
     }
 
     pub fn ustack_base(&self) -> usize {

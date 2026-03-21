@@ -68,6 +68,8 @@ const SYSCALL_PREAD64: usize = 67;
 const SYSCALL_PWRITE64: usize = 68;
 /// sendfile syscall
 const SYSCALL_SENDFILE: usize = 71;
+/// readlinkat syscall
+const SYSCALL_READLINKAT: usize = 78;
 /// ppoll syscall
 const SYSCALL_POLL: usize = 73;
 /// fstatat syscall
@@ -80,6 +82,8 @@ const SYSCALL_UTIMENSAT: usize = 88;
 const SYSCALL_STATX: usize = 291;
 /// renameat2 syscall
 const SYSCALL_RENAMEAT2: usize = 276;
+/// getrandom syscall
+const SYSCALL_GETRANDOM: usize = 278;
 /// exit syscall
 const SYSCALL_EXIT: usize = 93;
 /// exit_group syscall
@@ -98,6 +102,8 @@ const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_GETITIMER: usize = 102;
 /// setitimer syscall
 const SYSCALL_SETITIMER: usize = 103;
+/// clock_nanosleep syscall
+const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 /// yield syscall
 const SYSCALL_YIELD: usize = 124;
 /// thread_create syscall
@@ -631,6 +637,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_PWRITE64 => sys_pwrite64(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut isize, args[3]),
+        SYSCALL_READLINKAT => sys_readlinkat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+        ),
         SYSCALL_FSTATAT => sys_fstatat(
             args[0] as isize,
             args[1] as *const u8,
@@ -672,6 +684,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[0] as isize,
             args[1] as *const process::ITimerVal,
             args[2] as *mut process::ITimerVal,
+        ),
+        SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(
+            args[0],
+            args[1],
+            args[2] as *const TimeSpec,
+            args[3] as *mut TimeSpec,
         ),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
@@ -767,6 +785,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *mut RLimit,
         ),
         SYSCALL_SETPGID => sys_setpgid(args[0], args[1]),
+        SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2] as u32),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),
@@ -783,7 +802,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SBRK => sys_sbrk(args[0] as isize),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
-        SYSCALL_POLL => sys_ppoll(args[0] as *mut PollFd, args[1], args[2] as i32),
+        SYSCALL_POLL => sys_ppoll(args[0] as *mut PollFd, args[1], args[2] as *const TimeSpec),
         SYSCALL_SHUTDOWN => sys_shutdown(),
         // ---- Network syscalls ----
         SYSCALL_SOCKET => crate::net::syscall::sys_socket(args[0], args[1], args[2]),

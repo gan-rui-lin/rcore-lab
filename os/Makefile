@@ -33,8 +33,9 @@ KERNEL_ENTRY_PA := 0x80200000
 OBJDUMP := rust-objdump --arch-name=riscv64
 OBJCOPY := rust-objcopy --binary-architecture=riscv64
 OBJCOPY_ELF := rust-objcopy
+CARGO_OFFLINE_ARG := $(if $(OFFLINE),--offline,)
 
-CHAPTER ?= $(shell git rev-parse --abbrev-ref HEAD | sed -nE 's/^ch([0-9]+).*$$/\1/p')
+CHAPTER ?= $(shell (git rev-parse --abbrev-ref HEAD 2>/dev/null || true) | sed -nE 's/^ch([0-9]+).*$$/\1/p')
 CHAPTER := $(if $(CHAPTER),$(CHAPTER),0)
 TEST ?= $(CHAPTER)
 BASE ?= 1
@@ -47,7 +48,7 @@ TEST ?=
 
 build: env $(KERNEL_RV_BIN) fs-img 
 
-rv: env kernel-rv sbi-qemu
+rv: env kernel-rv $(KERNEL_RV_BIN) sbi-qemu
 la: env-la kernel-la
 all: rv la
 
@@ -71,9 +72,9 @@ kernel-rv: kernel
 	@cp $(KERNEL_RV_ELF) $(KERNEL_RV)
 
 kernel-la: env-la
-	@make -C ../user build ARCH=la MODE=$(MODE) TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE)
+	@make -C ../user build ARCH=la MODE=$(MODE) TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE) OFFLINE=$(OFFLINE)
 	@echo Platform: loongarch64
-	@LOG=$(LOG) cargo +nightly-2024-08-01 build $(MODE_ARG) --target $(TARGET_LA) --features $(FEATURES)
+	@LOG=$(LOG) cargo +nightly-2024-08-01 build $(MODE_ARG) $(CARGO_OFFLINE_ARG) --target $(TARGET_LA) --features $(FEATURES)
 	@cp $(KERNEL_LA_ELF) $(KERNEL_LA)
 
 sbi-qemu:
@@ -86,14 +87,14 @@ sbi-qemu:
 	cp $(BOOTLOADER) $(SBI_QEMU)
 
 fs-img: $(APPS)
-	@make -C ../user build MODE=$(MODE) TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE)
+	@make -C ../user build MODE=$(MODE) TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE) OFFLINE=$(OFFLINE)
 	@rm -f $(FS_IMG)
-	@cd ../easy-fs-fuse && cargo run --release -- -s ../user/build/app/ -t ../user/target/riscv64gc-unknown-none-elf/release/
+	@cd ../easy-fs-fuse && cargo run --release $(CARGO_OFFLINE_ARG) -- -s ../user/build/app/ -t ../user/target/riscv64gc-unknown-none-elf/release/
 
 kernel:
-	@make -C ../user build MODE=$(MODE) TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE)
+	@make -C ../user build MODE=$(MODE) TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE) OFFLINE=$(OFFLINE)
 	@echo Platform: $(BOARD)
-	@LOG=$(LOG) cargo build $(MODE_ARG) --features $(FEATURES)
+	@LOG=$(LOG) cargo build $(MODE_ARG) $(CARGO_OFFLINE_ARG) --features $(FEATURES)
 
 clean:
 	@cargo clean

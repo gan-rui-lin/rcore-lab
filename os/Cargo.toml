@@ -8,7 +8,7 @@ edition = "2021"
 
 [dependencies]
 arch = { path = "../arch" }
-crate_interface = { git = "https://github.com/Byte-OS/crate_interface.git" }
+crate_interface = { path = "../vendor/crate_interface" }
 bitflags = "1.2.1"
 buddy_system_allocator = "0.6"
 lazy_static = { version = "1.4.0", features = ["spin_no_std"] }

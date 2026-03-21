@@ -14,12 +14,6 @@ pub struct TrapFrame {
     pub prmd: usize,
     /// Exception Return Address
     pub sepc: usize,
-    /// Token of kernel address space (kept for API compatibility).
-    pub kernel_satp: usize,
-    /// Kernel stack pointer of the current application.
-    pub kernel_sp: usize,
-    /// Virtual address of trap handler entry point in kernel.
-    pub trap_handler: usize,
 }
 
 impl TrapFrame {
@@ -48,18 +42,9 @@ impl TrapFrame {
     }
 
     /// Init the trap context of an application.
-    pub fn app_init_context(
-        entry: usize,
-        sp: usize,
-        kernel_satp: usize,
-        kernel_sp: usize,
-        trap_handler: usize,
-    ) -> Self {
+    pub fn app_init_context(entry: usize, sp: usize) -> Self {
         let mut cx = Self::new();
         cx.sepc = entry;
-        cx.kernel_satp = kernel_satp;
-        cx.kernel_sp = kernel_sp;
-        cx.trap_handler = trap_handler;
         cx.set_sp(sp);
         cx
     }

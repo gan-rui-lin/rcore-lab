@@ -16,6 +16,7 @@ NET_MODE="user"
 TAP_IFNAME="tap0"
 BRIDGE_NAME="br0"
 SNAPSHOT_MODE="${QEMU_SNAPSHOT:-1}"
+OFFLINE_BUILD="${OFFLINE-1}"
 
 # 显示用法信息
 usage() {
@@ -30,6 +31,8 @@ usage() {
     echo "  --tap-ifname NAME  tap 模式网卡名, 默认: $TAP_IFNAME"
     echo "  --bridge NAME      bridge 模式桥接名(需预先创建), 默认: $BRIDGE_NAME"
     echo "  --persist          关闭 QEMU snapshot，允许写回基础镜像"
+    echo "  --offline          强制离线构建 (默认开启)"
+    echo "  --online           允许联网构建"
     echo "  -h, --help         显示此帮助信息"
     echo ""
     echo "示例:"
@@ -79,6 +82,14 @@ while [[ $# -gt 0 ]]; do
         --netdump)
             NET_DUMP_FILE="$2"
             shift 2
+            ;;
+        --offline)
+            OFFLINE_BUILD="1"
+            shift
+            ;;
+        --online)
+            OFFLINE_BUILD="0"
+            shift
             ;;
         -h|--help)
             usage
@@ -166,6 +177,11 @@ if [[ -n "$NET_DUMP_FILE" ]]; then
     NET_DUMP_OBJ="-object filter-dump,id=netdump,netdev=net,file=${NET_DUMP_FILE}"
     echo "NET 抓包: ${NET_DUMP_FILE}"
 fi
+if [[ "$OFFLINE_BUILD" == "1" ]]; then
+    echo "离线构建: 开启 (OFFLINE=1, CARGO_NET_OFFLINE=true)"
+else
+    echo "离线构建: 关闭"
+fi
 
 QEMU_SNAPSHOT_FLAG=""
 if [[ "$SNAPSHOT_MODE" == "1" ]]; then
@@ -177,19 +193,35 @@ fi
 
 # 执行构建[1](@ref)
 if [[ "$BUILD_TYPE" == "debug" ]]; then
-    if LOG="$LOG" make debug; then
+    if [[ "$OFFLINE_BUILD" == "1" ]]; then
+        BUILD_CMD="LOG=$LOG OFFLINE=1 CARGO_NET_OFFLINE=true make debug"
+    else
+        BUILD_CMD="LOG=$LOG make debug"
+    fi
+    if eval "$BUILD_CMD"; then
         echo "构建成功!"
     else
         echo "错误: 构建失败"
         exit 1
     fi
 else
-    if LOG="$LOG" make "$BUILD_TYPE"; then
+    if [[ "$OFFLINE_BUILD" == "1" ]]; then
+        BUILD_CMD="LOG=$LOG OFFLINE=1 CARGO_NET_OFFLINE=true make $BUILD_TYPE"
+    else
+        BUILD_CMD="LOG=$LOG make $BUILD_TYPE"
+    fi
+    if eval "$BUILD_CMD"; then
         echo "构建成功!"
     else
         echo "错误: 构建失败"
         exit 1
     fi
+fi
+
+EXTRA_DISK_ARGS=""
+if [[ -f "disk.img" ]]; then
+    EXTRA_DISK_ARGS="-drive file=disk.img,if=none,format=raw,id=x1 -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1"
+    echo "附加磁盘: disk.img"
 fi
 
 # 运行QEMU
@@ -203,9 +235,12 @@ qemu-system-riscv64 -machine virt \
   $QEMU_SNAPSHOT_FLAG \
   -drive file="$IMAGE_FILE",if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
-  -device virtio-net-device,netdev=net,bus=virtio-mmio-bus.1 \
+  -no-reboot \
+    -device virtio-net-device,netdev=net \
     -netdev "$NETDEV_OPTS" \
-        $NET_DUMP_OBJ \
+    -rtc base=utc \
+    $EXTRA_DISK_ARGS \
+    $NET_DUMP_OBJ \
     $GDB_FLAGS
 
 echo "QEMU已退出"

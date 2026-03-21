@@ -4,8 +4,6 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
-#![cfg_attr(target_arch = "loongarch64", feature(naked_functions))]
-#![cfg_attr(target_arch = "loongarch64", feature(asm_const))]
 
 #[macro_use]
 extern crate bitflags;
@@ -21,12 +19,8 @@ mod console;
 #[macro_use]
 mod logging;
 
-#[cfg(target_arch = "riscv64")]
-#[path = "boards/qemu.rs"]
-mod board;
-
-#[cfg(target_arch = "loongarch64")]
-#[path = "boards/qemu_la.rs"]
+#[cfg_attr(target_arch = "riscv64", path = "boards/qemu.rs")]
+#[cfg_attr(target_arch = "loongarch64", path = "boards/qemu_la.rs")]
 mod board;
 
 pub mod config;
@@ -36,12 +30,8 @@ pub mod drivers;
 pub mod fs;
 pub mod lang_items;
 pub mod mm;
-#[cfg(target_arch = "riscv64")]
-/// Network subsystem (smoltcp-based TCP/IP stack).
-pub mod net;
-#[cfg(target_arch = "loongarch64")]
-#[path = "net_stub.rs"]
-/// Network subsystem stub for LoongArch64.
+#[cfg_attr(target_arch = "loongarch64", path = "net_stub.rs")]
+/// Network subsystem (RISC-V uses full stack; LoongArch64 uses stub).
 pub mod net;
 pub mod sync;
 pub mod syscall;
@@ -75,6 +65,16 @@ struct ArchInterfaceImpl;
 
 #[crate_interface::impl_interface]
 impl arch::api::ArchInterface for ArchInterfaceImpl {
+    fn init_allocator() {}
+
+    fn init_logging() {}
+
+    fn add_memory_region(_start: usize, _end: usize) {}
+
+    fn main(_hartid: usize) {}
+
+    fn prepare_drivers() {}
+
     fn kernel_interrupt(trap_type: arch::TrapType) {
         crate::trap::kernel_interrupt_dispatch(trap_type);
     }
@@ -88,5 +88,9 @@ impl arch::api::ArchInterface for ArchInterfaceImpl {
 
     fn frame_dealloc(ppn: usize) {
         crate::mm::frame_dealloc(arch::PhysPageNum(ppn));
+    }
+
+    fn kernel_page_table_token() -> usize {
+        crate::mm::kernel_page_table_token_if_ready()
     }
 }

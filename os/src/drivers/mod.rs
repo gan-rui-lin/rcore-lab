@@ -18,7 +18,6 @@ pub mod plic;
 
 /// Global block device instance.
 pub use block::BLOCK_DEVICE;
-#[cfg(target_arch = "riscv64")]
 pub use bus::*;
 #[cfg(target_arch = "riscv64")]
 pub use input::*;

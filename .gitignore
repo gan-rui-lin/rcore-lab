@@ -37,4 +37,6 @@ Dockerfile.ext4
 kernel-la
 kernel-rv
 kernel-qemu
+*.bin
+*.elf
 ltp-full/
