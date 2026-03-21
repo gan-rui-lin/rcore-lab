@@ -324,3 +324,255 @@ broken   0
 - 当前剩余重点问题集中在：`exit01` / `exit02` 的可执行文件读取或识别异常
 
 当前最重要的经验是：**不能再看 LTP 自己打印的 `Summary` 或 `initcode` 外层 `[LTP] PASS`，必须按 `TPASS/TFAIL/TBROK` 判定真实结果。**
+
+---
+
+## 6. 2026-03-21 最新进度修正
+
+本节**优先于前文旧统计**。  
+原因是 2026-03-17 之后已经更换了新的 SD 镜像，之前关于 `exit01/exit02` 的“镜像读取异常”判断不再成立；同时 `initcode.rs` 的 LTP 驱动也进一步调整了批量运行策略。
+
+### 6.1 新镜像带来的结论修正
+
+- 旧镜像中确实存在 LTP 二进制损坏现象，典型表现是：
+  - `getitimer01` / `exit01` 被读成目录
+  - `getitimer02` / `exit02` 被读成极小文本文件
+- 更换新镜像后，这类问题已经消失。
+- 因此，前文把 `exit01` / `exit02` 归因到 ext4 路径解析或 inode 读取错误的结论，**现在应视为已过期**。
+
+### 6.2 新镜像下已确认单测通过
+
+以下用例在新镜像下已经重新单独验证通过，判定口径仍然是 `TPASS/TFAIL/TBROK`：
+
+**进程/时间/系统信息类**
+- `waitpid01`
+- `waitpid03`
+- `clone01`
+- `exit01`
+- `exit02`
+- `times01`
+- `sysinfo01`
+- `sysinfo02`
+- `uname01`
+- `uname02`
+- `newuname01`
+- `clock_gettime01`
+- `sched_getaffinity01`
+- `setitimer01`
+- `setitimer02`
+- `getitimer01`
+- `getitimer02`
+
+说明：
+- `waitpid01` 在新镜像下单测完整通过，日志中可见 `passed 146 / failed 0 / broken 0`
+- `exit01` / `exit02` 已经不再受旧镜像损坏影响，当前是可执行且可通过的
+- `getitimer01` / `getitimer02` 同样在新镜像下恢复正常
+
+### 6.3 initcode 批量运行策略已更新
+
+当前 [`user/src/bin/initcode.rs`](/home/hwt/桌面/sources/实验和项目类/os区域赛/rcore-lab/user/src/bin/initcode.rs) 中的 LTP 批量驱动做了两点重要调整：
+
+1. 仍保留“只跑当前人工筛过的一批 LTP 用例”的思路。
+2. 默认关闭内部 per-test watchdog：
+   - `const ENABLE_LTP_WATCHDOG: bool = false;`
+   - 原因不是这些用例本身会无限挂住，而是 watchdog 子进程会并发执行 `sleep()/gettimeofday()/yield()`，反而干扰 `waitpid01`、`waitpid03`、`write03` 这类本来单测可过的用例。
+
+这意味着：
+- 当前这批 `initcode` 里的 LTP 更适合当作“已筛选稳定集”的顺序回归入口
+- 如果后续要继续扩大到更多未知用例，再考虑恢复更稳妥的超时机制
+
+### 6.4 最新批量回归现状
+
+在关闭内部 watchdog 后，批量运行已经稳定越过之前最明显的卡点：
+
+**已确认在批量中继续通过**
+- `getpid02`
+- `fork01`
+- `fork03`
+- `wait01`
+- `wait02`
+- `wait401`
+- `waitpid01`
+- `waitpid03`
+- `clone01`
+- `clone02`
+- `pipe01`
+- `read01`
+- `read02`
+- `read04`
+- `write01`
+- `write02`
+
+**最新批量中暴露出的新问题**
+- `clone03`
+  - 在最近一轮“纯净批量回归”中返回 `status=0x8b`
+  - 这表示它当前更像是**批量场景下的回归**，不是单测语义失败
+  - 由于此前 `clone03` 单测已经通过，后续应优先按“前序用例污染状态 / 批量上下文交互”来排查
+
+**仍在继续观察的后续批量项**
+- `write03`
+- `write05`
+- `close01`
+- `close02`
+- `dup01`
+- `dup02`
+- `dup201`
+- `dup202`
+- `dup203`
+- `open01`
+- `lseek01`
+
+说明：
+- 这些用例里，有不少此前已经单独验证通过
+- 但最新批量日志在 `clone03` 之后开始出现新的不稳定点，因此需要重新做一轮“批量口径”的确认
+
+### 6.5 当前最值得继续投入的方向
+
+1. 先修复 `clone03` 的批量回归。
+   - 它目前是“单测能过、批量失败”的典型代表。
+   - 一旦这里稳定，后面的 `write03/write05/open01/lseek01` 批量通过率大概率还能再涨一截。
+
+2. 把“单测已通过、批量未重新确认”的用例分层记录。
+   - 避免像旧报告那样把“单测通过”和“批量稳定通过”混在一起。
+
+3. 后续如果要扩大 LTP 覆盖面，优先继续捡已有 syscall 适配成果附近的低垂果实：
+   - `getitimer/setitimer`
+   - `sysinfo/times/uname`
+   - `sched_getaffinity`
+   - `clock_gettime`
+
+### 6.6 当前阶段结论
+
+到 2026-03-21 为止，可以比较明确地下结论：
+
+- **新镜像已经解决了旧镜像损坏导致的伪失败问题**
+- **`waitpid01/waitpid03` 这类长用例的主要障碍一度来自测试驱动 watchdog，而不是内核主体语义**
+- **当前真正需要继续攻坚的是“批量上下文下的新回归”，代表用例是 `clone03`**
+
+因此，后续 HWTDocs 中的统计建议分成两栏维护：
+- `单测确认通过`
+- `批量稳定通过`
+
+这样能更准确反映当前 rCore 的真实适配进度。
+
+## 7. 2026-03-21 批量回归补充定位
+
+### 7.1 本轮新增代码改动
+
+- 顶层 [`Makefile`](/home/hwt/桌面/sources/实验和项目类/os区域赛/rcore-lab/Makefile) 已补上 `OFFLINE=$(OFFLINE)` 透传：
+  - `rv`
+  - `la`
+  - `debug`
+- [`user/src/bin/initcode.rs`](/home/hwt/桌面/sources/实验和项目类/os区域赛/rcore-lab/user/src/bin/initcode.rs) 新增 `LTP_PROFILE`：
+  - 默认 `stable`
+  - `clone-repro`
+  - `batch-repro`
+- [`user/src/bin/initcode.rs`](/home/hwt/桌面/sources/实验和项目类/os区域赛/rcore-lab/user/src/bin/initcode.rs) 的 LTP 主循环不再为每个用例临时分配 `Vec` 拼接路径和 argv，而是改为栈上固定缓冲区，目的是减少长批量下驱动自身堆分配噪音。
+
+### 7.2 本轮重新确认的单测结果
+
+以下用例本轮都重新单独验证通过：
+
+- `clone03`
+- `read04`
+- `write05`
+- `dup02`
+
+这说明这几项当前的问题都更偏向“批量上下文中的状态污染 / 清理问题”，而不是单个 syscall 基本语义彻底错误。
+
+### 7.3 缩小复现结果
+
+#### `clone-repro`
+
+编译方式：
+
+```bash
+LTP_PROFILE=clone-repro OFFLINE=1 make rv
+```
+
+对应批量序列：
+
+- `clone01`
+- `clone02`
+- `clone03`
+
+结果：
+
+- 3 项全部通过
+
+结论：
+
+- `clone03` 的批量异常**不是**由 `clone01/clone02` 两个前序 clone 用例直接触发的。
+
+#### `batch-repro`
+
+编译方式：
+
+```bash
+LTP_PROFILE=batch-repro OFFLINE=1 make rv
+```
+
+对应批量序列：
+
+- `waitpid01`
+- `waitpid03`
+- `clone01`
+- `clone02`
+- `clone03`
+- `read04`
+- `write05`
+- `dup02`
+
+第一次明确复现到的结果是：
+
+- `waitpid01` 通过
+- `waitpid03` 通过
+- `clone01` 通过
+- `clone02` 通过
+- `clone03` 通过
+- 刚进入 `read04` 时内核 panic
+
+panic 已定位到：
+
+- [`arch/src/riscv64/mm/page_table.rs:190`](/home/hwt/桌面/sources/实验和项目类/os区域赛/rcore-lab/arch/src/riscv64/mm/page_table.rs:190)
+
+该位置对应：
+
+- `PageTable::unmap()` 中对 `find_pte(vpn).unwrap()` 的假设失败
+- 实质上是“应该被解除映射的页，在页表里已经不是有效 PTE”这一类不一致
+
+### 7.4 当前更可信的根因方向
+
+基于本轮日志，当前更像是：
+
+- 长批量下某个地址空间区域的 `MapArea` 元数据和真实页表状态发生了不同步
+
+优先怀疑的内核路径：
+
+1. [`os/src/syscall/process.rs`](/home/hwt/桌面/sources/实验和项目类/os区域赛/rcore-lab/os/src/syscall/process.rs) 中的 `sys_munmap()`
+   - 目前只按 `start_vpn` 删除整个 area
+   - 没有真正按 `[start, len)` 处理
+
+2. [`os/src/mm/memory_set.rs`](/home/hwt/桌面/sources/实验和项目类/os区域赛/rcore-lab/os/src/mm/memory_set.rs) 中的 `change_protection()`
+   - 当前只改覆盖页的 PTE flags
+   - 不会拆分 `MapArea`
+
+3. LTP guarded buffer 机制
+   - `tst_buffers` 使用 `mmap + mprotect(PROT_NONE) + munmap`
+   - 很容易把 area 元数据与页表状态不一致的问题放大出来
+
+### 7.5 当前阶段结论修正
+
+到这一步，之前“`clone03` 是当前主要批量 blocker”的结论需要修正为：
+
+- `clone03` 本身并不是当前最核心的问题
+- 更核心的问题是：
+  - **长批量回归下的虚存区域清理/解除映射一致性**
+- 第一处已经稳定打到的断点是：
+  - [`arch/src/riscv64/mm/page_table.rs:190`](/home/hwt/桌面/sources/实验和项目类/os区域赛/rcore-lab/arch/src/riscv64/mm/page_table.rs:190)
+
+说明：
+
+- 本轮最后一次在去掉 `initcode` 内层 `Vec` 分配后继续复跑 `batch-repro`，还在持续观察中。
+- 最新一次带该改动的 `batch-repro` 在 `clone02` 处超时，尚未再次跑到之前的 `read04` panic 点。
+- 因此这里先只记录**已经确认**的结论，不把尚未跑完的新现象写成定论。

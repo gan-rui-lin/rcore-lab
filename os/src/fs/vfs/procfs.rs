@@ -1,6 +1,6 @@
 use super::core::{VfsInode, VfsNodeKind};
 use crate::config::MEMORY_END;
-use crate::task::{pid2process, pid2process_snapshot, TaskStatus};
+use crate::task::{current_process, pid2process, pid2process_snapshot, TaskStatus};
 use crate::timer::get_time_us;
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -22,6 +22,46 @@ impl ProcRootInode {
     }
 }
 
+struct ProcStaticDirInode {
+    entries: BTreeMap<String, Arc<dyn VfsInode>>,
+}
+
+impl ProcStaticDirInode {
+    fn new(entries: BTreeMap<String, Arc<dyn VfsInode>>) -> Arc<Self> {
+        Arc::new(Self { entries })
+    }
+}
+
+impl VfsInode for ProcStaticDirInode {
+    fn kind(&self) -> VfsNodeKind {
+        VfsNodeKind::Dir
+    }
+
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn lookup(&self, name: &str) -> Option<Arc<dyn VfsInode>> {
+        self.entries.get(name).cloned()
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
+        None
+    }
+
+    fn truncate(&self) {}
+
+    fn list(&self) -> Vec<String> {
+        let mut entries: Vec<String> = self.entries.keys().cloned().collect();
+        entries.sort();
+        entries
+    }
+}
+
 impl VfsInode for ProcRootInode {
     fn kind(&self) -> VfsNodeKind {
         VfsNodeKind::Dir
@@ -39,6 +79,9 @@ impl VfsInode for ProcRootInode {
         if let Some(node) = self.entries.get(name) {
             return Some(node.clone());
         }
+        if name == "self" {
+            return Some(ProcPidDirInode::new(current_process().getpid()));
+        }
         let pid = name.parse::<usize>().ok()?;
         pid2process(pid)?;
         Some(ProcPidDirInode::new(pid))
@@ -52,6 +95,7 @@ impl VfsInode for ProcRootInode {
 
     fn list(&self) -> Vec<String> {
         let mut entries: Vec<String> = self.entries.keys().cloned().collect();
+        entries.push(String::from("self"));
         for (pid, _) in pid2process_snapshot() {
             entries.push(format!("{}", pid));
         }
@@ -192,7 +236,7 @@ impl ProcPidStatInode {
             }
         }
         format!(
-            "{} ({}) {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+            "{} ({}) {} 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
             self.pid, comm, state
         )
     }
@@ -274,9 +318,17 @@ fn proc_uptime() -> String {
 
 pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
     let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    let mut kernel_entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    kernel_entries.insert(
+        String::from("pid_max"),
+        ProcFileInode::new(|| String::from("32768\n")),
+    );
+    let mut sys_entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    sys_entries.insert(String::from("kernel"), ProcStaticDirInode::new(kernel_entries));
     entries.insert(String::from("mounts"), ProcFileInode::new(proc_mounts));
     entries.insert(String::from("meminfo"), ProcFileInode::new(proc_meminfo));
     entries.insert(String::from("stat"), ProcFileInode::new(proc_stat));
+    entries.insert(String::from("sys"), ProcStaticDirInode::new(sys_entries));
     entries.insert(String::from("uptime"), ProcFileInode::new(proc_uptime));
     ProcRootInode::new(entries)
 }

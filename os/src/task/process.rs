@@ -35,6 +35,12 @@ pub struct RLimit {
     pub rlim_max: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IntervalTimerState {
+    pub interval_us: usize,
+    pub remaining_us: usize,
+}
+
 fn default_rlimits() -> [RLimit; RLIMIT_NLIMITS] {
     let mut limits = [
         RLimit {
@@ -112,6 +118,7 @@ pub struct ProcessControlBlockInner {
     pub mmap_base: usize,
     pub tls_area: Option<TlsArea>,
     pub rlimits: [RLimit; RLIMIT_NLIMITS],
+    pub itimers: [IntervalTimerState; 3],
 }
 
 impl ProcessControlBlockInner {
@@ -234,6 +241,7 @@ impl ProcessControlBlock {
                     mmap_base: DEFAULT_MMAP_BASE,
                     tls_area: tls_area.clone(),
                     rlimits: default_rlimits(),
+                    itimers: [IntervalTimerState::default(); 3],
                 })
             },
         });
@@ -397,6 +405,7 @@ impl ProcessControlBlock {
                 inner.mmap_base = core::cmp::max(DEFAULT_MMAP_BASE, user_stack_top);
             }
             inner.tls_area = tls_area.clone();
+            inner.itimers = [IntervalTimerState::default(); 3];
         }
         let task = self.inner_exclusive_access().get_task(0);
         let mut task_inner = task.inner_exclusive_access();
@@ -649,6 +658,7 @@ impl ProcessControlBlock {
                     mmap_base: parent.mmap_base,
                     tls_area,
                     rlimits: parent.rlimits,
+                    itimers: [IntervalTimerState::default(); 3],
                 })
             },
         });

@@ -254,7 +254,11 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
             break;
         }
     }
-    Ok(())
+    if offset == data.len() {
+        Ok(())
+    } else {
+        Err(errno(EFAULT))
+    }
 }
 
 fn build_statfs() -> StatFs {

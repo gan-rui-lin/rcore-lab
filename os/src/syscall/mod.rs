@@ -154,6 +154,8 @@ const SYSCALL_STATFS: usize = 43;
 const SYSCALL_FSTATFS: usize = 44;
 /// clock_gettime syscall
 const SYSCALL_CLOCK_GETTIME: usize = 113;
+/// clock_getres syscall
+const SYSCALL_CLOCK_GETRES: usize = 114;
 /// sched_getaffinity syscall
 const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 /// syslog syscall
@@ -728,6 +730,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),
+        SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0], args[1] as *mut TimeSpec),
         SYSCALL_SCHED_GETAFFINITY => sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8),
         SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_GET_TIME => sys_get_time(args[0] as *mut TimeVal, args[1]),
