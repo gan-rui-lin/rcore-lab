@@ -17,6 +17,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use arch::{TrapContext, TrapFrameArgs};
 use xmas_elf::sections::{SectionData, ShType};
+use xmas_elf::symbol_table::Entry;
 use xmas_elf::ElfFile;
 
 #[cfg(target_arch = "loongarch64")]

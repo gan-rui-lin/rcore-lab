@@ -1,4 +1,5 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
+#[cfg(target_arch = "loongarch64")]
 use super::PhysAddr;
 use super::{frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
@@ -6,7 +7,7 @@ use super::{PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::USER_STACK_TOP;
 #[allow(unused_imports)]
-use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
+use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, USER_STACK_SIZE};
 use crate::sync::UPIntrFreeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -463,6 +464,7 @@ impl MemorySet {
             MapArea::new(
                 user_stack_bottom.into(),
                 user_stack_top.into(),
+                MapType::Framed,
                 MapPermission::R | MapPermission::W | MapPermission::U,
             ),
             None,
@@ -974,6 +976,7 @@ impl MapArea {
             start_va: another.start_va,
             vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
             data_frames: BTreeMap::new(),
+            map_type: another.map_type,
             map_perm: another.map_perm,
             shared_frames: another.shared_frames,
             mmap_meta: another.mmap_meta,
@@ -1191,7 +1194,7 @@ fn map_perm_to_pte_flags(map_perm: MapPermission) -> PTEFlags {
     flags
 }
 
-#[cfg_attr(target_arch = "loongarch64", allow(dead_code))]
+#[allow(dead_code)]
 #[derive(Copy, Clone, PartialEq, Debug)]
 /// map type for memory set: identical or framed
 pub enum MapType {

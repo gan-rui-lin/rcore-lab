@@ -6,8 +6,8 @@ use crate::fs::{
     OpenFlags, PollEvents, Stat, StatMode,
 };
 use crate::mm::{
-    translated_byte_buffer, translated_byte_buffer_checked, translated_refmut, translated_str,
-    UserBuffer,
+    translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
+    translated_str, UserBuffer,
 };
 #[allow(unused_imports)] // for debug
 use crate::task::{

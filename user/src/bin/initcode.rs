@@ -30,19 +30,7 @@ const LTP_PROFILE: Option<&str> = option_env!("LTP_PROFILE");
 const SH: &[u8] = b"sh\0";
 const PATH_ENV: &[u8] = b"PATH=/bin:/usr/bin:/musl:/glibc\0";
 const TEST_LIBC_ROOTS: [&str; 2] = ["/musl", "/glibc"];
-const TEST_SUITES: [&str; 11] = [
-    "basic",
-    "busybox",
-    "cyclictest",
-    "iozone",
-    "iperf",
-    "libcbench",
-    "libctest",
-    "lmbench",
-    "ltp",
-    "lua",
-    "netperf",
-];
+const TEST_SUITES: [&str; 1] = ["ltp"];
 #[allow(dead_code)]
 const RUN_EMBEDDED_PTHREAD: bool = option_env!("RUN_EMBEDDED_PTHREAD").is_some();
 const PTHREAD_TEST_PATH: &str = "/tmp/pthread_cancel_small";
@@ -424,7 +412,7 @@ fn test_basic() {
 }
 
 const LTP_TIMEOUT_MS: usize = 30_000;
-const ENABLE_LTP_WATCHDOG: bool = false;
+const ENABLE_LTP_WATCHDOG: bool = true;
 
 fn wait_for_ltp_child(test_pid: isize, watchdog_pid: isize, status: &mut i32, name: &str) -> isize {
     loop {

@@ -1,5 +1,6 @@
 [build]
 target = "riscv64gc-unknown-none-elf"
+target-dir = "target-user"
 
 [target.riscv64gc-unknown-none-elf]
 rustflags = [
