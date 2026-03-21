@@ -1,7 +1,5 @@
 #![allow(missing_docs)]
 
-#[cfg(target_arch = "riscv64")]
-use super::__switch;
 use super::{
     fetch_task, ready_queue_snapshot, ProcessControlBlock, TaskContext, TaskControlBlock,
     TaskStatus,
@@ -47,21 +45,17 @@ pub fn run_tasks() {
     loop {
         let mut processor = PROCESSOR.exclusive_access();
         if let Some(task) = fetch_task() {
+            task.kstack.check_guard();
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
             let mut task_inner = task.inner_exclusive_access();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
             drop(task_inner);
-            // Get the page table token for LoongArch context_switch_pt
-            #[cfg(target_arch = "loongarch64")]
             let pt_token = task.get_user_token();
             processor.current = Some(task);
             drop(processor);
             unsafe {
-                #[cfg(target_arch = "riscv64")]
-                __switch(idle_task_cx_ptr, next_task_cx_ptr);
-                #[cfg(target_arch = "loongarch64")]
-                arch::context_switch_pt(idle_task_cx_ptr, next_task_cx_ptr, pt_token);
+                arch::switch_to_task(idle_task_cx_ptr, next_task_cx_ptr, pt_token);
             }
         } else {
             let count = RUN_TASKS_EMPTY_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -116,9 +110,6 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
     drop(processor);
     unsafe {
-        #[cfg(target_arch = "riscv64")]
-        __switch(switched_task_cx_ptr, idle_task_cx_ptr);
-        #[cfg(target_arch = "loongarch64")]
-        arch::context_switch(switched_task_cx_ptr, idle_task_cx_ptr);
+        arch::switch_to_idle(switched_task_cx_ptr, idle_task_cx_ptr);
     }
 }

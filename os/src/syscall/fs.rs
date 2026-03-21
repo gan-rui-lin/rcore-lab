@@ -48,6 +48,7 @@ fn rdev_for_path(path: &str) -> u64 {
 
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use lazy_static::lazy_static;
 
 #[cfg(feature = "ext4")]
@@ -85,6 +86,8 @@ lazy_static! {
     static ref PATH_MODES: UPSafeCell<BTreeMap<String, u32>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
 }
+
+static GETRANDOM_STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
 #[allow(dead_code)]
 fn ts_alloc_id() -> usize {
@@ -389,6 +392,15 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         };
         resolve_path(&base, &raw_path)
     };
+    let proc_name = process.inner_exclusive_access().name.clone();
+    let trace_so_open =
+        proc_name == "entry-dynamic.exe" && (raw_path.contains(".so") || full_path.contains(".so"));
+    if trace_so_open {
+        info!(
+            "[openat-so] pid={} raw={} full={} flags={:#x}",
+            pid, raw_path, full_path, flags
+        );
+    }
     // let proc_name = process.inner_exclusive_access().name.clone();
     // if (proc_name == "busybox" || proc_name == "sh")
     //     && (raw_path.starts_with("./") || raw_path.contains("/basic/"))
@@ -432,8 +444,17 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
             None => return errno(EMFILE),
         };
         inner.fd_table[fd] = Some(inode);
+        if trace_so_open {
+            info!(
+                "[openat-so] pid={} open ok full={} -> fd={}",
+                pid, full_path, fd
+            );
+        }
         fd as isize
     } else {
+        if trace_so_open {
+            info!("[openat-so] pid={} open failed full={}", pid, full_path);
+        }
         errno(ENOENT)
     }
 }
@@ -468,6 +489,107 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, _mode: u32, _flags: u32) -> 
     } else {
         errno(ENOENT)
     }
+}
+
+pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsize: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_readlinkat", pid);
+    }
+    if path.is_null() || buf.is_null() {
+        return errno(EFAULT);
+    }
+    if bufsize == 0 {
+        return errno(EINVAL);
+    }
+
+    let token = current_user_token();
+    let raw_path = translated_str(token, path);
+    if raw_path.is_empty() {
+        return errno(ENOENT);
+    }
+    let full_path = if raw_path.starts_with('/') {
+        normalize_path(&raw_path)
+    } else {
+        let base = match dirfd_base(dirfd) {
+            Ok(base) => base,
+            Err(err) => return err,
+        };
+        resolve_path(&base, &raw_path)
+    };
+
+    // Minimal procfs compatibility for busybox/glibc probes.
+    // If /proc/<pid>/exe (or /proc/self/exe) is requested, return a stable executable path.
+    let process = current_process();
+    let process_name = process.inner_exclusive_access().name.clone();
+    let self_exe =
+        full_path == "/proc/self/exe" || full_path == format!("/proc/{}/exe", process.pid.0);
+
+    let target = if self_exe {
+        if process_name == "busybox" || process_name == "sh" {
+            String::from("/bin/sh")
+        } else {
+            format!("/{}", process_name)
+        }
+    } else {
+        // Generic fs symlink read is not available yet in current VFS abstraction.
+        return errno(ENOENT);
+    };
+
+    let bytes = target.as_bytes();
+    let write_len = bytes.len().min(bufsize);
+    let slices = translated_byte_buffer(token, buf, write_len);
+    let mut off = 0usize;
+    for slice in slices {
+        if off >= write_len {
+            break;
+        }
+        let n = slice.len().min(write_len - off);
+        slice[..n].copy_from_slice(&bytes[off..off + n]);
+        off += n;
+    }
+    off as isize
+}
+
+pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_getrandom", pid);
+    }
+    if buf.is_null() {
+        return errno(EFAULT);
+    }
+    // Linux: unsupported flag bits => EINVAL.
+    const GRND_NONBLOCK: u32 = 0x0001;
+    const GRND_RANDOM: u32 = 0x0002;
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM) != 0 {
+        return errno(EINVAL);
+    }
+    if len == 0 {
+        return 0;
+    }
+
+    let token = current_user_token();
+    let slices = translated_byte_buffer(token, buf, len);
+    let mut state = GETRANDOM_STATE
+        .load(AtomicOrdering::Relaxed)
+        .wrapping_add(get_time_us() as u64)
+        .wrapping_add((pid as u64) << 32)
+        .wrapping_add(len as u64);
+
+    let mut written = 0usize;
+    for slice in slices {
+        for byte in slice.iter_mut() {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let x = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            *byte = (x & 0xff) as u8;
+            written += 1;
+        }
+    }
+    GETRANDOM_STATE.store(state, AtomicOrdering::Relaxed);
+    written as isize
 }
 
 pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
@@ -1751,7 +1873,7 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 ///
 /// # Arguments
 /// * `fd` - file descriptor
-/// * `cmd` - command (F_GETFL, F_SETFL, F_GETFD, F_SETFD, F_DUPFD)
+/// * `cmd` - command (F_GETFL, F_SETFL, F_GETFD, F_SETFD, F_DUPFD, F_DUPFD_CLOEXEC)
 /// * `arg` - command-specific argument
 ///
 /// # Returns
@@ -1770,6 +1892,7 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     }
 
     const F_DUPFD: i32 = 0;
+    const F_DUPFD_CLOEXEC: i32 = 1030;
     const F_GETFD: i32 = 1;
     const F_SETFD: i32 = 2;
     const F_GETFL: i32 = 3;
@@ -1797,7 +1920,7 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     //     );
     // }
     match cmd {
-        F_DUPFD => {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
             // Duplicate fd to the lowest numbered available fd >= arg
             let new_fd = if arg < inner.fd_table.len() {
                 let mut found = None;
@@ -2130,56 +2253,110 @@ pub fn sys_fstatfs(fd: usize, buf: *mut StatFs) -> isize {
 /// 2. Proper handling of file offset updates
 /// 3. Support for splice/pipe operations
 pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut isize, count: usize) -> isize {
-    use super::errno::*;
+    if count == 0 {
+        return 0;
+    }
 
     let process = current_process();
-    let (_in_file, _out_file) = {
+    let (in_file, out_file) = {
         let inner = process.inner_exclusive_access();
-        // Validate file descriptors
         if in_fd >= inner.fd_table.len() || out_fd >= inner.fd_table.len() {
             return errno(EBADF);
         }
-
         let Some(in_file) = &inner.fd_table[in_fd] else {
             return errno(EBADF);
         };
-
         let Some(out_file) = &inner.fd_table[out_fd] else {
             return errno(EBADF);
         };
-
-        // Check permissions
-        if !in_file.readable() {
+        if !in_file.readable() || !out_file.writable() {
             return errno(EBADF);
         }
-        if !out_file.writable() {
-            return errno(EBADF);
-        }
-
         (in_file.clone(), out_file.clone())
     };
 
-    // Validate offset parameter if provided
-    if !offset.is_null() {
-        use crate::mm::translated_refmut;
+    let in_inode = in_file.inode();
+    let out_inode = out_file.inode();
+
+    // Linux semantics: offset!=NULL requires a seekable input fd.
+    if !offset.is_null() && in_inode.is_none() {
+        return errno(ESPIPE);
+    }
+
+    let mut src_off = if offset.is_null() {
+        in_file.get_offset().unwrap_or(0)
+    } else {
         let token = current_user_token();
         let offset_ref = translated_refmut(token, offset);
         if *offset_ref < 0 {
             return errno(EINVAL);
         }
+        *offset_ref as usize
+    };
+
+    let mut out_off = out_file.get_offset().unwrap_or(0);
+    let mut transferred = 0usize;
+    const SENDFILE_CHUNK: usize = 16 * 1024;
+
+    while transferred < count {
+        let want = core::cmp::min(SENDFILE_CHUNK, count - transferred);
+        let mut kbuf = alloc::vec![0u8; want];
+
+        let nread = if let Some(inode) = &in_inode {
+            inode.read_at(src_off, &mut kbuf)
+        } else {
+            let read_buf = unsafe {
+                UserBuffer::new(alloc::vec![core::slice::from_raw_parts_mut(
+                    kbuf.as_mut_ptr(),
+                    want,
+                )])
+            };
+            in_file.read(read_buf)
+        };
+
+        if nread == 0 {
+            break;
+        }
+
+        let nwritten = if let Some(inode) = &out_inode {
+            inode.write_at(out_off, &kbuf[..nread])
+        } else {
+            let write_buf = unsafe {
+                UserBuffer::new(alloc::vec![core::slice::from_raw_parts_mut(
+                    kbuf.as_mut_ptr(),
+                    nread,
+                )])
+            };
+            out_file.write(write_buf)
+        };
+
+        if nwritten == 0 {
+            break;
+        }
+
+        src_off = src_off.saturating_add(nwritten);
+        out_off = out_off.saturating_add(nwritten);
+        transferred += nwritten;
+
+        // partial write: return current progress to match typical sendfile behavior
+        if nwritten < nread {
+            break;
+        }
     }
 
-    // For now, return ENOSYS (not fully implemented)
-    // A complete implementation would require kernel buffer management
-    // to efficiently transfer data without going through user space
-    debug!(
-        "[sys_sendfile] in_fd={} out_fd={} count={} (not fully implemented)",
-        in_fd, out_fd, count
-    );
+    if !offset.is_null() {
+        let token = current_user_token();
+        let offset_ref = translated_refmut(token, offset);
+        *offset_ref = src_off as isize;
+    } else if in_inode.is_some() {
+        in_file.set_offset(src_off);
+    }
 
-    // Return 0 to indicate no bytes transferred (but not an error)
-    // Applications can fall back to read/write loops
-    errno(ENOSYS)
+    if out_inode.is_some() {
+        out_file.set_offset(out_off);
+    }
+
+    transferred as isize
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -2193,7 +2370,7 @@ pub struct PollFd {
     revents: PollEvents,
 }
 
-pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: i32) -> isize {
+pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: *const TimeSpec) -> isize {
     if fds.is_null() {
         return errno(EFAULT);
     }
@@ -2201,10 +2378,18 @@ pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: i32) -> isize {
     let token = current_user_token();
 
     let mut poll_fds: Vec<&mut PollFd> = Vec::new();
-    let deadline = if timeout > 0 {
-        Some(get_time_ms().saturating_add(timeout as usize))
-    } else {
+    let deadline = if timeout.is_null() {
         None
+    } else {
+        let spec = *translated_ref(token, timeout);
+        if spec.tv_nsec >= 1_000_000_000 {
+            return errno(EINVAL);
+        }
+        let timeout_ms = spec
+            .tv_sec
+            .saturating_mul(1000)
+            .saturating_add(spec.tv_nsec / 1_000_000);
+        Some(get_time_ms().saturating_add(timeout_ms))
     };
 
     for i in 0..nfds {
@@ -2243,7 +2428,7 @@ pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: i32) -> isize {
                 ret += 1;
             }
         }
-        if ret != 0 || timeout == 0 {
+        if ret != 0 {
             return ret;
         }
         if let Some(deadline) = deadline {

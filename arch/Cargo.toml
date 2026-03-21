@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 log = "0.4"
 bitflags = "1.2.1"
-crate_interface = { git = "https://github.com/Byte-OS/crate_interface.git" }
+crate_interface = { path = "../vendor/crate_interface" }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 riscv = { path = "../vendor/riscv", features = ["inline-asm"] }

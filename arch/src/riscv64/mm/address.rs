@@ -1,6 +1,7 @@
 //! Implementation of physical and virtual address and page number.
 
 use super::page_table::PageTableEntry;
+use crate::VIRT_ADDR_START;
 
 /// Page size: 4 KiB.
 pub const PAGE_SIZE: usize = 0x1000;
@@ -65,7 +66,14 @@ impl Debug for PhysPageNum {
 
 impl From<usize> for PhysAddr {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << PA_WIDTH_SV39) - 1))
+        // Only strip the direct-map alias when the incoming address is in the
+        // high-half alias window. Keep normal physical addresses unchanged.
+        let stripped = if (v & VIRT_ADDR_START) == VIRT_ADDR_START {
+            v & !VIRT_ADDR_START
+        } else {
+            v
+        };
+        Self(stripped & ((1 << PA_WIDTH_SV39) - 1))
     }
 }
 impl From<usize> for PhysPageNum {
@@ -207,11 +215,11 @@ impl VirtPageNum {
 impl PhysAddr {
     /// Get an immutable reference to a value at this physical address.
     pub fn get_ref<T>(&self) -> &'static T {
-        unsafe { (self.0 as *const T).as_ref().unwrap() }
+        unsafe { ((self.0 | VIRT_ADDR_START) as *const T).as_ref().unwrap() }
     }
     /// Get a mutable reference to a value at this physical address.
     pub fn get_mut<T>(&self) -> &'static mut T {
-        unsafe { (self.0 as *mut T).as_mut().unwrap() }
+        unsafe { ((self.0 | VIRT_ADDR_START) as *mut T).as_mut().unwrap() }
     }
 }
 
@@ -229,12 +237,14 @@ impl PhysPageNum {
     /// Interpret this physical page as a page-table node (512 PTEs).
     pub fn get_pte_array(&self) -> &'static mut [PageTableEntry] {
         let pa: PhysAddr = (*self).into();
-        unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut PageTableEntry, 512) }
+        unsafe {
+            core::slice::from_raw_parts_mut((pa.0 | VIRT_ADDR_START) as *mut PageTableEntry, 512)
+        }
     }
     /// Interpret this physical page as a raw byte array (4096 bytes).
     pub fn get_bytes_array(&self) -> &'static mut [u8] {
         let pa: PhysAddr = (*self).into();
-        unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut u8, 4096) }
+        unsafe { core::slice::from_raw_parts_mut((pa.0 | VIRT_ADDR_START) as *mut u8, 4096) }
     }
 }
 

@@ -9,6 +9,7 @@
 mod frame_allocator;
 mod heap_allocator;
 mod memory_set;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 pub use arch::{
     translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
@@ -22,9 +23,20 @@ pub use memory_set::{
     kernel_token, MapPermission, MemorySet, MmapMeta, ProtectError, KERNEL_SPACE,
 };
 
+static KERNEL_PT_READY: AtomicBool = AtomicBool::new(false);
+
 /// initiate heap allocator, frame allocator and kernel space
 pub fn init() {
     heap_allocator::init_heap();
     frame_allocator::init_frame_allocator();
     KERNEL_SPACE.exclusive_access().activate();
+    KERNEL_PT_READY.store(true, Ordering::Release);
+}
+
+/// Return kernel page-table token only when kernel mappings are ready.
+pub fn kernel_page_table_token_if_ready() -> usize {
+    if !KERNEL_PT_READY.load(Ordering::Acquire) {
+        return 0;
+    }
+    kernel_token()
 }

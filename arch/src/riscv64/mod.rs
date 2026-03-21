@@ -10,6 +10,7 @@ pub mod entry;
 pub mod interrupt;
 pub mod mm;
 pub mod sbi;
+pub mod sigtrx;
 pub mod signal;
 pub mod task;
 pub mod timer;
@@ -30,6 +31,9 @@ pub use console::{console_getchar, console_putchar};
 // Entry / boot helpers
 // ---------------------------------------------------------------------------
 pub use entry::clear_bss;
+pub use entry::kernel_page_table_token;
+pub use entry::switch_to_kernel_page_table;
+pub use entry::VIRT_ADDR_START;
 
 // ---------------------------------------------------------------------------
 // Interrupt control
@@ -65,6 +69,20 @@ pub use signal::{FpRegs, RiscvFpRegs, MContext};
 // ---------------------------------------------------------------------------
 pub use task::{TaskContext, __switch};
 
+#[inline]
+pub unsafe fn switch_to_task(
+    idle_task_cx_ptr: *mut TaskContext,
+    next_task_cx_ptr: *const TaskContext,
+    _pt_token: usize,
+) {
+    __switch(idle_task_cx_ptr, next_task_cx_ptr);
+}
+
+#[inline]
+pub unsafe fn switch_to_idle(switched_task_cx_ptr: *mut TaskContext, idle_task_cx_ptr: *mut TaskContext) {
+    __switch(switched_task_cx_ptr, idle_task_cx_ptr);
+}
+
 // ---------------------------------------------------------------------------
 // Timer
 // ---------------------------------------------------------------------------
@@ -74,7 +92,19 @@ pub use timer::{get_time, get_time_ms, get_time_us, set_next_trigger};
 // Trap handling
 // ---------------------------------------------------------------------------
 pub use trap::TrapContext;
-pub use trap::TRAMPOLINE;
 pub use trap::init as trap_init;
 pub use trap::enable_timer_interrupt as trap_enable_timer_interrupt;
-pub use trap::trap_return;
+pub use trap::enter_user_and_trap;
+
+/// Fixed virtual base where the RISC-V signal-return trampoline page is mapped.
+pub const SIG_RETURN_ADDR: usize = 0xFFFF_FFC1_0000_0000;
+
+/// Canonicalize a kernel text/function address to the high-half alias.
+#[inline]
+pub fn kernel_text_addr(addr: usize) -> usize {
+    if addr >= VIRT_ADDR_START {
+        addr
+    } else {
+        addr | VIRT_ADDR_START
+    }
+}

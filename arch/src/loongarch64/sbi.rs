@@ -2,9 +2,8 @@
 
 #![allow(missing_docs)]
 
-use crate::consts::VIRT_ADDR_START;
-// const VIRT_ADDR_START: usize = 0x9000_0000_0000_0000;
-const UART_BASE: usize = 0x1fe0_01e0 | VIRT_ADDR_START;
+use crate::consts::{UART_BASE, VIRT_ADDR_START};
+
 const UART_THR: usize = UART_BASE + 0x0;
 const UART_LSR: usize = UART_BASE + 0x5;
 

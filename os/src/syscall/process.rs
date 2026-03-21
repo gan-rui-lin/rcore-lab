@@ -341,6 +341,57 @@ pub fn sys_futex(
                     return errno(ETIMEDOUT);
                 }
             }
+            if ret == errno(EINTR) {
+                let process = current_process();
+                let process_pending = process.inner_exclusive_access().signal_pending;
+                let (tid, mask, task_pending, handling_sig, interrupted_by_signal, sepc, ra, tp) =
+                    match current_task() {
+                        Some(task) => {
+                            let task_inner = task.inner_exclusive_access();
+                            let trap_cx = task_inner.get_trap_cx();
+                            (
+                                task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
+                                task_inner.signal_mask,
+                                task_inner.signal_pending,
+                                task_inner.handling_sig,
+                                task_inner.interrupted_by_signal,
+                                trap_cx.sepc,
+                                trap_cx[TrapFrameArgs::RA],
+                                trap_cx[TrapFrameArgs::TLS],
+                            )
+                        }
+                        None => (
+                            0,
+                            SignalFlags::empty(),
+                            SignalFlags::empty(),
+                            -1,
+                            false,
+                            0,
+                            0,
+                            0,
+                        ),
+                    };
+                let pending_unmasked = (process_pending | task_pending) & !mask;
+                info!(
+                    "[sys_futex] wait EINTR pid={} tid={} uaddr1={:#x} pa={:#x} val={} handling_sig={} interrupted={} sepc={:#x} ra={:#x} tp={:#x} mask={:?} task_pending={:?} proc_pending={:?} unmasked={:?} sig33_pending(task={},proc={})",
+                    pid_now,
+                    tid,
+                    uaddr1 as usize,
+                    pa.0,
+                    val,
+                    handling_sig,
+                    interrupted_by_signal,
+                    sepc,
+                    ra,
+                    tp,
+                    mask,
+                    task_pending,
+                    process_pending,
+                    pending_unmasked,
+                    task_pending.contains(SignalFlags::SIG33),
+                    process_pending.contains(SignalFlags::SIG33),
+                );
+            }
             ret
         }
         FutexCmd::FUTEX_WAKE => {
@@ -413,6 +464,58 @@ pub fn sys_futex(
                     trace!("[sys_futex] pid={} wait_bitset timed out", pid_now);
                     return errno(ETIMEDOUT);
                 }
+            }
+            if ret == errno(EINTR) {
+                let process = current_process();
+                let process_pending = process.inner_exclusive_access().signal_pending;
+                let (tid, mask, task_pending, handling_sig, interrupted_by_signal, sepc, ra, tp) =
+                    match current_task() {
+                        Some(task) => {
+                            let task_inner = task.inner_exclusive_access();
+                            let trap_cx = task_inner.get_trap_cx();
+                            (
+                                task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
+                                task_inner.signal_mask,
+                                task_inner.signal_pending,
+                                task_inner.handling_sig,
+                                task_inner.interrupted_by_signal,
+                                trap_cx.sepc,
+                                trap_cx[TrapFrameArgs::RA],
+                                trap_cx[TrapFrameArgs::TLS],
+                            )
+                        }
+                        None => (
+                            0,
+                            SignalFlags::empty(),
+                            SignalFlags::empty(),
+                            -1,
+                            false,
+                            0,
+                            0,
+                            0,
+                        ),
+                    };
+                let pending_unmasked = (process_pending | task_pending) & !mask;
+                info!(
+                    "[sys_futex] wait_bitset EINTR pid={} tid={} uaddr1={:#x} pa={:#x} val={} bitset={:#x} handling_sig={} interrupted={} sepc={:#x} ra={:#x} tp={:#x} mask={:?} task_pending={:?} proc_pending={:?} unmasked={:?} sig33_pending(task={},proc={})",
+                    pid_now,
+                    tid,
+                    uaddr1 as usize,
+                    pa.0,
+                    val,
+                    val3,
+                    handling_sig,
+                    interrupted_by_signal,
+                    sepc,
+                    ra,
+                    tp,
+                    mask,
+                    task_pending,
+                    process_pending,
+                    pending_unmasked,
+                    task_pending.contains(SignalFlags::SIG33),
+                    process_pending.contains(SignalFlags::SIG33),
+                );
             }
             ret
         }
@@ -501,7 +604,6 @@ pub fn sys_fork() -> isize {
     if clone_stack != 0 {
         trap_cx[TrapFrameArgs::SP] = clone_stack;
     }
-    trap_cx.kernel_sp = new_task.kstack.get_top();
     new_pid as isize
 }
 
@@ -563,8 +665,6 @@ pub fn sys_clone(
         let mut inner = new_task.inner_exclusive_access();
         inner.signal_mask = parent_signal_mask;
     }
-    add_task(Arc::clone(&new_task));
-
     let new_task_inner = new_task.inner_exclusive_access();
     let new_task_res = new_task_inner.res.as_ref().unwrap();
     let new_task_tid = new_task_res.tid;
@@ -598,7 +698,6 @@ pub fn sys_clone(
             dump_user_bytes("tp+0x0", token, tls_addr, 64);
         }
     }
-    new_trap_cx.kernel_sp = new_task.kstack.get_top();
     drop(new_task_inner);
     if clone_flags.contains(CloneFlags::CHILD_CLEARTID) && !ctid.is_null() {
         let mut inner = new_task.inner_exclusive_access();
@@ -643,6 +742,9 @@ pub fn sys_clone(
         }
         *translated_refmut(token, ctid) = new_task_tid as i32;
     }
+
+    // Queue the child only after its trap context/TLS/tid pointers are fully initialized.
+    add_task(Arc::clone(&new_task));
 
     new_task_tid as isize
 }
@@ -721,22 +823,9 @@ fn build_exec_candidates(exec_path: &str, envs: &[String]) -> Vec<String> {
     candidates
 }
 
-fn exec_image_cache_key(path: &str) -> Option<&'static str> {
-    // Some exec paths may contain "/./" from relative path expansion.
-    if path.ends_with("/bin/sh") || path.ends_with("/busybox") {
-        // /bin/sh is hardlinked to busybox in our rootfs.
-        Some("/musl/busybox")
-    } else if path.ends_with("/libc.so") {
-        Some("/musl/lib/libc.so")
-    } else if path.ends_with("/runtest.exe") {
-        Some("/musl/runtest.exe")
-    } else if path.ends_with("/entry-static.exe") {
-        Some("/musl/entry-static.exe")
-    } else if path.ends_with("/entry-dynamic.exe") {
-        Some("/musl/entry-dynamic.exe")
-    } else {
-        None
-    }
+fn exec_image_cache_key(_path: &str) -> Option<&'static str> {
+    // Strict mode: disable cross-path cache aliasing to avoid mixing musl/glibc images.
+    None
 }
 
 fn read_exec_image(path: &str, file: &Arc<dyn File>) -> Arc<[u8]> {
@@ -775,7 +864,10 @@ fn trace_exec_resolution(name: &str, exec_path: &str, exec_path_resolved: &str, 
 }
 
 fn trace_entry_bytes(exec_path_resolved: &str, all_data: &[u8], app: &Arc<dyn File>) {
-    if exec_path_resolved != "/bin/sh" && exec_path_resolved != "/musl/busybox" {
+    if exec_path_resolved != "/bin/sh"
+        && exec_path_resolved != "/musl/busybox"
+        && exec_path_resolved != "/glibc/busybox"
+    {
         return;
     }
     if let Ok(elf) = xmas_elf::ElfFile::new(all_data) {
@@ -997,6 +1089,23 @@ fn sys_exec_internal(
                 continue;
             }
             // Non-ELF without shebang: fall back to /bin/sh (execlp-like behavior).
+            // // Guard against recursive /bin/sh -> /bin/sh fallback loops.
+            // if exec_path == "/bin/sh" || exec_path_resolved == "/bin/sh" {
+            //     warn!(
+            //         "[sys_exec] non-ELF /bin/sh without shebang, stop recursive fallback for {}",
+            //         exec_path_resolved
+            //     );
+            //     return errno(ENOEXEC);
+            // }
+            // if args.get(0).map(|s| s.as_str()) == Some("sh")
+            //     && args.get(1).map(|s| s.as_str()) == Some("/bin/sh")
+            // {
+            //     warn!(
+            //         "[sys_exec] detected recursive sh argv chain for {}, abort fallback",
+            //         exec_path_resolved
+            //     );
+            //     return errno(ENOEXEC);
+            // }
             if depth >= MAX_SHEBANG_DEPTH {
                 return errno(ELOOP);
             }
@@ -1033,7 +1142,7 @@ fn sys_exec_internal(
                     break;
                 }
             }
-            if let Some(mut interp_path) = interp {
+            if let Some(interp_path) = interp {
                 if open_file(interp_path.as_str(), OpenFlags::empty()).is_none() {
                     // Fallback: try musl/glibc loader for known interpreter paths
                     let musl_loader = "/musl/lib/libc.so";
@@ -1273,7 +1382,63 @@ pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
         .saturating_mul(1_000_000)
         .saturating_add(req.tv_nsec / 1_000);
     let target = get_time_us().saturating_add(sleep_us);
+
+    let unmasked_pending_signal = || -> Option<(SignalFlags, SignalFlags, SignalFlags)> {
+        let process = current_process();
+        let process_inner = process.inner_exclusive_access();
+        let task = match current_task() {
+            Some(task) => task,
+            None => return None,
+        };
+        let task_inner = task.inner_exclusive_access();
+        let process_pending = process_inner.signal_pending;
+        let task_pending = task_inner.signal_pending;
+        let signal_mask = task_inner.signal_mask;
+        let pending = (process_pending | task_pending) & !signal_mask;
+        if pending.is_empty() {
+            None
+        } else {
+            Some((task_pending, process_pending, signal_mask))
+        }
+    };
+
     while get_time_us() < target {
+        if let Some((task_pending, process_pending, signal_mask)) = unmasked_pending_signal() {
+            let unmasked = (task_pending | process_pending) & !signal_mask;
+            let cancel_related = unmasked & (SignalFlags::SIG32 | SignalFlags::SIG33);
+            if !cancel_related.is_empty() {
+                info!(
+                    "[sys_nanosleep] pid={} EINTR by pending signal: unmasked={:?} task_pending={:?} proc_pending={:?} mask={:?}",
+                    pid,
+                    unmasked,
+                    task_pending,
+                    process_pending,
+                    signal_mask
+                );
+            } else {
+                trace!(
+                    "[sys_nanosleep] pid={} EINTR by pending signal: unmasked={:?}",
+                    pid,
+                    unmasked
+                );
+            }
+            if !rem.is_null() {
+                let now = get_time_us();
+                let remain_us = target.saturating_sub(now);
+                let remain = TimeSpec {
+                    tv_sec: remain_us / 1_000_000,
+                    tv_nsec: (remain_us % 1_000_000) * 1_000,
+                };
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        (&remain as *const TimeSpec) as *const u8,
+                        core::mem::size_of::<TimeSpec>(),
+                    )
+                };
+                let _ = copy_to_user(token, rem as *mut u8, bytes);
+            }
+            return errno(EINTR);
+        }
         suspend_current_and_run_next();
     }
     if !rem.is_null() {
@@ -1383,6 +1548,20 @@ pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: *mut u8) -> is
         Ok(_) => cpusetsize as isize,
         Err(err) => err,
     }
+}
+
+pub fn sys_clock_nanosleep(
+    _clock_id: usize,
+    _flags: usize,
+    req: *const TimeSpec,
+    rem: *mut TimeSpec,
+) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_clock_nanosleep", pid);
+    }
+    // libc pthread paths only need relative sleep behavior here.
+    sys_nanosleep(req, rem)
 }
 
 pub fn sys_times(tms: *mut Tms) -> isize {
@@ -1537,8 +1716,15 @@ pub fn sys_mmap(
     const MAP_TYPE_MASK: usize = MAP_SHARED | MAP_PRIVATE;
 
     let pid = current_process().pid.0;
+    let proc_name = current_process().inner_exclusive_access().name.clone();
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_mmap", pid);
+    }
+    if proc_name == "entry-dynamic.exe" && (flags & MAP_ANON) == 0 && fd != usize::MAX {
+        info!(
+            "[mmap-file] pid={} start={:#x} len={:#x} prot={:#x} flags={:#x} fd={} off={:#x}",
+            pid, start, len, prot, flags, fd, offset
+        );
     }
 
     let mut len = len;
@@ -1963,7 +2149,7 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
     let mut inner = process.inner_exclusive_access();
     inner.signal_pending |= flag;
     for task in inner.tasks.iter().filter_map(|t| t.as_ref()) {
-        wake_task_for_signal(task);
+        wake_task_for_signal(task, flag);
     }
     0
 }
@@ -1982,9 +2168,11 @@ fn signal_flag_from_signum(signum: i32) -> Result<SignalFlags, isize> {
     Ok(flag)
 }
 
-fn wake_task_for_signal(task: &Arc<TaskControlBlock>) {
+fn wake_task_for_signal(task: &Arc<TaskControlBlock>, flag: SignalFlags) {
     let mut task_inner = task.inner_exclusive_access();
-    if task_inner.task_status == TaskStatus::Blocked {
+    let signal_unmasked = !task_inner.signal_mask.contains(flag);
+    let force_wake = flag == SignalFlags::SIGKILL;
+    if task_inner.task_status == TaskStatus::Blocked && (signal_unmasked || force_wake) {
         futex_remove_waiter_any(task);
         task_inner.interrupted_by_signal = true;
         task_inner.task_status = TaskStatus::Ready;
@@ -2023,7 +2211,7 @@ fn send_signal_to_task_from_list(
     let mut task_inner = task.inner_exclusive_access();
     task_inner.signal_pending |= flag;
     drop(task_inner);
-    wake_task_for_signal(&task);
+    wake_task_for_signal(&task, flag);
     0
 }
 
@@ -2063,8 +2251,8 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
 }
 
 pub fn sys_tgkill(tgid: isize, tid: isize, signum: i32) -> isize {
-    let pid_now = current_process().pid.0;
-    if crate::syscall::should_trace_syscall(pid_now) {
+    let pid_now = current_process().pid.0 as isize;
+    if crate::syscall::should_trace_syscall(pid_now as usize) {
         syscall!(
             "kernel:pid[{}] sys_tgkill tgid={} tid={} signum={}",
             pid_now,
@@ -2076,19 +2264,10 @@ pub fn sys_tgkill(tgid: isize, tid: isize, signum: i32) -> isize {
     if tgid <= 0 || tid <= 0 {
         return errno(EINVAL);
     }
-    let flag = match signal_flag_from_signum(signum) {
-        Ok(flag) => flag,
-        Err(err) => return err,
-    };
-    let process = match pid2process(tgid as usize) {
-        Some(process) => process,
-        None => return errno(ESRCH),
-    };
-    let process_pid = process.getpid();
-    let inner = process.inner_exclusive_access();
-    let ret = send_signal_to_task_from_list(tid as usize, process_pid, &inner.tasks, flag);
-    drop(inner);
-    ret
+    if tgid != pid_now {
+        return errno(ESRCH);
+    }
+    sys_tkill(tid, signum)
 }
 
 pub fn sys_sigaction(
@@ -2128,7 +2307,7 @@ pub fn sys_sigaction(
             Ok(v) => v,
             Err(err) => return err,
         };
-        if signum == 33 || signum == crate::task::SIGCHLD as i32 {
+        if signum == 32 || signum == 33 || signum == crate::task::SIGCHLD as i32 {
             info!(
                 "[sigaction] pid={} signum={} handler={:#x} flags={:#x} restorer={:#x} mask={:?}",
                 pid,
@@ -2291,10 +2470,12 @@ pub fn sys_sigreturn() -> isize {
     // SA_RESETHAND 处理
     let current_sig = inner.handling_sig;
     inner.handling_sig = -1;
+    let mut process_pending_snapshot = SignalFlags::empty();
 
     if current_sig >= 0 && (current_sig as usize) <= crate::task::MAX_SIG {
         let process = current_process();
         let mut process_inner = process.inner_exclusive_access();
+        process_pending_snapshot = process_inner.signal_pending;
         let action = process_inner.signal_actions.table[current_sig as usize];
         if (action.flags & crate::task::SA_RESETHAND) != 0 {
             info!(
@@ -2319,12 +2500,22 @@ pub fn sys_sigreturn() -> isize {
         inner.signal_mask.remove(SignalFlags::SIG33);
     }
 
-    if current_sig == 33 {
+    if current_sig == 32 || current_sig == 33 {
         let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
         let tp = inner.get_trap_cx()[TrapFrameArgs::TLS];
+        let task_pending = inner.signal_pending;
         info!(
-            "[sigreturn] pid={} tid={} sig33 tp={:#x} saved_pc={:#x} return_pc={:#x} mask={:?}",
-            pid, tid, tp, saved_pc, return_pc, inner.signal_mask
+            "[signal-flow] route=sigreturn pid={} tid={} sig{} tp={:#x} saved_pc={:#x} return_pc={:#x} pc_changed={} handling_reset=-1 mask_after={:?} task_pending={:?} proc_pending={:?}",
+            pid,
+            tid,
+            current_sig,
+            tp,
+            saved_pc,
+            return_pc,
+            return_pc != saved_pc,
+            inner.signal_mask,
+            task_pending,
+            process_pending_snapshot
         );
     }
 
