@@ -12,8 +12,8 @@
 use super::errno::*;
 use crate::task::current_user_token;
 use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use spin::Mutex;
 
 /// IPC key type (used to identify IPC objects)
@@ -26,32 +26,32 @@ pub type IpcId = i32;
 pub const IPC_PRIVATE: IpcKey = 0;
 
 /// IPC flags
-pub const IPC_CREAT: i32 = 0o1000;  // Create if key doesn't exist
-pub const IPC_EXCL: i32 = 0o2000;   // Fail if key exists
+pub const IPC_CREAT: i32 = 0o1000; // Create if key doesn't exist
+pub const IPC_EXCL: i32 = 0o2000; // Fail if key exists
 pub const IPC_NOWAIT: i32 = 0o4000; // Return immediately if would block
 
 /// IPC control commands
-pub const IPC_RMID: i32 = 0;  // Remove identifier
-pub const IPC_SET: i32 = 1;   // Set options
-pub const IPC_STAT: i32 = 2;  // Get options
-pub const IPC_INFO: i32 = 3;  // Get info
+pub const IPC_RMID: i32 = 0; // Remove identifier
+pub const IPC_SET: i32 = 1; // Set options
+pub const IPC_STAT: i32 = 2; // Get options
+pub const IPC_INFO: i32 = 3; // Get info
 
 /// Message queue limits
-const MSGMAX: usize = 8192;      // Max message size
-const MSGMNB: usize = 16384;     // Max queue size in bytes
-const MSGMNI: usize = 128;       // Max number of message queues
+const MSGMAX: usize = 8192; // Max message size
+const MSGMNB: usize = 16384; // Max queue size in bytes
+const MSGMNI: usize = 128; // Max number of message queues
 
 /// Shared memory limits
-const SHMMAX: usize = 32 * 1024 * 1024;  // Max segment size (32MB)
-const SHMMIN: usize = 1;                  // Min segment size
-const SHMMNI: usize = 128;                // Max number of segments
-const SHMSEG: usize = 128;                // Max segments per process
+const SHMMAX: usize = 32 * 1024 * 1024; // Max segment size (32MB)
+const SHMMIN: usize = 1; // Min segment size
+const SHMMNI: usize = 128; // Max number of segments
+const SHMSEG: usize = 128; // Max segments per process
 
 /// Message structure for message queues
 #[derive(Clone)]
 pub struct Message {
-    pub mtype: isize,      // Message type (must be > 0)
-    pub mtext: Vec<u8>,    // Message data
+    pub mtype: isize,   // Message type (must be > 0)
+    pub mtext: Vec<u8>, // Message data
 }
 
 /// Message queue structure
@@ -360,7 +360,8 @@ pub fn sys_msgrcv(msqid: i32, msgp: usize, msgsz: usize, msgtyp: isize, msgflg: 
 
     let msg_size = msg.mtext.len();
     if msg_size > msgsz {
-        if msgflg & 0o10000 == 0 {  // MSG_NOERROR not set
+        if msgflg & 0o10000 == 0 {
+            // MSG_NOERROR not set
             return errno(E2BIG);
         }
         // Truncate message
@@ -389,7 +390,8 @@ pub fn sys_msgrcv(msqid: i32, msgp: usize, msgsz: usize, msgtyp: isize, msgflg: 
     }
 
     // Write mtext
-    let mtext_buffers = translated_byte_buffer(token, (msgp + mtype_size) as *const u8, actual_size);
+    let mtext_buffers =
+        translated_byte_buffer(token, (msgp + mtype_size) as *const u8, actual_size);
     offset = 0;
     for buf in mtext_buffers {
         let len = buf.len().min(actual_size - offset);

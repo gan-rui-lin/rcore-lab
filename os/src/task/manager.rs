@@ -3,9 +3,9 @@
 use super::{ProcessControlBlock, TaskControlBlock, TaskStatus};
 use crate::sync::UPIntrFreeCell;
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::Arc;
 #[allow(unused_imports)]
 use alloc::vec::Vec;
-use alloc::sync::Arc;
 use lazy_static::*;
 
 pub struct TaskManager {
@@ -106,8 +106,7 @@ pub fn pid2process_len() -> usize {
     PID2PCB.exclusive_access().len()
 }
 
-pub fn pid2process_aggregate(
-) -> (
+pub fn pid2process_aggregate() -> (
     usize,
     usize,
     usize,

@@ -1,21 +1,21 @@
 //! Task pid and user resource implementation.
 
 use super::ProcessControlBlock;
-use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 #[cfg(not(target_arch = "loongarch64"))]
 use crate::config::TRAMPOLINE;
+use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 #[cfg(not(target_arch = "loongarch64"))]
 use crate::mm::KERNEL_SPACE;
-use crate::mm::{MapPermission, PhysPageNum, VirtAddr};
 #[cfg(target_arch = "loongarch64")]
 use crate::mm::{frame_alloc, FrameTracker};
+use crate::mm::{MapPermission, PhysPageNum, VirtAddr};
 use crate::sync::UPIntrFreeCell;
+#[cfg(target_arch = "loongarch64")]
+use alloc::vec;
 use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-#[cfg(target_arch = "loongarch64")]
-use alloc::vec;
 use lazy_static::*;
 
 pub struct RecycleAllocator {
@@ -115,7 +115,10 @@ pub fn kstack_alloc() -> KernelStack {
 #[cfg(target_arch = "loongarch64")]
 pub fn kstack_alloc() -> KernelStack {
     KernelStack {
-        inner: Arc::new(vec![0u128; KERNEL_STACK_SIZE / core::mem::size_of::<u128>()]),
+        inner: Arc::new(vec![
+            0u128;
+            KERNEL_STACK_SIZE / core::mem::size_of::<u128>()
+        ]),
     }
 }
 
@@ -193,7 +196,11 @@ fn ustack_bottom_from_tid(ustack_base: usize, tid: usize) -> usize {
 }
 
 impl TaskUserRes {
-    pub fn new(process: Arc<ProcessControlBlock>, ustack_base: usize, alloc_user_res: bool) -> Self {
+    pub fn new(
+        process: Arc<ProcessControlBlock>,
+        ustack_base: usize,
+        alloc_user_res: bool,
+    ) -> Self {
         let tid = process.inner_exclusive_access().alloc_tid();
         let mut task_user_res = Self {
             tid,
@@ -250,14 +257,14 @@ impl TaskUserRes {
         let mut process_inner = process.inner_exclusive_access();
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-            if let Some(pte) = process_inner
-                .memory_set
-                .translate(VirtAddr::from(trap_cx_bottom).floor())
-            {
-                if pte.is_valid() {
-                    return;
-                }
+        if let Some(pte) = process_inner
+            .memory_set
+            .translate(VirtAddr::from(trap_cx_bottom).floor())
+        {
+            if pte.is_valid() {
+                return;
             }
+        }
         process_inner.memory_set.insert_framed_area(
             trap_cx_bottom.into(),
             trap_cx_top.into(),

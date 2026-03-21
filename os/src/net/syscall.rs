@@ -51,8 +51,8 @@ const EOPNOTSUPP: isize = -95;
 #[derive(Clone, Copy, Debug)]
 struct SockAddrIn {
     sin_family: u16,
-    sin_port: u16,   // big-endian
-    sin_addr: u32,   // big-endian
+    sin_port: u16, // big-endian
+    sin_addr: u32, // big-endian
     sin_zero: [u8; 8],
 }
 
@@ -182,14 +182,10 @@ pub fn sys_socket(domain: usize, sock_type: usize, _protocol: usize) -> isize {
                 stack.sockets.add(socket)
             }
             SocketType::Udp => {
-                let rx_buf = udp::PacketBuffer::new(
-                    vec![udp::PacketMetadata::EMPTY; 32],
-                    vec![0u8; 65536],
-                );
-                let tx_buf = udp::PacketBuffer::new(
-                    vec![udp::PacketMetadata::EMPTY; 32],
-                    vec![0u8; 65536],
-                );
+                let rx_buf =
+                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0u8; 65536]);
+                let tx_buf =
+                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0u8; 65536]);
                 let socket = udp::Socket::new(rx_buf, tx_buf);
                 stack.sockets.add(socket)
             }
@@ -216,8 +212,7 @@ fn endpoint_to_listen(ep: &IpEndpoint) -> IpListenEndpoint {
         IpAddress::Ipv4(v4) => {
             let bytes = v4.as_bytes();
             // 0.0.0.0 = INADDR_ANY, 127.x.x.x = loopback → treat as wildcard
-            if (bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0)
-                || bytes[0] == 127
+            if (bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0) || bytes[0] == 127
             {
                 None
             } else {
@@ -315,10 +310,7 @@ pub fn sys_listen(fd: usize, _backlog: usize) -> isize {
     };
 
     let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-    let listen_ep = IpListenEndpoint {
-        addr: None,
-        port,
-    };
+    let listen_ep = IpListenEndpoint { addr: None, port };
     if let Err(e) = socket.listen(listen_ep) {
         warn!("[net] TCP listen failed: {:?}", e);
         return EINVAL;
@@ -639,11 +631,7 @@ pub fn sys_sendto(
 
             if is_loopback {
                 // Loopback: inject directly into target socket's rx buffer
-                let sender_port = stack
-                    .sockets
-                    .get_mut::<udp::Socket>(handle)
-                    .endpoint()
-                    .port;
+                let sender_port = stack.sockets.get_mut::<udp::Socket>(handle).endpoint().port;
                 let sender_meta = udp::UdpMetadata {
                     endpoint: IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), sender_port),
                     meta: Default::default(),

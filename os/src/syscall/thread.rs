@@ -1,11 +1,11 @@
-use arch::{TrapContext, TrapFrameArgs};
+use crate::trap::user_trap_entry;
 use crate::{
     mm::kernel_token,
     syscall::errno::{errno, EAGAIN, ECHILD},
-    task::{TaskControlBlock, add_task, current_process, current_task},
+    task::{add_task, current_process, current_task, TaskControlBlock},
 };
-use crate::trap::user_trap_entry;
 use alloc::sync::Arc;
+use arch::{TrapContext, TrapFrameArgs};
 
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     let task = current_task().unwrap();
@@ -48,12 +48,7 @@ pub fn sys_gettid() -> isize {
     let task = current_task().unwrap();
     let process = current_process();
     let process_pid = process.pid.0 as isize;
-    let tid = task
-        .inner_exclusive_access()
-        .res
-        .as_ref()
-        .unwrap()
-        .tid as isize;
+    let tid = task.inner_exclusive_access().res.as_ref().unwrap().tid as isize;
     if tid == 0 {
         process_pid
     } else {

@@ -62,10 +62,8 @@ fn probe_ext4_size() -> Option<i64> {
         return None;
     }
     let blocks_lo = u32::from_le_bytes([buf[0x04], buf[0x05], buf[0x06], buf[0x07]]) as u64;
-    let log_block_size =
-        u32::from_le_bytes([buf[0x18], buf[0x19], buf[0x1A], buf[0x1B]]) as u32;
-    let blocks_hi =
-        u32::from_le_bytes([buf[0x150], buf[0x151], buf[0x152], buf[0x153]]) as u64;
+    let log_block_size = u32::from_le_bytes([buf[0x18], buf[0x19], buf[0x1A], buf[0x1B]]) as u32;
+    let blocks_hi = u32::from_le_bytes([buf[0x150], buf[0x151], buf[0x152], buf[0x153]]) as u64;
     let blocks = blocks_lo | (blocks_hi << 32);
     if blocks == 0 {
         return None;

@@ -1,22 +1,28 @@
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
-use super::{PidHandle, SignalAction, SignalActions, SignalFlags, TaskControlBlock, TlsArea, add_task, pid_alloc};
-use crate::config::USER_STACK_SIZE;
+use super::{
+    add_task, pid_alloc, PidHandle, SignalAction, SignalActions, SignalFlags, TaskControlBlock,
+    TlsArea,
+};
 #[cfg(target_arch = "loongarch64")]
 use crate::config::USER_MMAP_TOP;
+use crate::config::USER_STACK_SIZE;
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{KERNEL_SPACE, MemorySet, translated_byte_buffer, translated_ref, translated_refmut, translated_str};
+use crate::mm::{
+    translated_byte_buffer, translated_ref, translated_refmut, translated_str, MemorySet,
+    KERNEL_SPACE,
+};
+use crate::sync::UPIntrRefMut;
 use crate::sync::{Condvar, Mutex, Semaphore, UPIntrFreeCell};
-use arch::{TrapContext, TrapFrameArgs};
 use crate::trap::user_trap_entry;
-use xmas_elf::ElfFile;
-use xmas_elf::sections::{SectionData, ShType};
-use xmas_elf::symbol_table::Entry;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use crate::sync::UPIntrRefMut;
+use arch::{TrapContext, TrapFrameArgs};
+use xmas_elf::sections::{SectionData, ShType};
+use xmas_elf::symbol_table::Entry;
+use xmas_elf::ElfFile;
 
 #[allow(unused)]
 const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
@@ -42,13 +48,10 @@ pub struct IntervalTimerState {
 }
 
 fn default_rlimits() -> [RLimit; RLIMIT_NLIMITS] {
-    let mut limits = [
-        RLimit {
-            rlim_cur: RLIM_INFINITY,
-            rlim_max: RLIM_INFINITY,
-        };
-        RLIMIT_NLIMITS
-    ];
+    let mut limits = [RLimit {
+        rlim_cur: RLIM_INFINITY,
+        rlim_max: RLIM_INFINITY,
+    }; RLIMIT_NLIMITS];
     let stack = USER_STACK_SIZE as u64;
     limits[RLIMIT_STACK] = RLimit {
         rlim_cur: stack,
@@ -195,12 +198,12 @@ impl ProcessControlBlock {
         } else {
             0
         };
-        let gp = find_global_pointer(elf_data).map(|v| v + load_base).unwrap_or(0);
+        let gp = find_global_pointer(elf_data)
+            .map(|v| v + load_base)
+            .unwrap_or(0);
 
         // Initialize TLS if PT_TLS segment exists
-        let tls_area = tls_info.map(|info| {
-            TlsArea::new(&info, &mut memory_set, elf_data)
-        });
+        let tls_area = tls_info.map(|info| TlsArea::new(&info, &mut memory_set, elf_data));
         #[cfg(target_arch = "loongarch64")]
         let minimal_tcb = if tls_area.is_none() {
             Some(Self::alloc_minimal_tcb(&mut memory_set))
@@ -245,7 +248,11 @@ impl ProcessControlBlock {
                 })
             },
         });
-        let task = Arc::new(TaskControlBlock::new(Arc::clone(&process), ustack_base, false));
+        let task = Arc::new(TaskControlBlock::new(
+            Arc::clone(&process),
+            ustack_base,
+            false,
+        ));
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         let ustack_top = user_stack_top;
@@ -313,17 +320,55 @@ impl ProcessControlBlock {
     ) {
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
         let exec_name = self.inner_exclusive_access().name.clone();
-        debug!("[kernel] exec: process name={} argc={}", exec_name, args.len());
-        let (mut memory_set, heap_bottom, user_stack_top, main_entry, tls_info, auxv_info, interp_base, interp_entry) =
-            if let Some(interp_data) = interp_data {
-                let (memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info, interp_base, interp_entry) =
-                    MemorySet::from_elf_with_interp(elf_data, interp_data);
-                (memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info, Some(interp_base), Some(interp_entry))
-            } else {
-                let (memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info) =
-                    MemorySet::from_elf(elf_data);
-                (memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info, None, None)
-            };
+        debug!(
+            "[kernel] exec: process name={} argc={}",
+            exec_name,
+            args.len()
+        );
+        let (
+            mut memory_set,
+            heap_bottom,
+            user_stack_top,
+            main_entry,
+            tls_info,
+            auxv_info,
+            interp_base,
+            interp_entry,
+        ) = if let Some(interp_data) = interp_data {
+            let (
+                memory_set,
+                heap_bottom,
+                user_stack_top,
+                entry_point,
+                tls_info,
+                auxv_info,
+                interp_base,
+                interp_entry,
+            ) = MemorySet::from_elf_with_interp(elf_data, interp_data);
+            (
+                memory_set,
+                heap_bottom,
+                user_stack_top,
+                entry_point,
+                tls_info,
+                auxv_info,
+                Some(interp_base),
+                Some(interp_entry),
+            )
+        } else {
+            let (memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info) =
+                MemorySet::from_elf(elf_data);
+            (
+                memory_set,
+                heap_bottom,
+                user_stack_top,
+                entry_point,
+                tls_info,
+                auxv_info,
+                None,
+                None,
+            )
+        };
         let entry_point = interp_entry.unwrap_or(main_entry);
         let load_base = if let Ok(elf) = ElfFile::new(elf_data) {
             main_entry.saturating_sub(elf.header.pt2.entry_point() as usize)
@@ -340,7 +385,9 @@ impl ProcessControlBlock {
                 0
             }
         } else {
-            find_global_pointer(elf_data).map(|v| v + load_base).unwrap_or(0)
+            find_global_pointer(elf_data)
+                .map(|v| v + load_base)
+                .unwrap_or(0)
         };
         debug!(
             "[kernel] exec: entry={:#x} heap_bottom={:#x} user_stack_top={:#x} auxv_phdr={:#x} auxv_entry={:#x}",
@@ -352,9 +399,7 @@ impl ProcessControlBlock {
         );
 
         // Initialize TLS if PT_TLS segment exists
-        let tls_area = tls_info.map(|info| {
-            TlsArea::new(&info, &mut memory_set, elf_data)
-        });
+        let tls_area = tls_info.map(|info| TlsArea::new(&info, &mut memory_set, elf_data));
 
         #[cfg(target_arch = "loongarch64")]
         let minimal_tcb = if tls_area.is_none() {
@@ -495,7 +540,10 @@ impl ProcessControlBlock {
         };
         if let Some(base) = interp_base {
             let at_base = crate::task::auxv::auxv_type::AT_BASE;
-            if let Some(pos) = auxv_entries.iter().position(|(k, _)| *k == crate::task::auxv::auxv_type::AT_NULL) {
+            if let Some(pos) = auxv_entries
+                .iter()
+                .position(|(k, _)| *k == crate::task::auxv::auxv_type::AT_NULL)
+            {
                 auxv_entries.insert(pos, (at_base, base));
             } else {
                 auxv_entries.push((at_base, base));
@@ -531,7 +579,7 @@ impl ProcessControlBlock {
             *translated_refmut(new_token, current_sp as *mut usize) = *addr;
             current_sp += word_size;
         }
-        *translated_refmut(new_token, current_sp as *mut usize) = 0;  // argv NULL terminator
+        *translated_refmut(new_token, current_sp as *mut usize) = 0; // argv NULL terminator
         current_sp += word_size;
 
         // Write envp pointers
@@ -540,14 +588,18 @@ impl ProcessControlBlock {
             *translated_refmut(new_token, current_sp as *mut usize) = *addr;
             current_sp += word_size;
         }
-        *translated_refmut(new_token, current_sp as *mut usize) = 0;  // envp NULL terminator
+        *translated_refmut(new_token, current_sp as *mut usize) = 0; // envp NULL terminator
         current_sp += word_size;
 
         // Write auxv entries immediately after envp NULL terminator.
         let auxv_base = current_sp;
         for (i, (aux_type, aux_val)) in auxv_entries.iter().enumerate() {
-            *translated_refmut(new_token, (auxv_base + i * 2 * word_size) as *mut usize) = *aux_type;
-            *translated_refmut(new_token, (auxv_base + i * 2 * word_size + word_size) as *mut usize) = *aux_val;
+            *translated_refmut(new_token, (auxv_base + i * 2 * word_size) as *mut usize) =
+                *aux_type;
+            *translated_refmut(
+                new_token,
+                (auxv_base + i * 2 * word_size + word_size) as *mut usize,
+            ) = *aux_val;
         }
 
         let argc_mem = *translated_ref(new_token, user_sp as *const usize);
@@ -563,32 +615,31 @@ impl ProcessControlBlock {
             };
             debug!(
                 "[kernel] exec: argv0_str={} argv1_str={} argc={}",
-                argv0_str,
-                argv1_str,
-                argc
+                argv0_str, argv1_str, argc
             );
         }
         info!(
             "[kernel] exec: sp={:#x}, argc={}, argv_base={:#x}, envp_base={:#x}",
-            user_sp,
-            argc,
-            argv_base,
-            envp_base
+            user_sp, argc, argv_base, envp_base
         );
-        info!("[kernel] exec: auxv_base={:#x}, auxv_entries={}", auxv_base, auxv_entries.len());
+        info!(
+            "[kernel] exec: auxv_base={:#x}, auxv_entries={}",
+            auxv_base,
+            auxv_entries.len()
+        );
         info!(
             "[kernel] exec: argc@sp={} argv0@argv_base={:#x} envp0@envp_base={:#x}",
-            argc_mem,
-            argv0_mem,
-            envp0_mem
+            argc_mem, argv0_mem, envp0_mem
         );
-        info!("[kernel] exec: argv[0]={:#x}, argv[1]={:#x}",
+        info!(
+            "[kernel] exec: argv[0]={:#x}, argv[1]={:#x}",
             if argc > 0 { arg_addrs[0] } else { 0 },
-            if argc > 1 { arg_addrs[1] } else { 0 });
+            if argc > 1 { arg_addrs[1] } else { 0 }
+        );
 
         let mut trap_cx = TrapContext::app_init_context(
             entry_point,
-            user_sp,  // sp should point to argc
+            user_sp, // sp should point to argc
             KERNEL_SPACE.exclusive_access().token(),
             task.kstack.get_top(),
             user_trap_entry as usize,
@@ -671,9 +722,7 @@ impl ProcessControlBlock {
             .unwrap()
             .ustack_base;
         // 获取父线程的 signal_mask，用于子进程继承
-        let parent_signal_mask = parent.get_task(0)
-            .inner_exclusive_access()
-            .signal_mask;
+        let parent_signal_mask = parent.get_task(0).inner_exclusive_access().signal_mask;
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&child),
             ustack_base,

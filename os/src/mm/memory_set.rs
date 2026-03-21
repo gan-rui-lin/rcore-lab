@@ -3,10 +3,10 @@ use super::{frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
-#[allow(unused_imports)]
-use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 #[cfg(target_arch = "loongarch64")]
 use crate::config::USER_STACK_TOP;
+#[allow(unused_imports)]
+use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 use crate::sync::UPIntrFreeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -53,6 +53,15 @@ pub struct MemorySet {
     areas: Vec<MapArea>,
 }
 
+/// Result classification for `mprotect()`-style permission changes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ProtectError {
+    /// The requested range is not fully mapped.
+    Unmapped,
+    /// The underlying mapping does not permit the requested access.
+    AccessDenied,
+}
+
 impl MemorySet {
     /// Create a new empty `MemorySet`.
     pub fn new_bare() -> Self {
@@ -89,6 +98,21 @@ impl MemorySet {
             None,
         );
     }
+    /// Insert a user mmap region with bookkeeping metadata.
+    pub fn insert_mmap_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+        meta: MmapMeta,
+    ) {
+        let area = MapArea::new(start_va, end_va, MapType::Framed, permission).with_mmap_meta(meta);
+        if meta.shared {
+            self.push(area.with_shared_frames(), None);
+        } else {
+            self.push(area, None);
+        }
+    }
     /// remove a area
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some((idx, area)) = self
@@ -99,6 +123,53 @@ impl MemorySet {
         {
             area.unmap(&mut self.page_table);
             self.areas.remove(idx);
+        }
+    }
+    /// Unmap a user range `[start, end)`, keeping unaffected portions intact.
+    pub fn unmap_range(&mut self, start: VirtAddr, end: VirtAddr) {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        if start_vpn >= end_vpn {
+            return;
+        }
+        let mut idx = 0usize;
+        while idx < self.areas.len() {
+            let area_start = self.areas[idx].vpn_range.get_start();
+            let area_end = self.areas[idx].vpn_range.get_end();
+            if area_end <= start_vpn || area_start >= end_vpn {
+                idx += 1;
+                continue;
+            }
+            let overlap_start = area_start.max(start_vpn);
+            let overlap_end = area_end.min(end_vpn);
+            if overlap_start == area_start && overlap_end == area_end {
+                self.areas[idx].unmap(&mut self.page_table);
+                self.areas.remove(idx);
+                continue;
+            }
+            if overlap_start == area_start {
+                let right = {
+                    let area = &mut self.areas[idx];
+                    area.split_off(overlap_end)
+                };
+                self.areas[idx].unmap(&mut self.page_table);
+                self.areas[idx] = right;
+                idx += 1;
+                continue;
+            }
+            if overlap_end == area_end {
+                self.areas[idx].shrink_to(&mut self.page_table, overlap_start);
+                idx += 1;
+                continue;
+            }
+            let right = {
+                let area = &mut self.areas[idx];
+                let right = area.split_off(overlap_end);
+                area.shrink_to(&mut self.page_table, overlap_start);
+                right
+            };
+            self.areas.insert(idx + 1, right);
+            idx += 2;
         }
     }
     /// Add a new MapArea into this MemorySet.
@@ -223,7 +294,10 @@ impl MemorySet {
                 if interp_end < elf_data.len() {
                     let interp_bytes = &elf_data[interp_start..interp_end];
                     if let Ok(interp_str) = core::str::from_utf8(interp_bytes) {
-                        info!("[ELF] Found PT_INTERP: {}", interp_str.trim_end_matches('\0'));
+                        info!(
+                            "[ELF] Found PT_INTERP: {}",
+                            interp_str.trim_end_matches('\0')
+                        );
                     }
                 }
             } else if ph_type == xmas_elf::program::Type::Load {
@@ -280,10 +354,7 @@ impl MemorySet {
         max_end_vpn
     }
 
-    fn scan_tls_info(
-        elf: &xmas_elf::ElfFile,
-        load_base: usize,
-    ) -> Option<crate::task::TlsInfo> {
+    fn scan_tls_info(elf: &xmas_elf::ElfFile, load_base: usize) -> Option<crate::task::TlsInfo> {
         let ph_count = elf.header.pt2.ph_count();
         let mut tls_info = None;
         info!("[ELF] Scanning {} program headers for PT_TLS", ph_count);
@@ -319,10 +390,7 @@ impl MemorySet {
         tls_info
     }
 
-    fn prepare_auxv_info(
-        elf: &xmas_elf::ElfFile,
-        load_base: usize,
-    ) -> crate::task::AuxvInfo {
+    fn prepare_auxv_info(elf: &xmas_elf::ElfFile, load_base: usize) -> crate::task::AuxvInfo {
         let elf_header = elf.header;
         let ph_count = elf_header.pt2.ph_count();
         let phdr_addr = if ph_count > 0 {
@@ -358,10 +426,7 @@ impl MemorySet {
         }
         info!(
             "[ELF] Auxv: phdr={:#x}, phent={}, phnum={}, entry={:#x}",
-            auxv_info.phdr_addr,
-            auxv_info.phent_size,
-            auxv_info.phnum,
-            auxv_info.entry
+            auxv_info.phdr_addr, auxv_info.phent_size, auxv_info.phnum, auxv_info.entry
         );
         if let Some(first_load) = (0..ph_count)
             .filter_map(|i| elf.program_header(i).ok())
@@ -415,9 +480,8 @@ impl MemorySet {
                 tramp_page,
                 tramp_addr & (PAGE_SIZE - 1)
             );
-            let tramp_bytes = unsafe {
-                core::slice::from_raw_parts(tramp_page as *const u8, PAGE_SIZE)
-            };
+            let tramp_bytes =
+                unsafe { core::slice::from_raw_parts(tramp_page as *const u8, PAGE_SIZE) };
             memory_set.push(
                 MapArea::new(
                     tramp_base.into(),
@@ -428,7 +492,10 @@ impl MemorySet {
                 Some(tramp_bytes),
             );
         }
-        if let Some(pte) = memory_set.page_table.translate(VirtAddr::from(user_stack_bottom).floor()) {
+        if let Some(pte) = memory_set
+            .page_table
+            .translate(VirtAddr::from(user_stack_bottom).floor())
+        {
             trace!(
                 "[stack_map] bottom={:#x} top={:#x} pte_bits={:#x}",
                 user_stack_bottom,
@@ -466,7 +533,7 @@ impl MemorySet {
     /// also returns heap_bottom, user_sp_base, entry point, TLS info (if present), and auxv info.
     /// 不处理解释器，只加载主程序 ELF
     pub fn from_elf(
-        elf_data: &[u8]
+        elf_data: &[u8],
     ) -> (
         Self,
         usize,
@@ -498,10 +565,7 @@ impl MemorySet {
         };
         info!(
             "[ELF] type={:?} has_interp={} min_load_vaddr={:#x} load_base={:#x}",
-            elf_type,
-            has_interp,
-            min_load_vaddr,
-            load_base
+            elf_type, has_interp, min_load_vaddr, load_base
         );
         let max_end_vpn = Self::map_load_segments(&mut memory_set, &elf, load_base);
 
@@ -560,10 +624,7 @@ impl MemorySet {
         };
         info!(
             "[ELF] type={:?} has_interp={} min_load_vaddr={:#x} load_base={:#x}",
-            elf_type,
-            has_interp,
-            min_load_vaddr,
-            load_base
+            elf_type, has_interp, min_load_vaddr, load_base
         );
 
         let mut max_end_vpn = Self::map_load_segments(&mut memory_set, &elf, load_base);
@@ -663,17 +724,11 @@ impl MemorySet {
                 dst_ppn
                     .get_bytes_array()
                     .copy_from_slice(src_ppn.get_bytes_array());
-                memory_set
-                    .page_table
-                    .change_pte_flags(vpn, src_pte.flags());
+                memory_set.page_table.change_pte_flags(vpn, src_pte.flags());
                 pages_copied += 1;
                 if (pages_copied & 0x3ff) == 0 {
                     debug!("[kernel] area {} copied {} pages", idx, pages_copied);
-                    trace!(
-                        "memory_set: area {} copied {} pages",
-                        idx,
-                        pages_copied
-                    );
+                    trace!("memory_set: area {} copied {} pages", idx, pages_copied);
                 }
             }
             debug!("[kernel] clone area {} done ({} pages)", idx, pages_copied);
@@ -786,68 +841,100 @@ impl MemorySet {
         start: VirtAddr,
         end: VirtAddr,
         new_perm: MapPermission,
-    ) -> bool {
+    ) -> Result<(), ProtectError> {
         let start_vpn = start.floor();
         let end_vpn = end.ceil();
+        if start_vpn >= end_vpn {
+            return Ok(());
+        }
 
-        // Find overlapping areas and change their permissions
-        let mut success = false;
-        for area in self.areas.iter_mut() {
+        let mut cursor = start_vpn;
+        while cursor < end_vpn {
+            let mut next_end: Option<VirtPageNum> = None;
+            for area in self.areas.iter() {
+                let area_start = area.vpn_range.get_start();
+                let area_end = area.vpn_range.get_end();
+                if area_start <= cursor && area_end > cursor {
+                    next_end = Some(match next_end {
+                        Some(cur_end) => cur_end.max(area_end),
+                        None => area_end,
+                    });
+                }
+            }
+            let Some(covered_end) = next_end else {
+                return Err(ProtectError::Unmapped);
+            };
+            cursor = covered_end.min(end_vpn);
+        }
+
+        for area in self.areas.iter() {
             let area_start = area.vpn_range.get_start();
             let area_end = area.vpn_range.get_end();
-
-            // Check if this area overlaps with the requested range
             if area_start < end_vpn && area_end > start_vpn {
-                // Calculate the actual range to modify within this area
-                let modify_start = area_start.max(start_vpn);
-                let modify_end = area_end.min(end_vpn);
-                let area_start_addr: usize = VirtAddr::from(area_start).into();
-                let area_end_addr: usize = VirtAddr::from(area_end).into();
-                let modify_start_addr: usize = VirtAddr::from(modify_start).into();
-                let modify_end_addr: usize = VirtAddr::from(modify_end).into();
-
-                // Convert MapPermission to PTEFlags
-                let mut flags = PTEFlags::V;
-                if new_perm.contains(MapPermission::R) {
-                    flags |= PTEFlags::R;
+                if let Some(meta) = area.mmap_meta {
+                    if meta.file_backed
+                        && meta.shared
+                        && new_perm.contains(MapPermission::W)
+                        && !meta.file_writable
+                    {
+                        return Err(ProtectError::AccessDenied);
+                    }
                 }
-                if new_perm.contains(MapPermission::W) {
-                    flags |= PTEFlags::W;
-                }
-                if new_perm.contains(MapPermission::X) {
-                    flags |= PTEFlags::X;
-                }
-                if new_perm.contains(MapPermission::U) {
-                    flags |= PTEFlags::U;
-                }
-
-                // Update page table entries for this range
-                for vpn in VPNRange::new(modify_start, modify_end) {
-                    self.page_table.change_pte_flags(vpn, flags);
-                }
-
-                if let Some(pte) = self.page_table.translate(modify_start) {
-                    trace!(
-                        "[mprotect] area={:#x}-{:#x} modify={:#x}-{:#x} perm_bits={:#x} pte_bits={:#x}",
-                        area_start_addr,
-                        area_end_addr,
-                        modify_start_addr,
-                        modify_end_addr,
-                        new_perm.bits,
-                        pte.bits
-                    );
-                }
-
-                // If the entire area is being modified, update the area's permission
-                if modify_start == area_start && modify_end == area_end {
-                    area.map_perm = new_perm;
-                }
-
-                success = true;
             }
         }
 
-        success
+        let mut idx = 0usize;
+        while idx < self.areas.len() {
+            let area_start = self.areas[idx].vpn_range.get_start();
+            let area_end = self.areas[idx].vpn_range.get_end();
+            if area_end <= start_vpn || area_start >= end_vpn {
+                idx += 1;
+                continue;
+            }
+
+            let modify_start = area_start.max(start_vpn);
+            let modify_end = area_end.min(end_vpn);
+            if modify_start == area_start && modify_end == area_end {
+                self.areas[idx].apply_perm(&mut self.page_table, new_perm);
+                idx += 1;
+                continue;
+            }
+
+            if modify_start == area_start {
+                let right = {
+                    let area = &mut self.areas[idx];
+                    area.split_off(modify_end)
+                };
+                self.areas[idx].apply_perm(&mut self.page_table, new_perm);
+                self.areas.insert(idx + 1, right);
+                idx += 2;
+                continue;
+            }
+
+            if modify_end == area_end {
+                let mut middle = {
+                    let area = &mut self.areas[idx];
+                    area.split_off(modify_start)
+                };
+                middle.apply_perm(&mut self.page_table, new_perm);
+                self.areas.insert(idx + 1, middle);
+                idx += 2;
+                continue;
+            }
+
+            let (mut middle, right) = {
+                let area = &mut self.areas[idx];
+                let mut middle = area.split_off(modify_start);
+                let right = middle.split_off(modify_end);
+                (middle, right)
+            };
+            middle.apply_perm(&mut self.page_table, new_perm);
+            self.areas.insert(idx + 1, middle);
+            self.areas.insert(idx + 2, right);
+            idx += 3;
+        }
+
+        Ok(())
     }
 }
 /// map area structure, controls a contiguous piece of virtual memory
@@ -858,6 +945,7 @@ pub struct MapArea {
     map_type: MapType,
     map_perm: MapPermission,
     shared_frames: bool,
+    mmap_meta: Option<MmapMeta>,
 }
 
 impl MapArea {
@@ -876,6 +964,7 @@ impl MapArea {
             map_type,
             map_perm,
             shared_frames: false,
+            mmap_meta: None,
         }
     }
     pub fn from_another(another: &Self) -> Self {
@@ -886,14 +975,58 @@ impl MapArea {
             map_type: another.map_type,
             map_perm: another.map_perm,
             shared_frames: another.shared_frames,
+            mmap_meta: another.mmap_meta,
         }
     }
     fn with_shared_frames(mut self) -> Self {
         self.shared_frames = true;
         self
     }
+    fn with_mmap_meta(mut self, meta: MmapMeta) -> Self {
+        self.mmap_meta = Some(meta);
+        self
+    }
     fn shares_frames(&self) -> bool {
         self.shared_frames
+    }
+    fn split_off(&mut self, split_vpn: VirtPageNum) -> Self {
+        let start_vpn = self.vpn_range.get_start();
+        let end_vpn = self.vpn_range.get_end();
+        assert!(split_vpn >= start_vpn && split_vpn <= end_vpn);
+        let data_frames = if self.map_type == MapType::Framed {
+            self.data_frames.split_off(&split_vpn)
+        } else {
+            BTreeMap::new()
+        };
+        let new_area = Self {
+            start_va: VirtAddr::from(split_vpn),
+            vpn_range: VPNRange::new(split_vpn, end_vpn),
+            data_frames,
+            map_type: self.map_type,
+            map_perm: self.map_perm,
+            shared_frames: self.shared_frames,
+            mmap_meta: self.mmap_meta,
+        };
+        self.vpn_range = VPNRange::new(start_vpn, split_vpn);
+        new_area
+    }
+    fn apply_perm(&mut self, page_table: &mut PageTable, new_perm: MapPermission) {
+        let flags = map_perm_to_pte_flags(new_perm);
+        for vpn in self.vpn_range {
+            page_table.change_pte_flags(vpn, flags);
+        }
+        self.map_perm = new_perm;
+        if let Some(pte) = page_table.translate(self.vpn_range.get_start()) {
+            let area_start_addr: usize = VirtAddr::from(self.vpn_range.get_start()).into();
+            let area_end_addr: usize = VirtAddr::from(self.vpn_range.get_end()).into();
+            trace!(
+                "[mprotect] area={:#x}-{:#x} perm_bits={:#x} pte_bits={:#x}",
+                area_start_addr,
+                area_end_addr,
+                new_perm.bits,
+                pte.bits
+            );
+        }
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
@@ -944,7 +1077,7 @@ impl MapArea {
         if self.map_type == MapType::Framed {
             self.data_frames.remove(&vpn);
         }
-        page_table.unmap(vpn);
+        let _ = page_table.unmap(vpn);
     }
     pub fn map(&mut self, page_table: &mut PageTable) {
         for (_i, vpn) in self.vpn_range.into_iter().enumerate() {
@@ -954,8 +1087,7 @@ impl MapArea {
                 if let Some(pte) = page_table.translate(vpn) {
                     info!(
                         "[ELF] map_one first vpn: vpn={:#x} pte_bits={:#x}",
-                        vpn.0,
-                        pte.bits
+                        vpn.0, pte.bits
                     );
                 } else {
                     info!("[ELF] map_one first vpn: vpn={:#x} pte=None", vpn.0);
@@ -1029,6 +1161,34 @@ impl MapArea {
             first_page = false;
         }
     }
+}
+
+/// Minimal mmap provenance used by `mprotect()` compatibility checks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MmapMeta {
+    /// Whether the mapping was created with `MAP_SHARED`.
+    pub shared: bool,
+    /// Whether the mapping is backed by a file instead of anonymous memory.
+    pub file_backed: bool,
+    /// Whether the originating file descriptor allowed writes.
+    pub file_writable: bool,
+}
+
+fn map_perm_to_pte_flags(map_perm: MapPermission) -> PTEFlags {
+    let mut flags = PTEFlags::V;
+    if map_perm.contains(MapPermission::R) {
+        flags |= PTEFlags::R;
+    }
+    if map_perm.contains(MapPermission::W) {
+        flags |= PTEFlags::W;
+    }
+    if map_perm.contains(MapPermission::X) {
+        flags |= PTEFlags::X;
+    }
+    if map_perm.contains(MapPermission::U) {
+        flags |= PTEFlags::U;
+    }
+    flags
 }
 
 #[cfg_attr(target_arch = "loongarch64", allow(dead_code))]

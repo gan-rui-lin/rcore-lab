@@ -116,7 +116,11 @@ impl File for SocketFile {
     }
 
     fn fd_flags(&self) -> u32 {
-        if self.cloexec { 1 } else { 0 } // FD_CLOEXEC = 1
+        if self.cloexec {
+            1
+        } else {
+            0
+        } // FD_CLOEXEC = 1
     }
 
     fn status_flags(&self) -> u32 {

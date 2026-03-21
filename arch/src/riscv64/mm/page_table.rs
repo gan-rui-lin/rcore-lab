@@ -186,10 +186,15 @@ impl PageTable {
 
     /// Unmap `vpn`.
     #[allow(unused)]
-    pub fn unmap(&mut self, vpn: VirtPageNum) {
-        let pte = self.find_pte(vpn).unwrap();
-        assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
+    pub fn unmap(&mut self, vpn: VirtPageNum) -> bool {
+        let Some(pte) = self.find_pte(vpn) else {
+            return false;
+        };
+        if !pte.is_valid() {
+            return false;
+        }
         *pte = PageTableEntry::empty();
+        true
     }
 
     /// Change the flags of an existing mapping.

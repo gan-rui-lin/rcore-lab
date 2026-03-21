@@ -33,7 +33,7 @@ pub trait File: Send + Sync {
     }
     /// poll the file for events, return the events bitflags
     /// default implementation returns POLLIN | POLLOUT, which means always readable and writable.
-    /// ! for files that are not always ready, e.g. pipes, this should be overridden to return the actual events. 
+    /// ! for files that are not always ready, e.g. pipes, this should be overridden to return the actual events.
     fn poll(&self, _events: PollEvents) -> PollEvents {
         PollEvents::POLLIN | PollEvents::POLLOUT
     }
@@ -161,7 +161,6 @@ impl OpenFlags {
     }
 }
 
-
 bitflags::bitflags! {
     /// Poll events for file polling.
     pub struct PollEvents: i16 {
@@ -180,6 +179,8 @@ bitflags::bitflags! {
     }
 }
 
+pub use pipe::make_pipe;
+pub use stdio::{DevNull, DevZero, Stdin, Stdout};
 #[cfg(feature = "ext4")]
 /// Mount ext4 as root with explicit device size.
 pub use vfs::mount_ext4;
@@ -190,8 +191,6 @@ pub use vfs::{
     create_dir, list_apps, mount_easyfs, mount_fat32, mount_fat32_auto, mount_procfs, open_file,
     path_exists, path_is_dir, remove_path,
 };
-pub use pipe::make_pipe;
-pub use stdio::{DevNull, DevZero, Stdin, Stdout};
 
 /// Create minimal /etc and /dev files used by BusyBox tests.
 pub fn ensure_basic_paths() {
@@ -204,10 +203,7 @@ pub fn ensure_basic_paths() {
     create_dir("/usr/bin");
     create_dir("/tmp");
 
-    write_file_if_missing(
-        "/etc/passwd",
-        "root:x:0:0:root:/root:/bin/sh\n",
-    );
+    write_file_if_missing("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n");
     write_file_if_missing("/etc/group", "root:x:0:\n");
     write_file_if_missing("/etc/localtime", "");
     write_file_if_missing("/etc/adjtime", "");
@@ -225,8 +221,10 @@ fn write_file_if_missing(path: &str, content: &str) {
     if path_exists(path) {
         return;
     }
-    let Some(file) = open_file(path, OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY)
-    else {
+    let Some(file) = open_file(
+        path,
+        OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY,
+    ) else {
         return;
     };
     let Some(inode) = file.inode() else {
@@ -258,7 +256,10 @@ fn ensure_hardlink(linkpath: &str, target: &str) {
     if rc == 0 {
         info!("ext4: created hardlink {} -> {}", linkpath, target);
     } else {
-        warn!("ext4: hardlink create failed {} -> {} rc={}", linkpath, target, rc);
+        warn!(
+            "ext4: hardlink create failed {} -> {} rc={}",
+            linkpath, target, rc
+        );
     }
 }
 
@@ -298,7 +299,10 @@ pub fn ensure_busybox_links() {
     } else if open_file(GLIBC_LOADER, OpenFlags::empty()).is_some() {
         ensure_hardlink("/lib/ld-linux-riscv64-lp64d.so.1", GLIBC_LOADER);
     } else {
-        error!("[ext4] missing loader at {} and {}", MUSL_LOADER, GLIBC_LOADER);
+        error!(
+            "[ext4] missing loader at {} and {}",
+            MUSL_LOADER, GLIBC_LOADER
+        );
     }
     if open_file("/bin/sh", OpenFlags::empty()).is_some() {
         debug!("[ext4] /bin/sh ready");

@@ -68,10 +68,7 @@ impl VirtIOPCIBlock {
         let mut blk_dev_fn = None;
         for (dev_fn, info) in pci_root.enumerate_bus(0) {
             if let Some(DeviceType::Block) = virtio_device_type(&info) {
-                info!(
-                    "[pci] Found VirtIO block device at {} : {}",
-                    dev_fn, info
-                );
+                info!("[pci] Found VirtIO block device at {} : {}", dev_fn, info);
                 blk_dev_fn = Some(dev_fn);
                 break;
             }
@@ -83,9 +80,7 @@ impl VirtIOPCIBlock {
         let mut allocator = PciRangeAllocator::new(VIRT_PCI_BASE, VIRT_PCI_SIZE);
         let mut bar_index = 0u8;
         while bar_index < 6 {
-            let bar_info = pci_root
-                .bar_info(dev_fn, bar_index)
-                .expect("pci bar_info");
+            let bar_info = pci_root.bar_info(dev_fn, bar_index).expect("pci bar_info");
             if let BarInfo::Memory {
                 address,
                 size,
@@ -94,9 +89,7 @@ impl VirtIOPCIBlock {
             } = bar_info
             {
                 if address == 0 && size != 0 {
-                    let addr = allocator
-                        .alloc(size as usize)
-                        .expect("pci bar alloc");
+                    let addr = allocator.alloc(size as usize).expect("pci bar alloc");
                     match address_type {
                         MemoryBarType::Width64 => {
                             pci_root.set_bar_64(dev_fn, bar_index, addr as u64)
@@ -126,8 +119,8 @@ impl VirtIOPCIBlock {
             PciTransport::new::<VirtioHal>(&mut pci_root, dev_fn).expect("PciTransport::new");
 
         // Create the block device driver.
-        let blk = VirtIOBlk::<VirtioHal, PciTransport>::new(transport)
-            .expect("VirtIOBlk::new over PCI");
+        let blk =
+            VirtIOBlk::<VirtioHal, PciTransport>::new(transport).expect("VirtIOBlk::new over PCI");
 
         info!(
             "[pci] VirtIO block device ready: capacity = {} sectors",

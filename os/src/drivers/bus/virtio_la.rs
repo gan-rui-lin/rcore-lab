@@ -5,14 +5,12 @@
 //! Mapping Window) to access physical memory / MMIO, so the phys-to-virt
 //! mapping is a simple offset.
 
-use crate::mm::{
-    frame_alloc_more, frame_dealloc, FrameTracker, PhysAddr, PhysPageNum,
-};
+use crate::mm::{frame_alloc_more, frame_dealloc, FrameTracker, PhysAddr, PhysPageNum};
 use crate::sync::UPIntrFreeCell;
 use alloc::vec::Vec;
+use arch::VIRT_ADDR_START;
 use core::ptr::NonNull;
 use lazy_static::*;
-use arch::VIRT_ADDR_START;
 use virtio_drivers_new::{BufferDirection, Hal, PhysAddr as VirtioPhysAddr, PAGE_SIZE};
 
 lazy_static! {
@@ -67,11 +65,7 @@ unsafe impl Hal for VirtioHal {
         }
     }
 
-    unsafe fn unshare(
-        _paddr: VirtioPhysAddr,
-        _buffer: NonNull<[u8]>,
-        _direction: BufferDirection,
-    ) {
+    unsafe fn unshare(_paddr: VirtioPhysAddr, _buffer: NonNull<[u8]>, _direction: BufferDirection) {
         // No-op: identity mapping, no bounce buffers needed.
     }
 }

@@ -324,7 +324,10 @@ pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
         ProcFileInode::new(|| String::from("32768\n")),
     );
     let mut sys_entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
-    sys_entries.insert(String::from("kernel"), ProcStaticDirInode::new(kernel_entries));
+    sys_entries.insert(
+        String::from("kernel"),
+        ProcStaticDirInode::new(kernel_entries),
+    );
     entries.insert(String::from("mounts"), ProcFileInode::new(proc_mounts));
     entries.insert(String::from("meminfo"), ProcFileInode::new(proc_meminfo));
     entries.insert(String::from("stat"), ProcFileInode::new(proc_stat));

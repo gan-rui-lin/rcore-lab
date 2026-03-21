@@ -1,13 +1,13 @@
+use super::super::core::{VfsInode, VfsNodeKind};
 use super::disk::Fat32IoError;
 use super::fs::Fat32Fs;
 use crate::sync::UPIntrFreeCell;
-use super::super::core::{VfsInode, VfsNodeKind};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use fatfs::{Dir, Error, File, LossyOemCpConverter, SeekFrom};
 use fatfs::{DefaultTimeProvider, Read, Seek, Write};
+use fatfs::{Dir, Error, File, LossyOemCpConverter, SeekFrom};
 
 pub struct Fat32Inode {
     path: String,

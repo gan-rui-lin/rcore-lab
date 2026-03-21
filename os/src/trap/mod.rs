@@ -7,28 +7,28 @@
 #![allow(missing_docs)]
 #![allow(unused_imports)]
 
+use crate::config::PAGE_SIZE;
+use crate::mm::{PageTable, VirtAddr};
 use crate::syscall::syscall;
 use crate::task::{
     current_add_signal, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
     current_user_token, handle_signals, process_interval_timers, suspend_current_and_run_next,
     SignalFlags,
 };
-use crate::mm::{PageTable, VirtAddr};
-use crate::config::PAGE_SIZE;
 use crate::timer::{check_timer, set_next_trigger};
+use alloc::string::String;
 use arch::TrapFrameArgs;
 use core::sync::atomic::{AtomicU64, Ordering};
-use alloc::string::String;
 
 #[cfg(target_arch = "riscv64")]
 use crate::fs::{open_file, OpenFlags};
 #[cfg(target_arch = "riscv64")]
 use xmas_elf::ElfFile;
 
-#[cfg(target_arch = "riscv64")]
-pub use trap_handler as user_trap_entry;
 #[cfg(target_arch = "loongarch64")]
 pub use task_entry as user_trap_entry;
+#[cfg(target_arch = "riscv64")]
+pub use trap_handler as user_trap_entry;
 
 const TIMER_SAMPLE_INTERVAL: u64 = 200;
 static TIMER_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -156,7 +156,9 @@ pub fn trap_handler() -> ! {
             let mut cx = current_trap_cx();
             cx.sepc += 4;
             // Enable S-mode interrupts during syscall processing
-            unsafe { riscv::register::sstatus::set_sie(); }
+            unsafe {
+                riscv::register::sstatus::set_sie();
+            }
             let result = syscall(cx[TrapFrameArgs::SYSCALL], cx.args());
             cx = current_trap_cx();
             cx[TrapFrameArgs::RET] = result as usize;
@@ -257,11 +259,12 @@ pub fn trap_handler() -> ! {
                                 break;
                             }
                         }
-                        let load_base = if elf_type == xmas_elf::header::Type::SharedObject && !has_interp {
-                            0x4000_0000usize
-                        } else {
-                            0
-                        };
+                        let load_base =
+                            if elf_type == xmas_elf::header::Type::SharedObject && !has_interp {
+                                0x4000_0000usize
+                            } else {
+                                0
+                            };
                         let mut found = false;
                         for i in 0..ph_count {
                             let ph = elf.program_header(i).unwrap();
@@ -274,7 +277,8 @@ pub fn trap_handler() -> ! {
                                 continue;
                             }
                             let filesz = ph.file_size() as usize;
-                            let file_off = ph.offset() as usize + trap_cx.sepc.saturating_sub(vaddr);
+                            let file_off =
+                                ph.offset() as usize + trap_cx.sepc.saturating_sub(vaddr);
                             let end = (file_off + 8).min(data.len());
                             if file_off < end && file_off < ph.offset() as usize + filesz {
                                 error!("  file bytes @sepc={:02x?}", &data[file_off..end]);
@@ -342,11 +346,12 @@ pub fn trap_handler() -> ! {
                                 break;
                             }
                         }
-                        let load_base = if elf_type == xmas_elf::header::Type::SharedObject && !has_interp {
-                            0x4000_0000usize
-                        } else {
-                            0
-                        };
+                        let load_base =
+                            if elf_type == xmas_elf::header::Type::SharedObject && !has_interp {
+                                0x4000_0000usize
+                            } else {
+                                0
+                            };
                         let mut found = false;
                         for i in 0..ph_count {
                             let ph = elf.program_header(i).unwrap();
@@ -359,7 +364,8 @@ pub fn trap_handler() -> ! {
                                 continue;
                             }
                             let filesz = ph.file_size() as usize;
-                            let file_off = ph.offset() as usize + trap_cx.sepc.saturating_sub(vaddr);
+                            let file_off =
+                                ph.offset() as usize + trap_cx.sepc.saturating_sub(vaddr);
                             let end = (file_off + 8).min(data.len());
                             if file_off < end && file_off < ph.offset() as usize + filesz {
                                 error!("  file bytes @sepc={:02x?}", &data[file_off..end]);
@@ -396,10 +402,7 @@ pub fn trap_handler() -> ! {
                     let tp = task_inner.get_trap_cx()[TrapFrameArgs::TLS];
                     info!(
                         "[trap-timer] pid={} tid={} sig33 pending tp={:#x} mask={:?}",
-                        pid,
-                        tid,
-                        tp,
-                        task_inner.signal_mask
+                        pid, tid, tp, task_inner.signal_mask
                     );
                 }
             }
@@ -449,10 +452,7 @@ pub fn trap_handler() -> ! {
             let tp = task_inner.get_trap_cx()[TrapFrameArgs::TLS];
             info!(
                 "[trap] pid={} tid={} sig33 pending tp={:#x} mask={:?}",
-                pid,
-                tid,
-                tp,
-                task_inner.signal_mask
+                pid, tid, tp, task_inner.signal_mask
             );
         }
     }
@@ -548,11 +548,7 @@ pub fn task_entry() {
                 let args = trap_cx.args();
                 error!(
                     "[kernel] trap_handler: page fault addr={:#x} pid={} tid={} name={} sepc={:#x}",
-                    addr,
-                    pid,
-                    tid,
-                    name,
-                    trap_cx.sepc
+                    addr, pid, tid, name, trap_cx.sepc
                 );
                 error!(
                     "[kernel] trap_handler: ra={:#x} sp={:#x} tp={:#x} syscall={:#x} args={:x?}",
@@ -577,7 +573,10 @@ pub fn task_entry() {
                             bytes
                         );
                     } else {
-                        error!("[kernel] trap_handler: fault pte invalid flags={:?}", pte.flags());
+                        error!(
+                            "[kernel] trap_handler: fault pte invalid flags={:?}",
+                            pte.flags()
+                        );
                     }
                 } else {
                     error!("[kernel] trap_handler: fault pte unmapped");
@@ -595,7 +594,10 @@ pub fn task_entry() {
                             bytes
                         );
                     } else {
-                        error!("[kernel] trap_handler: sepc pte invalid flags={:?}", pte.flags());
+                        error!(
+                            "[kernel] trap_handler: sepc pte invalid flags={:?}",
+                            pte.flags()
+                        );
                     }
                 } else {
                     error!("[kernel] trap_handler: sepc pte unmapped");
@@ -604,14 +606,12 @@ pub fn task_entry() {
                 // ! 暂时直接 shutdown，后续可以考虑杀死进程
                 // use arch::shutdown;
                 // shutdown();
-
             }
             TrapType::IllegalInstruction(addr) => {
                 let args = trap_cx.args();
                 error!(
                     "[kernel] trap_handler: illegal instruction addr={:#x} sepc={:#x}",
-                    addr,
-                    trap_cx.sepc
+                    addr, trap_cx.sepc
                 );
                 error!(
                     "[kernel] trap_handler: ra={:#x} sp={:#x} tp={:#x} syscall={:#x} args={:x?}",
@@ -624,7 +624,10 @@ pub fn task_entry() {
                 current_add_signal(SignalFlags::SIGILL);
             }
             _ => {
-                warn!("[kernel] trap_handler: unknown trap at sepc={:#x}", trap_cx.sepc);
+                warn!(
+                    "[kernel] trap_handler: unknown trap at sepc={:#x}",
+                    trap_cx.sepc
+                );
             }
         }
         if current_task().is_some() {

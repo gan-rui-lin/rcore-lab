@@ -1,7 +1,6 @@
 //! Constants in the kernel
 
 #[allow(unused)]
-
 pub use arch::{CLOCK_FREQ, MEMORY_END, MMIO};
 
 /// user app's stack size

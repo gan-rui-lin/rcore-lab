@@ -576,3 +576,60 @@ panic 已定位到：
 - 本轮最后一次在去掉 `initcode` 内层 `Vec` 分配后继续复跑 `batch-repro`，还在持续观察中。
 - 最新一次带该改动的 `batch-repro` 在 `clone02` 处超时，尚未再次跑到之前的 `read04` panic 点。
 - 因此这里先只记录**已经确认**的结论，不把尚未跑完的新现象写成定论。
+
+## 8. 2026-03-21 内存权限语义补强
+
+### 8.1 本轮新增代码改动
+
+- [`os/src/mm/memory_set.rs`](/home/hwt/桌面/sources/实验和项目类/os区域赛/rcore-lab/os/src/mm/memory_set.rs)
+  - 新增 `MmapMeta`，为 `MapArea` 记录 `MAP_SHARED` / 文件映射 / 原始 fd 是否可写
+  - 新增 `ProtectError`
+  - `change_protection()` 不再只是“扫一遍重写 PTE”，而是会先检查整段是否完整映射，再按需拆分 `MapArea`，保证区域元数据与页表权限同步
+- [`os/src/syscall/process.rs`](/home/hwt/桌面/sources/实验和项目类/os区域赛/rcore-lab/os/src/syscall/process.rs)
+  - `sys_mmap()` 改为走 `insert_mmap_area()`，把映射来源信息带进地址空间
+  - `sys_mmap()` 增加了更严格的参数校验，并允许 `/dev/zero` 这类“无普通 inode 的文件映射”成功建立零页映射
+  - `sys_mprotect()` 对 `addr == 0` 返回 `ENOMEM`
+  - `sys_mprotect()` 现在能区分：
+    - 未映射区间 -> `ENOMEM`
+    - 只读共享文件映射提权到 `PROT_WRITE` -> `EACCES`
+- [`os/src/fs/stdio.rs`](/home/hwt/桌面/sources/实验和项目类/os区域赛/rcore-lab/os/src/fs/stdio.rs)
+  - `DevNull` / `DevZero` 改为携带“本次打开的读写权限”
+- [`os/src/syscall/fs.rs`](/home/hwt/桌面/sources/实验和项目类/os区域赛/rcore-lab/os/src/syscall/fs.rs)
+  - `/dev/null`、`/dev/zero` 在 `openat()` 时按 `O_RDONLY/O_WRONLY/O_RDWR` 生成对应权限的设备文件对象
+- [`user/src/bin/initcode.rs`](/home/hwt/桌面/sources/实验和项目类/os区域赛/rcore-lab/user/src/bin/initcode.rs)
+  - 已把当前新确认通过的内存管理类用例加入 `stable` 集合：
+    - `mmap01`
+    - `munmap01`
+    - `mprotect01`
+    - `mprotect02`
+    - `mprotect03`
+
+### 8.2 本轮新增确认通过
+
+以下用例均已重新单独验证，且日志中出现明确 `TPASS`：
+
+- `mmap01`
+- `munmap01`
+- `mprotect01`
+- `mprotect02`
+- `mprotect03`
+
+其中 `mprotect01` 三个子场景已经全部对齐：
+
+- `mprotect(NULL, ...)` -> `ENOMEM`
+- 非页对齐地址 -> `EINVAL`
+- 对 `O_RDONLY` 打开的 `/dev/zero` 的 `MAP_SHARED` 只读映射执行 `mprotect(..., PROT_WRITE)` -> `EACCES`
+
+### 8.3 当前累计进度
+
+基于此前已确认的 28 项，加上本轮新增确认通过的 5 项，当前**至少**已有 33 项 LTP 用例可以稳定单独通过：
+
+- 原有进程管理 + 基本 I/O：28 项
+- 新增内存管理：`mmap01`、`munmap01`、`mprotect01`、`mprotect02`、`mprotect03`
+
+### 8.4 仍未纳入统计的项目
+
+- `mmap03`
+  - 当前单独运行时退出状态是 `0`
+  - 但日志中仍未看到明确 `TPASS/TFAIL/TBROK` 正文
+  - 暂不计入通过数，后续继续单独复核

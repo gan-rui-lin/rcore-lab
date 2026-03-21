@@ -1,5 +1,5 @@
 #![allow(missing_docs)]
-use crate::task::{MAX_SIG, SignalFlags};
+use crate::task::{SignalFlags, MAX_SIG};
 
 /// Action for a signal
 ///
@@ -29,9 +29,13 @@ impl SignalAction {
     /// Returns the restorer address. Always 0 on LoongArch (no SA_RESTORER).
     pub fn restorer(&self) -> usize {
         #[cfg(not(target_arch = "loongarch64"))]
-        { self.restorer }
+        {
+            self.restorer
+        }
         #[cfg(target_arch = "loongarch64")]
-        { 0 }
+        {
+            0
+        }
     }
 }
 
