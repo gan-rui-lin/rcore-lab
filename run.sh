@@ -3,6 +3,22 @@
 # Set PATH to prioritize rustup nightly-2024-05-02 toolchain
 export PATH="$HOME/.rustup/toolchains/nightly-2024-05-02-aarch64-apple-darwin/bin:$HOME/.rustup/toolchains/nightly-2024-05-02-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin:$PATH"
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TESTENV_QEMU_BIN="$SCRIPT_DIR/tools/qemu-testenv-riscv64.sh"
+LOCAL_QEMU_BIN="$(command -v qemu-system-riscv64 2>/dev/null || true)"
+QEMU_BIN="${QEMU_BIN:-}"
+
+if [[ -z "$QEMU_BIN" ]]; then
+    if [[ -x "$TESTENV_QEMU_BIN" ]] && command -v docker >/dev/null 2>&1; then
+        QEMU_BIN="$TESTENV_QEMU_BIN"
+    elif [[ -n "$LOCAL_QEMU_BIN" ]]; then
+        QEMU_BIN="$LOCAL_QEMU_BIN"
+    else
+        echo "错误: 未找到可用的 qemu-system-riscv64" >&2
+        exit 1
+    fi
+fi
+
 # 默认配置
 BUILD_TYPE="rv"
 IMAGE_FILE="sdcard-rv.img"
@@ -141,6 +157,7 @@ fi
 
 echo "开始构建: make $BUILD_TYPE"
 echo "使用镜像: $IMAGE_FILE"
+echo "QEMU 命令: $QEMU_BIN"
 if [[ "$GDB_DEBUG" == "1" ]]; then
     GDB_FLAGS="-s -S"
     echo "GDB 调试: 开启 (-s -S)"
@@ -226,7 +243,7 @@ fi
 
 # 运行QEMU
 echo "启动QEMU模拟器..."
-qemu-system-riscv64 -machine virt \
+"$QEMU_BIN" -machine virt \
     -kernel kernel-rv \
   -m 128M \
   -nographic \
