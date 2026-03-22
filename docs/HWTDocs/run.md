@@ -15,3 +15,7 @@ timeout 60 qemu-system-riscv64 \
 rg -n "\\[LTP\\] (RUN|PASS|FAIL|TIMEOUT)|=== LTP Test|Total:|TPASS|TFAIL|TBROK" /tmp/rcore-ltp.log
 
 ```
+
+```bash
+python3 tools/ltp_log_summary.py /tmp/rcore-ltp.log
+```
