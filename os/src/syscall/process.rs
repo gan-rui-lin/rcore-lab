@@ -1251,13 +1251,15 @@ pub fn sys_exec(path: *const u8, argv: *const usize, envp: *const usize) -> isiz
     sys_exec_internal(path, argv, envp, 0)
 }
 
-/// If there is not a child process whose pid is same as given, return -ECHILD.
-/// Else if there is a child process but it is still running, return -EAGAIN.
-pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
+/// wait4 syscall: wait for child process state changes.
+/// options: WNOHANG (1) = return immediately if no zombie child.
+/// Returns child pid on success, 0 if WNOHANG and no zombie, -ECHILD if no matching child.
+pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
+    const WNOHANG: i32 = 1;
+    let my_pid = current_process().getpid();
     loop {
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-        let _trace_pid = process.getpid();
         if !inner.children.iter().any(|p| pid == -1 || pid as usize == p.getpid()) {
             return errno(ECHILD);
         }
@@ -1266,39 +1268,40 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
         });
         if let Some((idx, _)) = pair {
             let child = inner.children.remove(idx);
-            if Arc::strong_count(&child) > 1 {
-                trace!(
-                    "kernel:pid[{}] waitpid: child pid {} has {} refs",
-                    process.getpid(),
-                    child.getpid(),
-                    Arc::strong_count(&child)
-                );
-            }
             let found_pid = child.getpid();
             let exit_code = child.inner_exclusive_access().exit_code;
             if !exit_code_ptr.is_null() {
                 let status = (exit_code & 0xff) << 8;
                 *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
             }
+            trace!(
+                "[sys_waitpid] pid={} reaped child pid={} exit_code={}",
+                my_pid, found_pid, exit_code
+            );
             return found_pid as isize;
         }
-        // let child_count = inner.children.len();
-        // let pending = inner.signal_pending;
-        // let mask = inner.signal_mask;
-        // let name = inner.name.clone();
         drop(inner);
-        // if crate::syscall::should_trace_syscall(trace_pid) {
-        //     trace!(
-        //         "[sys_waitpid] pid={} name={} child_count={} pending={:?} mask={:?} -> yield",
-        //         trace_pid,
-        //         name,
-        //         child_count,
-        //         pending,
-        //         mask
-        //     );
-        //     crate::task::debug_dump_tasks();
-        // }
+
+        // WNOHANG: return 0 immediately if no zombie child
+        if (options & WNOHANG) != 0 {
+            return 0;
+        }
+
+        // Yield and retry (busy-wait until child exits)
         suspend_current_and_run_next();
+
+        // Check for pending unmasked signals -> return EINTR so signal can be delivered
+        {
+            let process = current_process();
+            let process_inner = process.inner_exclusive_access();
+            let task = current_task().unwrap();
+            let task_inner = task.inner_exclusive_access();
+            let unmasked = (process_inner.signal_pending | task_inner.signal_pending)
+                & !task_inner.signal_mask;
+            if !unmasked.is_empty() {
+                return errno(EINTR);
+            }
+        }
     }
 }
 
