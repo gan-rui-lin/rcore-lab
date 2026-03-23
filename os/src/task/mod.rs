@@ -39,7 +39,7 @@ use lazy_static::*;
 use manager::fetch_task;
 use process::ProcessControlBlock;
 
-pub use action::{SignalAction, SignalActions, SA_RESETHAND, SA_SIGINFO};
+pub use action::{SignalAction, SignalActions, SA_RESTART, SA_SIGINFO, SA_RESETHAND};
 pub use auxv::AuxvInfo;
 pub use context::TaskContext;
 pub use futex::{
