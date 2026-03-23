@@ -124,6 +124,9 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), ()> {
 }
 
 pub fn suspend_current_and_run_next() {
+    // Poll network before switching tasks so loopback packets get delivered
+    // even when all user processes are blocked in recv/send loops.
+    crate::net::poll_net_force();
     let task = take_current_task().unwrap();
     task.kstack.check_guard();
     let mut task_inner = task.inner_exclusive_access();

@@ -626,7 +626,15 @@ pub fn sys_sendto(
             }
             if socket.can_send() {
                 match socket.send_slice(&data) {
-                    Ok(n) => return n as isize,
+                    Ok(n) => {
+                        // Flush through loopback so peer can receive immediately
+                        let now = super::smoltcp_now();
+                        for _ in 0..4 {
+                            stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+                        }
+                        stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+                        return n as isize;
+                    }
                     Err(_) => return ENOTCONN,
                 }
             }
@@ -883,6 +891,12 @@ pub fn sys_shutdown_socket(fd: usize, _how: i32) -> isize {
         SocketType::Tcp => {
             let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
             socket.close();
+            // Flush FIN through loopback immediately
+            let now = super::smoltcp_now();
+            for _ in 0..4 {
+                stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+            }
+            stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
             0
         }
         SocketType::Udp => {

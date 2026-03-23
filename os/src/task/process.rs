@@ -109,6 +109,10 @@ pub struct ProcessControlBlockInner {
     pub rlimits: [RLimit; RLIMIT_NLIMITS],
     pub session_id: usize,
     pub pgid: usize,
+    /// ITIMER_REAL: absolute expire time in ms, 0 = inactive.
+    pub itimer_real_expire_ms: usize,
+    /// ITIMER_REAL: interval for repeating timer in ms, 0 = one-shot.
+    pub itimer_real_interval_ms: usize,
 }
 
 impl ProcessControlBlockInner {
@@ -257,6 +261,8 @@ impl ProcessControlBlock {
                     rlimits: default_rlimits(),
                     session_id: 0,
                     pgid: 0,
+                    itimer_real_expire_ms: 0,
+                    itimer_real_interval_ms: 0,
                 })
             },
         });
@@ -639,6 +645,8 @@ impl ProcessControlBlock {
                     rlimits: parent.rlimits,
                     session_id: parent.session_id,
                     pgid: parent.pgid,
+                    itimer_real_expire_ms: 0,
+                    itimer_real_interval_ms: 0,
                 })
             },
         });
