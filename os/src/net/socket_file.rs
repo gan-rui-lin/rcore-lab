@@ -221,6 +221,12 @@ impl SocketFile {
                     }
                 }
                 if total > 0 {
+                    // Flush through loopback so peer can receive immediately
+                    let now = super::smoltcp_now();
+                    for _ in 0..4 {
+                        stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+                    }
+                    stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
                     return total;
                 }
             }

@@ -124,9 +124,21 @@ pub fn poll_net_if_available() {
         if let Some(ref mut stack) = *net {
             let now = smoltcp_now();
             stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
-            stack
-                .lo_iface
-                .poll(now, &mut stack.lo_device, &mut stack.sockets);
+            for _ in 0..4 {
+                stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+            }
+        }
+    }
+}
+
+/// Force-poll network stack (blocking). Called from task scheduling context.
+pub fn poll_net_force() {
+    let mut net = NET_STACK.exclusive_access();
+    if let Some(ref mut stack) = *net {
+        let now = smoltcp_now();
+        stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+        for _ in 0..4 {
+            stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
         }
     }
 }

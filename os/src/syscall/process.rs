@@ -518,6 +518,128 @@ pub fn sys_getrusage(who: i32, usage: usize) -> isize {
     0
 }
 
+/// Linux itimerval: two timeval structs (each 16 bytes on 64-bit).
+/// struct itimerval { struct timeval it_interval; struct timeval it_value; }
+/// struct timeval { long tv_sec; long tv_usec; }
+fn timeval_to_ms(sec: i64, usec: i64) -> usize {
+    if sec == 0 && usec == 0 {
+        return 0;
+    }
+    (sec as usize) * 1000 + (usec as usize) / 1000
+}
+
+fn ms_to_timeval(ms: usize) -> (i64, i64) {
+    let sec = (ms / 1000) as i64;
+    let usec = ((ms % 1000) * 1000) as i64;
+    (sec, usec)
+}
+
+pub fn sys_setitimer(which: i32, new_value: *const u8, old_value: *mut u8) -> isize {
+    use crate::timer::get_time_ms;
+
+    // Only support ITIMER_REAL (0)
+    if which != 0 {
+        return 0; // silently ignore ITIMER_VIRTUAL/ITIMER_PROF
+    }
+
+    let token = current_user_token();
+    let process = current_process();
+
+    // Write old value if requested
+    if !old_value.is_null() {
+        let inner = process.inner_exclusive_access();
+        let now = get_time_ms();
+        let remaining = if inner.itimer_real_expire_ms > now {
+            inner.itimer_real_expire_ms - now
+        } else {
+            0
+        };
+        let (int_sec, int_usec) = ms_to_timeval(inner.itimer_real_interval_ms);
+        let (val_sec, val_usec) = ms_to_timeval(remaining);
+        drop(inner);
+
+        let mut buf = [0u8; 32];
+        buf[0..8].copy_from_slice(&int_sec.to_ne_bytes());
+        buf[8..16].copy_from_slice(&int_usec.to_ne_bytes());
+        buf[16..24].copy_from_slice(&val_sec.to_ne_bytes());
+        buf[24..32].copy_from_slice(&val_usec.to_ne_bytes());
+        let dst = translated_byte_buffer(token, old_value, 32);
+        let mut off = 0;
+        for slice in dst {
+            let n = slice.len().min(32 - off);
+            slice[..n].copy_from_slice(&buf[off..off + n]);
+            off += n;
+        }
+    }
+
+    // Read new value
+    if !new_value.is_null() {
+        let src = translated_byte_buffer(token, new_value, 32);
+        let mut buf = [0u8; 32];
+        let mut off = 0;
+        for slice in src {
+            let n = slice.len().min(32 - off);
+            buf[off..off + n].copy_from_slice(slice);
+            off += n;
+        }
+        let int_sec = i64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        let int_usec = i64::from_ne_bytes(buf[8..16].try_into().unwrap());
+        let val_sec = i64::from_ne_bytes(buf[16..24].try_into().unwrap());
+        let val_usec = i64::from_ne_bytes(buf[24..32].try_into().unwrap());
+
+        let interval_ms = timeval_to_ms(int_sec, int_usec);
+        let value_ms = timeval_to_ms(val_sec, val_usec);
+
+        let now = get_time_ms();
+        log::warn!("[setitimer] pid={} val={}ms int={}ms expire_at={}ms now={}ms",
+            process.pid.0, value_ms, interval_ms, now + value_ms, now);
+        let mut inner = process.inner_exclusive_access();
+        inner.itimer_real_interval_ms = interval_ms;
+        if value_ms == 0 {
+            inner.itimer_real_expire_ms = 0; // disarm
+        } else {
+            inner.itimer_real_expire_ms = now + value_ms;
+        }
+    }
+
+    0
+}
+
+pub fn sys_getitimer(which: i32, curr_value: *mut u8) -> isize {
+    use crate::timer::get_time_ms;
+
+    if which != 0 || curr_value.is_null() {
+        return 0;
+    }
+
+    let token = current_user_token();
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let now = get_time_ms();
+    let remaining = if inner.itimer_real_expire_ms > now {
+        inner.itimer_real_expire_ms - now
+    } else {
+        0
+    };
+    let (int_sec, int_usec) = ms_to_timeval(inner.itimer_real_interval_ms);
+    let (val_sec, val_usec) = ms_to_timeval(remaining);
+    drop(inner);
+
+    let mut buf = [0u8; 32];
+    buf[0..8].copy_from_slice(&int_sec.to_ne_bytes());
+    buf[8..16].copy_from_slice(&int_usec.to_ne_bytes());
+    buf[16..24].copy_from_slice(&val_sec.to_ne_bytes());
+    buf[24..32].copy_from_slice(&val_usec.to_ne_bytes());
+    let dst = translated_byte_buffer(token, curr_value, 32);
+    let mut off = 0;
+    for slice in dst {
+        let n = slice.len().min(32 - off);
+        slice[..n].copy_from_slice(&buf[off..off + n]);
+        off += n;
+    }
+    0
+}
+
 pub fn sys_setsid() -> isize {
     let process = current_process();
     let pid = process.pid.0;
