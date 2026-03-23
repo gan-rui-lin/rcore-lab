@@ -328,14 +328,7 @@ impl SocketFile {
                 meta: Default::default(),
             };
             let target_port = remote.port;
-            for (_sh, sock) in stack.sockets.iter_mut() {
-                if let smoltcp::socket::Socket::Udp(ref mut udp_sock) = sock {
-                    if udp_sock.endpoint().port == target_port {
-                        let _ = udp_sock.inject_recv(&data, sender_meta);
-                        break;
-                    }
-                }
-            }
+            super::loopback_udp_inject(stack, self.handle, target_port, &data, sender_meta);
             data.len()
         } else {
             let socket = stack.sockets.get_mut::<udp::Socket>(self.handle);
