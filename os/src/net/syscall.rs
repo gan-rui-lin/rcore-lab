@@ -9,10 +9,22 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::mm::{translated_byte_buffer, translated_refmut};
-use crate::task::{current_process, current_user_token, suspend_current_and_run_next};
+use crate::task::{current_process, current_task, current_user_token, suspend_current_and_run_next};
 
 use super::socket_file::{SocketFile, SocketType};
 use super::{alloc_ephemeral_port, poll_net, NET_STACK};
+
+/// Check if the current task has pending unmasked signals.
+/// Used to return EINTR from blocking network syscalls.
+fn has_pending_signal() -> bool {
+    let process = current_process();
+    let process_inner = process.inner_exclusive_access();
+    let task = current_task().unwrap();
+    let task_inner = task.inner_exclusive_access();
+    let unmasked = (process_inner.signal_pending | task_inner.signal_pending)
+        & !task_inner.signal_mask;
+    !unmasked.is_empty()
+}
 
 // Address family
 const AF_INET: usize = 2;
@@ -36,6 +48,7 @@ const SO_SNDTIMEO: usize = 21;
 const TCP_NODELAY: usize = 1;
 
 // Errno values
+const EINTR: isize = -4;
 const EBADF: isize = -9;
 const EINVAL: isize = -22;
 const ENOTSOCK: isize = -88;
@@ -421,6 +434,10 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize 
 
         drop(net);
         suspend_current_and_run_next();
+        // Check for pending signals -> EINTR so SIGALRM can be delivered
+        if has_pending_signal() {
+            return EINTR;
+        }
     }
 }
 
@@ -481,6 +498,9 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
 
                 drop(net);
                 suspend_current_and_run_next();
+                if has_pending_signal() {
+                    return EINTR;
+                }
             }
         }
         SocketType::Udp => {
@@ -641,6 +661,9 @@ pub fn sys_sendto(
 
             drop(net);
             suspend_current_and_run_next();
+            if has_pending_signal() {
+                return EINTR;
+            }
         },
         SocketType::Udp => {
             let dest = match read_sockaddr(dest_addr, addr_len, token) {
@@ -727,11 +750,14 @@ pub fn sys_recvfrom(
                 None => return EINVAL,
             };
             let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+            let state = socket.state();
 
             if socket.can_recv() {
                 let mut tmp = vec![0u8; len];
                 match socket.recv_slice(&mut tmp) {
                     Ok(n) => {
+                        let pid = current_process().getpid();
+                        trace!("[net] recvfrom TCP fd={} pid={} got {} bytes state={:?}", fd, pid, n, state);
                         // Write back to user buffer
                         let user_bufs = translated_byte_buffer(token, buf, n);
                         let mut off = 0;
@@ -750,11 +776,16 @@ pub fn sys_recvfrom(
             }
 
             if !socket.may_recv() {
+                let pid = current_process().getpid();
+                info!("[net] recvfrom TCP fd={} pid={} EOF state={:?}", fd, pid, state);
                 return 0; // EOF
             }
 
             drop(net);
             suspend_current_and_run_next();
+            if has_pending_signal() {
+                return EINTR;
+            }
         },
         SocketType::Udp => loop {
             poll_net();
@@ -790,6 +821,9 @@ pub fn sys_recvfrom(
 
             drop(net);
             suspend_current_and_run_next();
+            if has_pending_signal() {
+                return EINTR;
+            }
         },
     }
 }
@@ -864,6 +898,10 @@ pub fn sys_getsockopt(
         (SOL_SOCKET, SO_REUSEADDR) => { write_u32(1); 0 }
         (SOL_SOCKET, SO_KEEPALIVE) => { write_u32(0); 0 }
         (IPPROTO_TCP, TCP_NODELAY) => { write_u32(0); 0 }
+        // TCP_MAXSEG (2): return default MSS for loopback
+        (IPPROTO_TCP, 2) => { write_u32(65495); 0 }
+        // TCP_INFO (11): not supported, return silently
+        (IPPROTO_TCP, 11) => { write_u32(0); 0 }
         _ => {
             warn!(
                 "[net] getsockopt: unsupported level={} optname={}",
@@ -875,7 +913,7 @@ pub fn sys_getsockopt(
 }
 
 /// sys_shutdown(fd, how) -> 0
-pub fn sys_shutdown_socket(fd: usize, _how: i32) -> isize {
+pub fn sys_shutdown_socket(fd: usize, how: i32) -> isize {
     let (handle, sock_type) = match get_socket_info(fd) {
         Ok(info) => info,
         Err(e) => return e,
@@ -890,13 +928,17 @@ pub fn sys_shutdown_socket(fd: usize, _how: i32) -> isize {
     match sock_type {
         SocketType::Tcp => {
             let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+            let old_state = socket.state();
             socket.close();
             // Flush FIN through loopback immediately
             let now = super::smoltcp_now();
-            for _ in 0..4 {
+            for _ in 0..8 {
                 stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
             }
             stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+            let new_state = stack.sockets.get_mut::<tcp::Socket>(handle).state();
+            let pid = current_process().getpid();
+            info!("[net] shutdown TCP fd={} pid={} how={} state {:?} -> {:?}", fd, pid, how, old_state, new_state);
             0
         }
         SocketType::Udp => {
