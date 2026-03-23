@@ -356,7 +356,10 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize 
         Err(e) => return e,
     };
 
-    if sock_type != SocketType::Tcp || bound_port == 0 {
+    if sock_type != SocketType::Tcp {
+        return EOPNOTSUPP;
+    }
+    if !_listening || bound_port == 0 {
         return EINVAL;
     }
 

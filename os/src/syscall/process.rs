@@ -1290,7 +1290,8 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
         // Yield and retry (busy-wait until child exits)
         suspend_current_and_run_next();
 
-        // Check for pending unmasked signals -> return EINTR so signal can be delivered
+        // Check for pending signals that have a user handler -> return EINTR.
+        // Signals with SIG_DFL (default-ignore, like SIGCHLD) should NOT cause EINTR.
         {
             let process = current_process();
             let process_inner = process.inner_exclusive_access();
@@ -1299,7 +1300,29 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
             let unmasked = (process_inner.signal_pending | task_inner.signal_pending)
                 & !task_inner.signal_mask;
             if !unmasked.is_empty() {
-                return errno(EINTR);
+                // Only return EINTR if at least one pending signal has a user
+                // handler WITHOUT SA_RESTART. Signals with SIG_DFL/SIG_IGN don't
+                // cause EINTR. Signals with SA_RESTART cause the syscall to be
+                // restarted (we just continue the loop).
+                use crate::task::SA_RESTART;
+                let actions = &process_inner.signal_actions;
+                let raw = unmasked.bits();
+                let mut needs_eintr = false;
+                for bit in 0..64u32 {
+                    if raw & (1u64 << bit) != 0 {
+                        let signum = bit as usize + 1;
+                        if signum < actions.table.len() {
+                            let action = &actions.table[signum];
+                            if action.handler <= 1 { continue; } // SIG_DFL/SIG_IGN
+                            if (action.flags & SA_RESTART) != 0 { continue; }
+                            needs_eintr = true;
+                            break;
+                        }
+                    }
+                }
+                if needs_eintr {
+                    return errno(EINTR);
+                }
             }
         }
     }

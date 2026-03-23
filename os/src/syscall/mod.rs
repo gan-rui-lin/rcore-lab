@@ -34,6 +34,10 @@ const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_FTRUNCATE: usize = 46;
 /// faccessat syscall
 const SYSCALL_FACCESSAT: usize = 48;
+/// fchmod syscall
+const SYSCALL_FCHMOD: usize = 52;
+/// fchmodat syscall
+const SYSCALL_FCHMODAT: usize = 53;
 /// chdir syscall
 const SYSCALL_CHDIR: usize = 49;
 /// openat syscall
@@ -607,6 +611,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as u32,
             args[4],
         ),
+        SYSCALL_FCHMOD | SYSCALL_FCHMODAT => 0, // stub: FS doesn't track permission bits
+        54 | 55 => 0, // fchownat/fchown stub: FS doesn't track ownership
+        227 => 0, // msync stub: no-op (single-core, no persistent mmap)
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as isize, args[2]),
