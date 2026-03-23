@@ -639,7 +639,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as u32,
         ),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
-        SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
+        SYSCALL_EXIT_GROUP => {
+            log::warn!("[exit_group] pid={} name={} code={}", pid, name, args[0] as i32);
+            sys_exit_group(args[0] as i32)
+        }
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
         SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => sys_get_robust_list(args[0], args[1] as *mut u8, args[2] as *mut u8),
