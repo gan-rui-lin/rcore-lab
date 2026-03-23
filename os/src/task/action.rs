@@ -38,6 +38,7 @@ impl Default for SignalAction {
     }
 }
 
+pub const SA_RESTART: usize = 0x10000000;
 pub const SA_SIGINFO: usize = 4;
 pub const SA_RESETHAND: usize = 0x80000000;
 
