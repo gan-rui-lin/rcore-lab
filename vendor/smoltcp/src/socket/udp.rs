@@ -110,6 +110,9 @@ impl std::error::Error for RecvError {}
 #[derive(Debug)]
 pub struct Socket<'a> {
     endpoint: IpListenEndpoint,
+    /// Optional connected remote endpoint (set via `connect()`).
+    /// When set, `accepts()` only matches packets from this remote.
+    remote_endpoint: Option<IpEndpoint>,
     rx_buffer: PacketBuffer<'a>,
     tx_buffer: PacketBuffer<'a>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -125,6 +128,7 @@ impl<'a> Socket<'a> {
     pub fn new(rx_buffer: PacketBuffer<'a>, tx_buffer: PacketBuffer<'a>) -> Socket<'a> {
         Socket {
             endpoint: IpListenEndpoint::default(),
+            remote_endpoint: None,
             rx_buffer,
             tx_buffer,
             hop_limit: None,
@@ -174,6 +178,19 @@ impl<'a> Socket<'a> {
     #[inline]
     pub fn endpoint(&self) -> IpListenEndpoint {
         self.endpoint
+    }
+
+    /// Return the connected remote endpoint, if any.
+    #[inline]
+    pub fn remote_endpoint(&self) -> Option<IpEndpoint> {
+        self.remote_endpoint
+    }
+
+    /// Set the connected remote endpoint.
+    /// When set, only packets from this remote will be accepted.
+    #[inline]
+    pub fn set_remote_endpoint(&mut self, ep: Option<IpEndpoint>) {
+        self.remote_endpoint = ep;
     }
 
     /// Return the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -477,6 +494,15 @@ impl<'a> Socket<'a> {
             && !ip_repr.dst_addr().is_multicast()
         {
             return false;
+        }
+        // If this socket is "connected" to a specific remote, only accept
+        // packets from that remote. This prevents a connected UDP socket
+        // from stealing packets destined for an unconnected listener on
+        // the same port (needed for iperf3 parallel streams).
+        if let Some(remote) = self.remote_endpoint {
+            if remote.addr != ip_repr.src_addr() || remote.port != repr.src_port {
+                return false;
+            }
         }
 
         true

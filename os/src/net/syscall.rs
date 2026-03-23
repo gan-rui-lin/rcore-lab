@@ -492,6 +492,16 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
                     file.set_connected_remote(remote);
                 }
             }
+            // Also set smoltcp-level remote filter so that this connected
+            // socket won't steal packets destined for other sockets on the
+            // same port (e.g. iperf3 parallel UDP streams).
+            {
+                let mut net = NET_STACK.exclusive_access();
+                if let Some(ref mut ns) = *net {
+                    let sock = ns.sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
+                    sock.set_remote_endpoint(Some(remote));
+                }
+            }
             0
         }
     }
@@ -667,25 +677,9 @@ pub fn sys_sendto(
                     endpoint: IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), sender_port),
                     meta: Default::default(),
                 };
-                // Find the target socket bound to dest.port
                 let target_port = dest.port;
-                let mut delivered = false;
-                for (_sh, sock) in stack.sockets.iter_mut() {
-                    if let smoltcp::socket::Socket::Udp(ref mut udp_sock) = sock {
-                        if udp_sock.endpoint().port == target_port {
-                            if udp_sock.inject_recv(&data, sender_meta).is_ok() {
-                                delivered = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if delivered {
-                    data.len() as isize
-                } else {
-                    warn!("[net] loopback: no socket bound to port {}", target_port);
-                    data.len() as isize // pretend success like Linux
-                }
+                super::loopback_udp_inject(stack, handle, target_port, &data, sender_meta);
+                data.len() as isize
             } else {
                 // Normal send via smoltcp network stack
                 let socket = stack.sockets.get_mut::<udp::Socket>(handle);
