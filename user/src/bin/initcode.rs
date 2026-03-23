@@ -26,6 +26,10 @@ const ENABLE_FAT32_TESTS: bool = false;
 
 const SINGLE_TEST: Option<&str> = option_env!("SINGLE_TEST");
 const LTP_PROFILE: Option<&str> = option_env!("LTP_PROFILE");
+const LTP_TESTS_OSKERNEL2025_RISCV_RAW: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/ltp_oskernel2025_riscv.txt"
+));
 
 const SH: &[u8] = b"sh\0";
 const PATH_ENV: &[u8] = b"PATH=/bin:/usr/bin:/musl:/glibc\0";
@@ -413,6 +417,15 @@ fn test_basic() {
 
 const LTP_TIMEOUT_MS: usize = 30_000;
 const ENABLE_LTP_WATCHDOG: bool = true;
+const LTP_BIN_PREFIX: &[u8] = b"/musl/ltp/testcases/bin/";
+const LTP_PATH_MAX: usize = 128;
+
+struct LtpCounters {
+    total: usize,
+    passed: usize,
+    failed: usize,
+    timed_out: usize,
+}
 
 fn wait_for_ltp_child(test_pid: isize, watchdog_pid: isize, status: &mut i32, name: &str) -> isize {
     loop {
@@ -431,10 +444,123 @@ fn wait_for_ltp_child(test_pid: isize, watchdog_pid: isize, status: &mut i32, na
     }
 }
 
-fn test_ltp() {
-    const LTP_BIN_PREFIX: &[u8] = b"/musl/ltp/testcases/bin/";
-    const LTP_PATH_MAX: usize = 128;
+fn ltp_case_list_len(raw: &str) -> usize {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .count()
+}
 
+fn run_single_ltp_case(name: &str, counters: &mut LtpCounters) {
+    counters.total += 1;
+    let name_bytes = name.as_bytes();
+    let path_len = LTP_BIN_PREFIX.len() + name_bytes.len();
+    if path_len + 1 > LTP_PATH_MAX || name_bytes.len() + 1 > LTP_PATH_MAX {
+        println!("[LTP] SKIP {} (path too long)", name);
+        counters.failed += 1;
+        return;
+    }
+
+    let mut path_buf = [0u8; LTP_PATH_MAX];
+    path_buf[..LTP_BIN_PREFIX.len()].copy_from_slice(LTP_BIN_PREFIX);
+    path_buf[LTP_BIN_PREFIX.len()..path_len].copy_from_slice(name_bytes);
+    let path_str = unsafe { core::str::from_utf8_unchecked(&path_buf[..path_len + 1]) };
+
+    let mut name_buf = [0u8; LTP_PATH_MAX];
+    name_buf[..name_bytes.len()].copy_from_slice(name_bytes);
+
+    println!("[LTP] RUN  {}", name);
+
+    let test_pid = fork();
+    if test_pid == 0 {
+        let argv = [name_buf.as_ptr(), core::ptr::null()];
+        let envp_path = b"PATH=/musl:/bin:/usr/bin\0";
+        let envp_tmpdir = b"TMPDIR=/tmp\0";
+        let envp_home = b"HOME=/tmp\0";
+        let envp_ltproot = b"LTPROOT=/musl/ltp\0";
+        let envp = [
+            envp_path.as_ptr(),
+            envp_tmpdir.as_ptr(),
+            envp_home.as_ptr(),
+            envp_ltproot.as_ptr(),
+            core::ptr::null(),
+        ];
+        let _ = execve(path_str, &argv, &envp);
+        println!("[LTP] EXEC_FAIL {}", name);
+        exit(-1);
+    } else if test_pid < 0 {
+        println!("[LTP] FORK_FAIL {}", name);
+        counters.failed += 1;
+        return;
+    }
+
+    if !ENABLE_LTP_WATCHDOG {
+        let mut status: i32 = 0;
+        let _ = waitpid(test_pid as usize, &mut status);
+        if status == 0 {
+            println!("[LTP] PASS {}", name);
+            counters.passed += 1;
+        } else {
+            println!("[LTP] FAIL {} (status=0x{:x})", name, status);
+            counters.failed += 1;
+        }
+        return;
+    }
+
+    let watchdog_pid = fork();
+    if watchdog_pid == 0 {
+        sleep(LTP_TIMEOUT_MS);
+        exit(0);
+    } else if watchdog_pid < 0 {
+        let mut status: i32 = 0;
+        let _ = waitpid(test_pid as usize, &mut status);
+        if status == 0 {
+            println!("[LTP] PASS {}", name);
+            counters.passed += 1;
+        } else {
+            println!("[LTP] FAIL {} (status=0x{:x})", name, status);
+            counters.failed += 1;
+        }
+        return;
+    }
+
+    let mut status: i32 = 0;
+    let finished_pid = wait_for_ltp_child(test_pid, watchdog_pid, &mut status, name);
+
+    if finished_pid < 0 {
+        println!("[LTP] WAIT_FAIL {} (ret={})", name, finished_pid);
+        let _ = kill(test_pid as usize, 9);
+        let _ = kill(watchdog_pid as usize, 9);
+        let mut test_status: i32 = 0;
+        let _ = waitpid(test_pid as usize, &mut test_status);
+        let mut watchdog_status: i32 = 0;
+        let _ = waitpid(watchdog_pid as usize, &mut watchdog_status);
+        counters.failed += 1;
+        return;
+    }
+
+    if finished_pid == test_pid {
+        let _ = kill(watchdog_pid as usize, 9);
+        let mut watchdog_status: i32 = 0;
+        let _ = waitpid(watchdog_pid as usize, &mut watchdog_status);
+        if status == 0 {
+            println!("[LTP] PASS {}", name);
+            counters.passed += 1;
+        } else {
+            println!("[LTP] FAIL {} (status=0x{:x})", name, status);
+            counters.failed += 1;
+        }
+    } else {
+        let _ = kill(test_pid as usize, 9);
+        let mut test_status: i32 = 0;
+        let _ = waitpid(test_pid as usize, &mut test_status);
+        println!("[LTP] TIMEOUT {} (>{}ms)", name, LTP_TIMEOUT_MS);
+        counters.timed_out += 1;
+        counters.failed += 1;
+    }
+}
+
+fn test_ltp() {
     let _ = mkdir("/tmp\0");
     let _ = mkdir("/dev\0");
     let _ = mkdir("/dev/shm\0");
@@ -491,136 +617,60 @@ fn test_ltp() {
         "dup02",
     ];
 
-    let (profile_name, ltp_tests) = match LTP_PROFILE {
-        Some("clone-repro") => ("clone-repro", LTP_TESTS_CLONE_REPRO),
-        Some("batch-repro") => ("batch-repro", LTP_TESTS_BATCH_REPRO),
+    enum LtpCaseSource<'a> {
+        Slice(&'a [&'a str]),
+        Raw(&'a str),
+    }
+
+    let (profile_name, ltp_tests): (&str, LtpCaseSource<'_>) = match LTP_PROFILE {
+        Some("clone-repro") => ("clone-repro", LtpCaseSource::Slice(LTP_TESTS_CLONE_REPRO)),
+        Some("batch-repro") => ("batch-repro", LtpCaseSource::Slice(LTP_TESTS_BATCH_REPRO)),
+        Some("oskernel2025-riscv") | Some("oskernel2025-rv") => (
+            "oskernel2025-riscv",
+            LtpCaseSource::Raw(LTP_TESTS_OSKERNEL2025_RISCV_RAW),
+        ),
         Some(other) => {
             println!("[LTP] Unknown profile {}, fallback to stable", other);
-            ("stable", LTP_TESTS_STABLE)
+            ("stable", LtpCaseSource::Slice(LTP_TESTS_STABLE))
         }
-        None => ("stable", LTP_TESTS_STABLE),
+        None => ("stable", LtpCaseSource::Slice(LTP_TESTS_STABLE)),
     };
 
-    println!("[LTP] profile={} tests={}", profile_name, ltp_tests.len());
+    let ltp_test_count = match &ltp_tests {
+        LtpCaseSource::Slice(tests) => tests.len(),
+        LtpCaseSource::Raw(raw) => ltp_case_list_len(raw),
+    };
 
-    let mut total = 0;
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut timed_out = 0;
+    println!("[LTP] profile={} tests={}", profile_name, ltp_test_count);
 
-    for name in ltp_tests {
-        total += 1;
-        let name_bytes = name.as_bytes();
-        let path_len = LTP_BIN_PREFIX.len() + name_bytes.len();
-        if path_len + 1 > LTP_PATH_MAX || name_bytes.len() + 1 > LTP_PATH_MAX {
-            println!("[LTP] SKIP {} (path too long)", name);
-            failed += 1;
-            continue;
-        }
+    let mut counters = LtpCounters {
+        total: 0,
+        passed: 0,
+        failed: 0,
+        timed_out: 0,
+    };
 
-        let mut path_buf = [0u8; LTP_PATH_MAX];
-        path_buf[..LTP_BIN_PREFIX.len()].copy_from_slice(LTP_BIN_PREFIX);
-        path_buf[LTP_BIN_PREFIX.len()..path_len].copy_from_slice(name_bytes);
-        let path_str = unsafe { core::str::from_utf8_unchecked(&path_buf[..path_len + 1]) };
-
-        let mut name_buf = [0u8; LTP_PATH_MAX];
-        name_buf[..name_bytes.len()].copy_from_slice(name_bytes);
-
-        println!("[LTP] RUN  {}", name);
-
-        let test_pid = fork();
-        if test_pid == 0 {
-            let argv = [name_buf.as_ptr(), core::ptr::null()];
-            let envp_path = b"PATH=/musl:/bin:/usr/bin\0";
-            let envp_tmpdir = b"TMPDIR=/tmp\0";
-            let envp_home = b"HOME=/tmp\0";
-            let envp_ltproot = b"LTPROOT=/musl/ltp\0";
-            let envp = [
-                envp_path.as_ptr(),
-                envp_tmpdir.as_ptr(),
-                envp_home.as_ptr(),
-                envp_ltproot.as_ptr(),
-                core::ptr::null(),
-            ];
-            let _ = execve(path_str, &argv, &envp);
-            println!("[LTP] EXEC_FAIL {}", name);
-            exit(-1);
-        } else if test_pid < 0 {
-            println!("[LTP] FORK_FAIL {}", name);
-            failed += 1;
-            continue;
-        }
-
-        if !ENABLE_LTP_WATCHDOG {
-            let mut status: i32 = 0;
-            let _ = waitpid(test_pid as usize, &mut status);
-            if status == 0 {
-                println!("[LTP] PASS {}", name);
-                passed += 1;
-            } else {
-                println!("[LTP] FAIL {} (status=0x{:x})", name, status);
-                failed += 1;
+    match ltp_tests {
+        LtpCaseSource::Slice(tests) => {
+            for name in tests {
+                run_single_ltp_case(name, &mut counters);
             }
-            continue;
         }
-
-        let watchdog_pid = fork();
-        if watchdog_pid == 0 {
-            sleep(LTP_TIMEOUT_MS);
-            exit(0);
-        } else if watchdog_pid < 0 {
-            let mut status: i32 = 0;
-            let _ = waitpid(test_pid as usize, &mut status);
-            if status == 0 {
-                println!("[LTP] PASS {}", name);
-                passed += 1;
-            } else {
-                println!("[LTP] FAIL {} (status=0x{:x})", name, status);
-                failed += 1;
+        LtpCaseSource::Raw(raw) => {
+            for name in raw
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            {
+                run_single_ltp_case(name, &mut counters);
             }
-            continue;
-        }
-
-        let mut status: i32 = 0;
-        let finished_pid = wait_for_ltp_child(test_pid, watchdog_pid, &mut status, name);
-
-        if finished_pid < 0 {
-            println!("[LTP] WAIT_FAIL {} (ret={})", name, finished_pid);
-            let _ = kill(test_pid as usize, 9);
-            let _ = kill(watchdog_pid as usize, 9);
-            let mut test_status: i32 = 0;
-            let _ = waitpid(test_pid as usize, &mut test_status);
-            let mut watchdog_status: i32 = 0;
-            let _ = waitpid(watchdog_pid as usize, &mut watchdog_status);
-            failed += 1;
-            continue;
-        }
-
-        if finished_pid == test_pid {
-            let _ = kill(watchdog_pid as usize, 9);
-            let mut watchdog_status: i32 = 0;
-            let _ = waitpid(watchdog_pid as usize, &mut watchdog_status);
-            if status == 0 {
-                println!("[LTP] PASS {}", name);
-                passed += 1;
-            } else {
-                println!("[LTP] FAIL {} (status=0x{:x})", name, status);
-                failed += 1;
-            }
-        } else {
-            let _ = kill(test_pid as usize, 9);
-            let mut test_status: i32 = 0;
-            let _ = waitpid(test_pid as usize, &mut test_status);
-            println!("[LTP] TIMEOUT {} (>{}ms)", name, LTP_TIMEOUT_MS);
-            timed_out += 1;
-            failed += 1;
         }
     }
 
     println!("=== LTP Test End ===");
     println!(
         "Total: {}, Passed: {}, Failed: {} (Timeout: {})",
-        total, passed, failed, timed_out
+        counters.total, counters.passed, counters.failed, counters.timed_out
     );
 }
 

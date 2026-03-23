@@ -19,3 +19,8 @@ rg -n "\\[LTP\\] (RUN|PASS|FAIL|TIMEOUT)|=== LTP Test|Total:|TPASS|TFAIL|TBROK" 
 ```bash
 python3 tools/ltp_log_summary.py /tmp/rcore-ltp.log
 ```
+
+```bash
+python3 tools/extract_oskernel2025_ltp_cases.py --check
+LTP_PROFILE=oskernel2025-riscv OFFLINE=1 make rv
+```

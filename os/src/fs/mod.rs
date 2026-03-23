@@ -146,6 +146,8 @@ bitflags! {
         const DIRECTORY = 1 << 16;
         /// close-on-exec
         const CLOEXEC = 1 << 19;
+        /// path-only descriptor (Linux O_PATH on riscv64)
+        const PATH = 1 << 21;
     }
 }
 
@@ -202,9 +204,12 @@ pub fn ensure_basic_paths() {
     create_dir("/usr");
     create_dir("/usr/bin");
     create_dir("/tmp");
+    create_dir("/root");
 
     write_file_if_missing("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n");
     write_file_if_missing("/etc/group", "root:x:0:\n");
+    append_line_if_missing("/etc/passwd", "nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n");
+    append_line_if_missing("/etc/group", "nogroup:x:65534:\n");
     write_file_if_missing("/etc/localtime", "");
     write_file_if_missing("/etc/adjtime", "");
 
@@ -231,6 +236,25 @@ fn write_file_if_missing(path: &str, content: &str) {
         return;
     };
     let _ = inode.write_at(0, content.as_bytes());
+}
+
+fn append_line_if_missing(path: &str, line: &str) {
+    let Some(file) = open_file(path, OpenFlags::RDWR) else {
+        return;
+    };
+    let Some(inode) = file.inode() else {
+        return;
+    };
+    let existing = file.read_all();
+    if existing.windows(line.len()).any(|window| window == line.as_bytes()) {
+        return;
+    }
+    let mut data = existing;
+    if !data.is_empty() && !data.ends_with(b"\n") {
+        data.push(b'\n');
+    }
+    let offset = data.len();
+    let _ = inode.write_at(offset, line.as_bytes());
 }
 
 #[cfg(feature = "ext4")]

@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 pub struct VfsFile {
     readable: bool,
     writable: bool,
+    status_flags: u32,
     path: String,
     ts_id: usize,
     inner: UPIntrFreeCell<VfsFileInner>,
@@ -26,9 +27,20 @@ struct VfsFileInner {
 
 impl VfsFile {
     pub fn new(readable: bool, writable: bool, inode: Arc<dyn VfsInode>, path: String) -> Self {
+        Self::new_with_flags(readable, writable, 0, inode, path)
+    }
+
+    pub fn new_with_flags(
+        readable: bool,
+        writable: bool,
+        status_flags: u32,
+        inode: Arc<dyn VfsInode>,
+        path: String,
+    ) -> Self {
         Self {
             readable,
             writable,
+            status_flags,
             path,
             ts_id: NEXT_TS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             inner: unsafe { UPIntrFreeCell::new(VfsFileInner { offset: 0, inode }) },
@@ -122,6 +134,10 @@ impl File for VfsFile {
     fn ts_id(&self) -> Option<usize> {
         Some(self.ts_id)
     }
+
+    fn status_flags(&self) -> u32 {
+        self.status_flags
+    }
 }
 
 pub fn list_apps() {
@@ -137,24 +153,47 @@ pub fn list_apps() {
 
 pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<dyn File>> {
     let path = normalize_path(path);
-    let (readable, writable) = flags.read_write();
+    let (mut readable, mut writable) = flags.read_write();
+    let status_flags = flags.bits() & OpenFlags::PATH.bits();
+    if flags.contains(OpenFlags::PATH) {
+        readable = false;
+        writable = false;
+    }
     let vfs = ROOT_VFS.exclusive_access();
     if flags.contains(OpenFlags::CREATE) {
         if let Some(inode) = vfs.resolve_quiet(&path) {
             if flags.contains(OpenFlags::TRUNC) {
                 inode.truncate();
             }
-            return Some(Arc::new(VfsFile::new(readable, writable, inode, path)));
+            return Some(Arc::new(VfsFile::new_with_flags(
+                readable,
+                writable,
+                status_flags,
+                inode,
+                path,
+            )));
         }
         let (parent, name) = vfs.resolve_parent(&path)?;
         let inode = parent.create(&name)?;
-        Some(Arc::new(VfsFile::new(readable, writable, inode, path)))
+        Some(Arc::new(VfsFile::new_with_flags(
+            readable,
+            writable,
+            status_flags,
+            inode,
+            path,
+        )))
     } else {
         let inode = vfs.resolve_quiet(&path)?;
         if flags.contains(OpenFlags::TRUNC) {
             inode.truncate();
         }
-        Some(Arc::new(VfsFile::new(readable, writable, inode, path)))
+        Some(Arc::new(VfsFile::new_with_flags(
+            readable,
+            writable,
+            status_flags,
+            inode,
+            path,
+        )))
     }
 }
 

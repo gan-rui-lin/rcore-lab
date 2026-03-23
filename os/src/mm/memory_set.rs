@@ -10,6 +10,8 @@ use crate::config::USER_STACK_TOP;
 use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, USER_STACK_SIZE};
 use crate::sync::UPIntrFreeCell;
 use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use lazy_static::*;
@@ -763,6 +765,63 @@ impl MemorySet {
                 area.map_perm.bits
             );
         }
+    }
+
+    /// Render a minimal `/proc/<pid>/maps` view for user-space probes.
+    pub fn render_proc_maps(
+        &self,
+        process_name: &str,
+        heap_bottom: usize,
+        program_brk: usize,
+    ) -> String {
+        let mut out = String::new();
+        let mut emitted = 0usize;
+
+        for area in self.areas.iter() {
+            let start: usize = area.start_va.into();
+            let end: usize = area.vpn_range.get_end().into();
+            if start >= end {
+                continue;
+            }
+
+            let mut perms = ['-'; 4];
+            if area.map_perm.contains(MapPermission::R) {
+                perms[0] = 'r';
+            }
+            if area.map_perm.contains(MapPermission::W) {
+                perms[1] = 'w';
+            }
+            if area.map_perm.contains(MapPermission::X) {
+                perms[2] = 'x';
+            }
+            perms[3] = if area.mmap_meta.is_some() { 's' } else { 'p' };
+
+            let mut label = "";
+            if heap_bottom >= start && heap_bottom < end && program_brk >= heap_bottom {
+                label = " [heap]";
+            } else if area.map_perm.contains(MapPermission::X) && emitted == 0 {
+                label = " /";
+            }
+
+            if label == " /" {
+                out.push_str(&format!(
+                    "{start:016x}-{end:016x} {} 00000000 00:00 0 /{process_name}\n",
+                    perms.iter().collect::<String>(),
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{start:016x}-{end:016x} {} 00000000 00:00 0{label}\n",
+                    perms.iter().collect::<String>(),
+                ));
+            }
+            emitted += 1;
+        }
+
+        if out.is_empty() {
+            out.push_str("0000000000010000-0000000000011000 r-xp 00000000 00:00 0 /unknown\n");
+        }
+
+        out
     }
     /// Change page table by writing satp CSR Register.
     pub fn activate(&self) {

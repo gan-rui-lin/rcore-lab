@@ -10,6 +10,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::mm::{translated_byte_buffer, translated_refmut};
 use crate::task::{current_process, current_user_token, suspend_current_and_run_next};
+use crate::fs::OpenFlags;
 
 use super::socket_file::{SocketFile, SocketType};
 use super::{alloc_ephemeral_port, poll_net, NET_STACK};
@@ -120,10 +121,15 @@ fn get_socket_info(fd: usize) -> Result<(SocketHandle, SocketType), isize> {
         return Err(EBADF);
     }
     match inner.fd_table[fd].as_ref() {
-        Some(file) => match file.as_socket() {
-            Some((handle, sock_type)) => Ok((handle, sock_type)),
-            None => Err(ENOTSOCK),
-        },
+        Some(file) => {
+            if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
+                return Err(EBADF);
+            }
+            match file.as_socket() {
+                Some((handle, sock_type)) => Ok((handle, sock_type)),
+                None => Err(ENOTSOCK),
+            }
+        }
         None => Err(EBADF),
     }
 }
@@ -136,14 +142,19 @@ fn get_socket_extra(fd: usize) -> Result<(SocketHandle, SocketType, u16, bool), 
         return Err(EBADF);
     }
     match inner.fd_table[fd].as_ref() {
-        Some(file) => match file.as_socket() {
-            Some((handle, sock_type)) => {
-                let bound_port = file.bound_port();
-                let listening = file.is_listening();
-                Ok((handle, sock_type, bound_port, listening))
+        Some(file) => {
+            if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
+                return Err(EBADF);
             }
-            None => Err(ENOTSOCK),
-        },
+            match file.as_socket() {
+                Some((handle, sock_type)) => {
+                    let bound_port = file.bound_port();
+                    let listening = file.is_listening();
+                    Ok((handle, sock_type, bound_port, listening))
+                }
+                None => Err(ENOTSOCK),
+            }
+        }
         None => Err(EBADF),
     }
 }
@@ -330,12 +341,18 @@ pub fn sys_listen(fd: usize, _backlog: usize) -> isize {
 /// sys_accept(listen_fd, addr, addrlen) -> new_fd
 pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
     let token = current_user_token();
-    let (listen_handle, sock_type, bound_port, _listening) = match get_socket_extra(listen_fd) {
+    let (listen_handle, sock_type, bound_port, listening) = match get_socket_extra(listen_fd) {
         Ok(info) => info,
         Err(e) => return e,
     };
 
-    if sock_type != SocketType::Tcp || bound_port == 0 {
+    if sock_type != SocketType::Tcp {
+        return EOPNOTSUPP;
+    }
+
+    // Linux returns EINVAL for accept() on a TCP socket that has not entered
+    // the listening state yet, instead of blocking forever.
+    if bound_port == 0 || !listening {
         return EINVAL;
     }
 
