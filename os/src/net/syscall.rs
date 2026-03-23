@@ -484,8 +484,14 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
             }
         }
         SocketType::Udp => {
-            // UDP connect just stores the default destination
-            // smoltcp doesn't have "connected" UDP, so this is a no-op
+            // UDP connect stores the default destination for write()/send()
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            if fd < inner.fd_table.len() {
+                if let Some(ref file) = inner.fd_table[fd] {
+                    file.set_connected_remote(remote);
+                }
+            }
             0
         }
     }
@@ -536,25 +542,38 @@ pub fn sys_getpeername(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
         Err(e) => return e,
     };
 
-    if sock_type != SocketType::Tcp {
-        return EOPNOTSUPP;
+    match sock_type {
+        SocketType::Tcp => {
+            let mut net = NET_STACK.exclusive_access();
+            let stack = match net.as_mut() {
+                Some(s) => s,
+                None => return EINVAL,
+            };
+            let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+            let ep = match socket.remote_endpoint() {
+                Some(ep) => ep,
+                None => return ENOTCONN,
+            };
+            drop(net);
+            write_sockaddr(&ep, addr, addr_len, token);
+            0
+        }
+        SocketType::Udp => {
+            // Return the connected remote endpoint if set
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            if fd < inner.fd_table.len() {
+                if let Some(ref file) = inner.fd_table[fd] {
+                    if let Some(ep) = file.get_connected_remote() {
+                        drop(inner);
+                        write_sockaddr(&ep, addr, addr_len, token);
+                        return 0;
+                    }
+                }
+            }
+            ENOTCONN
+        }
     }
-
-    let mut net = NET_STACK.exclusive_access();
-    let stack = match net.as_mut() {
-        Some(s) => s,
-        None => return EINVAL,
-    };
-
-    let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-    let ep = match socket.remote_endpoint() {
-        Some(ep) => ep,
-        None => return ENOTCONN,
-    };
-    drop(net);
-
-    write_sockaddr(&ep, addr, addr_len, token);
-    0
 }
 
 /// sys_sendto(fd, buf, len, flags, dest_addr, addrlen) -> bytes_sent
@@ -820,22 +839,29 @@ pub fn sys_getsockopt(
 
     let token = current_user_token();
 
+    // Helper to write a u32 value to user optval/optlen
+    let write_u32 = |val: u32| {
+        if !optval.is_null() && !optlen.is_null() {
+            let bufs = translated_byte_buffer(token, optval, 4);
+            let bytes = val.to_ne_bytes();
+            if let Some(buf) = bufs.first() {
+                let dst =
+                    unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, 4) };
+                dst.copy_from_slice(&bytes);
+            }
+            let len_ref = translated_refmut(token, optlen);
+            *len_ref = 4;
+        }
+    };
+
     // Return default values for common options
     match (level, optname) {
-        (SOL_SOCKET, SO_ERROR) => {
-            if !optval.is_null() && !optlen.is_null() {
-                let bufs = translated_byte_buffer(token, optval, 4);
-                let zero = [0u8; 4];
-                if let Some(buf) = bufs.first() {
-                    let dst =
-                        unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, 4) };
-                    dst.copy_from_slice(&zero);
-                }
-                let len_ref = translated_refmut(token, optlen);
-                *len_ref = 4;
-            }
-            0
-        }
+        (SOL_SOCKET, SO_ERROR) => { write_u32(0); 0 }
+        (SOL_SOCKET, SO_SNDBUF) => { write_u32(65536); 0 }
+        (SOL_SOCKET, SO_RCVBUF) => { write_u32(65536); 0 }
+        (SOL_SOCKET, SO_REUSEADDR) => { write_u32(1); 0 }
+        (SOL_SOCKET, SO_KEEPALIVE) => { write_u32(0); 0 }
+        (IPPROTO_TCP, TCP_NODELAY) => { write_u32(0); 0 }
         _ => {
             warn!(
                 "[net] getsockopt: unsupported level={} optname={}",

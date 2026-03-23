@@ -18,6 +18,9 @@ pub struct DevNull;
 /// /dev/zero device: reads return zero bytes, writes succeed silently
 pub struct DevZero;
 
+/// /dev/urandom device: reads return pseudo-random bytes, writes succeed silently
+pub struct DevUrandom;
+
 /// stdin file for getting chars from console
 pub struct Stdin;
 
@@ -103,6 +106,7 @@ impl File for DevNull {
     fn writable(&self) -> bool { true }
     fn read(&self, _user_buf: UserBuffer) -> usize { 0 }
     fn write(&self, user_buf: UserBuffer) -> usize { user_buf.len() }
+    fn path(&self) -> Option<&str> { Some("/dev/null") }
 }
 
 impl File for DevZero {
@@ -117,4 +121,30 @@ impl File for DevZero {
         total
     }
     fn write(&self, user_buf: UserBuffer) -> usize { user_buf.len() }
+    fn path(&self) -> Option<&str> { Some("/dev/zero") }
+}
+
+impl File for DevUrandom {
+    fn readable(&self) -> bool { true }
+    fn writable(&self) -> bool { true }
+    fn read(&self, mut user_buf: UserBuffer) -> usize {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static STATE: AtomicU64 = AtomicU64::new(0xdead_beef_cafe_babe);
+        let mut s = STATE.load(Ordering::Relaxed)
+            .wrapping_add(crate::timer::get_time_us() as u64);
+        let mut total = 0;
+        for buffer in user_buf.buffers.iter_mut() {
+            for byte in buffer.iter_mut() {
+                s ^= s >> 12;
+                s ^= s << 25;
+                s ^= s >> 27;
+                *byte = s.wrapping_mul(0x2545_F491_4F6C_DD1D) as u8;
+                total += 1;
+            }
+        }
+        STATE.store(s, Ordering::Relaxed);
+        total
+    }
+    fn write(&self, user_buf: UserBuffer) -> usize { user_buf.len() }
+    fn path(&self) -> Option<&str> { Some("/dev/urandom") }
 }
