@@ -78,6 +78,12 @@ pub trait File: Send + Sync {
     fn set_listening(&self, _listening: bool) {}
     /// Optional: mark socket handle as transferred (prevents Drop from cleaning up).
     fn mark_transferred(&self) {}
+    /// Optional: set the connected remote endpoint for UDP sockets (used by connect()).
+    #[cfg(target_arch = "riscv64")]
+    fn set_connected_remote(&self, _addr: smoltcp::wire::IpEndpoint) {}
+    /// Optional: get the connected remote endpoint for UDP sockets (used by getpeername()).
+    #[cfg(target_arch = "riscv64")]
+    fn get_connected_remote(&self) -> Option<smoltcp::wire::IpEndpoint> { None }
 }
 
 /// Linux-compatible stat layout (riscv64, matches musl struct stat).
@@ -187,7 +193,7 @@ pub use vfs::{
     path_exists, path_is_dir, remove_path,
 };
 pub use pipe::make_pipe;
-pub use stdio::{DevNull, DevZero, Stdin, Stdout};
+pub use stdio::{DevNull, DevUrandom, DevZero, Stdin, Stdout};
 
 /// Create minimal /etc and /dev files used by BusyBox tests.
 pub fn ensure_basic_paths() {
@@ -211,6 +217,8 @@ pub fn ensure_basic_paths() {
     write_file_if_missing("/dev/null", "");
     write_file_if_missing("/dev/zero", "");
     write_file_if_missing("/dev/tty", "");
+    write_file_if_missing("/dev/urandom", "");
+    write_file_if_missing("/dev/random", "");
     write_file_if_missing("/dev/rtc", "");
     write_file_if_missing("/dev/rtc0", "");
     write_file_if_missing("/dev/misc/rtc", "");

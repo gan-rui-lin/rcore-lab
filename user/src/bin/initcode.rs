@@ -226,7 +226,15 @@ fn run_single_binary(path: &str) -> i32 {
         exit(-1);
     } else {
         let mut status: i32 = 0;
-        let _ = wait(&mut status);
+        loop {
+            let ret = user_lib::waitpid(pid as usize, &mut status);
+            if ret == pid {
+                break;
+            }
+            if ret < 0 && ret != -2 {
+                break;
+            }
+        }
         println!("=== {} completed (status=0x{:x}) ===\n", path, status);
         status
     }
@@ -341,7 +349,19 @@ fn run_testcode(script_path: &str, root: &str) -> i32 {
         exit(-1);
     } else {
         let mut status: i32 = 0;
-        let _ = wait(&mut status);
+        // Use waitpid(pid) instead of wait(-1) to avoid reaping
+        // orphan grandchildren (e.g. iperf3 daemon forks).
+        loop {
+            let ret = user_lib::waitpid(pid as usize, &mut status);
+            if ret == pid {
+                break;
+            }
+            if ret < 0 && ret != -2 {
+                // error other than EAGAIN
+                break;
+            }
+            // ret == -2 (EAGAIN) or reaped wrong child, keep waiting
+        }
         println!("=== {} completed (status=0x{:x}) ===\n", script_path, status);
         status
     }

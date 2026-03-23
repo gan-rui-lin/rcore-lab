@@ -63,6 +63,7 @@ const SYSCALL_SENDFILE: usize = 71;
 /// readlinkat syscall
 const SYSCALL_READLINKAT: usize = 78;
 /// ppoll syscall
+const SYSCALL_PSELECT6: usize = 72;
 const SYSCALL_POLL: usize = 73;
 /// fstatat syscall
 const SYSCALL_FSTATAT: usize = 79;
@@ -136,6 +137,14 @@ const SYSCALL_SIGRETURN: usize = 139;
 const SYSCALL_SET_PRIORITY: usize = 140;
 /// times syscall
 const SYSCALL_TIMES: usize = 153;
+/// setpgid syscall
+const SYSCALL_SETPGID: usize = 154;
+/// getpgid syscall
+const SYSCALL_GETPGID: usize = 155;
+/// getsid syscall
+const SYSCALL_GETSID: usize = 156;
+/// setsid syscall
+const SYSCALL_SETSID: usize = 157;
 /// uname syscall
 const SYSCALL_UNAME: usize = 160;
 /// getrlimit syscall
@@ -162,6 +171,8 @@ const SYSCALL_GETEUID: usize = 175;
 const SYSCALL_GETGID: usize = 176;
 /// getegid syscall
 const SYSCALL_GETEGID: usize = 177;
+/// getrusage syscall
+const SYSCALL_GETRUSAGE: usize = 165;
 /// sysinfo syscall
 const SYSCALL_SYSINFO: usize = 179;
 /// msgget syscall
@@ -683,6 +694,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
+        SYSCALL_SETPGID => sys_setpgid(args[0] as isize, args[1] as isize),
+        SYSCALL_GETPGID => sys_getpgid(args[0] as isize),
+        SYSCALL_GETSID => sys_getsid(args[0] as isize),
+        SYSCALL_SETSID => sys_setsid(),
+        SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1]),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut RLimit),
         SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut process::SysInfo),
         SYSCALL_MSGGET => sys_msgget(args[0] as i32, args[1] as i32),
@@ -726,6 +742,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SBRK => sys_sbrk(args[0] as isize),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
+        SYSCALL_PSELECT6 => sys_pselect6(args[0], args[1] as *mut u64, args[2] as *mut u64, args[3] as *mut u64, args[4] as *const TimeSpec, args[5]),
         SYSCALL_POLL => sys_ppoll(args[0] as *mut PollFd, args[1], args[2] as *const TimeSpec),
         SYSCALL_SHUTDOWN => sys_shutdown(),
         // ---- Network syscalls ----
