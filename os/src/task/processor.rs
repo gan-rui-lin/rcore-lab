@@ -43,6 +43,14 @@ static RUN_TASKS_EMPTY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn run_tasks() {
     loop {
+        // Enable interrupts briefly so pending timer interrupts can fire.
+        // This is critical: when all tasks are blocked in kernel-mode
+        // syscalls (e.g., accept, recv, waitpid), sstatus.SIE remains 0
+        // and timer interrupts are never taken. Without this, SIGALRM
+        // from setitimer can never be delivered.
+        arch::enable_interrupts();
+        arch::disable_interrupts();
+
         let mut processor = PROCESSOR.exclusive_access();
         if let Some(task) = fetch_task() {
             task.kstack.check_guard();

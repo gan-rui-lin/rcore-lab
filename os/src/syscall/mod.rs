@@ -36,12 +36,12 @@ const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_FTRUNCATE: usize = 46;
 /// faccessat syscall
 const SYSCALL_FACCESSAT: usize = 48;
-/// chdir syscall
-const SYSCALL_CHDIR: usize = 49;
 /// fchmod syscall
 const SYSCALL_FCHMOD: usize = 52;
 /// fchmodat syscall
 const SYSCALL_FCHMODAT: usize = 53;
+/// chdir syscall
+const SYSCALL_CHDIR: usize = 49;
 /// fchownat syscall
 const SYSCALL_FCHOWNAT: usize = 54;
 /// fchown syscall
@@ -75,6 +75,7 @@ const SYSCALL_SPLICE: usize = 76;
 /// readlinkat syscall
 const SYSCALL_READLINKAT: usize = 78;
 /// ppoll syscall
+const SYSCALL_PSELECT6: usize = 72;
 const SYSCALL_POLL: usize = 73;
 /// fstatat syscall
 const SYSCALL_FSTATAT: usize = 79;
@@ -156,10 +157,16 @@ const SYSCALL_SETGID: usize = 144;
 const SYSCALL_SETUID: usize = 146;
 /// times syscall
 const SYSCALL_TIMES: usize = 153;
-/// uname syscall
-const SYSCALL_UNAME: usize = 160;
 /// setpgid syscall
 const SYSCALL_SETPGID: usize = 154;
+/// getpgid syscall
+const SYSCALL_GETPGID: usize = 155;
+/// getsid syscall
+const SYSCALL_GETSID: usize = 156;
+/// setsid syscall
+const SYSCALL_SETSID: usize = 157;
+/// uname syscall
+const SYSCALL_UNAME: usize = 160;
 /// getrlimit syscall
 const SYSCALL_GETRLIMIT: usize = 163;
 /// statfs syscall
@@ -188,6 +195,8 @@ const SYSCALL_GETEUID: usize = 175;
 const SYSCALL_GETGID: usize = 176;
 /// getegid syscall
 const SYSCALL_GETEGID: usize = 177;
+/// getrusage syscall
+const SYSCALL_GETRUSAGE: usize = 165;
 /// sysinfo syscall
 const SYSCALL_SYSINFO: usize = 179;
 /// msgget syscall
@@ -623,6 +632,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as u32,
             args[4],
         ),
+        SYSCALL_FCHMOD | SYSCALL_FCHMODAT => 0, // stub: FS doesn't track permission bits
+        54 | 55 => 0, // fchownat/fchown stub: FS doesn't track ownership
+        227 => 0, // msync stub: no-op (single-core, no persistent mmap)
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
         SYSCALL_FCHMOD => sys_fchmod(args[0], args[1] as u32),
         SYSCALL_FCHMODAT => sys_fchmodat(
@@ -683,7 +695,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as u32,
         ),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
-        SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
+        SYSCALL_EXIT_GROUP => {
+            log::warn!("[exit_group] pid={} name={} code={}", pid, name, args[0] as i32);
+            sys_exit_group(args[0] as i32)
+        }
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
         SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => {
@@ -752,6 +767,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETEGID => sys_getegid(),
         SYSCALL_SETGID => sys_setgid(args[0] as u32),
         SYSCALL_SETUID => sys_setuid(args[0] as u32),
+        SYSCALL_SETPGID => sys_setpgid(args[0] as isize, args[1] as isize),
+        SYSCALL_GETPGID => sys_getpgid(args[0] as isize),
+        SYSCALL_GETSID => sys_getsid(args[0] as isize),
+        SYSCALL_SETSID => sys_setsid(),
+        SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1]),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut RLimit),
         SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut process::SysInfo),
         SYSCALL_MSGGET => sys_msgget(args[0] as i32, args[1] as i32),
@@ -798,14 +818,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as *const usize,
             args[2] as *const usize,
         ),
-        SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32),
+        SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32, args[2] as i32),
         SYSCALL_PRLIMIT64 => sys_prlimit64(
             args[0],
             args[1],
             args[2] as *const RLimit,
             args[3] as *mut RLimit,
         ),
-        SYSCALL_SETPGID => sys_setpgid(args[0], args[1]),
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2] as u32),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
@@ -823,6 +842,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SBRK => sys_sbrk(args[0] as isize),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
+        SYSCALL_PSELECT6 => sys_pselect6(args[0], args[1] as *mut u64, args[2] as *mut u64, args[3] as *mut u64, args[4] as *const TimeSpec, args[5]),
         SYSCALL_POLL => sys_ppoll(args[0] as *mut PollFd, args[1], args[2] as *const TimeSpec),
         SYSCALL_SHUTDOWN => sys_shutdown(),
         // ---- Network syscalls ----

@@ -573,12 +573,59 @@ pub fn sys_getppid() -> isize {
     }
 }
 
-/// setpgid(pid, pgid) - stub: always succeed
-/// LTP framework calls setpgid(0,0) to put test child in its own process group
-pub fn sys_setpgid(_pid: usize, _pgid: usize) -> isize {
+pub fn sys_getrusage(who: i32, usage: usize) -> isize {
+    let _ = who;
+    if usage == 0 {
+        return 0;
+    }
+    // Zero out the rusage struct (18 * 8 = 144 bytes)
+    let token = current_user_token();
+    let bufs = translated_byte_buffer(token, usage as *const u8, 144);
+    for buf in bufs {
+        buf.fill(0);
+    }
     0
 }
 
+pub fn sys_setsid() -> isize {
+    let process = current_process();
+    let pid = process.pid.0;
+    let mut inner = process.inner_exclusive_access();
+    inner.session_id = pid;
+    inner.pgid = pid;
+    pid as isize
+}
+
+pub fn sys_setpgid(pid: isize, pgid: isize) -> isize {
+    let process = current_process();
+    let target_pid = if pid == 0 { process.pid.0 } else { pid as usize };
+    let target_pgid = if pgid == 0 { target_pid } else { pgid as usize };
+    if target_pid == process.pid.0 {
+        let mut inner = process.inner_exclusive_access();
+        inner.pgid = target_pgid;
+    }
+    0
+}
+
+pub fn sys_getpgid(pid: isize) -> isize {
+    let process = current_process();
+    if pid == 0 || pid as usize == process.pid.0 {
+        let inner = process.inner_exclusive_access();
+        inner.pgid as isize
+    } else {
+        0
+    }
+}
+
+pub fn sys_getsid(pid: isize) -> isize {
+    let process = current_process();
+    if pid == 0 || pid as usize == process.pid.0 {
+        let inner = process.inner_exclusive_access();
+        inner.session_id as isize
+    } else {
+        0
+    }
+}
 pub fn sys_fork() -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
@@ -1219,18 +1266,16 @@ fn encode_wait_status(exit_code: i32) -> i32 {
     }
 }
 
-/// If there is not a child process whose pid is same as given, return -ECHILD.
-/// Else if there is a child process but it is still running, return -EAGAIN.
-pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
+/// wait4 syscall: wait for child process state changes.
+/// options: WNOHANG (1) = return immediately if no zombie child.
+/// Returns child pid on success, 0 if WNOHANG and no zombie, -ECHILD if no matching child.
+pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
+    const WNOHANG: i32 = 1;
+    let my_pid = current_process().getpid();
     loop {
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-        let _trace_pid = process.getpid();
-        if !inner
-            .children
-            .iter()
-            .any(|p| pid == -1 || pid as usize == p.getpid())
-        {
+        if !inner.children.iter().any(|p| pid == -1 || pid as usize == p.getpid()) {
             return errno(ECHILD);
         }
         let pair = inner.children.iter().enumerate().find(|(_, p)| {
@@ -1238,39 +1283,63 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
         });
         if let Some((idx, _)) = pair {
             let child = inner.children.remove(idx);
-            if Arc::strong_count(&child) > 1 {
-                trace!(
-                    "kernel:pid[{}] waitpid: child pid {} has {} refs",
-                    process.getpid(),
-                    child.getpid(),
-                    Arc::strong_count(&child)
-                );
-            }
             let found_pid = child.getpid();
             let exit_code = child.inner_exclusive_access().exit_code;
             if !exit_code_ptr.is_null() {
                 let status = encode_wait_status(exit_code);
                 *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
             }
+            trace!(
+                "[sys_waitpid] pid={} reaped child pid={} exit_code={}",
+                my_pid, found_pid, exit_code
+            );
             return found_pid as isize;
         }
-        // let child_count = inner.children.len();
-        // let pending = inner.signal_pending;
-        // let mask = inner.signal_mask;
-        // let name = inner.name.clone();
         drop(inner);
-        // if crate::syscall::should_trace_syscall(trace_pid) {
-        //     trace!(
-        //         "[sys_waitpid] pid={} name={} child_count={} pending={:?} mask={:?} -> yield",
-        //         trace_pid,
-        //         name,
-        //         child_count,
-        //         pending,
-        //         mask
-        //     );
-        //     crate::task::debug_dump_tasks();
-        // }
+
+        // WNOHANG: return 0 immediately if no zombie child
+        if (options & WNOHANG) != 0 {
+            return 0;
+        }
+
+        // Yield and retry (busy-wait until child exits)
         suspend_current_and_run_next();
+
+        // Check for pending signals that have a user handler -> return EINTR.
+        // Signals with SIG_DFL (default-ignore, like SIGCHLD) should NOT cause EINTR.
+        {
+            let process = current_process();
+            let process_inner = process.inner_exclusive_access();
+            let task = current_task().unwrap();
+            let task_inner = task.inner_exclusive_access();
+            let unmasked = (process_inner.signal_pending | task_inner.signal_pending)
+                & !task_inner.signal_mask;
+            if !unmasked.is_empty() {
+                // Only return EINTR if at least one pending signal has a user
+                // handler WITHOUT SA_RESTART. Signals with SIG_DFL/SIG_IGN don't
+                // cause EINTR. Signals with SA_RESTART cause the syscall to be
+                // restarted (we just continue the loop).
+                use crate::task::SA_RESTART;
+                let actions = &process_inner.signal_actions;
+                let raw = unmasked.bits();
+                let mut needs_eintr = false;
+                for bit in 0..64u32 {
+                    if raw & (1u64 << bit) != 0 {
+                        let signum = bit as usize + 1;
+                        if signum < actions.table.len() {
+                            let action = &actions.table[signum];
+                            if action.handler <= 1 { continue; } // SIG_DFL/SIG_IGN
+                            if (action.flags & SA_RESTART) != 0 { continue; }
+                            needs_eintr = true;
+                            break;
+                        }
+                    }
+                }
+                if needs_eintr {
+                    return errno(EINTR);
+                }
+            }
+        }
     }
 }
 
