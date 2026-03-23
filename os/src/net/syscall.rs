@@ -56,7 +56,9 @@ const EAFNOSUPPORT: isize = -97;
 const EADDRINUSE: isize = -98;
 const ENOTCONN: isize = -107;
 const ECONNREFUSED: isize = -111;
+const EFAULT: isize = -14;
 const EMFILE: isize = -24;
+const EMSGSIZE: isize = -90;
 const EOPNOTSUPP: isize = -95;
 
 /// Linux sockaddr_in structure (16 bytes).
@@ -461,7 +463,16 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
         SocketType::Tcp => {
             let local_port = alloc_ephemeral_port();
             let is_loopback = match remote.addr {
-                IpAddress::Ipv4(v4) => v4.as_bytes()[0] == 127,
+                IpAddress::Ipv4(v4) => {
+                    let b = v4.as_bytes();
+                    b[0] == 127 || (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0)
+                }
+            };
+            // Rewrite 0.0.0.0 to 127.0.0.1 (INADDR_ANY means localhost for connect)
+            let connect_remote = if remote.addr == IpAddress::v4(0, 0, 0, 0) {
+                IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), remote.port)
+            } else {
+                remote
             };
             {
                 poll_net();
@@ -471,13 +482,13 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
                     None => return EINVAL,
                 };
                 let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-                // Use loopback interface context for 127.x.x.x
+                // Use loopback interface context for 127.x.x.x and 0.0.0.0
                 let cx = if is_loopback {
                     stack.lo_iface.context()
                 } else {
                     stack.iface.context()
                 };
-                if let Err(e) = socket.connect(cx, remote, local_port) {
+                if let Err(e) = socket.connect(cx, connect_remote, local_port) {
                     warn!("[net] TCP connect failed: {:?}", e);
                     return ECONNREFUSED;
                 }
@@ -624,6 +635,11 @@ pub fn sys_sendto(
         Err(e) => return e,
     };
 
+    // Validate user buffer pointer
+    if len > 0 && (buf as usize) >= 0x4000_0000_0000 {
+        return EFAULT;
+    }
+
     // Read user data into kernel buffer
     let user_bufs = translated_byte_buffer(token, buf, len);
     let mut data = vec![0u8; len];
@@ -645,6 +661,14 @@ pub fn sys_sendto(
             let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
 
             if !socket.may_send() {
+                use smoltcp::socket::tcp::State;
+                let state = socket.state();
+                // Closed/non-established socket: EPIPE (not connected)
+                // CloseWait/LastAck/etc: return 0 (connection closed after established)
+                if matches!(state, State::Closed | State::Listen | State::SynSent | State::SynReceived) {
+                    const EPIPE: isize = -32;
+                    return EPIPE;
+                }
                 return 0;
             }
             if socket.can_send() {
@@ -669,10 +693,21 @@ pub fn sys_sendto(
             }
         },
         SocketType::Udp => {
+            // Validate dest_addr pointer and addr_len
+            if (addr_len as isize) < 0 {
+                return EINVAL;
+            }
+            if !dest_addr.is_null() && (dest_addr as usize) >= 0x4000_0000_0000 {
+                return EFAULT;
+            }
             let dest = match read_sockaddr(dest_addr, addr_len, token) {
                 Some(ep) => ep,
                 None => return EINVAL,
             };
+            // EMSGSIZE: UDP datagram too large
+            if len > 65535 {
+                return EMSGSIZE;
+            }
 
             let is_loopback = match dest.addr {
                 IpAddress::Ipv4(v4) => v4.as_bytes()[0] == 127,
