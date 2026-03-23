@@ -632,9 +632,6 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as u32,
             args[4],
         ),
-        SYSCALL_FCHMOD | SYSCALL_FCHMODAT => 0, // stub: FS doesn't track permission bits
-        54 | 55 => 0, // fchownat/fchown stub: FS doesn't track ownership
-        227 => 0, // msync stub: no-op (single-core, no persistent mmap)
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
         SYSCALL_FCHMOD => sys_fchmod(args[0], args[1] as u32),
         SYSCALL_FCHMODAT => sys_fchmodat(
