@@ -3,22 +3,6 @@
 # Set PATH to prioritize rustup nightly-2024-05-02 toolchain
 export PATH="$HOME/.rustup/toolchains/nightly-2024-05-02-aarch64-apple-darwin/bin:$HOME/.rustup/toolchains/nightly-2024-05-02-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin:$PATH"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TESTENV_QEMU_BIN="$SCRIPT_DIR/tools/qemu-testenv-riscv64.sh"
-LOCAL_QEMU_BIN="$(command -v qemu-system-riscv64 2>/dev/null || true)"
-QEMU_BIN="${QEMU_BIN:-}"
-
-if [[ -z "$QEMU_BIN" ]]; then
-    if [[ -x "$TESTENV_QEMU_BIN" ]] && command -v docker >/dev/null 2>&1; then
-        QEMU_BIN="$TESTENV_QEMU_BIN"
-    elif [[ -n "$LOCAL_QEMU_BIN" ]]; then
-        QEMU_BIN="$LOCAL_QEMU_BIN"
-    else
-        echo "错误: 未找到可用的 qemu-system-riscv64" >&2
-        exit 1
-    fi
-fi
-
 # 默认配置
 BUILD_TYPE="rv"
 IMAGE_FILE="sdcard-rv.img"
@@ -31,7 +15,6 @@ NET_DUMP_OBJ=""
 NET_MODE="user"
 TAP_IFNAME="tap0"
 BRIDGE_NAME="br0"
-SNAPSHOT_MODE="${QEMU_SNAPSHOT:-1}"
 OFFLINE_BUILD="${OFFLINE-1}"
 
 # 显示用法信息
@@ -46,7 +29,6 @@ usage() {
     echo "  --netmode MODE     网络模式 (user/tap), 默认: $NET_MODE"
     echo "  --tap-ifname NAME  tap 模式网卡名, 默认: $TAP_IFNAME"
     echo "  --bridge NAME      bridge 模式桥接名(需预先创建), 默认: $BRIDGE_NAME"
-    echo "  --persist          关闭 QEMU snapshot，允许写回基础镜像"
     echo "  --offline          强制离线构建 (默认开启)"
     echo "  --online           允许联网构建"
     echo "  -h, --help         显示此帮助信息"
@@ -90,10 +72,6 @@ while [[ $# -gt 0 ]]; do
         --bridge)
             BRIDGE_NAME="$2"
             shift 2
-            ;;
-        --persist)
-            SNAPSHOT_MODE="0"
-            shift
             ;;
         --netdump)
             NET_DUMP_FILE="$2"
@@ -157,7 +135,6 @@ fi
 
 echo "开始构建: make $BUILD_TYPE"
 echo "使用镜像: $IMAGE_FILE"
-echo "QEMU 命令: $QEMU_BIN"
 if [[ "$GDB_DEBUG" == "1" ]]; then
     GDB_FLAGS="-s -S"
     echo "GDB 调试: 开启 (-s -S)"
@@ -200,14 +177,6 @@ else
     echo "离线构建: 关闭"
 fi
 
-QEMU_SNAPSHOT_FLAG=""
-if [[ "$SNAPSHOT_MODE" == "1" ]]; then
-    QEMU_SNAPSHOT_FLAG="-snapshot"
-    echo "磁盘写回: 关闭 (QEMU snapshot)"
-else
-    echo "磁盘写回: 开启 (直接写回镜像)"
-fi
-
 # 执行构建[1](@ref)
 if [[ "$BUILD_TYPE" == "debug" ]]; then
     if [[ "$OFFLINE_BUILD" == "1" ]]; then
@@ -243,13 +212,16 @@ fi
 
 # 运行QEMU
 echo "启动QEMU模拟器..."
-"$QEMU_BIN" -machine virt \
-    -kernel kernel-rv \
+KERNEL_IMAGE="kernel-rv.bin"
+if [[ ! -f "$KERNEL_IMAGE" ]]; then
+    KERNEL_IMAGE="kernel-rv"
+fi
+qemu-system-riscv64 -machine virt \
+    -kernel "$KERNEL_IMAGE" \
   -m 128M \
   -nographic \
   -smp 1 \
   -bios default \
-  $QEMU_SNAPSHOT_FLAG \
   -drive file="$IMAGE_FILE",if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -no-reboot \
