@@ -732,7 +732,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as *const usize,
             args[2] as *const usize,
         ),
-        SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32),
+        SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32, args[2] as i32),
         SYSCALL_PRLIMIT64 => sys_prlimit64(
             args[0],
             args[1],
