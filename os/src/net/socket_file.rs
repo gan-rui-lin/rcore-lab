@@ -92,13 +92,19 @@ impl File for SocketFile {
         match self.sock_type {
             SocketType::Tcp => {
                 let socket = stack.sockets.get_mut::<tcp::Socket>(self.handle);
-                if events.contains(PollEvents::POLLIN) && socket.can_recv() {
+                let state = socket.state();
+                use smoltcp::socket::tcp::State;
+                // A socket is "was connected" if it's in any state past SynSent
+                let was_connected = !matches!(state, State::Closed | State::Listen | State::SynSent | State::SynReceived);
+                // POLLIN: data available OR peer sent FIN on an established connection
+                if events.contains(PollEvents::POLLIN) && (socket.can_recv() || (was_connected && !socket.may_recv())) {
                     result |= PollEvents::POLLIN;
                 }
                 if events.contains(PollEvents::POLLOUT) && socket.can_send() {
                     result |= PollEvents::POLLOUT;
                 }
-                if !socket.is_open() {
+                // POLLHUP: connection fully closed after being established
+                if !socket.is_open() && was_connected {
                     result |= PollEvents::POLLHUP;
                 }
             }
