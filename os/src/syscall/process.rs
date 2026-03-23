@@ -504,6 +504,60 @@ pub fn sys_getppid() -> isize {
     }
 }
 
+pub fn sys_getrusage(who: i32, usage: usize) -> isize {
+    let _ = who;
+    if usage == 0 {
+        return 0;
+    }
+    // Zero out the rusage struct (18 * 8 = 144 bytes)
+    let token = current_user_token();
+    let bufs = translated_byte_buffer(token, usage as *const u8, 144);
+    for buf in bufs {
+        buf.fill(0);
+    }
+    0
+}
+
+pub fn sys_setsid() -> isize {
+    let process = current_process();
+    let pid = process.pid.0;
+    let mut inner = process.inner_exclusive_access();
+    inner.session_id = pid;
+    inner.pgid = pid;
+    pid as isize
+}
+
+pub fn sys_setpgid(pid: isize, pgid: isize) -> isize {
+    let process = current_process();
+    let target_pid = if pid == 0 { process.pid.0 } else { pid as usize };
+    let target_pgid = if pgid == 0 { target_pid } else { pgid as usize };
+    if target_pid == process.pid.0 {
+        let mut inner = process.inner_exclusive_access();
+        inner.pgid = target_pgid;
+    }
+    0
+}
+
+pub fn sys_getpgid(pid: isize) -> isize {
+    let process = current_process();
+    if pid == 0 || pid as usize == process.pid.0 {
+        let inner = process.inner_exclusive_access();
+        inner.pgid as isize
+    } else {
+        0
+    }
+}
+
+pub fn sys_getsid(pid: isize) -> isize {
+    let process = current_process();
+    if pid == 0 || pid as usize == process.pid.0 {
+        let inner = process.inner_exclusive_access();
+        inner.session_id as isize
+    } else {
+        0
+    }
+}
+
 pub fn sys_fork() -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {

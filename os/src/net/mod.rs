@@ -103,14 +103,18 @@ pub fn init() {
 }
 
 /// Poll the network stack (always acquires lock). Use from syscall path.
+///
+/// Loopback needs multiple polls to complete a round-trip:
+/// TX→loopback_rx→process→TX→loopback_rx. We do 4 rounds which is
+/// enough for TCP 3-way handshake (SYN→SYN-ACK→ACK→data).
 pub fn poll_net() {
     let mut net = NET_STACK.exclusive_access();
     if let Some(ref mut stack) = *net {
         let now = smoltcp_now();
         stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
-        stack
-            .lo_iface
-            .poll(now, &mut stack.lo_device, &mut stack.sockets);
+        for _ in 0..4 {
+            stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+        }
     }
 }
 

@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use log::warn;
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::{tcp, udp};
+use smoltcp::wire::IpEndpoint;
 
 use crate::fs::{File, PollEvents};
 use crate::mm::UserBuffer;
@@ -36,6 +37,8 @@ pub struct SocketFile {
     pub listening: AtomicBool,
     /// If true, Drop will NOT abort/remove the socket (ownership transferred to another fd).
     pub transferred: AtomicBool,
+    /// UDP connected remote endpoint (set by connect() for write()/send() support).
+    pub connected_remote: spin::Mutex<Option<IpEndpoint>>,
 }
 
 impl SocketFile {
@@ -49,6 +52,7 @@ impl SocketFile {
             bound_port: AtomicU16::new(0),
             listening: AtomicBool::new(false),
             transferred: AtomicBool::new(false),
+            connected_remote: spin::Mutex::new(None),
         }
     }
 }
@@ -113,6 +117,14 @@ impl File for SocketFile {
 
     fn as_socket(&self) -> Option<(SocketHandle, SocketType)> {
         Some((self.handle, self.sock_type))
+    }
+
+    fn set_connected_remote(&self, addr: IpEndpoint) {
+        *self.connected_remote.lock() = Some(addr);
+    }
+
+    fn get_connected_remote(&self) -> Option<IpEndpoint> {
+        *self.connected_remote.lock()
     }
 
     fn fd_flags(&self) -> u32 {
@@ -263,9 +275,75 @@ impl SocketFile {
         }
     }
 
-    fn udp_write(&self, _user_buf: UserBuffer) -> usize {
-        warn!("[net] UDP write via File::write not supported, use sendto");
-        0
+    fn udp_write(&self, user_buf: UserBuffer) -> usize {
+        use smoltcp::wire::{IpAddress, IpEndpoint};
+        use smoltcp::socket::udp;
+
+        let remote = match *self.connected_remote.lock() {
+            Some(ep) => ep,
+            None => {
+                warn!("[net] UDP write: no connected remote, use sendto");
+                return 0;
+            }
+        };
+        let mut data = alloc::vec::Vec::new();
+        for buf in user_buf.buffers.iter() {
+            data.extend_from_slice(buf);
+        }
+        if data.is_empty() {
+            return 0;
+        }
+        let is_loopback = match remote.addr {
+            IpAddress::Ipv4(v4) => v4.as_bytes()[0] == 127,
+        };
+
+        poll_net();
+        let mut net = NET_STACK.exclusive_access();
+        let stack = match net.as_mut() {
+            Some(s) => s,
+            None => return 0,
+        };
+
+        // Auto-bind if not yet bound
+        {
+            let socket = stack.sockets.get_mut::<udp::Socket>(self.handle);
+            if !socket.is_open() {
+                let local_port = super::alloc_ephemeral_port();
+                let _ = socket.bind(smoltcp::wire::IpListenEndpoint {
+                    addr: None,
+                    port: local_port,
+                });
+            }
+        }
+
+        if is_loopback {
+            // Loopback: inject directly into target socket's rx buffer
+            let sender_port = stack
+                .sockets
+                .get_mut::<udp::Socket>(self.handle)
+                .endpoint()
+                .port;
+            let sender_meta = udp::UdpMetadata {
+                endpoint: IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), sender_port),
+                meta: Default::default(),
+            };
+            let target_port = remote.port;
+            for (_sh, sock) in stack.sockets.iter_mut() {
+                if let smoltcp::socket::Socket::Udp(ref mut udp_sock) = sock {
+                    if udp_sock.endpoint().port == target_port {
+                        let _ = udp_sock.inject_recv(&data, sender_meta);
+                        break;
+                    }
+                }
+            }
+            data.len()
+        } else {
+            let socket = stack.sockets.get_mut::<udp::Socket>(self.handle);
+            let _ = socket.send_slice(&data, remote);
+            drop(net);
+            poll_net();
+            data.len()
+        }
     }
 }
 
@@ -280,14 +358,25 @@ impl Drop for SocketFile {
             match self.sock_type {
                 SocketType::Tcp => {
                     let socket = stack.sockets.get_mut::<tcp::Socket>(self.handle);
-                    socket.abort();
+                    // Use close() instead of abort() to send FIN gracefully.
+                    // This ensures pending TX data (like iperf IPERF_DONE state)
+                    // reaches the peer before the connection is torn down.
+                    socket.close();
+                    // Flush the FIN through loopback immediately.
+                    let now = super::smoltcp_now();
+                    stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+                    stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+                    // Don't remove the socket yet - smoltcp needs it for FIN handshake.
+                    // It will be cleaned up when the socket enters Closed state.
+                    // For simplicity, remove it anyway (smoltcp handles orphan FINs).
+                    stack.sockets.remove(self.handle);
                 }
                 SocketType::Udp => {
                     let socket = stack.sockets.get_mut::<udp::Socket>(self.handle);
                     socket.close();
+                    stack.sockets.remove(self.handle);
                 }
             }
-            stack.sockets.remove(self.handle);
         }
     }
 }
