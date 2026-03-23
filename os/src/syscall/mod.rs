@@ -173,6 +173,10 @@ const SYSCALL_GETGID: usize = 176;
 const SYSCALL_GETEGID: usize = 177;
 /// getrusage syscall
 const SYSCALL_GETRUSAGE: usize = 165;
+/// setitimer syscall
+const SYSCALL_SETITIMER: usize = 103;
+/// getitimer syscall
+const SYSCALL_GETITIMER: usize = 102;
 /// sysinfo syscall
 const SYSCALL_SYSINFO: usize = 179;
 /// msgget syscall
@@ -699,6 +703,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETSID => sys_getsid(args[0] as isize),
         SYSCALL_SETSID => sys_setsid(),
         SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1]),
+        SYSCALL_SETITIMER => sys_setitimer(args[0] as i32, args[1] as *const u8, args[2] as *mut u8),
+        SYSCALL_GETITIMER => sys_getitimer(args[0] as i32, args[1] as *mut u8),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut RLimit),
         SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut process::SysInfo),
         SYSCALL_MSGGET => sys_msgget(args[0] as i32, args[1] as i32),
