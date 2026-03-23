@@ -2520,31 +2520,75 @@ pub fn sys_sigreturn() -> isize {
 }
 
 /// Get user ID
-/// rcore-lab is a single-user system, always returns 0
 pub fn sys_getuid() -> isize {
-    syscall!("kernel:pid[{}] sys_getuid", current_process().pid.0);
-    0
+    let process = current_process();
+    syscall!("kernel:pid[{}] sys_getuid", process.pid.0);
+    let uid = process.inner_exclusive_access().real_uid as isize;
+    uid
 }
 
 /// Get effective user ID
-/// rcore-lab is a single-user system, always returns 0
 pub fn sys_geteuid() -> isize {
-    syscall!("kernel:pid[{}] sys_geteuid", current_process().pid.0);
-    0
+    let process = current_process();
+    syscall!("kernel:pid[{}] sys_geteuid", process.pid.0);
+    let uid = process.inner_exclusive_access().effective_uid as isize;
+    uid
 }
 
 /// Get group ID
-/// rcore-lab is a single-user system, always returns 0
 pub fn sys_getgid() -> isize {
-    syscall!("kernel:pid[{}] sys_getgid", current_process().pid.0);
-    0
+    let process = current_process();
+    syscall!("kernel:pid[{}] sys_getgid", process.pid.0);
+    let gid = process.inner_exclusive_access().real_gid as isize;
+    gid
 }
 
 /// Get effective group ID
-/// rcore-lab is a single-user system, always returns 0
 pub fn sys_getegid() -> isize {
-    syscall!("kernel:pid[{}] sys_getegid", current_process().pid.0);
-    0
+    let process = current_process();
+    syscall!("kernel:pid[{}] sys_getegid", process.pid.0);
+    let gid = process.inner_exclusive_access().effective_gid as isize;
+    gid
+}
+
+/// Set user ID with minimal Linux-like semantics needed by LTP.
+pub fn sys_setuid(uid: u32) -> isize {
+    let process = current_process();
+    let pid = process.pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_setuid uid={}", pid, uid);
+    }
+    let mut inner = process.inner_exclusive_access();
+    if inner.effective_uid == 0 {
+        inner.real_uid = uid;
+        inner.effective_uid = uid;
+        return 0;
+    }
+    if uid == inner.real_uid || uid == inner.effective_uid {
+        inner.effective_uid = uid;
+        return 0;
+    }
+    errno(EPERM)
+}
+
+/// Set group ID with minimal Linux-like semantics needed by LTP.
+pub fn sys_setgid(gid: u32) -> isize {
+    let process = current_process();
+    let pid = process.pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_setgid gid={}", pid, gid);
+    }
+    let mut inner = process.inner_exclusive_access();
+    if inner.effective_gid == 0 {
+        inner.real_gid = gid;
+        inner.effective_gid = gid;
+        return 0;
+    }
+    if gid == inner.real_gid || gid == inner.effective_gid {
+        inner.effective_gid = gid;
+        return 0;
+    }
+    errno(EPERM)
 }
 
 pub fn sys_getrlimit(resource: usize, rlim: *mut RLimit) -> isize {

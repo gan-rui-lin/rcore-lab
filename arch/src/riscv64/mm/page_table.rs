@@ -350,22 +350,29 @@ pub fn translated_byte_buffer_checked(
 }
 
 /// Translate a NUL-terminated user-space string into a `String`.
-pub fn translated_str(token: usize, ptr: *const u8) -> String {
+pub fn translated_str_checked(token: usize, ptr: *const u8) -> Option<String> {
     let page_table = PageTable::from_token(token);
     let mut string = String::new();
     let mut va = ptr as usize;
     loop {
-        let ch: u8 = *(page_table
-            .translate_va(VirtAddr::from(va))
-            .unwrap()
-            .get_mut());
+        let pte = page_table.translate(VirtAddr::from(va).floor())?;
+        let flags = pte.flags();
+        if !pte.is_valid() || !flags.contains(PTEFlags::U) || !pte.readable() {
+            return None;
+        }
+        let ch: u8 = *(page_table.translate_va(VirtAddr::from(va))?.get_mut());
         if ch == 0 {
             break;
         }
         string.push(ch as char);
-        va += 1;
+        va = va.checked_add(1)?;
     }
-    string
+    Some(string)
+}
+
+/// Translate a NUL-terminated user-space string into a `String`.
+pub fn translated_str(token: usize, ptr: *const u8) -> String {
+    translated_str_checked(token, ptr).unwrap()
 }
 
 /// Translate a user-space pointer and return an immutable reference.

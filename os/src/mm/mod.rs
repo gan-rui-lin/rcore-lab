@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 pub use arch::{
     translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
-    translated_str, PTEFlags,
+    translated_str, translated_str_checked, PTEFlags,
 };
 pub use arch::{PageTable, PageTableEntry, UserBuffer, UserBufferIterator};
 pub use arch::{PhysAddr, PhysPageNum, StepByOne, VPNRange, VirtAddr, VirtPageNum};

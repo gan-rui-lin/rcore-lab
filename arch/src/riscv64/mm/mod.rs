@@ -10,7 +10,8 @@ pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, VPNRa
 pub use address::{PAGE_SIZE, PAGE_SIZE_BITS};
 pub use page_table::{
     translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
-    translated_str, PageTable, PageTableEntry, PTEFlags, UserBuffer, UserBufferIterator,
+    translated_str, translated_str_checked, PageTable, PageTableEntry, PTEFlags, UserBuffer,
+    UserBufferIterator,
 };
 
 /// Switch to the page table identified by the given `satp` token and

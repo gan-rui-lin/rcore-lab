@@ -47,7 +47,7 @@ pub use mm::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum, VPNRange, StepByOne};
 pub use mm::{PageTable, PageTableEntry, PTEFlags};
 pub use mm::{
     translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
-    translated_str,
+    translated_str, translated_str_checked,
 };
 pub use mm::{UserBuffer, UserBufferIterator};
 pub use mm::{PAGE_SIZE, PAGE_SIZE_BITS};

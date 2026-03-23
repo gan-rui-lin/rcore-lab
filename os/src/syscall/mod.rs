@@ -24,6 +24,8 @@ const SYSCALL_IOCTL: usize = 29;
 const SYSCALL_UNLINKAT: usize = 35;
 /// mkdirat syscall
 const SYSCALL_MKDIRAT: usize = 34;
+/// symlinkat syscall
+const SYSCALL_SYMLINKAT: usize = 36;
 /// linkat syscall
 const SYSCALL_LINKAT: usize = 37;
 /// umount2 syscall
@@ -68,6 +70,8 @@ const SYSCALL_PREAD64: usize = 67;
 const SYSCALL_PWRITE64: usize = 68;
 /// sendfile syscall
 const SYSCALL_SENDFILE: usize = 71;
+/// splice syscall
+const SYSCALL_SPLICE: usize = 76;
 /// readlinkat syscall
 const SYSCALL_READLINKAT: usize = 78;
 /// ppoll syscall
@@ -146,6 +150,10 @@ const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
 const SYSCALL_SIGRETURN: usize = 139;
 /// setpriority syscall
 const SYSCALL_SET_PRIORITY: usize = 140;
+/// setgid syscall
+const SYSCALL_SETGID: usize = 144;
+/// setuid syscall
+const SYSCALL_SETUID: usize = 146;
 /// times syscall
 const SYSCALL_TIMES: usize = 153;
 /// uname syscall
@@ -596,6 +604,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *const u8,
             args[4] as u32,
         ),
+        SYSCALL_SYMLINKAT => {
+            sys_symlinkat(args[0] as *const u8, args[1] as isize, args[2] as *const u8)
+        }
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_RENAMEAT2 => sys_renameat2(
             args[0] as isize,
@@ -637,6 +648,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_PWRITE64 => sys_pwrite64(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut isize, args[3]),
+        SYSCALL_SPLICE => sys_splice(
+            args[0],
+            args[1] as *mut isize,
+            args[2],
+            args[3] as *mut isize,
+            args[4],
+            args[5] as u32,
+        ),
         SYSCALL_READLINKAT => sys_readlinkat(
             args[0] as isize,
             args[1] as *const u8,
@@ -731,6 +750,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
+        SYSCALL_SETGID => sys_setgid(args[0] as u32),
+        SYSCALL_SETUID => sys_setuid(args[0] as u32),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut RLimit),
         SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut process::SysInfo),
         SYSCALL_MSGGET => sys_msgget(args[0] as i32, args[1] as i32),

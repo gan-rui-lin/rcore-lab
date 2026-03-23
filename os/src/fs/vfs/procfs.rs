@@ -184,6 +184,7 @@ impl VfsInode for ProcPidDirInode {
     fn lookup(&self, name: &str) -> Option<Arc<dyn VfsInode>> {
         match name {
             "stat" => Some(ProcPidStatInode::new(self.pid)),
+            "maps" => Some(ProcPidMapsInode::new(self.pid)),
             _ => None,
         }
     }
@@ -195,7 +196,66 @@ impl VfsInode for ProcPidDirInode {
     fn truncate(&self) {}
 
     fn list(&self) -> Vec<String> {
-        vec![String::from("stat")]
+        vec![String::from("maps"), String::from("stat")]
+    }
+}
+
+struct ProcPidMapsInode {
+    pid: usize,
+}
+
+impl ProcPidMapsInode {
+    fn new(pid: usize) -> Arc<Self> {
+        Arc::new(Self { pid })
+    }
+
+    fn render(&self) -> String {
+        let Some(process) = pid2process(self.pid) else {
+            return String::new();
+        };
+        let inner = process.inner_exclusive_access();
+        inner
+            .memory_set
+            .render_proc_maps(&inner.name, inner.heap_bottom, inner.program_brk)
+    }
+}
+
+impl VfsInode for ProcPidMapsInode {
+    fn kind(&self) -> VfsNodeKind {
+        VfsNodeKind::File
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let content = self.render();
+        let bytes = content.as_bytes();
+        if offset >= bytes.len() {
+            return 0;
+        }
+        let n = core::cmp::min(buf.len(), bytes.len() - offset);
+        buf[..n].copy_from_slice(&bytes[offset..offset + n]);
+        n
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn lookup(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
+        None
+    }
+
+    fn truncate(&self) {}
+
+    fn list(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn size(&self) -> usize {
+        self.render().as_bytes().len()
     }
 }
 
