@@ -39,3 +39,9 @@ smoltcp = { path = "../vendor/smoltcp", default-features = false, features = [
 [target.'cfg(target_arch = "loongarch64")'.dependencies]
 loongArch64 = { path = "../vendor/loongArch64" }
 virtio-drivers-new = { path = "../vendor/virtio-drivers", package = "virtio-drivers" }
+smoltcp = { path = "../vendor/smoltcp", default-features = false, features = [
+    "alloc", "log",
+    "medium-ethernet", "medium-ip",
+    "proto-ipv4",
+    "socket-tcp", "socket-udp", "socket-icmp", "socket-raw",
+] }
