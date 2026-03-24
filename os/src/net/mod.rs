@@ -9,8 +9,12 @@ use lazy_static::lazy_static;
 use log::info;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{Loopback, Medium};
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 
+#[cfg(target_arch = "riscv64")]
+use smoltcp::wire::{EthernetAddress, Ipv4Address};
+
+#[cfg(target_arch = "riscv64")]
 use crate::drivers::net::VirtIONetDevice;
 use crate::sync::UPIntrFreeCell;
 use crate::timer::get_time_ms;
@@ -25,9 +29,11 @@ static NEXT_PORT: AtomicU16 = AtomicU16::new(49152);
 
 /// The global network stack holding device, interface, and sockets.
 pub struct NetStack {
-    /// The VirtIO network device driver.
+    /// The VirtIO network device driver (RISC-V only).
+    #[cfg(target_arch = "riscv64")]
     pub device: VirtIONetDevice,
-    /// The smoltcp network interface (external network).
+    /// The smoltcp network interface for external network (RISC-V only).
+    #[cfg(target_arch = "riscv64")]
     pub iface: Interface,
     /// Loopback device for 127.0.0.1 traffic.
     pub lo_device: Loopback,
@@ -35,6 +41,20 @@ pub struct NetStack {
     pub lo_iface: Interface,
     /// The set of active sockets (shared across both interfaces).
     pub sockets: SocketSet<'static>,
+}
+
+impl NetStack {
+    /// Poll the external network interface. No-op on architectures without
+    /// a VirtIO network device (e.g. LoongArch64 loopback-only mode).
+    pub fn poll_external(&mut self, now: smoltcp::time::Instant) {
+        #[cfg(target_arch = "riscv64")]
+        {
+            self.iface.poll(now, &mut self.device, &mut self.sockets);
+        }
+        let _ = now; // suppress unused warning on non-riscv64
+    }
+
+
 }
 
 lazy_static! {
@@ -50,34 +70,41 @@ pub fn smoltcp_now() -> smoltcp::time::Instant {
 
 /// Initialize the network stack.
 pub fn init() {
-    let mut device = VirtIONetDevice::new();
-    let mac = device.mac_address();
-    info!(
-        "[net] VirtIO-Net MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-    );
-
-    let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
-    let mut config = Config::new(hw_addr);
-    config.random_seed = get_time_ms() as u64;
-
     let now = smoltcp_now();
-    let mut iface = Interface::new(config, &mut device, now);
 
-    // Configure IP: 10.0.2.15/24 (QEMU user-mode default)
-    iface.update_ip_addrs(|addrs| {
-        addrs
-            .push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24))
+    // --- External network interface (RISC-V only) ---
+    #[cfg(target_arch = "riscv64")]
+    let (device, iface) = {
+        let mut device = VirtIONetDevice::new();
+        let mac = device.mac_address();
+        info!(
+            "[net] VirtIO-Net MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        );
+
+        let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
+        let mut config = Config::new(hw_addr);
+        config.random_seed = get_time_ms() as u64;
+
+        let mut iface = Interface::new(config, &mut device, now);
+
+        // Configure IP: 10.0.2.15/24 (QEMU user-mode default)
+        iface.update_ip_addrs(|addrs| {
+            addrs
+                .push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24))
+                .unwrap();
+        });
+
+        // Default gateway: 10.0.2.2 (QEMU user-mode default)
+        iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2))
             .unwrap();
-    });
 
-    // Default gateway: 10.0.2.2 (QEMU user-mode default)
-    iface
-        .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2))
-        .unwrap();
+        (device, iface)
+    };
 
-    // Create loopback interface for 127.0.0.1
+    // --- Loopback interface (all architectures) ---
     let mut lo_device = Loopback::new(Medium::Ip);
     let lo_config = Config::new(HardwareAddress::Ip);
     let mut lo_iface = Interface::new(lo_config, &mut lo_device, now);
@@ -92,14 +119,19 @@ pub fn init() {
     let sockets = SocketSet::new(socket_storage);
 
     *NET_STACK.exclusive_access() = Some(NetStack {
+        #[cfg(target_arch = "riscv64")]
         device,
+        #[cfg(target_arch = "riscv64")]
         iface,
         lo_device,
         lo_iface,
         sockets,
     });
 
+    #[cfg(target_arch = "riscv64")]
     info!("[net] Network stack initialized: 10.0.2.15/24, gateway 10.0.2.2, loopback 127.0.0.1/8");
+    #[cfg(not(target_arch = "riscv64"))]
+    info!("[net] Network stack initialized: loopback 127.0.0.1/8 (loopback-only mode)");
 }
 
 /// Poll the network stack (always acquires lock). Use from syscall path.
@@ -111,7 +143,7 @@ pub fn poll_net() {
     let mut net = NET_STACK.exclusive_access();
     if let Some(ref mut stack) = *net {
         let now = smoltcp_now();
-        stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+        stack.poll_external(now);
         for _ in 0..4 {
             stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
         }
@@ -123,7 +155,7 @@ pub fn poll_net_if_available() {
     if let Some(mut net) = NET_STACK.try_exclusive_access() {
         if let Some(ref mut stack) = *net {
             let now = smoltcp_now();
-            stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+            stack.poll_external(now);
             for _ in 0..4 {
                 stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
             }
@@ -136,7 +168,7 @@ pub fn poll_net_force() {
     let mut net = NET_STACK.exclusive_access();
     if let Some(ref mut stack) = *net {
         let now = smoltcp_now();
-        stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+        stack.poll_external(now);
         for _ in 0..4 {
             stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
         }

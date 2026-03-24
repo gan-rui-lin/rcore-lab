@@ -734,7 +734,11 @@ pub fn handle_signals() {
             );
         }
     }
-    // RISC-V: use sa_restorer if valid; otherwise fallback to fixed SIG_RETURN_ADDR stub.
+    // RISC-V: use sa_restorer if valid and looks like a real mapped address;
+    // otherwise fallback to fixed SIG_RETURN_ADDR stub.
+    // glibc dynamic binaries may have unrelocated sa_restorer values
+    // (e.g., raw libc offset 0x2000 instead of libc_base + 0x2000).
+    // Our kernel trampoline does the same thing (calls rt_sigreturn).
     #[cfg(not(target_arch = "loongarch64"))]
     {
         if action.restorer != 0 {
@@ -749,6 +753,12 @@ pub fn handle_signals() {
                     arch::SIG_RETURN_ADDR + arch::sigtrx::sigreturn_trampoline_offset();
             }
         } else {
+            if action.restorer != 0 && action.restorer < 0x10000 {
+                warn!(
+                    "[signal] pid={} signum={} restorer={:#x} looks unrelocated, using kernel trampoline",
+                    pid, signum, action.restorer
+                );
+            }
             trap_cx[TrapFrameArgs::RA] =
                 arch::SIG_RETURN_ADDR + arch::sigtrx::sigreturn_trampoline_offset();
         }

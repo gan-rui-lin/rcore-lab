@@ -154,6 +154,7 @@ fn activate_runtime_profile(root: &str) -> bool {
     };
 
     force_link("/bin/sh", busybox_path);
+    force_link("/bin/busybox", busybox_path);
     force_link("/bin/basename", busybox_path);
     force_link("/bin/ls", busybox_path);
     force_link("/bin/sleep", busybox_path);
@@ -352,6 +353,11 @@ fn run_testcode(script_path: &str, root: &str) -> i32 {
     }
 
     if pid == 0 {
+        // Close inherited fds above stderr so child processes (iperf3, netperf)
+        // get low fd numbers (e.g., stream fd=5) matching judge regex expectations.
+        for fd in 3..20 {
+            let _ = close(fd as usize);
+        }
         if root == "/glibc" {
             let _ = chdir("/glibc/\0");
         } else {
