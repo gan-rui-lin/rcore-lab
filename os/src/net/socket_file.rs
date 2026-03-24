@@ -232,7 +232,7 @@ impl SocketFile {
                     for _ in 0..4 {
                         stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
                     }
-                    stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+                    stack.poll_external(now);
                     return total;
                 }
             }
@@ -370,7 +370,7 @@ impl Drop for SocketFile {
                     // Flush the FIN through loopback immediately.
                     let now = super::smoltcp_now();
                     stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
-                    stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+                    stack.poll_external(now);
                     // Don't remove the socket yet - smoltcp needs it for FIN handshake.
                     // It will be cleaned up when the socket enters Closed state.
                     // For simplicity, remove it anyway (smoltcp handles orphan FINs).

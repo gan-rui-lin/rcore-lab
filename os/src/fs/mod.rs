@@ -52,7 +52,6 @@ pub trait File: Send + Sync {
         None
     }
     /// Optional: downcast to socket handle + type for network syscalls.
-    #[cfg(target_arch = "riscv64")]
     fn as_socket(&self) -> Option<(smoltcp::iface::SocketHandle, crate::net::SocketType)> {
         None
     }
@@ -79,10 +78,8 @@ pub trait File: Send + Sync {
     /// Optional: mark socket handle as transferred (prevents Drop from cleaning up).
     fn mark_transferred(&self) {}
     /// Optional: set the connected remote endpoint for UDP sockets (used by connect()).
-    #[cfg(target_arch = "riscv64")]
     fn set_connected_remote(&self, _addr: smoltcp::wire::IpEndpoint) {}
     /// Optional: get the connected remote endpoint for UDP sockets (used by getpeername()).
-    #[cfg(target_arch = "riscv64")]
     fn get_connected_remote(&self) -> Option<smoltcp::wire::IpEndpoint> { None }
 }
 
