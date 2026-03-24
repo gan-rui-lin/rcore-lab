@@ -231,8 +231,8 @@ impl VfsInode for NullInode {
         0
     }
 
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
-        0
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        buf.len()
     }
 
     fn lookup(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {

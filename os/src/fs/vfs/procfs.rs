@@ -41,8 +41,8 @@ impl VfsInode for ProcStaticDirInode {
         0
     }
 
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
-        0
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        buf.len()
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn VfsInode>> {
@@ -71,8 +71,8 @@ impl VfsInode for ProcRootInode {
         0
     }
 
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
-        0
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        buf.len()
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn VfsInode>> {
@@ -135,8 +135,8 @@ impl VfsInode for ProcFileInode {
         n
     }
 
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
-        0
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        buf.len()
     }
 
     fn lookup(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
@@ -177,8 +177,8 @@ impl VfsInode for ProcPidDirInode {
         0
     }
 
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
-        0
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        buf.len()
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn VfsInode>> {
@@ -236,8 +236,8 @@ impl VfsInode for ProcPidMapsInode {
         n
     }
 
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
-        0
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        buf.len()
     }
 
     fn lookup(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
@@ -318,8 +318,8 @@ impl VfsInode for ProcPidStatInode {
         n
     }
 
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
-        0
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        buf.len()
     }
 
     fn lookup(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
