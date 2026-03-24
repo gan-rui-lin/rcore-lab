@@ -41,6 +41,21 @@ const EMBEDDED_PTHREAD_ELF: &[u8] = include_bytes!(concat!(
     "/../pthread_cancel_small"
 ));
 
+const TMP_LIBCTEST_PATH: &str = "/tmp/libctest_testcode.sh";
+const TMP_LIBCTEST_SCRIPT: &[u8] = b"\
+./runtest.exe -w entry-static.exe pthread_cancel_points\n\
+./runtest.exe -w entry-static.exe pthread_cancel\n\
+./runtest.exe -w entry-static.exe pthread_cancel_sem_wait\n\
+./runtest.exe -w entry-static.exe pthread_exit_cancel\n\
+./runtest.exe -w entry-static.exe pthread_cond\n\
+./runtest.exe -w entry-static.exe pthread_tsd\n\
+./runtest.exe -w entry-static.exe pthread_once_deadlock\n\
+./runtest.exe -w entry-static.exe pthread_rwlock_ebusy\n\
+./runtest.exe -w entry-static.exe pthread_robust_detach\n\
+./runtest.exe -w entry-static.exe pthread_cond_smasher\n\
+./runtest.exe -w entry-static.exe pthread_condattr_setclock\n\
+";
+
 fn cstring(s: &str) -> Vec<u8> {
     let mut v = Vec::from(s.as_bytes());
     if !v.ends_with(&[0]) {
@@ -420,6 +435,14 @@ fn run_selector(selector: &str) {
 
     if selector == "single-elf" {
         run_single_elf_suite();
+        return;
+    }
+
+    // Write /tmp/libctest_testcode.sh and run pthread_cancel tests
+    if selector == "tmp-libctest" {
+        let _ = activate_runtime_profile("/musl");
+        let _ = write_embedded_elf(TMP_LIBCTEST_PATH, TMP_LIBCTEST_SCRIPT);
+        let _ = run_testcode(TMP_LIBCTEST_PATH, "/musl");
         return;
     }
 
