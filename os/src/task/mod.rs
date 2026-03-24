@@ -741,17 +741,14 @@ pub fn handle_signals() {
     // Our kernel trampoline does the same thing (calls rt_sigreturn).
     #[cfg(not(target_arch = "loongarch64"))]
     {
-        if action.restorer != 0 {
-            if action.restorer < USER_ADDR_MAX {
-                trap_cx[TrapFrameArgs::RA] = action.restorer;
-            } else {
-                error!(
-                    "[signal] pid={} signum={} invalid restorer={:#x}, fallback to SIG_RETURN_ADDR",
-                    pid, signum, action.restorer
-                );
-                trap_cx[TrapFrameArgs::RA] =
-                    arch::SIG_RETURN_ADDR + arch::sigtrx::sigreturn_trampoline_offset();
-            }
+        // Heuristic: a valid restorer should be above 0x10000 (PIE load base or
+        // mmap region). Values below 0x10000 are clearly unrelocated offsets from
+        // glibc shared libraries (e.g., raw offset 0x200 instead of libc_base + 0x200).
+        let use_restorer = action.restorer != 0
+            && action.restorer < USER_ADDR_MAX
+            && action.restorer >= 0x10000;
+        if use_restorer {
+            trap_cx[TrapFrameArgs::RA] = action.restorer;
         } else {
             if action.restorer != 0 && action.restorer < 0x10000 {
                 warn!(

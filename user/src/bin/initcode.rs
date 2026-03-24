@@ -158,6 +158,13 @@ fn activate_runtime_profile(root: &str) -> bool {
     force_link("/bin/basename", busybox_path);
     force_link("/bin/ls", busybox_path);
     force_link("/bin/sleep", busybox_path);
+    force_link("/bin/mkdir", busybox_path);
+    force_link("/bin/rmdir", busybox_path);
+    force_link("/bin/cat", busybox_path);
+    force_link("/bin/echo", busybox_path);
+    force_link("/bin/grep", busybox_path);
+    force_link("/bin/mount", busybox_path);
+    force_link("/bin/umount", busybox_path);
     force_link("/usr/bin/basename", busybox_path);
     force_link("/usr/bin/ls", busybox_path);
     force_link("/usr/bin/sleep", busybox_path);
@@ -170,8 +177,9 @@ fn activate_runtime_profile(root: &str) -> bool {
                 "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
             );
             // glibc dynamic binaries need shared libs in default search path
-            force_link("/lib/libc.so.6", "/glibc/lib/libc.so.6");
-            force_link("/lib/libm.so.6", "/glibc/lib/libm.so.6");
+            // sdcard has libc.so / libm.so (without version suffix)
+            force_link("/lib/libc.so.6", "/glibc/lib/libc.so");
+            force_link("/lib/libm.so.6", "/glibc/lib/libm.so");
         } else {
             force_link("/lib/ld-linux-riscv64-lp64d.so.1", "/musl/lib/libc.so");
             force_link("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so");
