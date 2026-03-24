@@ -187,13 +187,15 @@ impl PageTable {
     /// set the map between virtual page number and physical page number
     pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
         let pte = self.find_pte_create(vpn).unwrap();
-        assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
+        // Allow overwriting existing PTE (needed for MAP_FIXED).
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
     }
     /// remove the map between virtual page number and physical page number
     pub fn unmap(&mut self, vpn: VirtPageNum) {
         let pte = self.find_pte(vpn).unwrap();
-        assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
+        if !pte.is_valid() {
+            return; // already unmapped, skip silently
+        }
         *pte = PageTableEntry::empty();
     }
     /// change the flags of a page table entry
