@@ -2653,10 +2653,117 @@ pub fn sys_rt_sigtimedwait(
 }
 
 pub fn sys_membarrier(_cmd: isize, _flags: isize) -> isize {
-    // let pid = current_process().pid.0;
-    // if crate::syscall::should_trace_syscall(pid) {
-    //     syscall!("kernel:pid[{}] sys_membarrier flags={:#x}", pid, flags);
-    // }
-    // // For simplicity, we ignore the flags and just return success.
+    0
+}
+
+/// sched_setscheduler(pid, policy, param)
+/// Stub: accept and pretend success — we only support SCHED_OTHER (0).
+pub fn sys_sched_setscheduler(_pid: usize, _policy: i32, _param: *const u8) -> isize {
+    info!("[sched] sched_setscheduler: stub, returning 0");
+    0
+}
+
+/// sched_getscheduler(pid) -> policy
+/// Always return SCHED_OTHER (0).
+pub fn sys_sched_getscheduler(_pid: usize) -> isize {
+    0 // SCHED_OTHER
+}
+
+/// sched_getparam(pid, param)
+/// Write sched_priority = 0 (for SCHED_OTHER).
+pub fn sys_sched_getparam(_pid: usize, param: *mut u8) -> isize {
+    if param.is_null() {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
+    // struct sched_param { int sched_priority; }
+    let priority: i32 = 0;
+    match copy_to_user(token, param, &priority.to_le_bytes()) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+/// sched_setattr(pid, attr, flags)
+/// Stub: pretend success.
+pub fn sys_sched_setattr(_pid: usize, _attr: usize, _flags: usize) -> isize {
+    warn!("[sched] sched_setattr: stub, returning 0");
+    0
+}
+
+/// sched_getattr(pid, attr, size, flags)
+/// Return a sched_attr struct with SCHED_OTHER policy and priority 0.
+pub fn sys_sched_getattr(_pid: usize, attr: *mut u8, size: usize, _flags: usize) -> isize {
+    warn!("[sched] sched_getattr: called, size={}", size);
+    if attr.is_null() || size < 48 {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
+    // struct sched_attr (48 bytes minimum):
+    //   u32 size = 48
+    //   u32 sched_policy = 0 (SCHED_OTHER)
+    //   u64 sched_flags = 0
+    //   s32 sched_nice = 0
+    //   u32 sched_priority = 0
+    //   u64 sched_runtime = 0
+    //   u64 sched_deadline = 0
+    //   u64 sched_period = 0
+    let mut buf = [0u8; 48];
+    buf[0..4].copy_from_slice(&48u32.to_le_bytes()); // size = 48
+    // All other fields are 0 (SCHED_OTHER, no priority, etc.)
+    match copy_to_user(token, attr, &buf) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+/// sched_setaffinity(pid, cpusetsize, mask)
+/// Stub: accept and ignore — we are single-core, so any mask is fine.
+pub fn sys_sched_setaffinity(_pid: usize, _cpusetsize: usize, _mask: *const u8) -> isize {
+    info!("[sched] sched_setaffinity: stub, always success");
+    0
+}
+
+/// sched_getaffinity(pid, cpusetsize, mask)
+/// Return a single-CPU mask (bit 0 set) — we only have 1 core.
+pub fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask: *mut u8) -> isize {
+    let token = current_user_token();
+    if mask.is_null() || cpusetsize == 0 {
+        return errno(EINVAL);
+    }
+    // Build a mask with only CPU 0 set
+    let len = cpusetsize.min(128); // reasonable upper bound
+    let mut buf = vec![0u8; len];
+    buf[0] = 1; // CPU 0
+    match copy_to_user(token, mask, &buf) {
+        Ok(_) => len as isize, // Linux returns the number of bytes written
+        Err(e) => e,
+    }
+}
+
+/// get_mempolicy(mode, nodemask, maxnode, addr, flags)
+/// Stub: return MPOL_DEFAULT (0) — we have no NUMA.
+pub fn sys_get_mempolicy(
+    mode: *mut i32,
+    nodemask: *mut usize,
+    maxnode: usize,
+    _addr: usize,
+    _flags: usize,
+) -> isize {
+    let token = current_user_token();
+    // Write mode = MPOL_DEFAULT (0)
+    if !mode.is_null() {
+        let val: i32 = 0; // MPOL_DEFAULT
+        if let Err(e) = copy_to_user(token, mode as *mut u8, &val.to_le_bytes()) {
+            return e;
+        }
+    }
+    // Write nodemask = node 0
+    if !nodemask.is_null() && maxnode > 0 {
+        let val: usize = 1; // node 0
+        if let Err(e) = copy_to_user(token, nodemask as *mut u8, &val.to_le_bytes()) {
+            return e;
+        }
+    }
     0
 }
