@@ -790,6 +790,23 @@ impl MemorySet {
         }
     }
 
+    /// COW remap: replace the mapping of `vpn` with `new_frame` and `new_flags`.
+    /// The caller has already copied the page content into new_frame.
+    pub fn remap_cow(&mut self, vpn: VirtPageNum, new_frame: FrameTracker, new_flags: PTEFlags) {
+        // Update page table entry to point to new frame
+        self.page_table.map(vpn, new_frame.ppn, new_flags);
+        // Store the frame tracker so it doesn't get freed
+        // Find the area containing this VPN and add the frame
+        for area in self.areas.iter_mut() {
+            if area.vpn_range.get_start() <= vpn && vpn < area.vpn_range.get_end() {
+                area.data_frames.insert(vpn, new_frame);
+                return;
+            }
+        }
+        // If no area found, store in a catch-all to prevent frame dealloc
+        core::mem::forget(new_frame);
+    }
+
     /// Change memory protection for a region
     /// Returns true on success, false if region not found or invalid
     pub fn change_protection(
