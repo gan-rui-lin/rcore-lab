@@ -174,7 +174,7 @@ pub fn set_trap_vector_base() {
 
 fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
     let estat = estat::read();
-    match estat.cause() {
+    let trap_type = match estat.cause() {
         Trap::Exception(Exception::Breakpoint) => {
             tf.sepc += 4;
             TrapType::Breakpoint
@@ -210,7 +210,17 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
             TrapType::LoadPageFault(badv::read().raw())
         }
         _ => TrapType::Unknown,
+    };
+
+    // Dispatch kernel-mode interrupts so check_timer() / check_itimers()
+    // can fire SIGALRM even when the CPU is executing kernel syscall code.
+    // The asm stub (trap_vector_base) calls us for kernel traps but does
+    // NOT invoke kernel_interrupt by itself — we must do it here.
+    if let TrapType::Time | TrapType::SupervisorExternal = trap_type {
+        crate::api::ArchInterface::kernel_interrupt(trap_type);
     }
+
+    trap_type
 }
 
 // ---------------------------------------------------------------------------
