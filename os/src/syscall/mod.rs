@@ -69,7 +69,6 @@ const SYSCALL_READLINKAT: usize = 78;
 /// pselect6 syscall
 const SYSCALL_PSELECT6: usize = 72;
 /// ppoll syscall
-const SYSCALL_PSELECT6: usize = 72;
 const SYSCALL_POLL: usize = 73;
 /// fstatat syscall
 const SYSCALL_FSTATAT: usize = 79;
@@ -185,12 +184,6 @@ const SYSCALL_GETEUID: usize = 175;
 const SYSCALL_GETGID: usize = 176;
 /// getegid syscall
 const SYSCALL_GETEGID: usize = 177;
-/// getrusage syscall
-const SYSCALL_GETRUSAGE: usize = 165;
-/// setitimer syscall
-const SYSCALL_SETITIMER: usize = 103;
-/// getitimer syscall
-const SYSCALL_GETITIMER: usize = 102;
 /// sysinfo syscall
 const SYSCALL_SYSINFO: usize = 179;
 /// msgget syscall
@@ -742,9 +735,6 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETPGID => sys_getpgid(args[0] as isize),
         SYSCALL_GETSID => sys_getsid(args[0] as isize),
         SYSCALL_SETSID => sys_setsid(),
-        SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1]),
-        SYSCALL_SETITIMER => sys_setitimer(args[0] as i32, args[1] as *const u8, args[2] as *mut u8),
-        SYSCALL_GETITIMER => sys_getitimer(args[0] as i32, args[1] as *mut u8),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut RLimit),
         SYSCALL_GETRUSAGE => sys_getrusage(args[0] as isize, args[1] as *mut RUsage),
         SYSCALL_UMASK => sys_umask(args[0]),
@@ -786,15 +776,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         114 => sys_clock_getres(args[0], args[1] as *mut TimeSpec),
         SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_GET_TIME => sys_get_time(args[0] as *mut TimeVal, args[1]),
-        // msync: no real page cache, return success
-        227 => 0,
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_SBRK => sys_sbrk(args[0] as isize),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
-        SYSCALL_PSELECT6 => sys_pselect6(args[0], args[1] as *mut u64, args[2] as *mut u64, args[3] as *mut u64, args[4] as *const TimeSpec, args[5]),
         SYSCALL_POLL => sys_ppoll(args[0] as *mut PollFd, args[1], args[2] as *const TimeSpec),
         SYSCALL_SHUTDOWN => sys_shutdown(),
         // ---- Network syscalls ----
