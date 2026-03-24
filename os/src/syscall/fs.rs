@@ -680,6 +680,15 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
         stat.blksize = 512;
         stat.blocks = ((size + 511) / 512) as i64;
     }
+    // Generate unique (dev, ino) so glibc ld-linux doesn't confuse different files
+    stat.dev = 1;
+    if !full_path.is_empty() {
+        let mut h: u64 = 5381;
+        for b in full_path.bytes() {
+            h = h.wrapping_mul(33).wrapping_add(b as u64);
+        }
+        stat.ino = h & 0x7FFF_FFFF;
+    }
     fill_stat_timestamps(&mut stat, None);
     let bytes = unsafe {
         core::slice::from_raw_parts(
