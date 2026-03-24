@@ -97,6 +97,16 @@ const SYSCALL_GET_ROBUST_LIST: usize = 100;
 const SYSCALL_NANOSLEEP: usize = 101;
 /// clock_nanosleep syscall
 const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
+/// sched_setscheduler syscall
+const SYSCALL_SCHED_SETSCHEDULER: usize = 119;
+/// sched_getscheduler syscall
+const SYSCALL_SCHED_GETSCHEDULER: usize = 120;
+/// sched_getparam syscall
+const SYSCALL_SCHED_GETPARAM: usize = 121;
+/// sched_setaffinity syscall
+const SYSCALL_SCHED_SETAFFINITY: usize = 122;
+/// sched_getaffinity syscall
+const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 /// yield syscall
 const SYSCALL_YIELD: usize = 124;
 /// thread_create syscall
@@ -238,6 +248,9 @@ const SYSCALL_SHUTDOWN_SOCKET: usize = 210;
 const SYSCALL_SENDMSG: usize = 211;
 const SYSCALL_RECVMSG: usize = 212;
 const SYSCALL_ACCEPT4: usize = 242;
+const SYSCALL_SCHED_SETATTR: usize = 274;
+const SYSCALL_SCHED_GETATTR: usize = 275;
+const SYSCALL_GET_MEMPOLICY: usize = 236;
 const SYSCALL_MEMBARRIER: usize = 283;
 
 mod errno;
@@ -668,6 +681,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *const TimeSpec,
             args[3] as *mut TimeSpec,
         ),
+        SYSCALL_SCHED_SETSCHEDULER => sys_sched_setscheduler(args[0], args[1] as i32, args[2] as *const u8),
+        SYSCALL_SCHED_GETSCHEDULER => sys_sched_getscheduler(args[0]),
+        SYSCALL_SCHED_GETPARAM => sys_sched_getparam(args[0], args[1] as *mut u8),
+        SYSCALL_SCHED_SETAFFINITY => sys_sched_setaffinity(args[0], args[1], args[2] as *const u8),
+        SYSCALL_SCHED_GETAFFINITY => sys_sched_getaffinity(args[0], args[1], args[2] as *mut u8),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
         SYSCALL_TKILL => process::sys_tkill(args[0] as isize, args[1] as i32),
@@ -763,7 +781,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHUTDOWN => sys_shutdown(),
         // ---- Network syscalls ----
         SYSCALL_SOCKET => crate::net::syscall::sys_socket(args[0], args[1], args[2]),
-        SYSCALL_SOCKETPAIR => crate::net::syscall::sys_socketpair(),
+        SYSCALL_SOCKETPAIR => crate::net::syscall::sys_socketpair(args[0], args[1], args[2], args[3] as *mut i32),
         SYSCALL_BIND => crate::net::syscall::sys_bind(args[0], args[1] as *const u8, args[2]),
         SYSCALL_LISTEN => crate::net::syscall::sys_listen(args[0], args[1]),
         SYSCALL_ACCEPT | SYSCALL_ACCEPT4 => crate::net::syscall::sys_accept(args[0], args[1] as *mut u8, args[2] as *mut u32),
@@ -777,6 +795,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHUTDOWN_SOCKET => crate::net::syscall::sys_shutdown_socket(args[0], args[1] as i32),
         SYSCALL_SENDMSG => crate::net::syscall::sys_sendmsg(),
         SYSCALL_RECVMSG => crate::net::syscall::sys_recvmsg(),
+        SYSCALL_SCHED_SETATTR => sys_sched_setattr(args[0], args[1], args[2]),
+        SYSCALL_SCHED_GETATTR => sys_sched_getattr(args[0], args[1] as *mut u8, args[2], args[3]),
+        SYSCALL_GET_MEMPOLICY => sys_get_mempolicy(args[0] as *mut i32, args[1] as *mut usize, args[2], args[3], args[4]),
         SYSCALL_MEMBARRIER => sys_membarrier(args[0] as isize, args[1] as isize),
         _ => {
             known = false;
