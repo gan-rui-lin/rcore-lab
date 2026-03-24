@@ -38,7 +38,7 @@ pub use sbi::shutdown;
 pub use signal::{FpRegs, MContext};
 pub use timer::{get_time, get_time_ms, get_time_us, set_next_trigger, init_timer, Time};
 pub use trap::{trap_init, trap_enable_timer_interrupt};
-pub use trap::{disable_irq as disable_interrupts, enable_irq as enable_interrupts};
+pub use trap::{disable_interrupts_now as disable_interrupts, enable_interrupts_now as enable_interrupts};
 pub use trap::{set_kernel_trap, set_kernel_user_rw_trap, set_trap_vector_base};
 pub use trap::{try_read_user, try_write_user, enter_user_and_trap};
 pub use trap::{disable_irq, enable_irq, enable_external_irq, init_interrupt};
@@ -76,10 +76,10 @@ pub unsafe fn switch_to_idle(switched_task_cx_ptr: *mut TaskContext, idle_task_c
 pub static DEV_NON_BLOCKING_ACCESS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Check whether interrupts are currently enabled.
+/// Check whether interrupts are currently enabled (crmd.IE).
 pub fn interrupts_enabled() -> bool {
-    use loongArch64::register::prmd;
-    prmd::read().pie()
+    use loongArch64::register::crmd;
+    crmd::read().ie()
 }
 
 /// Canonicalize a kernel text/function address.
