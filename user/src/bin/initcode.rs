@@ -56,6 +56,124 @@ const TMP_LIBCTEST_SCRIPT: &[u8] = b"\
 ./runtest.exe -w entry-static.exe pthread_condattr_setclock\n\
 ";
 
+const TMP_LTP_MINI_PATH: &str = "/tmp/ltp_mini.sh";
+const TMP_LTP_MINI_SCRIPT: &[u8] = b"\
+./busybox echo '=== ltp-mini: fork10 then fork11 ==='\n\
+ltp/testcases/bin/fork10\n\
+ltp/testcases/bin/fork11\n\
+ltp/testcases/bin/fork13\n\
+./busybox echo '=== ltp-mini: done ==='\n\
+";
+
+const TMP_LTP_PATH: &str = "/tmp/ltp_testcode.sh";
+const TMP_LTP_SCRIPT: &[u8] = b"\
+./busybox echo '=== tmp-ltp: process/thread/signal/memory tests ==='\n\
+ltp/testcases/bin/abort01\n\
+ltp/testcases/bin/access01\n\
+ltp/testcases/bin/access02\n\
+ltp/testcases/bin/access03\n\
+ltp/testcases/bin/brk01\n\
+ltp/testcases/bin/brk02\n\
+ltp/testcases/bin/clone01\n\
+ltp/testcases/bin/clone02\n\
+ltp/testcases/bin/clone03\n\
+ltp/testcases/bin/clone301\n\
+ltp/testcases/bin/clone302\n\
+ltp/testcases/bin/exit01\n\
+ltp/testcases/bin/exit02\n\
+ltp/testcases/bin/exit_group01\n\
+ltp/testcases/bin/fork01\n\
+ltp/testcases/bin/fork02\n\
+ltp/testcases/bin/fork03\n\
+ltp/testcases/bin/fork04\n\
+ltp/testcases/bin/fork05\n\
+ltp/testcases/bin/fork06\n\
+ltp/testcases/bin/fork07\n\
+ltp/testcases/bin/fork08\n\
+ltp/testcases/bin/fork09\n\
+ltp/testcases/bin/fork10\n\
+ltp/testcases/bin/fork11\n\
+ltp/testcases/bin/fork13\n\
+ltp/testcases/bin/fork14\n\
+ltp/testcases/bin/futex_cmp_requeue01\n\
+ltp/testcases/bin/futex_cmp_requeue02\n\
+ltp/testcases/bin/futex_wait01\n\
+ltp/testcases/bin/futex_wait02\n\
+ltp/testcases/bin/futex_wait03\n\
+ltp/testcases/bin/futex_wait04\n\
+ltp/testcases/bin/futex_wait05\n\
+ltp/testcases/bin/futex_wake01\n\
+ltp/testcases/bin/futex_wake02\n\
+ltp/testcases/bin/futex_wake03\n\
+ltp/testcases/bin/futex_wake04\n\
+ltp/testcases/bin/getpid01\n\
+ltp/testcases/bin/getpid02\n\
+ltp/testcases/bin/getppid01\n\
+ltp/testcases/bin/getppid02\n\
+ltp/testcases/bin/gettid01\n\
+ltp/testcases/bin/kill01\n\
+ltp/testcases/bin/kill02\n\
+ltp/testcases/bin/kill03\n\
+ltp/testcases/bin/kill04\n\
+ltp/testcases/bin/kill05\n\
+ltp/testcases/bin/kill06\n\
+ltp/testcases/bin/kill07\n\
+ltp/testcases/bin/kill08\n\
+ltp/testcases/bin/kill09\n\
+ltp/testcases/bin/kill10\n\
+ltp/testcases/bin/kill11\n\
+ltp/testcases/bin/kill12\n\
+ltp/testcases/bin/kill13\n\
+ltp/testcases/bin/mmap01\n\
+ltp/testcases/bin/mmap02\n\
+ltp/testcases/bin/mmap03\n\
+ltp/testcases/bin/mmap04\n\
+ltp/testcases/bin/mmap05\n\
+ltp/testcases/bin/mmap06\n\
+ltp/testcases/bin/munmap01\n\
+ltp/testcases/bin/munmap02\n\
+ltp/testcases/bin/munmap03\n\
+ltp/testcases/bin/pipe01\n\
+ltp/testcases/bin/pipe02\n\
+ltp/testcases/bin/pipe03\n\
+ltp/testcases/bin/pipe04\n\
+ltp/testcases/bin/pipe05\n\
+ltp/testcases/bin/pipe06\n\
+ltp/testcases/bin/pipe07\n\
+ltp/testcases/bin/pipe08\n\
+ltp/testcases/bin/read01\n\
+ltp/testcases/bin/read02\n\
+ltp/testcases/bin/read03\n\
+ltp/testcases/bin/read04\n\
+ltp/testcases/bin/rt_sigprocmask01\n\
+ltp/testcases/bin/rt_sigprocmask02\n\
+ltp/testcases/bin/rt_sigtimedwait01\n\
+ltp/testcases/bin/sigaction01\n\
+ltp/testcases/bin/sigaction02\n\
+ltp/testcases/bin/signal01\n\
+ltp/testcases/bin/signal02\n\
+ltp/testcases/bin/signal03\n\
+ltp/testcases/bin/signal04\n\
+ltp/testcases/bin/signal05\n\
+ltp/testcases/bin/signal06\n\
+ltp/testcases/bin/sigprocmask01\n\
+ltp/testcases/bin/wait01\n\
+ltp/testcases/bin/wait02\n\
+ltp/testcases/bin/wait401\n\
+ltp/testcases/bin/wait402\n\
+ltp/testcases/bin/waitpid01\n\
+ltp/testcases/bin/waitpid02\n\
+ltp/testcases/bin/waitpid03\n\
+ltp/testcases/bin/waitpid04\n\
+ltp/testcases/bin/waitpid05\n\
+ltp/testcases/bin/write01\n\
+ltp/testcases/bin/write02\n\
+ltp/testcases/bin/write03\n\
+ltp/testcases/bin/write04\n\
+ltp/testcases/bin/write05\n\
+./busybox echo '=== tmp-ltp: done ==='\n\
+";
+
 fn cstring(s: &str) -> Vec<u8> {
     let mut v = Vec::from(s.as_bytes());
     if !v.ends_with(&[0]) {
@@ -163,11 +281,45 @@ fn activate_runtime_profile(root: &str) -> bool {
     force_link("/bin/cat", busybox_path);
     force_link("/bin/echo", busybox_path);
     force_link("/bin/grep", busybox_path);
+    force_link("/bin/rm", busybox_path);
+    force_link("/bin/cp", busybox_path);
+    force_link("/bin/mv", busybox_path);
+    force_link("/bin/ln", busybox_path);
+    force_link("/bin/chmod", busybox_path);
+    force_link("/bin/chown", busybox_path);
+    force_link("/bin/kill", busybox_path);
     force_link("/bin/mount", busybox_path);
     force_link("/bin/umount", busybox_path);
+    force_link("/bin/date", busybox_path);
+    force_link("/bin/dd", busybox_path);
+    force_link("/bin/df", busybox_path);
+    force_link("/bin/ps", busybox_path);
+    force_link("/bin/pwd", busybox_path);
+    force_link("/bin/sed", busybox_path);
+    force_link("/bin/awk", busybox_path);
     force_link("/usr/bin/basename", busybox_path);
     force_link("/usr/bin/ls", busybox_path);
     force_link("/usr/bin/sleep", busybox_path);
+    force_link("/usr/bin/wc", busybox_path);
+    force_link("/usr/bin/expr", busybox_path);
+    force_link("/usr/bin/head", busybox_path);
+    force_link("/usr/bin/tail", busybox_path);
+    force_link("/usr/bin/cut", busybox_path);
+    force_link("/usr/bin/tr", busybox_path);
+    force_link("/usr/bin/sort", busybox_path);
+    force_link("/usr/bin/uniq", busybox_path);
+    force_link("/usr/bin/find", busybox_path);
+    force_link("/usr/bin/xargs", busybox_path);
+    force_link("/usr/bin/test", busybox_path);
+    force_link("/usr/bin/printf", busybox_path);
+    force_link("/usr/bin/id", busybox_path);
+    force_link("/usr/bin/whoami", busybox_path);
+    force_link("/usr/bin/hostname", busybox_path);
+    force_link("/usr/bin/diff", busybox_path);
+    force_link("/usr/bin/seq", busybox_path);
+    force_link("/usr/bin/tee", busybox_path);
+    force_link("/usr/bin/touch", busybox_path);
+    force_link("/usr/bin/stat", busybox_path);
 
     #[cfg(target_arch = "riscv64")]
     {
@@ -457,6 +609,25 @@ fn run_selector(selector: &str) {
         let _ = activate_runtime_profile("/musl");
         let _ = write_embedded_elf(TMP_LIBCTEST_PATH, TMP_LIBCTEST_SCRIPT);
         let _ = run_testcode(TMP_LIBCTEST_PATH, "/musl");
+        return;
+    }
+
+    // Minimal LTP debug script
+    if selector == "tmp-ltp-mini" || selector == "tmp-ltp-mini-glibc" {
+        let root = if selector.ends_with("-glibc") { "/glibc" } else { "/musl" };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_LTP_MINI_PATH, TMP_LTP_MINI_SCRIPT);
+        let _ = run_testcode(TMP_LTP_MINI_PATH, root);
+        return;
+    }
+
+    // Write /tmp/ltp_testcode.sh and run selected LTP tests
+    // Usage: SINGLE_TEST=tmp-ltp or SINGLE_TEST=tmp-ltp-glibc
+    if selector == "tmp-ltp" || selector == "tmp-ltp-glibc" {
+        let root = if selector == "tmp-ltp-glibc" { "/glibc" } else { "/musl" };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_LTP_PATH, TMP_LTP_SCRIPT);
+        let _ = run_testcode(TMP_LTP_PATH, root);
         return;
     }
 
