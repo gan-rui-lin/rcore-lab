@@ -93,6 +93,45 @@ impl MemorySet {
             self.areas.remove(idx);
         }
     }
+    /// Unmap pages in [start, end) for MAP_FIXED overlay.
+    /// For fully contained areas, removes them entirely.
+    /// For partially overlapping areas, unmaps individual pages in the range
+    /// and removes the page table entries so the range can be re-mapped.
+    pub fn unmap_range(&mut self, start: VirtAddr, end: VirtAddr) {
+        let unmap_start_vpn = start.floor();
+        let unmap_end_vpn = end.ceil();
+        let mut i = 0;
+        while i < self.areas.len() {
+            let a_start = self.areas[i].vpn_range.get_start();
+            let a_end = self.areas[i].vpn_range.get_end();
+            if a_start >= unmap_end_vpn || a_end <= unmap_start_vpn {
+                i += 1;
+                continue;
+            }
+            if a_start >= unmap_start_vpn && a_end <= unmap_end_vpn {
+                // Entire area within unmap range: remove completely
+                self.areas[i].unmap(&mut self.page_table);
+                self.areas.remove(i);
+            } else {
+                // Partial overlap: unmap only the overlapping pages
+                let overlap_start = a_start.max(unmap_start_vpn);
+                let overlap_end = a_end.min(unmap_end_vpn);
+                let mut vpn = overlap_start;
+                while vpn < overlap_end {
+                    // Only unmap if the page is actually mapped
+                    if self.areas[i].data_frames.contains_key(&vpn) {
+                        self.areas[i].unmap_one(&mut self.page_table, vpn);
+                    } else {
+                        // Page might be mapped in page table but not tracked in data_frames
+                        // (e.g. from file-backed mmap read path). Just clear the PTE.
+                        self.page_table.unmap(vpn);
+                    }
+                    vpn.step();
+                }
+                i += 1;
+            }
+        }
+    }
     /// Add a new MapArea into this MemorySet.
     /// Assuming that there are no conflicts in the virtual address
     /// space.
@@ -257,10 +296,8 @@ impl MemorySet {
                 }
                 let map_area = MapArea::new(start_va, end_va, map_perm);
                 max_end_vpn = map_area.vpn_range.get_end();
-                memory_set.push(
-                    map_area,
-                    Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
-                );
+                let file_data = &elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize];
+                memory_set.push(map_area, Some(file_data));
             }
         }
         max_end_vpn
@@ -535,7 +572,9 @@ impl MemorySet {
         let _ph_count = elf_header.pt2.ph_count();
         let elf_type = elf_header.pt2.type_().as_type();
         let (has_interp, min_load_vaddr) = Self::scan_elf_meta(&elf, elf_data);
-        let load_base = if elf_type == xmas_elf::header::Type::SharedObject && !has_interp {
+        // PIE executables (SharedObject with interp, min_load_vaddr=0) need
+        // a non-zero load_base so they don't start at VA 0x0.
+        let load_base = if elf_type == xmas_elf::header::Type::SharedObject && min_load_vaddr == 0 {
             0x4000_0000usize
         } else {
             0
@@ -854,6 +893,24 @@ impl MapArea {
         }
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+        // If already mapped (shared page between adjacent LOAD segments),
+        // COW: allocate new frame, copy old page content, remap with merged permissions.
+        // This preserves text data from LOAD1 while allowing LOAD2 to write data.
+        if let Some(pte) = page_table.translate(vpn) {
+            if pte.is_valid() {
+                let old_ppn = pte.ppn();
+                let new_frame = frame_alloc().unwrap();
+                let new_ppn = new_frame.ppn;
+                // Copy old page content to new frame
+                new_ppn.get_bytes_array().copy_from_slice(old_ppn.get_bytes_array());
+                self.data_frames.insert(vpn, new_frame);
+                let new_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
+                let merged = PTEFlags::from_bits(pte.flags().bits() | new_flags.bits()).unwrap();
+                page_table.unmap(vpn);
+                page_table.map(vpn, new_ppn, merged);
+                return;
+            }
+        }
         let frame = frame_alloc().unwrap();
         let ppn: PhysPageNum = frame.ppn;
         self.data_frames.insert(vpn, frame);
@@ -938,7 +995,8 @@ impl MapArea {
                     MEMORY_END
                 );
             }
-            let dst = &mut pte.ppn().get_bytes_array()[dst_offset..dst_offset + copy_len];
+            let page_bytes = pte.ppn().get_bytes_array();
+            let dst = &mut page_bytes[dst_offset..dst_offset + copy_len];
             let src = &data[data_offset..data_offset + copy_len];
             dst.copy_from_slice(src);
             data_offset += copy_len;

@@ -469,13 +469,17 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
                     Some(s) => s,
                     None => return EINVAL,
                 };
-                let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-                // Use loopback interface context for 127.x.x.x and 0.0.0.0
+                // Use loopback context for 127.x.x.x; external context otherwise
+                // (on LoongArch loopback-only mode, always uses loopback)
                 let cx = if is_loopback {
                     stack.lo_iface.context()
                 } else {
-                    stack.iface.context()
+                    #[cfg(target_arch = "riscv64")]
+                    { stack.iface.context() }
+                    #[cfg(not(target_arch = "riscv64"))]
+                    { stack.lo_iface.context() }
                 };
+                let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
                 if let Err(e) = socket.connect(cx, connect_remote, local_port) {
                     warn!("[net] TCP connect failed: {:?}", e);
                     return ECONNREFUSED;
@@ -667,7 +671,7 @@ pub fn sys_sendto(
                         for _ in 0..4 {
                             stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
                         }
-                        stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+                        stack.poll_external(now);
                         return n as isize;
                     }
                     Err(_) => return ENOTCONN,
@@ -961,7 +965,7 @@ pub fn sys_shutdown_socket(fd: usize, how: i32) -> isize {
             for _ in 0..8 {
                 stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
             }
-            stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+            stack.poll_external(now);
             let new_state = stack.sockets.get_mut::<tcp::Socket>(handle).state();
             let pid = current_process().getpid();
             info!("[net] shutdown TCP fd={} pid={} how={} state {:?} -> {:?}", fd, pid, how, old_state, new_state);

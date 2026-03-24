@@ -942,6 +942,13 @@ fn stat_from_path(full_path: &str) -> Result<Stat, isize> {
     stat.size = size as i64;
     stat.blksize = 512;
     stat.blocks = ((size + 511) / 512) as i64;
+    stat.dev = 1;
+    // Generate unique inode from path
+    let mut h: u64 = 5381;
+    for b in full_path.bytes() {
+        h = h.wrapping_mul(33).wrapping_add(b as u64);
+    }
+    stat.ino = h & 0x7FFF_FFFF; // keep positive when printed as signed
     fill_stat_timestamps(&mut stat, None);
     Ok(stat)
 }
@@ -985,6 +992,16 @@ pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
         stat.blocks = ((size + 511) / 512) as i64;
     }
     stat.nlink = 1;
+    // Generate unique (dev, ino) so glibc ld-linux doesn't confuse different files
+    stat.dev = 1; // non-zero device
+    let path_for_ino = file.path().unwrap_or("");
+    if !path_for_ino.is_empty() {
+        let mut h: u64 = 5381;
+        for b in path_for_ino.bytes() {
+            h = h.wrapping_mul(33).wrapping_add(b as u64);
+        }
+        stat.ino = h & 0x7FFF_FFFF; // keep positive when printed as signed
+    }
     fill_stat_timestamps(&mut stat, file.ts_id());
     let bytes = unsafe {
         core::slice::from_raw_parts(

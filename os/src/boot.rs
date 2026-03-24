@@ -93,6 +93,7 @@ pub fn rust_main() -> ! {
     crate::fs::mount_procfs();
     crate::fs::ensure_basic_paths();
     crate::fs::list_apps();
+    crate::net::init();
     crate::task::add_initproc();
     crate::task::run_tasks();
     panic!("Unreachable in rust_main!");
