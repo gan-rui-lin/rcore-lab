@@ -1778,14 +1778,12 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
     if overlap > 0 {
         if is_fixed {
             // MAP_FIXED: unmap overlapping pages in the target range.
-            // This preserves areas outside the range (partial overlap).
             inner.memory_set.unmap_range(VirtAddr(start), VirtAddr(start + len));
         } else {
             return errno(ENOMEM);
         }
     }
 
-    // 在进程的内存空间里插入一个新的映射区域，起始地址为 start，长度为 len，权限为 map_perm。
     inner
         .memory_set
         .insert_framed_area(VirtAddr(start), VirtAddr(start + len), map_perm);

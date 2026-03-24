@@ -194,7 +194,7 @@ impl PageTable {
     pub fn unmap(&mut self, vpn: VirtPageNum) {
         let pte = self.find_pte(vpn).unwrap();
         if !pte.is_valid() {
-            return; // already unmapped, skip silently
+            return;
         }
         *pte = PageTableEntry::empty();
     }
