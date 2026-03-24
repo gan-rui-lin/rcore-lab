@@ -2,24 +2,12 @@
 use super::{File, PollEvents};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
-use crate::task::{current_process, current_task, suspend_current_and_run_next};
+use crate::task::{has_pending_unmasked_signal, suspend_current_and_run_next};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
 const DEFAULT_PIPE_CAPACITY: usize = 4096;
-
-#[inline]
-fn has_pending_unmasked_signal() -> bool {
-    let process = current_process();
-    let process_inner = process.inner_exclusive_access();
-    let Some(task) = current_task() else {
-        return false;
-    };
-    let task_inner = task.inner_exclusive_access();
-    let pending = (process_inner.signal_pending | task_inner.signal_pending) & !task_inner.signal_mask;
-    !pending.is_empty()
-}
 
 struct Pipe {
     buf: Vec<u8>,
@@ -132,9 +120,8 @@ impl File for PipeEnd {
                 if total > 0 {
                     return total;
                 }
-                if has_pending_unmasked_signal() {
-                    // Let signal delivery happen after returning from syscall.
-                    return total;
+                if has_pending_unmasked_signal(true) {
+                    return usize::MAX; // EINTR sentinel
                 }
                 drop(pipe);
                 suspend_current_and_run_next();
@@ -163,9 +150,8 @@ impl File for PipeEnd {
                     if total > 0 {
                         return total;
                     }
-                    if has_pending_unmasked_signal() {
-                        // Let signal delivery happen after returning from syscall.
-                        return total;
+                    if has_pending_unmasked_signal(true) {
+                        return usize::MAX; // EINTR sentinel
                     }
                     drop(pipe);
                     suspend_current_and_run_next();

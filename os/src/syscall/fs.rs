@@ -277,7 +277,11 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
         let file = file.clone();
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
-        let written = file.write(UserBuffer::new(translated_byte_buffer(token, buf, len))) as isize;
+        let raw = file.write(UserBuffer::new(translated_byte_buffer(token, buf, len)));
+        if raw == usize::MAX {
+            return errno(EINTR); // interrupted by signal
+        }
+        let written = raw as isize;
         // let name = process.inner_exclusive_access().name.clone();
         // if (name == "busybox" || name == "sh") && fd <= 2 && len > 0 {
         //     if written == 0 {
@@ -321,7 +325,11 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
         trace!("kernel: sys_read .. file.read");
-        file.read(UserBuffer::new(translated_byte_buffer(token, buf, len))) as isize
+        let raw = file.read(UserBuffer::new(translated_byte_buffer(token, buf, len)));
+        if raw == usize::MAX {
+            return errno(EINTR); // interrupted by signal
+        }
+        raw as isize
     } else {
         errno(EBADF)
     }
@@ -1667,6 +1675,9 @@ pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 
         let buffers = translated_byte_buffer(token, base as *const u8, len);
         let read = file.read(UserBuffer::new(buffers));
+        if read == usize::MAX {
+            return if total_read > 0 { total_read } else { errno(EINTR) };
+        }
         total_read += read as isize;
         if read < len {
             break;
@@ -1752,6 +1763,9 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 
         let buffers = translated_byte_buffer(token, base as *const u8, len);
         let written = file.write(UserBuffer::new(buffers));
+        if written == usize::MAX {
+            return if total_written > 0 { total_written } else { errno(EINTR) };
+        }
         total_written += written as isize;
     }
 
@@ -2491,6 +2505,9 @@ pub fn sys_pselect6(
             }
         }
         suspend_current_and_run_next();
+        if crate::task::has_pending_unmasked_signal(false) {
+            return errno(EINTR);
+        }
     }
 }
 
@@ -2561,6 +2578,9 @@ pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: *const TimeSpec) -> isi
             }
         }
         suspend_current_and_run_next();
+        if crate::task::has_pending_unmasked_signal(false) {
+            return errno(EINTR);
+        }
     }
 }
 
