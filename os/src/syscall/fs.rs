@@ -901,6 +901,15 @@ fn stat_from_fd(fd: usize) -> Result<Stat, isize> {
         stat.blocks = ((size + 511) / 512) as i64;
     }
     stat.nlink = 1;
+    // Generate unique (dev, ino) so glibc ld-linux doesn't confuse different files
+    stat.dev = 1;
+    if !path.is_empty() {
+        let mut h: u64 = 5381;
+        for b in path.bytes() {
+            h = h.wrapping_mul(33).wrapping_add(b as u64);
+        }
+        stat.ino = h & 0x7FFF_FFFF;
+    }
     fill_stat_timestamps(&mut stat, file.ts_id());
     Ok(stat)
 }
