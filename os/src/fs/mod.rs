@@ -344,6 +344,6 @@ pub fn ensure_busybox_links() {
     if open_file("/bin/sh", OpenFlags::empty()).is_some() {
         debug!("[ext4] /bin/sh ready");
     } else {
-        error!("[ext4] /bin/sh missing after link attempt");
+        debug!("[ext4] /bin/sh not created (both musl and glibc busybox present, deferred to initcode)");
     }
 }
