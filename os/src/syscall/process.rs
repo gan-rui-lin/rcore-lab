@@ -2299,20 +2299,25 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
         Err(err) => return err,
     };
     let tid = tid as usize;
-    if let Some(process) = pid2process(tid) {
-        let process_pid = process.getpid();
-        let inner = process.inner_exclusive_access();
-        let ret = send_signal_to_task_from_list(tid, process_pid, &inner.tasks, flag);
-        drop(inner);
-        if ret == 0 {
-            return 0;
-        }
-    }
+    // First search current process (most common case: pthread_cancel sends
+    // tkill to a thread in the same process). Only fall back to pid2process
+    // for cross-process tkill.
     let process = current_process();
     let process_pid = process.getpid();
     let inner = process.inner_exclusive_access();
     let ret = send_signal_to_task_from_list(tid, process_pid, &inner.tasks, flag);
     drop(inner);
+    if ret == 0 {
+        return 0;
+    }
+    // Fallback: try as a global PID (for cross-process tkill)
+    if let Some(process) = pid2process(tid) {
+        let process_pid = process.getpid();
+        let inner = process.inner_exclusive_access();
+        let ret = send_signal_to_task_from_list(tid, process_pid, &inner.tasks, flag);
+        drop(inner);
+        return ret;
+    }
     ret
 }
 
