@@ -41,7 +41,7 @@ pub use manager::{
 };
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
-    current_user_token, run_tasks, schedule, take_current_task,
+    current_user_token, has_pending_unmasked_signal, run_tasks, schedule, take_current_task,
 };
 pub use process::{RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY};
 pub use signal::{
