@@ -27,7 +27,7 @@ const TEST_SUITES: [&str; 4] = [
     "libctest",
     "lmbench",
 ];
-const LMBENCH_PROT_ONLY_SCRIPT: &[u8] = b"#!/bin/sh\n\necho \"#### OS COMP TEST GROUP START lmbench-musl ####\"\n\necho latency measurements\n./lmbench_all lat_sig -P 1 prot lat_sig\n./lmbench_all lat_pipe -P 1\n\necho \"#### OS COMP TEST GROUP END lmbench-musl ####\"\n";
+const LMBENCH_PROT_ONLY_SCRIPT: &[u8] = b"#!/bin/sh\n\necho \"#### OS COMP TEST GROUP START lmbench-musl ####\"\n\necho latency measurements\necho \"[lmbench-debug] START lat_sig -P 1 prot lat_sig\"\n./lmbench_all lat_sig -P 1 prot lat_sig\necho \"[lmbench-debug] DONE  lat_sig -P 1 prot lat_sig rc=$?\"\necho \"[lmbench-debug] START lat_pipe -P 1\"\n./lmbench_all lat_pipe -P 1\necho \"[lmbench-debug] DONE  lat_pipe -P 1 rc=$?\"\n\necho \"#### OS COMP TEST GROUP END lmbench-musl ####\"\n";
 #[allow(dead_code)]
 const RUN_EMBEDDED_PTHREAD: bool = option_env!("RUN_EMBEDDED_PTHREAD").is_some();
 const PTHREAD_TEST_PATH: &str = "/tmp/pthread_cancel_small";
