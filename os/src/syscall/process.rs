@@ -1812,13 +1812,16 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
             let token = current_user_token();
             let slices = translated_byte_buffer(token, start as *const u8, len);
             let mut file_off = offset;
+            let mut total_read = 0usize;
             for slice in slices {
                 let n = inode.read_at(file_off, slice);
+                total_read += n;
                 file_off += n;
                 if n < slice.len() {
                     break;
                 }
             }
+            let _ = total_read;
         }
     }
 
