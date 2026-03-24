@@ -934,7 +934,7 @@ fn stat_from_path(full_path: &str) -> Result<Stat, isize> {
     for b in full_path.bytes() {
         h = h.wrapping_mul(33).wrapping_add(b as u64);
     }
-    stat.ino = h;
+    stat.ino = h & 0x7FFF_FFFF; // keep positive when printed as signed
     fill_stat_timestamps(&mut stat, None);
     Ok(stat)
 }
@@ -986,7 +986,7 @@ pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
         for b in path_for_ino.bytes() {
             h = h.wrapping_mul(33).wrapping_add(b as u64);
         }
-        stat.ino = h;
+        stat.ino = h & 0x7FFF_FFFF; // keep positive when printed as signed
     }
     fill_stat_timestamps(&mut stat, file.ts_id());
     let bytes = unsafe {

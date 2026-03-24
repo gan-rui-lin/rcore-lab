@@ -574,7 +574,9 @@ impl MemorySet {
         let _ph_count = elf_header.pt2.ph_count();
         let elf_type = elf_header.pt2.type_().as_type();
         let (has_interp, min_load_vaddr) = Self::scan_elf_meta(&elf, elf_data);
-        let load_base = if elf_type == xmas_elf::header::Type::SharedObject && !has_interp {
+        // PIE executables (SharedObject with interp, min_load_vaddr=0) need
+        // a non-zero load_base so they don't start at VA 0x0.
+        let load_base = if elf_type == xmas_elf::header::Type::SharedObject && min_load_vaddr == 0 {
             0x4000_0000usize
         } else {
             0
