@@ -1106,7 +1106,13 @@ impl MapArea {
                 }
             }
             MapType::Framed => {
-                let frame = Arc::new(frame_alloc().unwrap());
+                let frame = match frame_alloc() {
+                    Some(f) => Arc::new(f),
+                    None => {
+                        error!("[OOM] frame_alloc failed in map_one vpn={:?}", vpn);
+                        return;
+                    }
+                };
                 ppn = frame.ppn;
                 self.data_frames.insert(vpn, frame);
             }
