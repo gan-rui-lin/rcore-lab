@@ -2734,26 +2734,43 @@ pub fn sys_prlimit64(
     0
 }
 
-/// Exit all threads in the process
-/// In rcore-lab, exit_group behaves the same as exit since we terminate the entire process
+/// Exit all threads in the process (Linux do_group_exit semantics).
+/// Sends SIGKILL to all sibling threads, then exits the current thread.
 pub fn sys_exit_group(exit_code: i32) -> ! {
+    let task = current_task().unwrap();
+    let process = task.process.upgrade().unwrap();
+    let pid = process.getpid();
     trace!(
         "kernel:pid[{}] sys_exit_group (exit_code={})",
-        current_process().pid.0,
+        pid,
         exit_code
     );
-    let pid = current_process().pid.0;
-    let name = current_process().inner_exclusive_access().name.clone();
-    if pid == 4 || name == "sh" {
-        trace!(
-            "[sys_exit_group] pid={} name={} code={} sepc={:#x}",
-            pid,
-            name,
-            exit_code,
-            current_trap_cx().sepc
-        );
+
+    // Send SIGKILL to all sibling threads so they exit on next schedule
+    {
+        let process_inner = process.inner_exclusive_access();
+        for other_task in process_inner.tasks.iter().filter_map(|t| t.as_ref()) {
+            if !Arc::ptr_eq(other_task, &task) {
+                let mut other_inner = other_task.inner_exclusive_access();
+                if other_inner.exit_code.is_some() {
+                    continue; // already exited
+                }
+                other_inner.signal_pending.insert(SignalFlags::SIGKILL);
+                if other_inner.task_status == TaskStatus::Blocked {
+                    futex_remove_waiter_any(other_task);
+                    other_inner.interrupted_by_signal = true;
+                    other_inner.task_status = TaskStatus::Ready;
+                    drop(other_inner);
+                    add_task(other_task.clone());
+                }
+            }
+        }
     }
-    sys_exit(exit_code)
+    drop(process);
+    drop(task);
+
+    exit_current_and_run_next(exit_code);
+    panic!("Unreachable in sys_exit_group!");
 }
 
 pub fn sys_shutdown() -> ! {
