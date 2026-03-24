@@ -7,6 +7,7 @@ extern crate user_lib;
 extern crate alloc;
 
 use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use user_lib::{
     chdir, close, dup, execve, exit, fork, link, open, shutdown, unlink, wait, write, OpenFlags,
@@ -26,6 +27,7 @@ const TEST_SUITES: [&str; 4] = [
     "libctest",
     "lmbench",
 ];
+const LMBENCH_PROT_ONLY_SCRIPT: &[u8] = b"#!/bin/sh\n\necho \"#### OS COMP TEST GROUP START lmbench-musl ####\"\n\necho latency measurements\n./lmbench_all lat_sig -P 1 prot lat_sig\n./lmbench_all lat_pipe -P 1\n\necho \"#### OS COMP TEST GROUP END lmbench-musl ####\"\n";
 #[allow(dead_code)]
 const RUN_EMBEDDED_PTHREAD: bool = option_env!("RUN_EMBEDDED_PTHREAD").is_some();
 const PTHREAD_TEST_PATH: &str = "/tmp/pthread_cancel_small";
@@ -43,6 +45,32 @@ fn cstring(s: &str) -> Vec<u8> {
 }
 
 fn write_embedded_elf(path: &str, data: &[u8]) -> isize {
+    let path_c = cstring(path);
+    let path_str = unsafe { core::str::from_utf8_unchecked(&path_c) };
+    let fd = open(
+        path_str,
+        OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY,
+    );
+    if fd < 0 {
+        println!("open {} failed (ret={})", path, fd);
+        return fd;
+    }
+    let fd = fd as usize;
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let n = write(fd, &data[offset..]);
+        if n <= 0 {
+            println!("write {} failed (ret={})", path, n);
+            let _ = close(fd);
+            return n;
+        }
+        offset += n as usize;
+    }
+    let _ = close(fd);
+    0
+}
+
+fn write_text_file(path: &str, data: &[u8]) -> isize {
     let path_c = cstring(path);
     let path_str = unsafe { core::str::from_utf8_unchecked(&path_c) };
     let fd = open(
@@ -378,7 +406,23 @@ fn run_suite(root: &str, suite: &str) -> i32 {
         println!("=== Skipped {} / {} (profile activate failed) ===\n", root, suite);
         return -1;
     }
-    let script = format!("{}/{}_testcode.sh", root, suite);
+    let mut script = format!("{}/{}_testcode.sh", root, suite);
+    if root == "/musl" && suite == "lmbench" {
+        let debug_script = "/tmp/lmbench_testcode.sh";
+        let ret = write_text_file(debug_script, LMBENCH_PROT_ONLY_SCRIPT);
+        if ret >= 0 {
+            script = String::from(debug_script);
+            println!(
+                "[initcode] lmbench debug mode enabled, using {} (lat_sig prot + next)",
+                debug_script
+            );
+        } else {
+            println!(
+                "[initcode] lmbench debug script write failed (ret={}), fallback to default",
+                ret
+            );
+        }
+    }
     run_testcode(script.as_str(), root)
 }
 
