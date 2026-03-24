@@ -103,14 +103,18 @@ pub fn init() {
 }
 
 /// Poll the network stack (always acquires lock). Use from syscall path.
+///
+/// Loopback needs multiple polls to complete a round-trip:
+/// TX→loopback_rx→process→TX→loopback_rx. We do 4 rounds which is
+/// enough for TCP 3-way handshake (SYN→SYN-ACK→ACK→data).
 pub fn poll_net() {
     let mut net = NET_STACK.exclusive_access();
     if let Some(ref mut stack) = *net {
         let now = smoltcp_now();
         stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
-        stack
-            .lo_iface
-            .poll(now, &mut stack.lo_device, &mut stack.sockets);
+        for _ in 0..4 {
+            stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+        }
     }
 }
 
@@ -120,10 +124,79 @@ pub fn poll_net_if_available() {
         if let Some(ref mut stack) = *net {
             let now = smoltcp_now();
             stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
-            stack
-                .lo_iface
-                .poll(now, &mut stack.lo_device, &mut stack.sockets);
+            for _ in 0..4 {
+                stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+            }
         }
+    }
+}
+
+/// Force-poll network stack (blocking). Called from task scheduling context.
+pub fn poll_net_force() {
+    let mut net = NET_STACK.exclusive_access();
+    if let Some(ref mut stack) = *net {
+        let now = smoltcp_now();
+        stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+        for _ in 0..4 {
+            stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+        }
+    }
+}
+
+/// Loopback UDP inject with demux: deliver a packet to the best-matching
+/// UDP socket on `target_port`, skipping the sender socket (`sender_handle`).
+///
+/// Matching priority:
+///   1. Connected socket whose `remote_endpoint` matches the sender
+///   2. Unconnected (wildcard) socket on the same port
+///
+/// This allows iperf3's parallel UDP streams to each receive only their
+/// own traffic, while the server's unconnected listener still receives
+/// new stream-setup cookies.
+pub fn loopback_udp_inject(
+    stack: &mut NetStack,
+    sender_handle: smoltcp::iface::SocketHandle,
+    target_port: u16,
+    data: &[u8],
+    sender_meta: smoltcp::socket::udp::UdpMetadata,
+) {
+    use smoltcp::socket::udp::Socket as UdpSocket;
+
+    let sender_ep = sender_meta.endpoint; // (127.0.0.1, sender_port)
+
+    // Two-pass: first look for a connected socket matching the sender,
+    // then fall back to any unconnected socket on the same port.
+    let mut connected_handle: Option<smoltcp::iface::SocketHandle> = None;
+    let mut wildcard_handle: Option<smoltcp::iface::SocketHandle> = None;
+
+    for (sh, sock) in stack.sockets.iter() {
+        if let smoltcp::socket::Socket::Udp(ref udp_sock) = sock {
+            if udp_sock.endpoint().port != target_port {
+                continue;
+            }
+            // Don't deliver to the sender itself
+            if sh == sender_handle {
+                continue;
+            }
+            if let Some(remote) = udp_sock.remote_endpoint() {
+                // Connected socket: must match sender's addr+port
+                if remote.addr == sender_ep.addr && remote.port == sender_ep.port {
+                    connected_handle = Some(sh);
+                    break; // exact match, no need to keep looking
+                }
+            } else {
+                // Unconnected (wildcard) listener
+                if wildcard_handle.is_none() {
+                    wildcard_handle = Some(sh);
+                }
+            }
+        }
+    }
+
+    let target = connected_handle.or(wildcard_handle);
+    if let Some(handle) = target {
+        let udp_sock = stack.sockets.get_mut::<UdpSocket>(handle);
+        let _ = udp_sock.inject_recv(data, sender_meta);
     }
 }
 

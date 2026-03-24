@@ -9,10 +9,22 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::mm::{translated_byte_buffer, translated_refmut};
-use crate::task::{current_process, current_user_token, suspend_current_and_run_next};
+use crate::task::{current_process, current_task, current_user_token, suspend_current_and_run_next};
 
 use super::socket_file::{SocketFile, SocketType};
 use super::{alloc_ephemeral_port, poll_net, NET_STACK};
+
+/// Check if the current task has pending unmasked signals.
+/// Used to return EINTR from blocking network syscalls.
+fn has_pending_signal() -> bool {
+    let process = current_process();
+    let process_inner = process.inner_exclusive_access();
+    let task = current_task().unwrap();
+    let task_inner = task.inner_exclusive_access();
+    let unmasked = (process_inner.signal_pending | task_inner.signal_pending)
+        & !task_inner.signal_mask;
+    !unmasked.is_empty()
+}
 
 // Address family
 const AF_INET: usize = 2;
@@ -36,6 +48,7 @@ const SO_SNDTIMEO: usize = 21;
 const TCP_NODELAY: usize = 1;
 
 // Errno values
+const EINTR: isize = -4;
 const EBADF: isize = -9;
 const EINVAL: isize = -22;
 const ENOTSOCK: isize = -88;
@@ -43,7 +56,9 @@ const EAFNOSUPPORT: isize = -97;
 const EADDRINUSE: isize = -98;
 const ENOTCONN: isize = -107;
 const ECONNREFUSED: isize = -111;
+const EFAULT: isize = -14;
 const EMFILE: isize = -24;
+const EMSGSIZE: isize = -90;
 const EOPNOTSUPP: isize = -95;
 
 /// Linux sockaddr_in structure (16 bytes).
@@ -343,7 +358,10 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize 
         Err(e) => return e,
     };
 
-    if sock_type != SocketType::Tcp || bound_port == 0 {
+    if sock_type != SocketType::Tcp {
+        return EOPNOTSUPP;
+    }
+    if !_listening || bound_port == 0 {
         return EINVAL;
     }
 
@@ -421,6 +439,10 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize 
 
         drop(net);
         suspend_current_and_run_next();
+        // Check for pending signals -> EINTR so SIGALRM can be delivered
+        if has_pending_signal() {
+            return EINTR;
+        }
     }
 }
 
@@ -441,7 +463,16 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
         SocketType::Tcp => {
             let local_port = alloc_ephemeral_port();
             let is_loopback = match remote.addr {
-                IpAddress::Ipv4(v4) => v4.as_bytes()[0] == 127,
+                IpAddress::Ipv4(v4) => {
+                    let b = v4.as_bytes();
+                    b[0] == 127 || (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0)
+                }
+            };
+            // Rewrite 0.0.0.0 to 127.0.0.1 (INADDR_ANY means localhost for connect)
+            let connect_remote = if remote.addr == IpAddress::v4(0, 0, 0, 0) {
+                IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), remote.port)
+            } else {
+                remote
             };
             {
                 poll_net();
@@ -451,13 +482,13 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
                     None => return EINVAL,
                 };
                 let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-                // Use loopback interface context for 127.x.x.x
+                // Use loopback interface context for 127.x.x.x and 0.0.0.0
                 let cx = if is_loopback {
                     stack.lo_iface.context()
                 } else {
                     stack.iface.context()
                 };
-                if let Err(e) = socket.connect(cx, remote, local_port) {
+                if let Err(e) = socket.connect(cx, connect_remote, local_port) {
                     warn!("[net] TCP connect failed: {:?}", e);
                     return ECONNREFUSED;
                 }
@@ -481,11 +512,30 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
 
                 drop(net);
                 suspend_current_and_run_next();
+                if has_pending_signal() {
+                    return EINTR;
+                }
             }
         }
         SocketType::Udp => {
-            // UDP connect just stores the default destination
-            // smoltcp doesn't have "connected" UDP, so this is a no-op
+            // UDP connect stores the default destination for write()/send()
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            if fd < inner.fd_table.len() {
+                if let Some(ref file) = inner.fd_table[fd] {
+                    file.set_connected_remote(remote);
+                }
+            }
+            // Also set smoltcp-level remote filter so that this connected
+            // socket won't steal packets destined for other sockets on the
+            // same port (e.g. iperf3 parallel UDP streams).
+            {
+                let mut net = NET_STACK.exclusive_access();
+                if let Some(ref mut ns) = *net {
+                    let sock = ns.sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
+                    sock.set_remote_endpoint(Some(remote));
+                }
+            }
             0
         }
     }
@@ -536,25 +586,38 @@ pub fn sys_getpeername(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
         Err(e) => return e,
     };
 
-    if sock_type != SocketType::Tcp {
-        return EOPNOTSUPP;
+    match sock_type {
+        SocketType::Tcp => {
+            let mut net = NET_STACK.exclusive_access();
+            let stack = match net.as_mut() {
+                Some(s) => s,
+                None => return EINVAL,
+            };
+            let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+            let ep = match socket.remote_endpoint() {
+                Some(ep) => ep,
+                None => return ENOTCONN,
+            };
+            drop(net);
+            write_sockaddr(&ep, addr, addr_len, token);
+            0
+        }
+        SocketType::Udp => {
+            // Return the connected remote endpoint if set
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            if fd < inner.fd_table.len() {
+                if let Some(ref file) = inner.fd_table[fd] {
+                    if let Some(ep) = file.get_connected_remote() {
+                        drop(inner);
+                        write_sockaddr(&ep, addr, addr_len, token);
+                        return 0;
+                    }
+                }
+            }
+            ENOTCONN
+        }
     }
-
-    let mut net = NET_STACK.exclusive_access();
-    let stack = match net.as_mut() {
-        Some(s) => s,
-        None => return EINVAL,
-    };
-
-    let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-    let ep = match socket.remote_endpoint() {
-        Some(ep) => ep,
-        None => return ENOTCONN,
-    };
-    drop(net);
-
-    write_sockaddr(&ep, addr, addr_len, token);
-    0
 }
 
 /// sys_sendto(fd, buf, len, flags, dest_addr, addrlen) -> bytes_sent
@@ -571,6 +634,11 @@ pub fn sys_sendto(
         Ok(info) => info,
         Err(e) => return e,
     };
+
+    // Validate user buffer pointer
+    if len > 0 && (buf as usize) >= 0x4000_0000_0000 {
+        return EFAULT;
+    }
 
     // Read user data into kernel buffer
     let user_bufs = translated_byte_buffer(token, buf, len);
@@ -593,23 +661,53 @@ pub fn sys_sendto(
             let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
 
             if !socket.may_send() {
+                use smoltcp::socket::tcp::State;
+                let state = socket.state();
+                // Closed/non-established socket: EPIPE (not connected)
+                // CloseWait/LastAck/etc: return 0 (connection closed after established)
+                if matches!(state, State::Closed | State::Listen | State::SynSent | State::SynReceived) {
+                    const EPIPE: isize = -32;
+                    return EPIPE;
+                }
                 return 0;
             }
             if socket.can_send() {
                 match socket.send_slice(&data) {
-                    Ok(n) => return n as isize,
+                    Ok(n) => {
+                        // Flush through loopback so peer can receive immediately
+                        let now = super::smoltcp_now();
+                        for _ in 0..4 {
+                            stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+                        }
+                        stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+                        return n as isize;
+                    }
                     Err(_) => return ENOTCONN,
                 }
             }
 
             drop(net);
             suspend_current_and_run_next();
+            if has_pending_signal() {
+                return EINTR;
+            }
         },
         SocketType::Udp => {
+            // Validate dest_addr pointer and addr_len
+            if (addr_len as isize) < 0 {
+                return EINVAL;
+            }
+            if !dest_addr.is_null() && (dest_addr as usize) >= 0x4000_0000_0000 {
+                return EFAULT;
+            }
             let dest = match read_sockaddr(dest_addr, addr_len, token) {
                 Some(ep) => ep,
                 None => return EINVAL,
             };
+            // EMSGSIZE: UDP datagram too large
+            if len > 65535 {
+                return EMSGSIZE;
+            }
 
             let is_loopback = match dest.addr {
                 IpAddress::Ipv4(v4) => v4.as_bytes()[0] == 127,
@@ -648,25 +746,9 @@ pub fn sys_sendto(
                     endpoint: IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), sender_port),
                     meta: Default::default(),
                 };
-                // Find the target socket bound to dest.port
                 let target_port = dest.port;
-                let mut delivered = false;
-                for (_sh, sock) in stack.sockets.iter_mut() {
-                    if let smoltcp::socket::Socket::Udp(ref mut udp_sock) = sock {
-                        if udp_sock.endpoint().port == target_port {
-                            if udp_sock.inject_recv(&data, sender_meta).is_ok() {
-                                delivered = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if delivered {
-                    data.len() as isize
-                } else {
-                    warn!("[net] loopback: no socket bound to port {}", target_port);
-                    data.len() as isize // pretend success like Linux
-                }
+                super::loopback_udp_inject(stack, handle, target_port, &data, sender_meta);
+                data.len() as isize
             } else {
                 // Normal send via smoltcp network stack
                 let socket = stack.sockets.get_mut::<udp::Socket>(handle);
@@ -706,11 +788,14 @@ pub fn sys_recvfrom(
                 None => return EINVAL,
             };
             let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+            let state = socket.state();
 
             if socket.can_recv() {
                 let mut tmp = vec![0u8; len];
                 match socket.recv_slice(&mut tmp) {
                     Ok(n) => {
+                        let pid = current_process().getpid();
+                        trace!("[net] recvfrom TCP fd={} pid={} got {} bytes state={:?}", fd, pid, n, state);
                         // Write back to user buffer
                         let user_bufs = translated_byte_buffer(token, buf, n);
                         let mut off = 0;
@@ -729,11 +814,16 @@ pub fn sys_recvfrom(
             }
 
             if !socket.may_recv() {
+                let pid = current_process().getpid();
+                info!("[net] recvfrom TCP fd={} pid={} EOF state={:?}", fd, pid, state);
                 return 0; // EOF
             }
 
             drop(net);
             suspend_current_and_run_next();
+            if has_pending_signal() {
+                return EINTR;
+            }
         },
         SocketType::Udp => loop {
             poll_net();
@@ -769,6 +859,9 @@ pub fn sys_recvfrom(
 
             drop(net);
             suspend_current_and_run_next();
+            if has_pending_signal() {
+                return EINTR;
+            }
         },
     }
 }
@@ -820,22 +913,33 @@ pub fn sys_getsockopt(
 
     let token = current_user_token();
 
+    // Helper to write a u32 value to user optval/optlen
+    let write_u32 = |val: u32| {
+        if !optval.is_null() && !optlen.is_null() {
+            let bufs = translated_byte_buffer(token, optval, 4);
+            let bytes = val.to_ne_bytes();
+            if let Some(buf) = bufs.first() {
+                let dst =
+                    unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, 4) };
+                dst.copy_from_slice(&bytes);
+            }
+            let len_ref = translated_refmut(token, optlen);
+            *len_ref = 4;
+        }
+    };
+
     // Return default values for common options
     match (level, optname) {
-        (SOL_SOCKET, SO_ERROR) => {
-            if !optval.is_null() && !optlen.is_null() {
-                let bufs = translated_byte_buffer(token, optval, 4);
-                let zero = [0u8; 4];
-                if let Some(buf) = bufs.first() {
-                    let dst =
-                        unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, 4) };
-                    dst.copy_from_slice(&zero);
-                }
-                let len_ref = translated_refmut(token, optlen);
-                *len_ref = 4;
-            }
-            0
-        }
+        (SOL_SOCKET, SO_ERROR) => { write_u32(0); 0 }
+        (SOL_SOCKET, SO_SNDBUF) => { write_u32(65536); 0 }
+        (SOL_SOCKET, SO_RCVBUF) => { write_u32(65536); 0 }
+        (SOL_SOCKET, SO_REUSEADDR) => { write_u32(1); 0 }
+        (SOL_SOCKET, SO_KEEPALIVE) => { write_u32(0); 0 }
+        (IPPROTO_TCP, TCP_NODELAY) => { write_u32(0); 0 }
+        // TCP_MAXSEG (2): return default MSS for loopback
+        (IPPROTO_TCP, 2) => { write_u32(65495); 0 }
+        // TCP_INFO (11): not supported, return silently
+        (IPPROTO_TCP, 11) => { write_u32(0); 0 }
         _ => {
             warn!(
                 "[net] getsockopt: unsupported level={} optname={}",
@@ -847,7 +951,7 @@ pub fn sys_getsockopt(
 }
 
 /// sys_shutdown(fd, how) -> 0
-pub fn sys_shutdown_socket(fd: usize, _how: i32) -> isize {
+pub fn sys_shutdown_socket(fd: usize, how: i32) -> isize {
     let (handle, sock_type) = match get_socket_info(fd) {
         Ok(info) => info,
         Err(e) => return e,
@@ -862,7 +966,17 @@ pub fn sys_shutdown_socket(fd: usize, _how: i32) -> isize {
     match sock_type {
         SocketType::Tcp => {
             let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+            let old_state = socket.state();
             socket.close();
+            // Flush FIN through loopback immediately
+            let now = super::smoltcp_now();
+            for _ in 0..8 {
+                stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+            }
+            stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+            let new_state = stack.sockets.get_mut::<tcp::Socket>(handle).state();
+            let pid = current_process().getpid();
+            info!("[net] shutdown TCP fd={} pid={} how={} state {:?} -> {:?}", fd, pid, how, old_state, new_state);
             0
         }
         SocketType::Udp => {
