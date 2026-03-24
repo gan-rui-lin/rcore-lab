@@ -356,10 +356,8 @@ impl MemorySet {
                 }
                 let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
                 max_end_vpn = map_area.vpn_range.get_end();
-                memory_set.push(
-                    map_area,
-                    Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
-                );
+                let file_data = &elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize];
+                memory_set.push(map_area, Some(file_data));
             }
         }
         max_end_vpn
@@ -627,7 +625,9 @@ impl MemorySet {
         let _ph_count = elf_header.pt2.ph_count();
         let elf_type = elf_header.pt2.type_().as_type();
         let (has_interp, min_load_vaddr) = Self::scan_elf_meta(&elf, elf_data);
-        let load_base = if elf_type == xmas_elf::header::Type::SharedObject && !has_interp {
+        // PIE executables (SharedObject with interp, min_load_vaddr=0) need
+        // a non-zero load_base so they don't start at VA 0x0.
+        let load_base = if elf_type == xmas_elf::header::Type::SharedObject && min_load_vaddr == 0 {
             0x4000_0000usize
         } else {
             0
@@ -1215,7 +1215,8 @@ impl MapArea {
                     MEMORY_END
                 );
             }
-            let dst = &mut pte.ppn().get_bytes_array()[dst_offset..dst_offset + copy_len];
+            let page_bytes = pte.ppn().get_bytes_array();
+            let dst = &mut page_bytes[dst_offset..dst_offset + copy_len];
             let src = &data[data_offset..data_offset + copy_len];
             dst.copy_from_slice(src);
             data_offset += copy_len;

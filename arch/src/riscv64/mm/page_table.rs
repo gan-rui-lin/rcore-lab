@@ -221,7 +221,10 @@ impl PageTable {
     #[allow(unused)]
     pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
         let pte = self.find_pte_create(vpn).unwrap();
-        assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
+        // MAP_FIXED may remap already-mapped pages. Clear old mapping if needed.
+        if pte.is_valid() {
+            *pte = PageTableEntry::empty();
+        }
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
     }
 

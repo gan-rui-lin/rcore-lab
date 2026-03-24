@@ -30,8 +30,7 @@ pub mod drivers;
 pub mod fs;
 pub mod lang_items;
 pub mod mm;
-#[cfg_attr(target_arch = "loongarch64", path = "net_stub.rs")]
-/// Network subsystem (RISC-V uses full stack; LoongArch64 uses stub).
+/// Network subsystem (smoltcp-based, loopback on all arches, external net on RISC-V).
 pub mod net;
 pub mod sync;
 pub mod syscall;

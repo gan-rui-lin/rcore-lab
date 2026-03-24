@@ -60,12 +60,27 @@ pub fn init_interrupt() {
 // IRQ enable / disable
 // ---------------------------------------------------------------------------
 
+/// Enable interrupts immediately by setting crmd.IE.
+/// Used in the idle loop to open an interrupt window.
+#[inline(always)]
+pub fn enable_interrupts_now() {
+    crmd::set_ie(true);
+}
+
+/// Disable interrupts immediately by clearing crmd.IE.
+#[inline(always)]
+pub fn disable_interrupts_now() {
+    crmd::set_ie(false);
+}
+
+/// Set saved interrupt enable (prmd.PIE) for ertn return.
 #[allow(dead_code)]
 #[inline(always)]
 pub fn enable_irq() {
     prmd::set_pie(true);
 }
 
+/// Clear saved interrupt enable (prmd.PIE) for ertn return.
 #[inline(always)]
 pub fn disable_irq() {
     prmd::set_pie(false);
@@ -159,7 +174,7 @@ pub fn set_trap_vector_base() {
 
 fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
     let estat = estat::read();
-    match estat.cause() {
+    let trap_type = match estat.cause() {
         Trap::Exception(Exception::Breakpoint) => {
             tf.sepc += 4;
             TrapType::Breakpoint
@@ -195,7 +210,17 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
             TrapType::LoadPageFault(badv::read().raw())
         }
         _ => TrapType::Unknown,
+    };
+
+    // Dispatch kernel-mode interrupts so check_timer() / check_itimers()
+    // can fire SIGALRM even when the CPU is executing kernel syscall code.
+    // The asm stub (trap_vector_base) calls us for kernel traps but does
+    // NOT invoke kernel_interrupt by itself — we must do it here.
+    if let TrapType::Time | TrapType::SupervisorExternal = trap_type {
+        crate::api::ArchInterface::kernel_interrupt(trap_type);
     }
+
+    trap_type
 }
 
 // ---------------------------------------------------------------------------

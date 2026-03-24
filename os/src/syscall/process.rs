@@ -1990,7 +1990,6 @@ pub fn sys_mmap(
                 );
             }
         }
-        return errno(ENOMEM);
     }
 
     // 在进程的内存空间里插入一个新的映射区域，起始地址为 start，长度为 len，权限为 map_perm。
@@ -2016,13 +2015,16 @@ pub fn sys_mmap(
             let token = current_user_token();
             let slices = translated_byte_buffer(token, start as *const u8, len);
             let mut file_off = offset;
+            let mut total_read = 0usize;
             for slice in slices {
                 let n = inode.read_at(file_off, slice);
+                total_read += n;
                 file_off += n;
                 if n < slice.len() {
                     break;
                 }
             }
+            let _ = total_read;
         }
     }
 
