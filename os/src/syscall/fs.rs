@@ -1,6 +1,6 @@
 //! File and filesystem-related syscalls
 use crate::fs::{
-    create_dir, make_pipe, open_file, path_is_dir, remove_path, DevNull, DevZero,
+    create_dir, make_pipe, open_file, path_is_dir, remove_path, DevNull, DevUrandom, DevZero,
     OpenFlags, Stat, StatMode, PollEvents,
 };
 use crate::mm::{translated_byte_buffer, translated_ref, translated_str, translated_refmut, UserBuffer};
@@ -379,6 +379,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     let dev_file: Option<Arc<dyn crate::fs::File + Send + Sync>> = match full_path.as_str() {
         "/dev/null" => Some(Arc::new(DevNull)),
         "/dev/zero" => Some(Arc::new(DevZero)),
+        "/dev/urandom" | "/dev/random" => Some(Arc::new(DevUrandom)),
         _ => None,
     };
     if let Some(file) = dev_file {
@@ -598,6 +599,7 @@ pub fn sys_close(fd: usize) -> isize {
 }
 
 /// fstatat: stat by path, relative to dirfd.
+/// ! 暂时未使用 flags 参数
 pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
@@ -614,50 +616,77 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
 
     let token = current_user_token();
     let raw_path = translated_str(token, path);
-
-    let stat = if raw_path.is_empty() {
+    // AT_EMPTY_PATH: stat the fd itself when path is empty
+    if raw_path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
-            return errno(ENOENT);
+            return errno(EINVAL);
         }
-        if dirfd == AT_FDCWD {
-            let cwd = current_process().inner_exclusive_access().cwd.clone();
-            match stat_from_path(&cwd) {
-                Ok(stat) => stat,
-                Err(err) => return err,
-            }
-        } else if dirfd < 0 {
-            return errno(EBADF);
-        } else {
-            match stat_from_fd(dirfd as usize) {
-                Ok(stat) => stat,
-                Err(err) => return err,
-            }
-        }
+        // fstat-like behavior: stat the open fd
+        return sys_fstat(dirfd as usize, st);
+    }
+    let base = if raw_path.starts_with('/') {
+        String::new()
     } else {
-        let full_path = if raw_path.starts_with('/') {
-            normalize_path(&raw_path)
-        } else {
-            let base = match dirfd_base(dirfd) {
-                Ok(base) => base,
-                Err(err) => return err,
-            };
-            resolve_path(&base, &raw_path)
-        };
-
-        // Check for path traversal through non-directory (e.g. /dev/null/invalid)
-        let comps: Vec<&str> = full_path.split('/').filter(|s| !s.is_empty()).collect();
-        for i in 0..comps.len().saturating_sub(1) {
-            let partial = format!("/{}", comps[..=i].join("/"));
-            if is_char_device(&partial) {
-                return errno(ENOTDIR);
-            }
-        }
-        match stat_from_path(&full_path) {
-            Ok(stat) => stat,
+        match dirfd_base(dirfd) {
+            Ok(base) => base,
             Err(err) => return err,
         }
     };
+    let full_path = if raw_path.starts_with('/') {
+        normalize_path(&raw_path)
+    } else {
+        resolve_path(&base, &raw_path)
+    };
+    // trace!(
+    //     "[sys_fstatat] pid={} dirfd={} flags={:#x} path={} full={}",
+    //     pid,
+    //     dirfd,
+    //     flags,
+    //     raw_path,
+    //     full_path
+    // );
 
+        // Check for path traversal through non-directory (e.g. /dev/null/invalid)
+    let comps: Vec<&str> = full_path.split('/').filter(|s| !s.is_empty()).collect();
+    for i in 0..comps.len().saturating_sub(1) {
+        let partial = format!("/{}", comps[..=i].join("/"));
+        if is_char_device(&partial) {
+            return errno(ENOTDIR);
+        }
+    }
+
+    let mut stat = Stat::default();
+    // Handle character devices specially
+    if is_char_device(&full_path) {
+        stat.mode = StatMode::CHR.bits() | 0o666;
+        stat.nlink = 1;
+        stat.rdev = rdev_for_path(&full_path);
+    } else {
+        let open_flags = if path_is_dir(&full_path) {
+            OpenFlags::DIRECTORY
+        } else {
+            OpenFlags::empty()
+        };
+        let Some(file) = open_file(full_path.as_str(), open_flags) else {
+            return errno(ENOENT);
+        };
+        let (mode_bits, size) = if let Some(inode) = file.inode() {
+            let mode = if inode.is_dir() {
+                StatMode::DIR
+            } else {
+                StatMode::FILE
+            };
+            (mode.bits() | 0o777, inode.size())
+        } else {
+            (StatMode::FILE.bits() | 0o666, 0)
+        };
+        stat.mode = mode_bits;
+        stat.nlink = 1;
+        stat.size = size as i64;
+        stat.blksize = 512;
+        stat.blocks = ((size + 511) / 512) as i64;
+    }
+    fill_stat_timestamps(&mut stat, None);
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&stat as *const Stat) as *const u8,
@@ -2528,6 +2557,125 @@ pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: *const TimeSpec) -> isi
         }
         if let Some(deadline) = deadline {
             if get_time_ms() >= deadline {
+                return 0;
+            }
+        }
+        suspend_current_and_run_next();
+    }
+}
+
+/// pselect6 (syscall 72) — select()-style I/O multiplexing
+///
+/// Translates fd_set bitmasks into poll() calls internally.
+pub fn sys_pselect6(
+    nfds: usize,
+    readfds: *mut u64,
+    writefds: *mut u64,
+    exceptfds: *mut u64,
+    timeout: *const TimeSpec,
+    _sigmask: usize,
+) -> isize {
+    let token = current_user_token();
+
+    let deadline = if timeout.is_null() {
+        None
+    } else {
+        let spec = *translated_ref(token, timeout);
+        if spec.tv_nsec >= 1_000_000_000 {
+            return errno(EINVAL);
+        }
+        let timeout_ms = spec
+            .tv_sec
+            .saturating_mul(1000)
+            .saturating_add(spec.tv_nsec / 1_000_000);
+        Some(get_time_ms().saturating_add(timeout_ms))
+    };
+
+    let nfds = core::cmp::min(nfds, 1024);
+    // Number of u64 words needed for nfds bits
+    let nwords = (nfds + 63) / 64;
+
+    // Helper: read fd_set bitmask from user space
+    let read_fdset = |ptr: *mut u64| -> Vec<u64> {
+        if ptr.is_null() {
+            vec![0u64; nwords]
+        } else {
+            (0..nwords)
+                .map(|i| *translated_ref(token, unsafe { ptr.add(i) }))
+                .collect()
+        }
+    };
+    let write_fdset = |ptr: *mut u64, bits: &[u64]| {
+        if !ptr.is_null() {
+            for (i, &val) in bits.iter().enumerate() {
+                *translated_refmut(token, unsafe { ptr.add(i) }) = val;
+            }
+        }
+    };
+
+    let rfds = read_fdset(readfds);
+    let wfds = read_fdset(writefds);
+    let efds = read_fdset(exceptfds);
+
+    loop {
+        let mut out_r = vec![0u64; nwords];
+        let mut out_w = vec![0u64; nwords];
+        let mut out_e = vec![0u64; nwords];
+        let mut total = 0i32;
+
+        for fd in 0..nfds {
+            let word = fd / 64;
+            let bit = 1u64 << (fd % 64);
+            let want_r = rfds[word] & bit != 0;
+            let want_w = wfds[word] & bit != 0;
+            let want_e = efds[word] & bit != 0;
+            if !want_r && !want_w && !want_e {
+                continue;
+            }
+
+            let file = {
+                let process = current_process();
+                let inner = process.inner_exclusive_access();
+                if fd >= inner.fd_table.len() {
+                    continue;
+                }
+                match &inner.fd_table[fd] {
+                    Some(f) => f.clone(),
+                    None => continue,
+                }
+            };
+
+            let mut req = PollEvents::empty();
+            if want_r { req |= PollEvents::POLLIN; }
+            if want_w { req |= PollEvents::POLLOUT; }
+            req |= PollEvents::POLLERR | PollEvents::POLLHUP;
+            let ready = file.poll(req);
+
+            if want_r && ready.intersects(PollEvents::POLLIN | PollEvents::POLLHUP | PollEvents::POLLERR) {
+                out_r[word] |= bit;
+                total += 1;
+            }
+            if want_w && ready.intersects(PollEvents::POLLOUT | PollEvents::POLLERR) {
+                out_w[word] |= bit;
+                total += 1;
+            }
+            if want_e && ready.contains(PollEvents::POLLERR) {
+                out_e[word] |= bit;
+                total += 1;
+            }
+        }
+
+        if total > 0 {
+            write_fdset(readfds, &out_r);
+            write_fdset(writefds, &out_w);
+            write_fdset(exceptfds, &out_e);
+            return total as isize;
+        }
+        if let Some(deadline) = deadline {
+            if get_time_ms() >= deadline {
+                write_fdset(readfds, &out_r);
+                write_fdset(writefds, &out_w);
+                write_fdset(exceptfds, &out_e);
                 return 0;
             }
         }

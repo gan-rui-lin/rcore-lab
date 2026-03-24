@@ -31,7 +31,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use manager::fetch_task;
 use process::ProcessControlBlock;
 
-pub use action::{SignalAction, SignalActions, SA_SIGINFO, SA_RESETHAND};
+pub use action::{SignalAction, SignalActions, SA_RESTART, SA_SIGINFO, SA_RESETHAND};
 pub use auxv::AuxvInfo;
 pub use context::TaskContext;
 pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};

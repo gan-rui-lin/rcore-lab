@@ -79,6 +79,38 @@ pub fn check_timer() {
             break;
         }
     }
+    drop(timers);
+    // Poll network stack from timer interrupt so loopback TCP packets
+    // get delivered even when all user processes are blocked in recv().
+    crate::net::poll_net_if_available();
+    // Check ITIMER_REAL for all processes
+    check_itimers(current_ms);
+}
+
+/// Check and fire ITIMER_REAL timers across all processes.
+fn check_itimers(current_ms: usize) {
+    use crate::task::{pid2process_snapshot, SignalFlags};
+    let procs = pid2process_snapshot();
+    for (_pid, process) in procs {
+        // Use try_inner_exclusive_access to avoid deadlocking if the timer
+        // interrupt fires while someone holds this process's inner lock.
+        let mut inner = match process.try_inner_exclusive_access() {
+            Some(inner) => inner,
+            None => continue,
+        };
+        let expire = inner.itimer_real_expire_ms;
+        if expire != 0 && expire <= current_ms {
+            // Fire SIGALRM
+            log::warn!("[itimer] pid={} SIGALRM fired, expire={} now={}", _pid, expire, current_ms);
+            inner.signal_pending |= SignalFlags::SIGALRM;
+            // Reload interval or disarm
+            if inner.itimer_real_interval_ms > 0 {
+                inner.itimer_real_expire_ms = current_ms + inner.itimer_real_interval_ms;
+            } else {
+                inner.itimer_real_expire_ms = 0;
+            }
+        }
+    }
 }
 
 pub fn timer_len() -> usize {

@@ -107,6 +107,12 @@ pub struct ProcessControlBlockInner {
     pub mmap_base: usize,
     pub tls_area: Option<TlsArea>,
     pub rlimits: [RLimit; RLIMIT_NLIMITS],
+    pub session_id: usize,
+    pub pgid: usize,
+    /// ITIMER_REAL: absolute expire time in ms, 0 = inactive.
+    pub itimer_real_expire_ms: usize,
+    /// ITIMER_REAL: interval for repeating timer in ms, 0 = one-shot.
+    pub itimer_real_interval_ms: usize,
 }
 
 impl ProcessControlBlockInner {
@@ -253,9 +259,19 @@ impl ProcessControlBlock {
                     mmap_base: USER_MMAP_TOP,
                     tls_area: tls_area.clone(),
                     rlimits: default_rlimits(),
+                    session_id: 0,
+                    pgid: 0,
+                    itimer_real_expire_ms: 0,
+                    itimer_real_interval_ms: 0,
                 })
             },
         });
+        // Init process is its own session leader and process group leader
+        {
+            let mut inner = process.inner_exclusive_access();
+            inner.session_id = process.pid.0;
+            inner.pgid = process.pid.0;
+        }
         let task = Arc::new(TaskControlBlock::new(Arc::clone(&process), ustack_base, false));
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
@@ -627,6 +643,10 @@ impl ProcessControlBlock {
                     mmap_base: parent.mmap_base,
                     tls_area,
                     rlimits: parent.rlimits,
+                    session_id: parent.session_id,
+                    pgid: parent.pgid,
+                    itimer_real_expire_ms: 0,
+                    itimer_real_interval_ms: 0,
                 })
             },
         });

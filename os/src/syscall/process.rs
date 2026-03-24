@@ -553,6 +553,182 @@ pub fn sys_getppid() -> isize {
     }
 }
 
+pub fn sys_getrusage(who: i32, usage: usize) -> isize {
+    let _ = who;
+    if usage == 0 {
+        return 0;
+    }
+    // Zero out the rusage struct (18 * 8 = 144 bytes)
+    let token = current_user_token();
+    let bufs = translated_byte_buffer(token, usage as *const u8, 144);
+    for buf in bufs {
+        buf.fill(0);
+    }
+    0
+}
+
+/// Linux itimerval: two timeval structs (each 16 bytes on 64-bit).
+/// struct itimerval { struct timeval it_interval; struct timeval it_value; }
+/// struct timeval { long tv_sec; long tv_usec; }
+fn timeval_to_ms(sec: i64, usec: i64) -> usize {
+    if sec == 0 && usec == 0 {
+        return 0;
+    }
+    (sec as usize) * 1000 + (usec as usize) / 1000
+}
+
+fn ms_to_timeval(ms: usize) -> (i64, i64) {
+    let sec = (ms / 1000) as i64;
+    let usec = ((ms % 1000) * 1000) as i64;
+    (sec, usec)
+}
+
+pub fn sys_setitimer(which: i32, new_value: *const u8, old_value: *mut u8) -> isize {
+    use crate::timer::get_time_ms;
+
+    // Only support ITIMER_REAL (0)
+    if which != 0 {
+        return 0; // silently ignore ITIMER_VIRTUAL/ITIMER_PROF
+    }
+
+    let token = current_user_token();
+    let process = current_process();
+
+    // Write old value if requested
+    if !old_value.is_null() {
+        let inner = process.inner_exclusive_access();
+        let now = get_time_ms();
+        let remaining = if inner.itimer_real_expire_ms > now {
+            inner.itimer_real_expire_ms - now
+        } else {
+            0
+        };
+        let (int_sec, int_usec) = ms_to_timeval(inner.itimer_real_interval_ms);
+        let (val_sec, val_usec) = ms_to_timeval(remaining);
+        drop(inner);
+
+        let mut buf = [0u8; 32];
+        buf[0..8].copy_from_slice(&int_sec.to_ne_bytes());
+        buf[8..16].copy_from_slice(&int_usec.to_ne_bytes());
+        buf[16..24].copy_from_slice(&val_sec.to_ne_bytes());
+        buf[24..32].copy_from_slice(&val_usec.to_ne_bytes());
+        let dst = translated_byte_buffer(token, old_value, 32);
+        let mut off = 0;
+        for slice in dst {
+            let n = slice.len().min(32 - off);
+            slice[..n].copy_from_slice(&buf[off..off + n]);
+            off += n;
+        }
+    }
+
+    // Read new value
+    if !new_value.is_null() {
+        let src = translated_byte_buffer(token, new_value, 32);
+        let mut buf = [0u8; 32];
+        let mut off = 0;
+        for slice in src {
+            let n = slice.len().min(32 - off);
+            buf[off..off + n].copy_from_slice(slice);
+            off += n;
+        }
+        let int_sec = i64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        let int_usec = i64::from_ne_bytes(buf[8..16].try_into().unwrap());
+        let val_sec = i64::from_ne_bytes(buf[16..24].try_into().unwrap());
+        let val_usec = i64::from_ne_bytes(buf[24..32].try_into().unwrap());
+
+        let interval_ms = timeval_to_ms(int_sec, int_usec);
+        let value_ms = timeval_to_ms(val_sec, val_usec);
+
+        let now = get_time_ms();
+        log::warn!("[setitimer] pid={} val={}ms int={}ms expire_at={}ms now={}ms",
+            process.pid.0, value_ms, interval_ms, now + value_ms, now);
+        let mut inner = process.inner_exclusive_access();
+        inner.itimer_real_interval_ms = interval_ms;
+        if value_ms == 0 {
+            inner.itimer_real_expire_ms = 0; // disarm
+        } else {
+            inner.itimer_real_expire_ms = now + value_ms;
+        }
+    }
+
+    0
+}
+
+pub fn sys_getitimer(which: i32, curr_value: *mut u8) -> isize {
+    use crate::timer::get_time_ms;
+
+    if which != 0 || curr_value.is_null() {
+        return 0;
+    }
+
+    let token = current_user_token();
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let now = get_time_ms();
+    let remaining = if inner.itimer_real_expire_ms > now {
+        inner.itimer_real_expire_ms - now
+    } else {
+        0
+    };
+    let (int_sec, int_usec) = ms_to_timeval(inner.itimer_real_interval_ms);
+    let (val_sec, val_usec) = ms_to_timeval(remaining);
+    drop(inner);
+
+    let mut buf = [0u8; 32];
+    buf[0..8].copy_from_slice(&int_sec.to_ne_bytes());
+    buf[8..16].copy_from_slice(&int_usec.to_ne_bytes());
+    buf[16..24].copy_from_slice(&val_sec.to_ne_bytes());
+    buf[24..32].copy_from_slice(&val_usec.to_ne_bytes());
+    let dst = translated_byte_buffer(token, curr_value, 32);
+    let mut off = 0;
+    for slice in dst {
+        let n = slice.len().min(32 - off);
+        slice[..n].copy_from_slice(&buf[off..off + n]);
+        off += n;
+    }
+    0
+}
+
+pub fn sys_setsid() -> isize {
+    let process = current_process();
+    let pid = process.pid.0;
+    let mut inner = process.inner_exclusive_access();
+    inner.session_id = pid;
+    inner.pgid = pid;
+    pid as isize
+}
+
+pub fn sys_setpgid(pid: isize, pgid: isize) -> isize {
+    let process = current_process();
+    let target_pid = if pid == 0 { process.pid.0 } else { pid as usize };
+    let target_pgid = if pgid == 0 { target_pid } else { pgid as usize };
+    if target_pid == process.pid.0 {
+        let mut inner = process.inner_exclusive_access();
+        inner.pgid = target_pgid;
+    }
+    0
+}
+
+pub fn sys_getpgid(pid: isize) -> isize {
+    let process = current_process();
+    if pid == 0 || pid as usize == process.pid.0 {
+        let inner = process.inner_exclusive_access();
+        inner.pgid as isize
+    } else {
+        0
+    }
+}
+
+pub fn sys_getsid(pid: isize) -> isize {
+    let process = current_process();
+    if pid == 0 || pid as usize == process.pid.0 {
+        let inner = process.inner_exclusive_access();
+        inner.session_id as isize
+    } else {
+        0
+    }
+}
+
 pub fn sys_fork() -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
@@ -1124,13 +1300,15 @@ pub fn sys_exec(path: *const u8, argv: *const usize, envp: *const usize) -> isiz
     sys_exec_internal(path, argv, envp, 0)
 }
 
-/// If there is not a child process whose pid is same as given, return -ECHILD.
-/// Else if there is a child process but it is still running, return -EAGAIN.
-pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
+/// wait4 syscall: wait for child process state changes.
+/// options: WNOHANG (1) = return immediately if no zombie child.
+/// Returns child pid on success, 0 if WNOHANG and no zombie, -ECHILD if no matching child.
+pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
+    const WNOHANG: i32 = 1;
+    let my_pid = current_process().getpid();
     loop {
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-        let _trace_pid = process.getpid();
         if !inner.children.iter().any(|p| pid == -1 || pid as usize == p.getpid()) {
             return errno(ECHILD);
         }
@@ -1139,39 +1317,63 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
         });
         if let Some((idx, _)) = pair {
             let child = inner.children.remove(idx);
-            if Arc::strong_count(&child) > 1 {
-                trace!(
-                    "kernel:pid[{}] waitpid: child pid {} has {} refs",
-                    process.getpid(),
-                    child.getpid(),
-                    Arc::strong_count(&child)
-                );
-            }
             let found_pid = child.getpid();
             let exit_code = child.inner_exclusive_access().exit_code;
             if !exit_code_ptr.is_null() {
                 let status = (exit_code & 0xff) << 8;
                 *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
             }
+            trace!(
+                "[sys_waitpid] pid={} reaped child pid={} exit_code={}",
+                my_pid, found_pid, exit_code
+            );
             return found_pid as isize;
         }
-        // let child_count = inner.children.len();
-        // let pending = inner.signal_pending;
-        // let mask = inner.signal_mask;
-        // let name = inner.name.clone();
         drop(inner);
-        // if crate::syscall::should_trace_syscall(trace_pid) {
-        //     trace!(
-        //         "[sys_waitpid] pid={} name={} child_count={} pending={:?} mask={:?} -> yield",
-        //         trace_pid,
-        //         name,
-        //         child_count,
-        //         pending,
-        //         mask
-        //     );
-        //     crate::task::debug_dump_tasks();
-        // }
+
+        // WNOHANG: return 0 immediately if no zombie child
+        if (options & WNOHANG) != 0 {
+            return 0;
+        }
+
+        // Yield and retry (busy-wait until child exits)
         suspend_current_and_run_next();
+
+        // Check for pending signals that have a user handler -> return EINTR.
+        // Signals with SIG_DFL (default-ignore, like SIGCHLD) should NOT cause EINTR.
+        {
+            let process = current_process();
+            let process_inner = process.inner_exclusive_access();
+            let task = current_task().unwrap();
+            let task_inner = task.inner_exclusive_access();
+            let unmasked = (process_inner.signal_pending | task_inner.signal_pending)
+                & !task_inner.signal_mask;
+            if !unmasked.is_empty() {
+                // Only return EINTR if at least one pending signal has a user
+                // handler WITHOUT SA_RESTART. Signals with SIG_DFL/SIG_IGN don't
+                // cause EINTR. Signals with SA_RESTART cause the syscall to be
+                // restarted (we just continue the loop).
+                use crate::task::SA_RESTART;
+                let actions = &process_inner.signal_actions;
+                let raw = unmasked.bits();
+                let mut needs_eintr = false;
+                for bit in 0..64u32 {
+                    if raw & (1u64 << bit) != 0 {
+                        let signum = bit as usize + 1;
+                        if signum < actions.table.len() {
+                            let action = &actions.table[signum];
+                            if action.handler <= 1 { continue; } // SIG_DFL/SIG_IGN
+                            if (action.flags & SA_RESTART) != 0 { continue; }
+                            needs_eintr = true;
+                            break;
+                        }
+                    }
+                }
+                if needs_eintr {
+                    return errno(EINTR);
+                }
+            }
+        }
     }
 }
 
