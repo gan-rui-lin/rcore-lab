@@ -58,11 +58,11 @@ const TMP_LIBCTEST_SCRIPT: &[u8] = b"\
 
 const TMP_LTP_MINI_PATH: &str = "/tmp/ltp_mini.sh";
 const TMP_LTP_MINI_SCRIPT: &[u8] = b"\
-./busybox echo '=== ltp-mini: fork10 then fork11 ==='\n\
-ltp/testcases/bin/fork10\n\
-ltp/testcases/bin/fork11\n\
-ltp/testcases/bin/fork13\n\
-./busybox echo '=== ltp-mini: done ==='\n\
+./busybox echo '=== ltp-mini start ==='\n\
+ltp/testcases/bin/fork14\n\
+ltp/testcases/bin/futex_wait01\n\
+ltp/testcases/bin/futex_wake01\n\
+./busybox echo '=== ltp-mini done ==='\n\
 ";
 
 const TMP_LTP_PATH: &str = "/tmp/ltp_testcode.sh";

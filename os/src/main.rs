@@ -79,7 +79,13 @@ impl arch::api::ArchInterface for ArchInterfaceImpl {
     }
 
     fn frame_alloc() -> usize {
-        let frame = crate::mm::frame_alloc().unwrap();
+        let frame = match crate::mm::frame_alloc() {
+            Some(f) => f,
+            None => {
+                error!("[OOM] frame_alloc failed in page table allocation");
+                panic!("[OOM] kernel page table frame exhausted");
+            }
+        };
         let ppn = frame.ppn.0;
         core::mem::forget(frame);
         ppn
