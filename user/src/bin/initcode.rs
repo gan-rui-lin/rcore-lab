@@ -139,6 +139,7 @@ fn activate_runtime_profile(root: &str) -> bool {
     };
 
     force_link("/bin/sh", busybox_path);
+    force_link("/bin/busybox", busybox_path);
     force_link("/bin/basename", busybox_path);
     force_link("/bin/ls", busybox_path);
     force_link("/bin/sleep", busybox_path);
