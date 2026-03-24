@@ -26,6 +26,7 @@ struct VfsFileInner {
 }
 
 impl VfsFile {
+    #[allow(dead_code)]
     pub fn new(readable: bool, writable: bool, inode: Arc<dyn VfsInode>, path: String) -> Self {
         Self::new_with_flags(readable, writable, 0, inode, path)
     }
