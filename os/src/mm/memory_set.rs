@@ -995,7 +995,8 @@ impl MapArea {
                     MEMORY_END
                 );
             }
-            let dst = &mut pte.ppn().get_bytes_array()[dst_offset..dst_offset + copy_len];
+            let page_bytes = pte.ppn().get_bytes_array();
+            let dst = &mut page_bytes[dst_offset..dst_offset + copy_len];
             let src = &data[data_offset..data_offset + copy_len];
             dst.copy_from_slice(src);
             data_offset += copy_len;
