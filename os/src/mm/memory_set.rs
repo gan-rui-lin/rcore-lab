@@ -296,10 +296,8 @@ impl MemorySet {
                 }
                 let map_area = MapArea::new(start_va, end_va, map_perm);
                 max_end_vpn = map_area.vpn_range.get_end();
-                memory_set.push(
-                    map_area,
-                    Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
-                );
+                let file_data = &elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize];
+                memory_set.push(map_area, Some(file_data));
             }
         }
         max_end_vpn
@@ -895,6 +893,24 @@ impl MapArea {
         }
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+        // If already mapped (shared page between adjacent LOAD segments),
+        // COW: allocate new frame, copy old page content, remap with merged permissions.
+        // This preserves text data from LOAD1 while allowing LOAD2 to write data.
+        if let Some(pte) = page_table.translate(vpn) {
+            if pte.is_valid() {
+                let old_ppn = pte.ppn();
+                let new_frame = frame_alloc().unwrap();
+                let new_ppn = new_frame.ppn;
+                // Copy old page content to new frame
+                new_ppn.get_bytes_array().copy_from_slice(old_ppn.get_bytes_array());
+                self.data_frames.insert(vpn, new_frame);
+                let new_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
+                let merged = PTEFlags::from_bits(pte.flags().bits() | new_flags.bits()).unwrap();
+                page_table.unmap(vpn);
+                page_table.map(vpn, new_ppn, merged);
+                return;
+            }
+        }
         let frame = frame_alloc().unwrap();
         let ppn: PhysPageNum = frame.ppn;
         self.data_frames.insert(vpn, frame);
