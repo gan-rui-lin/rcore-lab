@@ -527,6 +527,9 @@ pub fn should_trace_syscall(pid: usize) -> bool {
     if SYSCALL_TRACE_ALL.load(Ordering::Relaxed) {
         return true;
     }
+    if TRACE_PID.is_none() && TRACE_NAME.is_none() {
+        return false;
+    }
     if let Some(target) = TRACE_PID {
         if target != pid {
             return false;
