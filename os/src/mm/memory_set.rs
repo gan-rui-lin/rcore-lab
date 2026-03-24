@@ -93,6 +93,45 @@ impl MemorySet {
             self.areas.remove(idx);
         }
     }
+    /// Unmap pages in [start, end) for MAP_FIXED overlay.
+    /// For fully contained areas, removes them entirely.
+    /// For partially overlapping areas, unmaps individual pages in the range
+    /// and removes the page table entries so the range can be re-mapped.
+    pub fn unmap_range(&mut self, start: VirtAddr, end: VirtAddr) {
+        let unmap_start_vpn = start.floor();
+        let unmap_end_vpn = end.ceil();
+        let mut i = 0;
+        while i < self.areas.len() {
+            let a_start = self.areas[i].vpn_range.get_start();
+            let a_end = self.areas[i].vpn_range.get_end();
+            if a_start >= unmap_end_vpn || a_end <= unmap_start_vpn {
+                i += 1;
+                continue;
+            }
+            if a_start >= unmap_start_vpn && a_end <= unmap_end_vpn {
+                // Entire area within unmap range: remove completely
+                self.areas[i].unmap(&mut self.page_table);
+                self.areas.remove(i);
+            } else {
+                // Partial overlap: unmap only the overlapping pages
+                let overlap_start = a_start.max(unmap_start_vpn);
+                let overlap_end = a_end.min(unmap_end_vpn);
+                let mut vpn = overlap_start;
+                while vpn < overlap_end {
+                    // Only unmap if the page is actually mapped
+                    if self.areas[i].data_frames.contains_key(&vpn) {
+                        self.areas[i].unmap_one(&mut self.page_table, vpn);
+                    } else {
+                        // Page might be mapped in page table but not tracked in data_frames
+                        // (e.g. from file-backed mmap read path). Just clear the PTE.
+                        self.page_table.unmap(vpn);
+                    }
+                    vpn.step();
+                }
+                i += 1;
+            }
+        }
+    }
     /// Add a new MapArea into this MemorySet.
     /// Assuming that there are no conflicts in the virtual address
     /// space.
