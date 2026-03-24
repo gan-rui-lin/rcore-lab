@@ -60,12 +60,27 @@ pub fn init_interrupt() {
 // IRQ enable / disable
 // ---------------------------------------------------------------------------
 
+/// Enable interrupts immediately by setting crmd.IE.
+/// Used in the idle loop to open an interrupt window.
+#[inline(always)]
+pub fn enable_interrupts_now() {
+    crmd::set_ie(true);
+}
+
+/// Disable interrupts immediately by clearing crmd.IE.
+#[inline(always)]
+pub fn disable_interrupts_now() {
+    crmd::set_ie(false);
+}
+
+/// Set saved interrupt enable (prmd.PIE) for ertn return.
 #[allow(dead_code)]
 #[inline(always)]
 pub fn enable_irq() {
     prmd::set_pie(true);
 }
 
+/// Clear saved interrupt enable (prmd.PIE) for ertn return.
 #[inline(always)]
 pub fn disable_irq() {
     prmd::set_pie(false);
