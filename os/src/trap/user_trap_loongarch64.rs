@@ -15,11 +15,8 @@ pub(super) fn handle_user_page_fault(addr: usize) {
     // COW: if the page is mapped read-only (no W) but valid, copy it to a
     // new writable frame.  This is needed for glibc ld.so which does
     // MAP_PRIVATE file-backed mmap (R+X) then writes relocations to it.
-    error!("[cow-enter] addr={:#x} vpn={:#x}", addr, fault_vpn.0);
     if let Some(pte) = page_table.translate(fault_vpn) {
         let flags = pte.flags();
-        error!("[cow-check] vpn={:#x} bits={:#x} flags={:?} valid={} has_W={}",
-            fault_vpn.0, pte.bits, flags, pte.is_valid(), flags.contains(PTEFlags::W));
         if pte.is_valid() && !flags.contains(PTEFlags::W) {
             // Allocate a new frame and copy the old page content
             let old_ppn = pte.ppn();
@@ -34,9 +31,9 @@ pub(super) fn handle_user_page_fault(addr: usize) {
                 let process = current_process();
                 let mut inner = process.inner_exclusive_access();
                 inner.memory_set.remap_cow(fault_vpn, frame, new_flags);
-                error!(
-                    "[cow] pid={} addr={:#x} vpn={:#x} old_ppn={:#x} new_ppn={:#x} flags={:?}",
-                    process.pid.0, addr, fault_vpn.0, old_ppn.0, new_ppn.0, new_flags
+                trace!(
+                    "[cow] pid={} addr={:#x} vpn={:#x} old_ppn={:#x} new_ppn={:#x}",
+                    process.pid.0, addr, fault_vpn.0, old_ppn.0, new_ppn.0
                 );
                 return; // COW handled, resume user
             }

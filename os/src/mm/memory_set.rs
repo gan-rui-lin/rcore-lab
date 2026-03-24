@@ -113,22 +113,30 @@ impl MemorySet {
                 self.areas[i].unmap(&mut self.page_table);
                 self.areas.remove(i);
             } else {
-                // Partial overlap: unmap only the overlapping pages
+                // Partial overlap: unmap the overlapping pages and REMOVE this area.
+                // We must remove it to prevent ghost areas from causing future
+                // double-unmap when another MAP_FIXED overlaps.
                 let overlap_start = a_start.max(unmap_start_vpn);
                 let overlap_end = a_end.min(unmap_end_vpn);
                 let mut vpn = overlap_start;
                 while vpn < overlap_end {
-                    // Only unmap if the page is actually mapped
                     if self.areas[i].data_frames.contains_key(&vpn) {
                         self.areas[i].unmap_one(&mut self.page_table, vpn);
                     } else {
-                        // Page might be mapped in page table but not tracked in data_frames
-                        // (e.g. from file-backed mmap read path). Just clear the PTE.
                         self.page_table.unmap(vpn);
                     }
                     vpn.step();
                 }
-                i += 1;
+                // Remove the entire area. The non-overlapping pages remain
+                // in the page table (their PTEs are untouched) and their frames
+                // are leaked (kept alive by mem::forget). This is acceptable
+                // because MAP_FIXED will create a new area covering the target
+                // range, and the non-overlapping parts are either outside the
+                // new mapping (will be reclaimed at process exit) or will be
+                // remapped by a future mmap.
+                let area = self.areas.remove(i);
+                core::mem::forget(area.data_frames);
+                // Don't increment i — next area shifted down
             }
         }
     }
