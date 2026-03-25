@@ -737,8 +737,6 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *mut usize,
             args[3],
         ),
-        // sched_setaffinity/getaffinity: single CPU, succeed silently
-        122 | 123 => 0,
         // sigaltstack: stub for glibc compatibility
         132 => 0,
         SYSCALL_SIGRETURN => sys_sigreturn(),
