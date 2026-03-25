@@ -113,30 +113,50 @@ impl MemorySet {
                 self.areas[i].unmap(&mut self.page_table);
                 self.areas.remove(i);
             } else {
-                // Partial overlap: unmap the overlapping pages and REMOVE this area.
-                // We must remove it to prevent ghost areas from causing future
-                // double-unmap when another MAP_FIXED overlaps.
+                // Partial overlap: unmap overlapping pages and split/shrink the area.
                 let overlap_start = a_start.max(unmap_start_vpn);
                 let overlap_end = a_end.min(unmap_end_vpn);
+                // Unmap overlapping VPNs
                 let mut vpn = overlap_start;
                 while vpn < overlap_end {
                     if self.areas[i].data_frames.contains_key(&vpn) {
                         self.areas[i].unmap_one(&mut self.page_table, vpn);
-                    } else {
+                    } else if self.page_table.translate(vpn).map_or(false, |pte| pte.is_valid()) {
                         self.page_table.unmap(vpn);
                     }
                     vpn.step();
                 }
-                // Remove the entire area. The non-overlapping pages remain
-                // in the page table (their PTEs are untouched) and their frames
-                // are leaked (kept alive by mem::forget). This is acceptable
-                // because MAP_FIXED will create a new area covering the target
-                // range, and the non-overlapping parts are either outside the
-                // new mapping (will be reclaimed at process exit) or will be
-                // remapped by a future mmap.
-                let area = self.areas.remove(i);
-                core::mem::forget(area.data_frames);
-                // Don't increment i — next area shifted down
+                // Keep the non-overlapping portion as a valid area.
+                // IMPORTANT: also unmap any orphaned PTEs outside the overlap
+                // that will no longer be tracked by this area, to prevent ghost
+                // PTEs from triggering COW in future MAP_FIXED mmaps.
+                if overlap_start == a_start {
+                    // Overlap at the start: shrink area to [overlap_end, a_end)
+                    self.areas[i].vpn_range = VPNRange::new(overlap_end, a_end);
+                    self.areas[i].start_va = VirtAddr::from(overlap_end);
+                    i += 1;
+                } else if overlap_end == a_end {
+                    // Overlap at the end: shrink area to [a_start, overlap_start)
+                    self.areas[i].vpn_range = VPNRange::new(a_start, overlap_start);
+                    i += 1;
+                } else {
+                    // Overlap in the middle: keep [a_start, overlap_start)
+                    // Unmap orphaned tail [overlap_end, a_end) PTEs
+                    let mut tail_vpn = overlap_end;
+                    while tail_vpn < a_end {
+                        if self.areas[i].data_frames.remove(&tail_vpn).is_some() {
+                            // frame dropped, unmap PTE
+                            if self.page_table.translate(tail_vpn).map_or(false, |pte| pte.is_valid()) {
+                                self.page_table.unmap(tail_vpn);
+                            }
+                        } else if self.page_table.translate(tail_vpn).map_or(false, |pte| pte.is_valid()) {
+                            self.page_table.unmap(tail_vpn);
+                        }
+                        tail_vpn.step();
+                    }
+                    self.areas[i].vpn_range = VPNRange::new(a_start, overlap_start);
+                    i += 1;
+                }
             }
         }
     }
@@ -938,6 +958,8 @@ impl MapArea {
         }
         let frame = frame_alloc().unwrap();
         let ppn: PhysPageNum = frame.ppn;
+        // Zero the frame — anonymous mmap and BSS require zero-initialized pages.
+        ppn.get_bytes_array().fill(0);
         self.data_frames.insert(vpn, frame);
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
         page_table.map(vpn, ppn, pte_flags);

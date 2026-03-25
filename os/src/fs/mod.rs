@@ -314,6 +314,13 @@ pub fn ensure_busybox_links() {
     #[cfg(target_arch = "loongarch64")]
     if open_file("/glibc/lib/ld-linux-loongarch-lp64d.so.1", OpenFlags::empty()).is_some() {
         ensure_hardlink("/lib64/ld-linux-loongarch-lp64d.so.1", "/glibc/lib/ld-linux-loongarch-lp64d.so.1");
+        // glibc ld.so searches /lib64/ for shared libraries; create hardlinks so it finds them
+        if open_file("/glibc/lib/libc.so.6", OpenFlags::empty()).is_some() {
+            ensure_hardlink("/lib64/libc.so.6", "/glibc/lib/libc.so.6");
+        }
+        if open_file("/glibc/lib/libm.so.6", OpenFlags::empty()).is_some() {
+            ensure_hardlink("/lib64/libm.so.6", "/glibc/lib/libm.so.6");
+        }
     }
 
     if open_file("/bin/sh", OpenFlags::empty()).is_none() {
