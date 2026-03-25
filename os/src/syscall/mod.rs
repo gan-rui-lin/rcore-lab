@@ -73,6 +73,8 @@ const SYSCALL_POLL: usize = 73;
 const SYSCALL_FSTATAT: usize = 79;
 /// fstat syscall
 const SYSCALL_FSTAT: usize = 80;
+/// sync syscall
+const SYSCALL_SYNC: usize = 81;
 /// utimensat syscall
 const SYSCALL_UTIMENSAT: usize = 88;
 /// statx syscall
@@ -550,6 +552,11 @@ pub fn should_trace_syscall(pid: usize) -> bool {
     true
 }
 
+/// Called by task-exit path to release per-process SHM attachment records.
+pub fn cleanup_shm_for_process_exit(pid: usize) {
+    ipc::cleanup_shm_attachments_for_pid(pid);
+}
+
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     // !Avoid holding Arc<ProcessControlBlock> across potentially non-returning
@@ -632,6 +639,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
+        SYSCALL_SYNC => 0,
         SYSCALL_READV => sys_readv(args[0], args[1] as *const usize, args[2]),
         SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const usize, args[2]),
         SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *const u8, args[2], args[3]),

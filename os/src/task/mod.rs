@@ -223,6 +223,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         if pid == IDLE_PID {
             shutdown();
         }
+        crate::syscall::cleanup_shm_for_process_exit(pid);
         remove_from_pid2process(pid);
         let mut process_inner = process.inner_exclusive_access();
         process_inner.is_zombie = true;
