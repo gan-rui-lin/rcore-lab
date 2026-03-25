@@ -28,6 +28,8 @@ const TEST_SUITES: [&str; 4] = [
 ];
 const TMP_LMBENCH_PATH: &str = "/tmp/lmbench_testcode.sh";
 const LMBENCH_PROT_ONLY_SCRIPT: &[u8] = b"#!/bin/sh\n\necho \"#### OS COMP TEST GROUP START lmbench-musl-debug ####\"\nbusybox mkdir -p /var/tmp\nbusybox rm -f /tmp/hello\nbusybox echo '#!/bin/sh' > /tmp/hello\nbusybox echo './lmbench_all hello \"$@\"' >> /tmp/hello\nbusybox chmod +x /tmp/hello\n\necho \"[lmbench] START lat_proc shell\"\n./lmbench_all lat_proc -P 1 shell\necho \"[lmbench] DONE  lat_proc shell rc=$?\"\n\necho \"[lmbench] START lmdd\"\n./lmbench_all lmdd label=\"File /var/tmp/XXX write bandwidth:\" of=/var/tmp/XXX move=1m fsync=1 print=3\necho \"[lmbench] DONE  lmdd rc=$?\"\n\necho \"[lmbench] START lat_pagefault\"\n./lmbench_all lat_pagefault -P 1 /var/tmp/XXX\necho \"[lmbench] DONE  lat_pagefault rc=$?\"\n\necho \"#### OS COMP TEST GROUP END lmbench-musl-debug ####\"\n";
+const TMP_LMBENCH_LATFS_PATH: &str = "/tmp/lmbench_latfs_testcode.sh";
+const LMBENCH_LATFS_ONLY_SCRIPT: &[u8] = b"#!/bin/sh\n\necho \"#### OS COMP TEST GROUP START lmbench-musl-latfs ####\"\nbusybox mkdir -p /var/tmp\n\necho file system latency\necho \"[lmbench] START lat_fs\"\n./lmbench_all lat_fs /var/tmp\necho \"[lmbench] DONE  lat_fs rc=$?\"\n\necho \"#### OS COMP TEST GROUP END lmbench-musl-latfs ####\"\n";
 #[allow(dead_code)]
 const RUN_EMBEDDED_PTHREAD: bool = option_env!("RUN_EMBEDDED_PTHREAD").is_some();
 const PTHREAD_TEST_PATH: &str = "/tmp/pthread_cancel_small";
@@ -570,6 +572,21 @@ fn run_selector(selector: &str) {
             let _ = run_testcode(TMP_LMBENCH_PATH, "/musl");
         } else {
             println!("[initcode] write {} failed (ret={})", TMP_LMBENCH_PATH, ret);
+        }
+        return;
+    }
+
+    if selector == "tmp-lmbench-latfs" {
+        let _ = activate_runtime_profile("/musl");
+        let ret = write_text_file(TMP_LMBENCH_LATFS_PATH, LMBENCH_LATFS_ONLY_SCRIPT);
+        if ret >= 0 {
+            let _ = run_testcode(TMP_LMBENCH_LATFS_PATH, "/musl");
+        } else {
+            println!(
+                "[initcode] write {} failed (ret={})",
+                TMP_LMBENCH_LATFS_PATH,
+                ret
+            );
         }
         return;
     }
