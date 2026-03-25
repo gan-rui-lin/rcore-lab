@@ -81,6 +81,26 @@ impl MemorySet {
     ) {
         self.push(MapArea::new(start_va, end_va, permission), None);
     }
+    /// Insert a shared framed area that maps to an existing set of physical frames.
+    /// Returns false when frame count doesn't match virtual page count.
+    pub fn insert_shared_framed_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+        frames: Vec<Arc<FrameTracker>>,
+    ) -> bool {
+        let mut map_area = MapArea::new(start_va, end_va, permission);
+        let expected = map_area.vpn_range.get_end().0.saturating_sub(map_area.vpn_range.get_start().0);
+        if expected != frames.len() {
+            return false;
+        }
+        for (idx, vpn) in map_area.vpn_range.into_iter().enumerate() {
+            map_area.map_shared(&mut self.page_table, vpn, frames[idx].clone());
+        }
+        self.areas.push(map_area);
+        true
+    }
     /// remove a area
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some((idx, area)) = self
@@ -119,12 +139,20 @@ impl MemorySet {
                 let mut vpn = overlap_start;
                 while vpn < overlap_end {
                     // Only unmap if the page is actually mapped
-                    if self.areas[i].data_frames.contains_key(&vpn) {
+                    if self.areas[i].data_frames.contains_key(&vpn)
+                        || self.areas[i].shared_ppns.contains_key(&vpn)
+                    {
                         self.areas[i].unmap_one(&mut self.page_table, vpn);
                     } else {
                         // Page might be mapped in page table but not tracked in data_frames
                         // (e.g. from file-backed mmap read path). Just clear the PTE.
-                        self.page_table.unmap(vpn);
+                        if self
+                            .page_table
+                            .translate(vpn)
+                            .map_or(false, |pte| pte.is_valid())
+                        {
+                            self.page_table.unmap(vpn);
+                        }
                     }
                     vpn.step();
                 }
@@ -646,6 +674,21 @@ impl MemorySet {
                 area.vpn_range.get_start(),
                 area.vpn_range.get_end()
             );
+            if !area.shared_ppns.is_empty() {
+                let mut new_area = MapArea::from_another(area);
+                for vpn in area.vpn_range {
+                    if let Some(frame) = area.shared_ppns.get(&vpn) {
+                        new_area.map_shared(&mut memory_set.page_table, vpn, frame.clone());
+                        if let Some(src_pte) = user_space.translate(vpn) {
+                            memory_set
+                                .page_table
+                                .change_pte_flags(vpn, src_pte.flags());
+                        }
+                    }
+                }
+                memory_set.areas.push(new_area);
+                continue;
+            }
             let new_area = MapArea::from_another(area);
             memory_set.push(new_area, None);
             if area.map_perm.contains(MapPermission::U)
@@ -866,6 +909,7 @@ pub struct MapArea {
     start_va: VirtAddr,
     vpn_range: VPNRange,
     data_frames: BTreeMap<VirtPageNum, FrameTracker>,
+    shared_ppns: BTreeMap<VirtPageNum, Arc<FrameTracker>>,
     map_perm: MapPermission,
 }
 
@@ -881,6 +925,7 @@ impl MapArea {
             start_va,
             vpn_range: VPNRange::new(start_vpn, end_vpn),
             data_frames: BTreeMap::new(),
+            shared_ppns: BTreeMap::new(),
             map_perm,
         }
     }
@@ -889,8 +934,19 @@ impl MapArea {
             start_va: another.start_va,
             vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
             data_frames: BTreeMap::new(),
+            shared_ppns: BTreeMap::new(),
             map_perm: another.map_perm,
         }
+    }
+    pub fn map_shared(
+        &mut self,
+        page_table: &mut PageTable,
+        vpn: VirtPageNum,
+        frame: Arc<FrameTracker>,
+    ) {
+        let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
+        page_table.map(vpn, frame.ppn, pte_flags);
+        self.shared_ppns.insert(vpn, frame);
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         // If already mapped (shared page between adjacent LOAD segments),
@@ -919,7 +975,10 @@ impl MapArea {
     }
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         self.data_frames.remove(&vpn);
-        page_table.unmap(vpn);
+        self.shared_ppns.remove(&vpn);
+        if page_table.translate(vpn).map_or(false, |pte| pte.is_valid()) {
+            page_table.unmap(vpn);
+        }
     }
     pub fn map(&mut self, page_table: &mut PageTable) {
         for (_i, vpn) in self.vpn_range.into_iter().enumerate() {
