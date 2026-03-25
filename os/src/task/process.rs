@@ -604,7 +604,7 @@ impl ProcessControlBlock {
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
-        let memory_set = MemorySet::from_existed_user(&parent.memory_set);
+        let memory_set = MemorySet::from_existed_user(&mut parent.memory_set);
 
         // TLS pages are already cloned via MemorySet::from_existed_user.
         let tls_area = parent.tls_area.clone();

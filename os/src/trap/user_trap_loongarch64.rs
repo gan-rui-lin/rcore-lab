@@ -1,5 +1,4 @@
 use super::*;
-use crate::mm::{frame_alloc, PTEFlags};
 
 pub(super) fn handle_user_supervisor_external() {
     let trap_cx = current_trap_cx();
@@ -7,40 +6,21 @@ pub(super) fn handle_user_supervisor_external() {
 }
 
 pub(super) fn handle_user_page_fault(addr: usize) {
+    // Try COW first
+    {
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        if inner.memory_set.handle_cow_fault(addr) {
+            return;
+        }
+    }
+
+    // Not COW-able: log and SIGSEGV
     let token = current_user_token();
     let page_table = PageTable::from_token(token);
     let fault_va = VirtAddr::from(addr);
     let fault_vpn = fault_va.floor();
 
-    // COW: if the page is mapped read-only (no W) but valid, copy it to a
-    // new writable frame.  This is needed for glibc ld.so which does
-    // MAP_PRIVATE file-backed mmap (R+X) then writes relocations to it.
-    if let Some(pte) = page_table.translate(fault_vpn) {
-        let flags = pte.flags();
-        if pte.is_valid() && !flags.contains(PTEFlags::W) {
-            // Allocate a new frame and copy the old page content
-            let old_ppn = pte.ppn();
-            if let Some(frame) = frame_alloc() {
-                let new_ppn = frame.ppn;
-                // Copy old page data
-                let src = old_ppn.get_bytes_array();
-                let dst = new_ppn.get_bytes_array();
-                dst.copy_from_slice(src);
-                // Remap with write permission added
-                let new_flags = flags | PTEFlags::W;
-                let process = current_process();
-                let mut inner = process.inner_exclusive_access();
-                inner.memory_set.remap_cow(fault_vpn, frame, new_flags);
-                trace!(
-                    "[cow] pid={} addr={:#x} vpn={:#x} old_ppn={:#x} new_ppn={:#x}",
-                    process.pid.0, addr, fault_vpn.0, old_ppn.0, new_ppn.0
-                );
-                return; // COW handled, resume user
-            }
-        }
-    }
-
-    // Not COW-able: log and SIGSEGV
     let trap_cx = current_trap_cx();
     let (pid, tid, name) = if let Some(task) = current_task() {
         let task_inner = task.inner_exclusive_access();
