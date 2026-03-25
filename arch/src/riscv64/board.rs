@@ -4,7 +4,8 @@
 pub const CLOCK_FREQ: usize = 10_000_000;
 
 /// Upper bound of physical memory available to the kernel.
-pub const MEMORY_END: usize = 0x8800_0000;
+/// Aligned with QEMU run.sh: -m 1024M (1GB = 0x4000_0000)
+pub const MEMORY_END: usize = 0x4000_0000;
 
 /// Memory-mapped I/O regions that the kernel must identity-map.
 pub const MMIO: &[(usize, usize)] = &[
