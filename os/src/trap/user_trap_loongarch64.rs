@@ -6,6 +6,21 @@ pub(super) fn handle_user_supervisor_external() {
 }
 
 pub(super) fn handle_user_page_fault(addr: usize) {
+    // Try COW first
+    {
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        if inner.memory_set.handle_cow_fault(addr) {
+            return;
+        }
+    }
+
+    // Not COW-able: log and SIGSEGV
+    let token = current_user_token();
+    let page_table = PageTable::from_token(token);
+    let fault_va = VirtAddr::from(addr);
+    let fault_vpn = fault_va.floor();
+
     let trap_cx = current_trap_cx();
     let (pid, tid, name) = if let Some(task) = current_task() {
         let task_inner = task.inner_exclusive_access();
@@ -22,11 +37,7 @@ pub(super) fn handle_user_page_fault(addr: usize) {
     let args = trap_cx.args();
     error!(
         "[kernel] trap_handler: page fault addr={:#x} pid={} tid={} name={} sepc={:#x}",
-        addr,
-        pid,
-        tid,
-        name,
-        trap_cx.sepc
+        addr, pid, tid, name, trap_cx.sepc
     );
     error!(
         "[kernel] trap_handler: ra={:#x} sp={:#x} tp={:#x} syscall={:#x} args={:x?}",
@@ -36,19 +47,14 @@ pub(super) fn handle_user_page_fault(addr: usize) {
         trap_cx[TrapFrameArgs::SYSCALL],
         args
     );
-    let token = current_user_token();
-    let page_table = PageTable::from_token(token);
-    let fault_va = VirtAddr::from(addr);
-    if let Some(pte) = page_table.translate(fault_va.floor()) {
+    if let Some(pte) = page_table.translate(fault_vpn) {
         if pte.is_valid() {
             let offset = fault_va.page_offset();
             let end = core::cmp::min(offset + 8, PAGE_SIZE);
             let bytes = &pte.ppn().get_bytes_array()[offset..end];
             error!(
                 "[kernel] trap_handler: fault pte ppn={:#x} flags={:?} bytes={:02x?}",
-                pte.ppn().0,
-                pte.flags(),
-                bytes
+                pte.ppn().0, pte.flags(), bytes
             );
         } else {
             error!("[kernel] trap_handler: fault pte invalid flags={:?}", pte.flags());
@@ -64,9 +70,7 @@ pub(super) fn handle_user_page_fault(addr: usize) {
             let bytes = &pte.ppn().get_bytes_array()[offset..end];
             error!(
                 "[kernel] trap_handler: sepc pte ppn={:#x} flags={:?} bytes={:02x?}",
-                pte.ppn().0,
-                pte.flags(),
-                bytes
+                pte.ppn().0, pte.flags(), bytes
             );
         } else {
             error!("[kernel] trap_handler: sepc pte invalid flags={:?}", pte.flags());

@@ -44,6 +44,14 @@ pub fn kernel_token() -> usize {
     KERNEL_SPACE.exclusive_access().token()
 }
 
+/// Flush TLB on the current hart (architecture-specific).
+fn flush_tlb() {
+    #[cfg(target_arch = "riscv64")]
+    unsafe { core::arch::asm!("sfence.vma") }
+    #[cfg(target_arch = "loongarch64")]
+    unsafe { core::arch::asm!("dbar 0; invtlb 0x00, $r0, $r0") }
+}
+
 /// address space
 pub struct MemorySet {
     page_table: PageTable,
@@ -81,26 +89,6 @@ impl MemorySet {
     ) {
         self.push(MapArea::new(start_va, end_va, permission), None);
     }
-    /// Insert a shared framed area that maps to an existing set of physical frames.
-    /// Returns false when frame count doesn't match virtual page count.
-    pub fn insert_shared_framed_area(
-        &mut self,
-        start_va: VirtAddr,
-        end_va: VirtAddr,
-        permission: MapPermission,
-        frames: Vec<Arc<FrameTracker>>,
-    ) -> bool {
-        let mut map_area = MapArea::new(start_va, end_va, permission);
-        let expected = map_area.vpn_range.get_end().0.saturating_sub(map_area.vpn_range.get_start().0);
-        if expected != frames.len() {
-            return false;
-        }
-        for (idx, vpn) in map_area.vpn_range.into_iter().enumerate() {
-            map_area.map_shared(&mut self.page_table, vpn, frames[idx].clone());
-        }
-        self.areas.push(map_area);
-        true
-    }
     /// remove a area
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some((idx, area)) = self
@@ -133,30 +121,50 @@ impl MemorySet {
                 self.areas[i].unmap(&mut self.page_table);
                 self.areas.remove(i);
             } else {
-                // Partial overlap: unmap only the overlapping pages
+                // Partial overlap: unmap overlapping pages and split/shrink the area.
                 let overlap_start = a_start.max(unmap_start_vpn);
                 let overlap_end = a_end.min(unmap_end_vpn);
+                // Unmap overlapping VPNs
                 let mut vpn = overlap_start;
                 while vpn < overlap_end {
-                    // Only unmap if the page is actually mapped
-                    if self.areas[i].data_frames.contains_key(&vpn)
-                        || self.areas[i].shared_ppns.contains_key(&vpn)
-                    {
+                    if self.areas[i].data_frames.contains_key(&vpn) {
                         self.areas[i].unmap_one(&mut self.page_table, vpn);
-                    } else {
-                        // Page might be mapped in page table but not tracked in data_frames
-                        // (e.g. from file-backed mmap read path). Just clear the PTE.
-                        if self
-                            .page_table
-                            .translate(vpn)
-                            .map_or(false, |pte| pte.is_valid())
-                        {
-                            self.page_table.unmap(vpn);
-                        }
+                    } else if self.page_table.translate(vpn).map_or(false, |pte| pte.is_valid()) {
+                        self.page_table.unmap(vpn);
                     }
                     vpn.step();
                 }
-                i += 1;
+                // Keep the non-overlapping portion as a valid area.
+                // IMPORTANT: also unmap any orphaned PTEs outside the overlap
+                // that will no longer be tracked by this area, to prevent ghost
+                // PTEs from triggering COW in future MAP_FIXED mmaps.
+                if overlap_start == a_start {
+                    // Overlap at the start: shrink area to [overlap_end, a_end)
+                    self.areas[i].vpn_range = VPNRange::new(overlap_end, a_end);
+                    self.areas[i].start_va = VirtAddr::from(overlap_end);
+                    i += 1;
+                } else if overlap_end == a_end {
+                    // Overlap at the end: shrink area to [a_start, overlap_start)
+                    self.areas[i].vpn_range = VPNRange::new(a_start, overlap_start);
+                    i += 1;
+                } else {
+                    // Overlap in the middle: keep [a_start, overlap_start)
+                    // Unmap orphaned tail [overlap_end, a_end) PTEs
+                    let mut tail_vpn = overlap_end;
+                    while tail_vpn < a_end {
+                        if self.areas[i].data_frames.remove(&tail_vpn).is_some() {
+                            // frame dropped, unmap PTE
+                            if self.page_table.translate(tail_vpn).map_or(false, |pte| pte.is_valid()) {
+                                self.page_table.unmap(tail_vpn);
+                            }
+                        } else if self.page_table.translate(tail_vpn).map_or(false, |pte| pte.is_valid()) {
+                            self.page_table.unmap(tail_vpn);
+                        }
+                        tail_vpn.step();
+                    }
+                    self.areas[i].vpn_range = VPNRange::new(a_start, overlap_start);
+                    i += 1;
+                }
             }
         }
     }
@@ -655,95 +663,146 @@ impl MemorySet {
             interp_entry,
         )
     }
-    /// Create a new address space by copy code&data from a exited process's address space.
-    pub fn from_existed_user(user_space: &Self) -> Self {
-        // debug!("[kernel] clone user space start");
-        trace!("memory_set: clone user space start");
-        let mut memory_set = Self::new_bare();
-        // map trampoline
-        debug!("[kernel] clone: map_trampoline start");
-        memory_set.map_trampoline();
-        debug!("[kernel] clone: map_trampoline done");
-        debug!("[kernel] clone areas len {}", user_space.areas.len());
-        // copy data sections/trap_context/user_stack
-        for (idx, area) in user_space.areas.iter().enumerate() {
-            debug!("[kernel] clone area {}", idx);
-            trace!(
-                "memory_set: clone area {} start={:?} end={:?}",
-                idx,
-                area.vpn_range.get_start(),
-                area.vpn_range.get_end()
-            );
-            if !area.shared_ppns.is_empty() {
-                let mut new_area = MapArea::from_another(area);
-                for vpn in area.vpn_range {
-                    if let Some(frame) = area.shared_ppns.get(&vpn) {
-                        new_area.map_shared(&mut memory_set.page_table, vpn, frame.clone());
-                        if let Some(src_pte) = user_space.translate(vpn) {
-                            memory_set
-                                .page_table
-                                .change_pte_flags(vpn, src_pte.flags());
-                        }
-                    }
-                }
-                memory_set.areas.push(new_area);
-                continue;
-            }
-            let new_area = MapArea::from_another(area);
-            memory_set.push(new_area, None);
-            if area.map_perm.contains(MapPermission::U)
-                && area.map_perm.contains(MapPermission::R)
-                && area.map_perm.contains(MapPermission::W)
-            {
-                let start_vpn = area.vpn_range.get_start();
-                let end_vpn = area.vpn_range.get_end();
-                let start_addr: usize = VirtAddr::from(start_vpn).into();
-                let end_addr: usize = VirtAddr::from(end_vpn).into();
-                if let Some(pte) = memory_set
-                    .page_table
-                    .translate(VirtAddr::from(start_addr).floor())
-                {
-                    trace!(
-                        "[clone_area] idx={} start={:#x} end={:#x} pte_bits={:#x}",
-                        idx,
-                        start_addr,
-                        end_addr,
-                        pte.bits
-                    );
-                }
-            }
-            // copy data from another space
-            let mut pages_copied: usize = 0;
+
+    /// COW fork: create a new address space sharing physical frames with the parent.
+    /// Writable pages are marked read-only in BOTH parent and child; actual copying
+    /// is deferred to the page-fault handler (`handle_cow_fault`).
+    pub fn from_existed_user(parent_space: &mut Self) -> Self {
+        trace!("memory_set: COW clone user space start");
+        let mut child = Self::new_bare();
+        child.map_trampoline();
+        debug!("[kernel] COW clone areas len {}", parent_space.areas.len());
+        for (idx, area) in parent_space.areas.iter_mut().enumerate() {
+            // Create a new MapArea with the same permissions and VPN range
+            let mut new_area = MapArea::from_another(area);
             for vpn in area.vpn_range {
-                let src_pte = user_space.translate(vpn).unwrap();
+                let src_pte = match parent_space.page_table.translate(vpn) {
+                    Some(pte) if pte.is_valid() => pte,
+                    _ => continue,
+                };
                 let src_ppn = src_pte.ppn();
-                let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
-                dst_ppn
-                    .get_bytes_array()
-                    .copy_from_slice(src_ppn.get_bytes_array());
-                memory_set
-                    .page_table
-                    .change_pte_flags(vpn, src_pte.flags());
-                pages_copied += 1;
-                if (pages_copied & 0x3ff) == 0 {
-                    debug!("[kernel] area {} copied {} pages", idx, pages_copied);
-                    trace!(
-                        "memory_set: area {} copied {} pages",
-                        idx,
-                        pages_copied
-                    );
+                let src_flags = src_pte.flags();
+                let is_writable = area.map_perm.contains(MapPermission::W);
+                // Share the frame: clone the Arc
+                let shared_frame = if let Some(frame_arc) = area.data_frames.get(&vpn) {
+                    frame_arc.clone()
+                } else {
+                    // Page not tracked by data_frames (e.g. identity-mapped kernel area
+                    // should not appear here, but handle gracefully).
+                    // Allocate a fresh frame and copy.
+                    let frame = frame_alloc().unwrap();
+                    frame.ppn.get_bytes_array().copy_from_slice(src_ppn.get_bytes_array());
+                    let arc = Arc::new(frame);
+                    // For writable pages, also need to remove W from parent
+                    if is_writable {
+                        let ro_flags = src_flags & !PTEFlags::W;
+                        parent_space.page_table.change_pte_flags(vpn, ro_flags);
+                    }
+                    // Map child with same flags as parent (possibly already RO)
+                    let child_flags = if is_writable {
+                        src_flags & !PTEFlags::W
+                    } else {
+                        src_flags
+                    };
+                    child.page_table.map(vpn, arc.ppn, child_flags);
+                    new_area.data_frames.insert(vpn, arc);
+                    continue;
+                };
+
+                if is_writable && src_flags.contains(PTEFlags::W) {
+                    // Remove W from parent's PTE (defer copy to fault handler)
+                    let ro_flags = src_flags & !PTEFlags::W;
+                    parent_space.page_table.change_pte_flags(vpn, ro_flags);
                 }
+
+                // Map child page with read-only flags (if originally writable)
+                let child_flags = if is_writable {
+                    src_flags & !PTEFlags::W
+                } else {
+                    src_flags
+                };
+                child.page_table.map(vpn, shared_frame.ppn, child_flags);
+                new_area.data_frames.insert(vpn, shared_frame);
             }
-            debug!("[kernel] clone area {} done ({} pages)", idx, pages_copied);
-            trace!(
-                "memory_set: clone area {} done ({} pages)",
-                idx,
-                pages_copied
-            );
+            child.areas.push(new_area);
+            debug!("[kernel] COW clone area {} done", idx);
         }
-        // debug!("[kernel] clone user space done");
-        trace!("memory_set: clone user space done");
-        memory_set
+        // Flush parent's TLB since we removed W bits from its PTEs
+        flush_tlb();
+        trace!("memory_set: COW clone user space done");
+        child
+    }
+
+    /// Handle a COW page fault at `addr`.
+    /// Returns `true` if the fault was a COW fault and was resolved,
+    /// `false` if it's a genuine page fault (caller should send SIGSEGV).
+    pub fn handle_cow_fault(&mut self, addr: usize) -> bool {
+        let fault_vpn = VirtAddr::from(addr).floor();
+
+        // Find the MapArea containing this VPN
+        let area = match self.areas.iter_mut().find(|a| {
+            a.vpn_range.get_start() <= fault_vpn && fault_vpn < a.vpn_range.get_end()
+        }) {
+            Some(a) => a,
+            None => return false,
+        };
+
+        // Check: area should be writable but PTE is read-only
+        if !area.map_perm.contains(MapPermission::W) {
+            return false;
+        }
+
+        let pte = match self.page_table.translate(fault_vpn) {
+            Some(pte) if pte.is_valid() && !pte.writable() => pte,
+            _ => return false,
+        };
+
+        let old_ppn = pte.ppn();
+        let old_flags = pte.flags();
+
+        // Build the writable flags
+        let new_flags = old_flags | PTEFlags::W;
+
+        // Check if we're the sole owner of this frame
+        let frame_arc = match area.data_frames.get(&fault_vpn) {
+            Some(arc) => arc,
+            None => return false,
+        };
+
+        if Arc::strong_count(frame_arc) == 1 {
+            // Sole owner: just make it writable again, no copy needed
+            self.page_table.change_pte_flags(fault_vpn, new_flags);
+            flush_tlb();
+            trace!(
+                "[cow] sole-owner vpn={:#x} ppn={:#x}",
+                fault_vpn.0, old_ppn.0
+            );
+            return true;
+        }
+
+        // Shared: allocate new frame, copy data, remap
+        let new_frame = match frame_alloc() {
+            Some(f) => f,
+            None => {
+                error!("[cow] frame_alloc failed for vpn={:#x}", fault_vpn.0);
+                return false;
+            }
+        };
+        let new_ppn = new_frame.ppn;
+        new_ppn.get_bytes_array().copy_from_slice(old_ppn.get_bytes_array());
+
+        // Replace the Arc (drops our reference to the shared frame)
+        let new_arc = Arc::new(new_frame);
+        area.data_frames.insert(fault_vpn, new_arc.clone());
+
+        // Remap to new frame with write permission
+        self.page_table.map(fault_vpn, new_ppn, new_flags);
+        flush_tlb();
+        trace!(
+            "[cow] copied vpn={:#x} old_ppn={:#x} new_ppn={:#x}",
+            fault_vpn.0, old_ppn.0, new_ppn.0
+        );
+        true
     }
 
     /// Debug helper to dump user area ranges.
@@ -833,6 +892,24 @@ impl MemorySet {
         }
     }
 
+    /// COW remap: replace the mapping of `vpn` with `new_frame` and `new_flags`.
+    /// The caller has already copied the page content into new_frame.
+    pub fn remap_cow(&mut self, vpn: VirtPageNum, new_frame: FrameTracker, new_flags: PTEFlags) {
+        // Update page table entry to point to new frame
+        self.page_table.map(vpn, new_frame.ppn, new_flags);
+        let new_arc = Arc::new(new_frame);
+        // Store the frame tracker so it doesn't get freed
+        // Find the area containing this VPN and add the frame
+        for area in self.areas.iter_mut() {
+            if area.vpn_range.get_start() <= vpn && vpn < area.vpn_range.get_end() {
+                area.data_frames.insert(vpn, new_arc);
+                return;
+            }
+        }
+        // If no area found, leak to prevent dealloc
+        core::mem::forget(new_arc);
+    }
+
     /// Change memory protection for a region
     /// Returns true on success, false if region not found or invalid
     pub fn change_protection(
@@ -903,61 +980,12 @@ impl MemorySet {
 
         success
     }
-
-    /// Generate /proc/self/smaps content for this memory set
-    pub fn generate_smaps(&self) -> alloc::string::String {
-        use crate::config::PAGE_SIZE;
-        use alloc::format;
-        
-        let mut output = alloc::string::String::new();
-        
-        for area in &self.areas {
-            let start_vpn = area.vpn_range.get_start();
-            let end_vpn = area.vpn_range.get_end();
-            
-            let start_addr = start_vpn.0 << 12;
-            let end_addr = end_vpn.0 << 12;
-            let size_kb = (end_addr.saturating_sub(start_addr)) / 1024;
-            
-            // Format permission
-            let r = if area.map_perm.contains(MapPermission::R) { 'r' } else { '-' };
-            let w = if area.map_perm.contains(MapPermission::W) { 'w' } else { '-' };
-            let x = if area.map_perm.contains(MapPermission::X) { 'x' } else { '-' };
-            let p = 'p'; // private
-            let perms = format!("{}{}{}{}", r, w, x, p);
-            
-            // Write map header
-            output.push_str(&format!(
-                "{:08x}-{:08x} {} 00000000 00:00 0\n",
-                start_addr, end_addr, perms
-            ));
-            
-            // Count allocated pages
-            let used_pages = area.data_frames.len() + area.shared_ppns.len();
-            let rss_kb = (used_pages * PAGE_SIZE) / 1024;
-            
-            // Write smaps fields
-            output.push_str(&format!("Size:           {} kB\n", size_kb));
-            output.push_str(&format!("Rss:            {} kB\n", rss_kb));
-            output.push_str(&format!("Pss:            {} kB\n", rss_kb));
-            output.push_str(&format!("Shared_Clean:   0 kB\n"));
-            output.push_str(&format!("Shared_Dirty:   0 kB\n"));
-            output.push_str(&format!("Private_Clean:  {} kB\n", rss_kb));
-            output.push_str(&format!("Private_Dirty:  {} kB\n", rss_kb));
-            output.push_str(&format!("Referenced:     {} kB\n", rss_kb));
-            output.push_str(&format!("Swap:           0 kB\n"));
-            output.push_str("\n");
-        }
-        
-        output
-    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
     start_va: VirtAddr,
     vpn_range: VPNRange,
-    data_frames: BTreeMap<VirtPageNum, FrameTracker>,
-    shared_ppns: BTreeMap<VirtPageNum, Arc<FrameTracker>>,
+    data_frames: BTreeMap<VirtPageNum, Arc<FrameTracker>>,
     map_perm: MapPermission,
 }
 
@@ -973,7 +1001,6 @@ impl MapArea {
             start_va,
             vpn_range: VPNRange::new(start_vpn, end_vpn),
             data_frames: BTreeMap::new(),
-            shared_ppns: BTreeMap::new(),
             map_perm,
         }
     }
@@ -982,19 +1009,8 @@ impl MapArea {
             start_va: another.start_va,
             vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
             data_frames: BTreeMap::new(),
-            shared_ppns: BTreeMap::new(),
             map_perm: another.map_perm,
         }
-    }
-    pub fn map_shared(
-        &mut self,
-        page_table: &mut PageTable,
-        vpn: VirtPageNum,
-        frame: Arc<FrameTracker>,
-    ) {
-        let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
-        page_table.map(vpn, frame.ppn, pte_flags);
-        self.shared_ppns.insert(vpn, frame);
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         // If already mapped (shared page between adjacent LOAD segments),
@@ -1007,7 +1023,7 @@ impl MapArea {
                 let new_ppn = new_frame.ppn;
                 // Copy old page content to new frame
                 new_ppn.get_bytes_array().copy_from_slice(old_ppn.get_bytes_array());
-                self.data_frames.insert(vpn, new_frame);
+                self.data_frames.insert(vpn, Arc::new(new_frame));
                 let new_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
                 let merged = PTEFlags::from_bits(pte.flags().bits() | new_flags.bits()).unwrap();
                 page_table.unmap(vpn);
@@ -1017,16 +1033,15 @@ impl MapArea {
         }
         let frame = frame_alloc().unwrap();
         let ppn: PhysPageNum = frame.ppn;
-        self.data_frames.insert(vpn, frame);
+        // Zero the frame — anonymous mmap and BSS require zero-initialized pages.
+        ppn.get_bytes_array().fill(0);
+        self.data_frames.insert(vpn, Arc::new(frame));
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
         page_table.map(vpn, ppn, pte_flags);
     }
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         self.data_frames.remove(&vpn);
-        self.shared_ppns.remove(&vpn);
-        if page_table.translate(vpn).map_or(false, |pte| pte.is_valid()) {
-            page_table.unmap(vpn);
-        }
+        page_table.unmap(vpn);
     }
     pub fn map(&mut self, page_table: &mut PageTable) {
         for (_i, vpn) in self.vpn_range.into_iter().enumerate() {
@@ -1064,7 +1079,6 @@ impl MapArea {
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
-    
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before
     pub fn copy_data(&mut self, page_table: &mut PageTable, data: &[u8]) {

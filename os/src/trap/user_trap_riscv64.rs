@@ -19,6 +19,16 @@ pub(super) fn handle_user_supervisor_external() {
 }
 
 pub(super) fn handle_user_page_fault(addr: usize) {
+    // Try COW first: the process lock is needed to access memory_set
+    {
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        if inner.memory_set.handle_cow_fault(addr) {
+            return;
+        }
+    }
+
+    // Not COW-able: log and SIGSEGV
     let trap_cx = current_trap_cx();
     // ! 这是因为 lmbench 大量触发 page fault 来测试性能，所以我们不把它当成错误来处理；其它测试可以再改回去
     debug!(
