@@ -167,6 +167,8 @@ fn activate_runtime_profile(root: &str) -> bool {
     force_link("/usr/bin/basename", busybox_path);
     force_link("/usr/bin/ls", busybox_path);
     force_link("/usr/bin/sleep", busybox_path);
+    // execve("/riscv/musl/busybox --install /bin");
+
 
     #[cfg(target_arch = "riscv64")]
     {
@@ -406,23 +408,25 @@ fn run_suite(root: &str, suite: &str) -> i32 {
         println!("=== Skipped {} / {} (profile activate failed) ===\n", root, suite);
         return -1;
     }
+    #[allow(unused_mut)]
     let mut script = format!("{}/{}_testcode.sh", root, suite);
-    if root == "/musl" && suite == "lmbench" {
-        let debug_script = "/tmp/lmbench_testcode.sh";
-        let ret = write_text_file(debug_script, LMBENCH_PROT_ONLY_SCRIPT);
-        if ret >= 0 {
-            script = String::from(debug_script);
-            println!(
-                "[initcode] lmbench debug mode enabled, using {} (lat_sig prot + next)",
-                debug_script
-            );
-        } else {
-            println!(
-                "[initcode] lmbench debug script write failed (ret={}), fallback to default",
-                ret
-            );
-        }
-    }
+    // ! 直接跑全量测试
+    // if root == "/musl" && suite == "lmbench" {
+    //     let debug_script = "/tmp/lmbench_testcode.sh";
+    //     let ret = write_text_file(debug_script, LMBENCH_PROT_ONLY_SCRIPT);
+    //     if ret >= 0 {
+    //         script = String::from(debug_script);
+    //         println!(
+    //             "[initcode] lmbench debug mode enabled, using {} (lat_sig prot + next)",
+    //             debug_script
+    //         );
+    //     } else {
+    //         println!(
+    //             "[initcode] lmbench debug script write failed (ret={}), fallback to default",
+    //             ret
+    //         );
+    //     }
+    // }
     run_testcode(script.as_str(), root)
 }
 
