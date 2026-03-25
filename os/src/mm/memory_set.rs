@@ -903,6 +903,54 @@ impl MemorySet {
 
         success
     }
+
+    /// Generate /proc/self/smaps content for this memory set
+    pub fn generate_smaps(&self) -> alloc::string::String {
+        use crate::config::PAGE_SIZE;
+        use alloc::format;
+        
+        let mut output = alloc::string::String::new();
+        
+        for area in &self.areas {
+            let start_vpn = area.vpn_range.get_start();
+            let end_vpn = area.vpn_range.get_end();
+            
+            let start_addr = start_vpn.0 << 12;
+            let end_addr = end_vpn.0 << 12;
+            let size_kb = (end_addr.saturating_sub(start_addr)) / 1024;
+            
+            // Format permission
+            let r = if area.map_perm.contains(MapPermission::R) { 'r' } else { '-' };
+            let w = if area.map_perm.contains(MapPermission::W) { 'w' } else { '-' };
+            let x = if area.map_perm.contains(MapPermission::X) { 'x' } else { '-' };
+            let p = 'p'; // private
+            let perms = format!("{}{}{}{}", r, w, x, p);
+            
+            // Write map header
+            output.push_str(&format!(
+                "{:08x}-{:08x} {} 00000000 00:00 0\n",
+                start_addr, end_addr, perms
+            ));
+            
+            // Count allocated pages
+            let used_pages = area.data_frames.len() + area.shared_ppns.len();
+            let rss_kb = (used_pages * PAGE_SIZE) / 1024;
+            
+            // Write smaps fields
+            output.push_str(&format!("Size:           {} kB\n", size_kb));
+            output.push_str(&format!("Rss:            {} kB\n", rss_kb));
+            output.push_str(&format!("Pss:            {} kB\n", rss_kb));
+            output.push_str(&format!("Shared_Clean:   0 kB\n"));
+            output.push_str(&format!("Shared_Dirty:   0 kB\n"));
+            output.push_str(&format!("Private_Clean:  {} kB\n", rss_kb));
+            output.push_str(&format!("Private_Dirty:  {} kB\n", rss_kb));
+            output.push_str(&format!("Referenced:     {} kB\n", rss_kb));
+            output.push_str(&format!("Swap:           0 kB\n"));
+            output.push_str("\n");
+        }
+        
+        output
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
@@ -1016,6 +1064,7 @@ impl MapArea {
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
+    
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before
     pub fn copy_data(&mut self, page_table: &mut PageTable, data: &[u8]) {

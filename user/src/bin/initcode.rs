@@ -282,9 +282,14 @@ fn activate_runtime_profile(root: &str) -> bool {
                 "/lib64/ld-linux-loongarch-lp64d.so.1",
                 "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
             );
+
+            let _ = run_busybox_mkdir_p("/glibc", busybox_path, "/code/lmbench_src/bin/build");
+            force_link("/code/lmbench_src/bin/build/lmbench_all", "/glibc/lmbench_all");
         } else {
             force_link("/lib64/ld-linux-loongarch-lp64d.so.1", "/musl/lib/libc.so");
             force_link("/lib64/ld-musl-loongarch-lp64d.so.1", "/musl/lib/libc.so");
+            let _ = run_busybox_mkdir_p("/musl", busybox_path, "/code/lmbench_src/bin/build");
+            force_link("/code/lmbench_src/bin/build/lmbench_all", "/musl/lmbench_all");
         }
     }
 
@@ -573,6 +578,15 @@ fn run_selector(selector: &str) {
         let root = if selector == "musl" { "/musl" } else { "/glibc" };
         for suite in TEST_SUITES {
             let _ = run_suite(root, suite);
+        }
+        return;
+    }
+
+    // Keep compatibility with SINGLE_TEST=lua: treat it as the lua suite
+    // instead of launching interactive "lua" binary directly.
+    if selector == "lua" {
+        for root in TEST_LIBC_ROOTS {
+            let _ = run_suite(root, "lua");
         }
         return;
     }

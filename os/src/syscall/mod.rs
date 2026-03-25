@@ -582,7 +582,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     if let Some(cwd) = cwd_for_exec_trace {
         trace!("[syscall] pid=4 entry name={} cwd={}", name, cwd);
     }
-    let trace = should_trace_syscall(pid);
+    let _trace = should_trace_syscall(pid);
     // for debug
     if let Some(task) = current_task() {
         if let Some(mut task_inner) = task.try_inner_exclusive_access() {
@@ -852,7 +852,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     //         ret, name, current_trap_cx()[arch::TrapFrameArgs::RA], current_trap_cx().sepc);
     // }
 
-    if known && trace && !(syscall_id == SYSCALL_WRITE && args[0] == 1) {
+    if known && !(syscall_id == SYSCALL_WRITE && args[0] == 1) {
         syscall!(
             "[syscall] pid={} name={} num={}({}) args=[0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x}] ret={}",
             pid,

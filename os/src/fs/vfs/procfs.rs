@@ -157,6 +157,13 @@ fn proc_sys() -> Arc<dyn VfsInode> {
     ProcDirInode::new(entries)
 }
 
+/// Generate /proc/self/smaps content
+fn proc_self_smaps() -> String {
+    let process = crate::task::current_process();
+    let inner = process.inner_exclusive_access();
+    inner.memory_set.generate_smaps()
+}
+
 /// Build /proc/self/ subtree
 fn proc_self_dir() -> Arc<dyn VfsInode> {
     let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
@@ -169,6 +176,10 @@ fn proc_self_dir() -> Arc<dyn VfsInode> {
                 pid
             )
         }),
+    );
+    entries.insert(
+        String::from("smaps"),
+        ProcFileInode::new(proc_self_smaps),
     );
     ProcDirInode::new(entries)
 }
