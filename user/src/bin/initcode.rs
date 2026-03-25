@@ -164,10 +164,53 @@ fn activate_runtime_profile(root: &str) -> bool {
     force_link("/bin/basename", busybox_path);
     force_link("/bin/ls", busybox_path);
     force_link("/bin/sleep", busybox_path);
+    force_link("/bin/mkdir", busybox_path);
+    force_link("/bin/rmdir", busybox_path);
+    force_link("/bin/cat", busybox_path);
+    force_link("/bin/echo", busybox_path);
+    force_link("/bin/grep", busybox_path);
+    force_link("/bin/rm", busybox_path);
+    force_link("/bin/cp", busybox_path);
+    force_link("/bin/mv", busybox_path);
+    force_link("/bin/ln", busybox_path);
+    force_link("/bin/chmod", busybox_path);
+    force_link("/bin/chown", busybox_path);
+    force_link("/bin/kill", busybox_path);
+    force_link("/bin/mount", busybox_path);
+    force_link("/bin/umount", busybox_path);
+    force_link("/bin/date", busybox_path);
+    force_link("/bin/dd", busybox_path);
+    force_link("/bin/df", busybox_path);
+    force_link("/bin/ps", busybox_path);
+    force_link("/bin/pwd", busybox_path);
+    force_link("/bin/sed", busybox_path);
+    force_link("/bin/awk", busybox_path);
     force_link("/usr/bin/basename", busybox_path);
     force_link("/usr/bin/ls", busybox_path);
     force_link("/usr/bin/sleep", busybox_path);
-    // execve("/riscv/musl/busybox --install /bin");
+    force_link("/usr/bin/wc", busybox_path);
+    force_link("/usr/bin/expr", busybox_path);
+    force_link("/usr/bin/head", busybox_path);
+    force_link("/usr/bin/tail", busybox_path);
+    force_link("/usr/bin/cut", busybox_path);
+    force_link("/usr/bin/tr", busybox_path);
+    force_link("/usr/bin/sort", busybox_path);
+    force_link("/usr/bin/uniq", busybox_path);
+    force_link("/usr/bin/find", busybox_path);
+    force_link("/usr/bin/xargs", busybox_path);
+    force_link("/usr/bin/test", busybox_path);
+    force_link("/usr/bin/printf", busybox_path);
+    force_link("/usr/bin/id", busybox_path);
+    force_link("/usr/bin/whoami", busybox_path);
+    force_link("/usr/bin/hostname", busybox_path);
+    force_link("/usr/bin/diff", busybox_path);
+    force_link("/usr/bin/seq", busybox_path);
+    force_link("/usr/bin/tee", busybox_path);
+    force_link("/usr/bin/touch", busybox_path);
+    force_link("/usr/bin/stat", busybox_path);
+
+
+    // TODO execve("/riscv/musl/busybox --install /bin");
 
 
     #[cfg(target_arch = "riscv64")]
