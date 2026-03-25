@@ -295,6 +295,14 @@ pub fn waitpid(pid: usize, exit_code: &mut i32) -> isize {
     }
 }
 
+/// Non-blocking waitpid (WNOHANG). Returns:
+/// - pid > 0: reaped child
+/// - 0: children exist but none exited
+/// - negative: error (e.g. ECHILD)
+pub fn waitpid_nohang(pid: usize, exit_code: &mut i32) -> isize {
+    syscall::syscall(syscall::SYSCALL_WAITPID, [pid, exit_code as *mut i32 as usize, 1])
+}
+
 pub fn sleep_blocking(sleep_ms: usize) {
     sys_sleep(sleep_ms);
 }
