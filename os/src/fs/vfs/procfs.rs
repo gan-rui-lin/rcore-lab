@@ -159,9 +159,9 @@ fn proc_sys() -> Arc<dyn VfsInode> {
 
 /// Generate /proc/self/smaps content
 fn proc_self_smaps() -> String {
-    let process = crate::task::current_process();
-    let inner = process.inner_exclusive_access();
-    inner.memory_set.generate_smaps()
+    // TODO: COW implementation removed shared_ppns tracking.
+    // Will need to re-implement smaps generation for new memory structure.
+    String::new()
 }
 
 /// Build /proc/self/ subtree
