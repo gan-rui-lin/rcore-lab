@@ -264,9 +264,16 @@ fn activate_runtime_profile(root: &str) -> bool {
                 "/lib64/ld-linux-loongarch-lp64d.so.1",
                 "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
             );
+
+            let _ = run_busybox_mkdir_p("/glibc", busybox_path, "/code/lmbench_src/bin/build");
+            force_link("/code/lmbench_src/bin/build/lmbench_all", "/glibc/lmbench_all");
+  
         } else {
             force_link("/lib64/ld-linux-loongarch-lp64d.so.1", "/musl/lib/libc.so");
             force_link("/lib64/ld-musl-loongarch-lp64d.so.1", "/musl/lib/libc.so");
+            let _ = run_busybox_mkdir_p("/musl", busybox_path, "/code/lmbench_src/bin/build");
+            force_link("/code/lmbench_src/bin/build/lmbench_all", "/musl/lmbench_all");
+
         }
     }
 
