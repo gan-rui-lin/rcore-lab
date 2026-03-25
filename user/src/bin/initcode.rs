@@ -7,10 +7,9 @@ extern crate user_lib;
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::String;
 use alloc::vec::Vec;
 use user_lib::{
-    chdir, close, dup, execve, exit, fork, link, open, shutdown, unlink, wait, write, OpenFlags,
+    chdir, close, dup, execve, exit, fork, link, open, shutdown, unlink, write, OpenFlags,
 };
 
 const ENABLE_ALL_TESTS: bool = true;
@@ -27,7 +26,8 @@ const TEST_SUITES: [&str; 4] = [
     "libctest",
     "lmbench",
 ];
-const LMBENCH_PROT_ONLY_SCRIPT: &[u8] = b"#!/bin/sh\n\necho \"#### OS COMP TEST GROUP START lmbench-musl ####\"\nbusybox mkdir -p /var/tmp\nbusybox touch /var/tmp/lmbench\n\necho latency measurements\necho \"[lmbench] START lat_syscall null\"\n./lmbench_all lat_syscall -P 1 null\necho \"[lmbench] DONE  lat_syscall null rc=$?\"\necho \"[lmbench] START lat_syscall read\"\n./lmbench_all lat_syscall -P 1 read\necho \"[lmbench] DONE  lat_syscall read rc=$?\"\necho \"[lmbench] START lat_syscall write\"\n./lmbench_all lat_syscall -P 1 write\necho \"[lmbench] DONE  lat_syscall write rc=$?\"\necho \"[lmbench] START lat_syscall stat\"\n./lmbench_all lat_syscall -P 1 stat /var/tmp/lmbench\necho \"[lmbench] DONE  lat_syscall stat rc=$?\"\necho \"[lmbench] START lat_syscall fstat\"\n./lmbench_all lat_syscall -P 1 fstat /var/tmp/lmbench\necho \"[lmbench] DONE  lat_syscall fstat rc=$?\"\necho \"[lmbench] START lat_syscall open\"\n./lmbench_all lat_syscall -P 1 open /var/tmp/lmbench\necho \"[lmbench] DONE  lat_syscall open rc=$?\"\necho \"[lmbench] START lat_select file\"\n./lmbench_all lat_select -n 100 -P 1 file\necho \"[lmbench] DONE  lat_select rc=$?\"\necho \"[lmbench] START lat_sig install\"\n./lmbench_all lat_sig -P 1 install\necho \"[lmbench] DONE  lat_sig install rc=$?\"\necho \"[lmbench] START lat_sig catch\"\n./lmbench_all lat_sig -P 1 catch\necho \"[lmbench] DONE  lat_sig catch rc=$?\"\necho \"[lmbench] START lat_sig prot\"\n./lmbench_all lat_sig -P 1 prot lat_sig\necho \"[lmbench] DONE  lat_sig prot rc=$?\"\necho \"[lmbench] START lat_pipe\"\n./lmbench_all lat_pipe -P 1\necho \"[lmbench] DONE  lat_pipe rc=$?\"\necho \"[lmbench] START lat_proc fork\"\n./lmbench_all lat_proc -P 1 fork\necho \"[lmbench] DONE  lat_proc fork rc=$?\"\necho \"[lmbench] START lat_proc exec\"\n./lmbench_all lat_proc -P 1 exec\necho \"[lmbench] DONE  lat_proc exec rc=$?\"\ncp hello /tmp\necho \"[lmbench] START lat_proc shell\"\n./lmbench_all lat_proc -P 1 shell\necho \"[lmbench] DONE  lat_proc shell rc=$?\"\necho \"[lmbench] START lmdd\"\n./lmbench_all lmdd label=\"File /var/tmp/XXX write bandwidth:\" of=/var/tmp/XXX move=1m fsync=1 print=3\necho \"[lmbench] DONE  lmdd rc=$?\"\necho \"[lmbench] START lat_pagefault\"\n./lmbench_all lat_pagefault -P 1 /var/tmp/XXX\necho \"[lmbench] DONE  lat_pagefault rc=$?\"\necho \"[lmbench] START lat_mmap\"\n./lmbench_all lat_mmap -P 1 512k /var/tmp/XXX\necho \"[lmbench] DONE  lat_mmap rc=$?\"\necho file system latency\necho \"[lmbench] START lat_fs\"\n./lmbench_all lat_fs /var/tmp\necho \"[lmbench] DONE  lat_fs rc=$?\"\necho Bandwidth measurements\necho \"[lmbench] START bw_pipe\"\n./lmbench_all bw_pipe -P 1\necho \"[lmbench] DONE  bw_pipe rc=$?\"\necho \"[lmbench] START bw_file_rd io_only\"\n./lmbench_all bw_file_rd -P 1 512k io_only /var/tmp/XXX\necho \"[lmbench] DONE  bw_file_rd io_only rc=$?\"\necho \"[lmbench] START bw_file_rd open2close\"\n./lmbench_all bw_file_rd -P 1 512k open2close /var/tmp/XXX\necho \"[lmbench] DONE  bw_file_rd open2close rc=$?\"\necho \"[lmbench] START bw_mmap_rd mmap_only\"\n./lmbench_all bw_mmap_rd -P 1 512k mmap_only /var/tmp/XXX\necho \"[lmbench] DONE  bw_mmap_rd mmap_only rc=$?\"\necho \"[lmbench] START bw_mmap_rd open2close\"\n./lmbench_all bw_mmap_rd -P 1 512k open2close /var/tmp/XXX\necho \"[lmbench] DONE  bw_mmap_rd open2close rc=$?\"\necho context switch overhead\necho \"[lmbench] START lat_ctx\"\n./lmbench_all lat_ctx -P 1 -s 32 2 4 8 16 24 32 64 96\necho \"[lmbench] DONE  lat_ctx rc=$?\"\n\necho \"#### OS COMP TEST GROUP END lmbench-musl ####\"\n";
+const TMP_LMBENCH_PATH: &str = "/tmp/lmbench_testcode.sh";
+const LMBENCH_PROT_ONLY_SCRIPT: &[u8] = b"#!/bin/sh\n\necho \"#### OS COMP TEST GROUP START lmbench-musl-debug ####\"\nbusybox mkdir -p /var/tmp\nbusybox rm -f /tmp/hello\nbusybox echo '#!/bin/sh' > /tmp/hello\nbusybox echo './lmbench_all hello \"$@\"' >> /tmp/hello\nbusybox chmod +x /tmp/hello\n\necho \"[lmbench] START lat_proc shell\"\n./lmbench_all lat_proc -P 1 shell\necho \"[lmbench] DONE  lat_proc shell rc=$?\"\n\necho \"[lmbench] START lmdd\"\n./lmbench_all lmdd label=\"File /var/tmp/XXX write bandwidth:\" of=/var/tmp/XXX move=1m fsync=1 print=3\necho \"[lmbench] DONE  lmdd rc=$?\"\n\necho \"[lmbench] START lat_pagefault\"\n./lmbench_all lat_pagefault -P 1 /var/tmp/XXX\necho \"[lmbench] DONE  lat_pagefault rc=$?\"\n\necho \"#### OS COMP TEST GROUP END lmbench-musl-debug ####\"\n";
 #[allow(dead_code)]
 const RUN_EMBEDDED_PTHREAD: bool = option_env!("RUN_EMBEDDED_PTHREAD").is_some();
 const PTHREAD_TEST_PATH: &str = "/tmp/pthread_cancel_small";
@@ -133,6 +133,46 @@ fn force_link(link_path: &str, target_path: &str) {
     // }
 }
 
+fn run_busybox_mkdir_p(root: &str, busybox_path: &str, path: &str) -> isize {
+    let pid = fork();
+    if pid < 0 {
+        return -1;
+    }
+    if pid == 0 {
+        let _ = chdir("/\0");
+        let busybox = cstring(busybox_path);
+        let applet = cstring("mkdir");
+        let opt_p = cstring("-p");
+        let dir = cstring(path);
+        let argv = [
+            busybox.as_ptr(),
+            applet.as_ptr(),
+            opt_p.as_ptr(),
+            dir.as_ptr(),
+            core::ptr::null(),
+        ];
+        let ld_lib = if root == "/glibc" { LD_LIB_GLIBC } else { LD_LIB_MUSL };
+        let envp = [PATH_ENV.as_ptr(), ld_lib.as_ptr(), core::ptr::null()];
+        let ret = execve(
+            unsafe { core::str::from_utf8_unchecked(&busybox) },
+            &argv,
+            &envp,
+        );
+        exit(if ret < 0 { 127 } else { 0 });
+    }
+    let mut status = 0;
+    loop {
+        let ret = user_lib::waitpid(pid as usize, &mut status);
+        if ret == pid {
+            break;
+        }
+        if ret < 0 && ret != -2 {
+            break;
+        }
+    }
+    status as isize
+}
+
 fn select_busybox_for_root(root: &str) -> Option<&'static str> {
     match root {
         "/musl" => {
@@ -223,10 +263,15 @@ fn activate_runtime_profile(root: &str) -> bool {
             // glibc dynamic binaries need shared libs in default search path
             force_link("/lib/libc.so.6", "/glibc/lib/libc.so.6");
             force_link("/lib/libm.so.6", "/glibc/lib/libm.so.6");
+
+            let _ = run_busybox_mkdir_p("/glibc", busybox_path, "/code/lmbench_src/bin/build");
+            force_link("/code/lmbench_src/bin/build/lmbench_all", "/glibc/lmbench_all");
         } else {
             force_link("/lib/ld-linux-riscv64-lp64d.so.1", "/musl/lib/libc.so");
             force_link("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so");
             force_link("/lib/ld-musl-riscv64-sf.so.1", "/musl/lib/libc.so");
+            let _ = run_busybox_mkdir_p("/musl", busybox_path, "/code/lmbench_src/bin/build");
+            force_link("/code/lmbench_src/bin/build/lmbench_all", "/musl/lmbench_all");
         }
     }
 
@@ -510,6 +555,17 @@ fn run_selector(selector: &str) {
 
     if selector == "single-elf" {
         run_single_elf_suite();
+        return;
+    }
+
+    if selector == "tmp-lmbench" {
+        let _ = activate_runtime_profile("/musl");
+        let ret = write_text_file(TMP_LMBENCH_PATH, LMBENCH_PROT_ONLY_SCRIPT);
+        if ret >= 0 {
+            let _ = run_testcode(TMP_LMBENCH_PATH, "/musl");
+        } else {
+            println!("[initcode] write {} failed (ret={})", TMP_LMBENCH_PATH, ret);
+        }
         return;
     }
 
