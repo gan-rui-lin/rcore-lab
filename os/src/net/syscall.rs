@@ -498,7 +498,9 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
                 }
             }
 
-            // Block until connected
+            // Block until connected, with retry on loopback RST.
+            // glibc ld.so is slow; the server may not have called listen() yet.
+            let mut retries_left: i32 = if is_loopback { 3 } else { 0 };
             loop {
                 poll_net();
                 let mut net = NET_STACK.exclusive_access();
@@ -510,7 +512,22 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
 
                 match socket.state() {
                     tcp::State::Established => return 0,
-                    tcp::State::Closed => return ECONNREFUSED,
+                    tcp::State::Closed => {
+                        if retries_left > 0 {
+                            retries_left -= 1;
+                            // Re-initiate connect with a new ephemeral port
+                            let new_port = alloc_ephemeral_port();
+                            let cx = stack.lo_iface.context();
+                            let _ = socket.connect(cx, connect_remote, new_port);
+                            drop(net);
+                            // Yield to let server process run
+                            for _ in 0..5 {
+                                suspend_current_and_run_next();
+                            }
+                            continue;
+                        }
+                        return ECONNREFUSED;
+                    }
                     _ => {}
                 }
 
