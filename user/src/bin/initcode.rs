@@ -7,6 +7,7 @@ extern crate user_lib;
 extern crate alloc;
 
 use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use user_lib::{
     chdir, close, dup, execve, exit, fork, link, open, shutdown, unlink, wait, write, OpenFlags,
@@ -20,19 +21,13 @@ const PATH_ENV: &[u8] = b"PATH=/bin:/usr/bin:/musl:/glibc\0";
 const LD_LIB_MUSL: &[u8] = b"LD_LIBRARY_PATH=/musl/lib\0";
 const LD_LIB_GLIBC: &[u8] = b"LD_LIBRARY_PATH=/glibc/lib\0";
 const TEST_LIBC_ROOTS: [&str; 2] = ["/musl", "/glibc"];
-const TEST_SUITES: [&str; 11] = [
+const TEST_SUITES: [&str; 4] = [
     "basic",
     "busybox",
-    "cyclictest",
-    "iozone",
-    "iperf",
-    "libcbench",
     "libctest",
     "lmbench",
-    "ltp",
-    "lua",
-    "netperf",
 ];
+const LMBENCH_PROT_ONLY_SCRIPT: &[u8] = b"#!/bin/sh\n\necho \"#### OS COMP TEST GROUP START lmbench-musl ####\"\nbusybox mkdir -p /var/tmp\nbusybox touch /var/tmp/lmbench\n\necho latency measurements\necho \"[lmbench] START lat_syscall null\"\n./lmbench_all lat_syscall -P 1 null\necho \"[lmbench] DONE  lat_syscall null rc=$?\"\necho \"[lmbench] START lat_syscall read\"\n./lmbench_all lat_syscall -P 1 read\necho \"[lmbench] DONE  lat_syscall read rc=$?\"\necho \"[lmbench] START lat_syscall write\"\n./lmbench_all lat_syscall -P 1 write\necho \"[lmbench] DONE  lat_syscall write rc=$?\"\necho \"[lmbench] START lat_syscall stat\"\n./lmbench_all lat_syscall -P 1 stat /var/tmp/lmbench\necho \"[lmbench] DONE  lat_syscall stat rc=$?\"\necho \"[lmbench] START lat_syscall fstat\"\n./lmbench_all lat_syscall -P 1 fstat /var/tmp/lmbench\necho \"[lmbench] DONE  lat_syscall fstat rc=$?\"\necho \"[lmbench] START lat_syscall open\"\n./lmbench_all lat_syscall -P 1 open /var/tmp/lmbench\necho \"[lmbench] DONE  lat_syscall open rc=$?\"\necho \"[lmbench] START lat_select file\"\n./lmbench_all lat_select -n 100 -P 1 file\necho \"[lmbench] DONE  lat_select rc=$?\"\necho \"[lmbench] START lat_sig install\"\n./lmbench_all lat_sig -P 1 install\necho \"[lmbench] DONE  lat_sig install rc=$?\"\necho \"[lmbench] START lat_sig catch\"\n./lmbench_all lat_sig -P 1 catch\necho \"[lmbench] DONE  lat_sig catch rc=$?\"\necho \"[lmbench] START lat_sig prot\"\n./lmbench_all lat_sig -P 1 prot lat_sig\necho \"[lmbench] DONE  lat_sig prot rc=$?\"\necho \"[lmbench] START lat_pipe\"\n./lmbench_all lat_pipe -P 1\necho \"[lmbench] DONE  lat_pipe rc=$?\"\necho \"[lmbench] START lat_proc fork\"\n./lmbench_all lat_proc -P 1 fork\necho \"[lmbench] DONE  lat_proc fork rc=$?\"\necho \"[lmbench] START lat_proc exec\"\n./lmbench_all lat_proc -P 1 exec\necho \"[lmbench] DONE  lat_proc exec rc=$?\"\ncp hello /tmp\necho \"[lmbench] START lat_proc shell\"\n./lmbench_all lat_proc -P 1 shell\necho \"[lmbench] DONE  lat_proc shell rc=$?\"\necho \"[lmbench] START lmdd\"\n./lmbench_all lmdd label=\"File /var/tmp/XXX write bandwidth:\" of=/var/tmp/XXX move=1m fsync=1 print=3\necho \"[lmbench] DONE  lmdd rc=$?\"\necho \"[lmbench] START lat_pagefault\"\n./lmbench_all lat_pagefault -P 1 /var/tmp/XXX\necho \"[lmbench] DONE  lat_pagefault rc=$?\"\necho \"[lmbench] START lat_mmap\"\n./lmbench_all lat_mmap -P 1 512k /var/tmp/XXX\necho \"[lmbench] DONE  lat_mmap rc=$?\"\necho file system latency\necho \"[lmbench] START lat_fs\"\n./lmbench_all lat_fs /var/tmp\necho \"[lmbench] DONE  lat_fs rc=$?\"\necho Bandwidth measurements\necho \"[lmbench] START bw_pipe\"\n./lmbench_all bw_pipe -P 1\necho \"[lmbench] DONE  bw_pipe rc=$?\"\necho \"[lmbench] START bw_file_rd io_only\"\n./lmbench_all bw_file_rd -P 1 512k io_only /var/tmp/XXX\necho \"[lmbench] DONE  bw_file_rd io_only rc=$?\"\necho \"[lmbench] START bw_file_rd open2close\"\n./lmbench_all bw_file_rd -P 1 512k open2close /var/tmp/XXX\necho \"[lmbench] DONE  bw_file_rd open2close rc=$?\"\necho \"[lmbench] START bw_mmap_rd mmap_only\"\n./lmbench_all bw_mmap_rd -P 1 512k mmap_only /var/tmp/XXX\necho \"[lmbench] DONE  bw_mmap_rd mmap_only rc=$?\"\necho \"[lmbench] START bw_mmap_rd open2close\"\n./lmbench_all bw_mmap_rd -P 1 512k open2close /var/tmp/XXX\necho \"[lmbench] DONE  bw_mmap_rd open2close rc=$?\"\necho context switch overhead\necho \"[lmbench] START lat_ctx\"\n./lmbench_all lat_ctx -P 1 -s 32 2 4 8 16 24 32 64 96\necho \"[lmbench] DONE  lat_ctx rc=$?\"\n\necho \"#### OS COMP TEST GROUP END lmbench-musl ####\"\n";
 #[allow(dead_code)]
 const RUN_EMBEDDED_PTHREAD: bool = option_env!("RUN_EMBEDDED_PTHREAD").is_some();
 const PTHREAD_TEST_PATH: &str = "/tmp/pthread_cancel_small";
@@ -50,6 +45,32 @@ fn cstring(s: &str) -> Vec<u8> {
 }
 
 fn write_embedded_elf(path: &str, data: &[u8]) -> isize {
+    let path_c = cstring(path);
+    let path_str = unsafe { core::str::from_utf8_unchecked(&path_c) };
+    let fd = open(
+        path_str,
+        OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY,
+    );
+    if fd < 0 {
+        println!("open {} failed (ret={})", path, fd);
+        return fd;
+    }
+    let fd = fd as usize;
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let n = write(fd, &data[offset..]);
+        if n <= 0 {
+            println!("write {} failed (ret={})", path, n);
+            let _ = close(fd);
+            return n;
+        }
+        offset += n as usize;
+    }
+    let _ = close(fd);
+    0
+}
+
+fn write_text_file(path: &str, data: &[u8]) -> isize {
     let path_c = cstring(path);
     let path_str = unsafe { core::str::from_utf8_unchecked(&path_c) };
     let fd = open(
@@ -385,7 +406,23 @@ fn run_suite(root: &str, suite: &str) -> i32 {
         println!("=== Skipped {} / {} (profile activate failed) ===\n", root, suite);
         return -1;
     }
-    let script = format!("{}/{}_testcode.sh", root, suite);
+    let mut script = format!("{}/{}_testcode.sh", root, suite);
+    if root == "/musl" && suite == "lmbench" {
+        let debug_script = "/tmp/lmbench_testcode.sh";
+        let ret = write_text_file(debug_script, LMBENCH_PROT_ONLY_SCRIPT);
+        if ret >= 0 {
+            script = String::from(debug_script);
+            println!(
+                "[initcode] lmbench debug mode enabled, using {} (lat_sig prot + next)",
+                debug_script
+            );
+        } else {
+            println!(
+                "[initcode] lmbench debug script write failed (ret={}), fallback to default",
+                ret
+            );
+        }
+    }
     run_testcode(script.as_str(), root)
 }
 

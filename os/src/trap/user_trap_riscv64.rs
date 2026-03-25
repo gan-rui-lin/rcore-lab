@@ -20,7 +20,8 @@ pub(super) fn handle_user_supervisor_external() {
 
 pub(super) fn handle_user_page_fault(addr: usize) {
     let trap_cx = current_trap_cx();
-    error!(
+    // ! 这是因为 lmbench 大量触发 page fault 来测试性能，所以我们不把它当成错误来处理；其它测试可以再改回去
+    debug!(
         "[kernel] trap_handler: page fault addr={:#x} sepc={:#x} ra={:#x} sp={:#x}",
         addr,
         trap_cx.sepc,

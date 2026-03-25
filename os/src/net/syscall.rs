@@ -9,22 +9,10 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::mm::{translated_byte_buffer, translated_refmut};
-use crate::task::{current_process, current_task, current_user_token, suspend_current_and_run_next};
+use crate::task::{current_process, current_user_token, has_pending_unmasked_signal, suspend_current_and_run_next};
 
 use super::socket_file::{SocketFile, SocketType};
 use super::{alloc_ephemeral_port, poll_net, NET_STACK};
-
-/// Check if the current task has pending unmasked signals.
-/// Used to return EINTR from blocking network syscalls.
-fn has_pending_signal() -> bool {
-    let process = current_process();
-    let process_inner = process.inner_exclusive_access();
-    let task = current_task().unwrap();
-    let task_inner = task.inner_exclusive_access();
-    let unmasked = (process_inner.signal_pending | task_inner.signal_pending)
-        & !task_inner.signal_mask;
-    !unmasked.is_empty()
-}
 
 // Address family
 const AF_INET: usize = 2;
@@ -440,7 +428,7 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize 
         drop(net);
         suspend_current_and_run_next();
         // Check for pending signals -> EINTR so SIGALRM can be delivered
-        if has_pending_signal() {
+        if has_pending_unmasked_signal(false) {
             return EINTR;
         }
     }
@@ -516,7 +504,7 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
 
                 drop(net);
                 suspend_current_and_run_next();
-                if has_pending_signal() {
+                if has_pending_unmasked_signal(false) {
                     return EINTR;
                 }
             }
@@ -692,7 +680,7 @@ pub fn sys_sendto(
 
             drop(net);
             suspend_current_and_run_next();
-            if has_pending_signal() {
+            if has_pending_unmasked_signal(false) {
                 return EINTR;
             }
         },
@@ -825,7 +813,7 @@ pub fn sys_recvfrom(
 
             drop(net);
             suspend_current_and_run_next();
-            if has_pending_signal() {
+            if has_pending_unmasked_signal(false) {
                 return EINTR;
             }
         },
@@ -863,7 +851,7 @@ pub fn sys_recvfrom(
 
             drop(net);
             suspend_current_and_run_next();
-            if has_pending_signal() {
+            if has_pending_unmasked_signal(false) {
                 return EINTR;
             }
         },
