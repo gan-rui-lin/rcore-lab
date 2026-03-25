@@ -9,7 +9,8 @@ extern crate alloc;
 use alloc::format;
 use alloc::vec::Vec;
 use user_lib::{
-    chdir, close, dup, execve, exit, fork, link, open, shutdown, unlink, wait, write, OpenFlags,
+    chdir, close, dup, execve, exit, fork, kill, link, open, shutdown, unlink, wait, write,
+    OpenFlags, SIGKILL,
 };
 
 const ENABLE_ALL_TESTS: bool = true;
@@ -386,7 +387,33 @@ fn run_suite(root: &str, suite: &str) -> i32 {
         return -1;
     }
     let script = format!("{}/{}_testcode.sh", root, suite);
-    run_testcode(script.as_str(), root)
+    let ret = run_testcode(script.as_str(), root);
+    // Kill orphan daemons (e.g. iperf3 -s -D, netserver -D) so they don't
+    // hold ports when the next libc variant runs the same suite.
+    reap_orphans();
+    ret
+}
+
+/// Kill orphan daemon processes and reap zombies.
+fn reap_orphans() {
+    let my_pid = user_lib::getpid();
+    for p in 2..256usize {
+        if p as isize != my_pid {
+            let _ = kill(p, SIGKILL);
+        }
+    }
+    // Reap with WNOHANG to avoid blocking
+    let mut status: i32 = 0;
+    for _ in 0..100 {
+        let ret = user_lib::waitpid_nohang(-1i32 as usize, &mut status);
+        if ret > 0 { continue; } // reaped one
+        if ret == 0 {
+            // children exist but none exited yet
+            user_lib::sys_yield();
+            continue;
+        }
+        break; // ECHILD or error
+    }
 }
 
 fn run_all_suites() {
