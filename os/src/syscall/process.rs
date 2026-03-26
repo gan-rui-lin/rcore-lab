@@ -1534,7 +1534,22 @@ pub fn sys_getitimer(which: isize, curr_value: *mut ITimerVal) -> isize {
     let timer = {
         let process = current_process();
         let inner = process.inner_exclusive_access();
-        itimer_state_to_user(inner.itimers[which as usize])
+        if which == 0 {
+            // ITIMER_REAL: compute actual remaining time from expire deadline
+            let expire_ms = inner.itimer_real_expire_ms;
+            let remaining_us = if expire_ms == 0 {
+                0usize
+            } else {
+                let now_ms = get_time_ms();
+                if expire_ms > now_ms { (expire_ms - now_ms) * 1000 } else { 0 }
+            };
+            ITimerVal {
+                it_interval: us_to_timeval(inner.itimer_real_interval_ms * 1000),
+                it_value: us_to_timeval(remaining_us),
+            }
+        } else {
+            itimer_state_to_user(inner.itimers[which as usize])
+        }
     };
     let bytes = unsafe {
         core::slice::from_raw_parts(
@@ -1570,8 +1585,34 @@ pub fn sys_setitimer(
     let old_timer = {
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-        let old_timer = itimer_state_to_user(inner.itimers[which as usize]);
+        let old_timer = if which == 0 {
+            // ITIMER_REAL: compute actual remaining time
+            let expire_ms = inner.itimer_real_expire_ms;
+            let remaining_us = if expire_ms == 0 {
+                0usize
+            } else {
+                let now_ms = get_time_ms();
+                if expire_ms > now_ms { (expire_ms - now_ms) * 1000 } else { 0 }
+            };
+            ITimerVal {
+                it_interval: us_to_timeval(inner.itimer_real_interval_ms * 1000),
+                it_value: us_to_timeval(remaining_us),
+            }
+        } else {
+            itimer_state_to_user(inner.itimers[which as usize])
+        };
         inner.itimers[which as usize] = new_state;
+        // Update itimer_real_expire_ms for ITIMER_REAL
+        if which == 0 {
+            let now_ms = get_time_ms();
+            let remaining_us = new_state.remaining_us;
+            if remaining_us == 0 {
+                inner.itimer_real_expire_ms = 0;
+            } else {
+                inner.itimer_real_expire_ms = now_ms + remaining_us / 1000;
+            }
+            inner.itimer_real_interval_ms = new_state.interval_us / 1000;
+        }
         old_timer
     };
     if !old_value.is_null() {
@@ -2136,7 +2177,10 @@ pub fn sys_sbrk(arg: isize) -> isize {
         );
         return errno(ENOMEM);
     }
-    let result = if delta < 0 {
+    // delta == 0 is a no-op (brk query or same address)
+    let result = if delta == 0 {
+        true
+    } else if delta < 0 {
         inner
             .memory_set
             .shrink_to(VirtAddr(heap_bottom), VirtAddr(new_brk))
@@ -2665,6 +2709,573 @@ pub fn sys_setgid(gid: u32) -> isize {
         return 0;
     }
     errno(EPERM)
+}
+
+
+/// setregid(rgid, egid) - syscall 143
+/// Set real and/or effective group ID.
+pub fn sys_setregid(rgid: u32, egid: u32) -> isize {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let is_root = inner.effective_gid == 0;
+    let neg1 = u32::MAX;
+
+    if !is_root {
+        // unprivileged: can only set to one of real/effective/saved
+        if rgid != neg1 && rgid != inner.real_gid && rgid != inner.effective_gid {
+            return errno(EPERM);
+        }
+        if egid != neg1 && egid != inner.real_gid && egid != inner.effective_gid && egid != inner.saved_gid {
+            return errno(EPERM);
+        }
+    }
+
+    if rgid != neg1 {
+        inner.real_gid = rgid;
+    }
+    if egid != neg1 {
+        inner.effective_gid = egid;
+    }
+    // Update saved_gid if effective changes
+    if rgid != neg1 {
+        inner.saved_gid = inner.effective_gid;
+    }
+    0
+}
+
+/// setreuid(ruid, euid) - syscall 145
+pub fn sys_setreuid(ruid: u32, euid: u32) -> isize {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let is_root = inner.effective_uid == 0;
+    let neg1 = u32::MAX;
+
+    if !is_root {
+        if ruid != neg1 && ruid != inner.real_uid && ruid != inner.effective_uid {
+            return errno(EPERM);
+        }
+        if euid != neg1 && euid != inner.real_uid && euid != inner.effective_uid && euid != inner.saved_uid {
+            return errno(EPERM);
+        }
+    }
+
+    if ruid != neg1 {
+        inner.real_uid = ruid;
+    }
+    if euid != neg1 {
+        inner.effective_uid = euid;
+    }
+    if ruid != neg1 {
+        inner.saved_uid = inner.effective_uid;
+    }
+    0
+}
+
+/// setresuid(ruid, euid, suid) - syscall 147
+pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> isize {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let is_root = inner.effective_uid == 0;
+    let neg1 = u32::MAX;
+
+    if !is_root {
+        // Non-root: can only set to one of current real/effective/saved
+        let allowed = [inner.real_uid, inner.effective_uid, inner.saved_uid];
+        if ruid != neg1 && !allowed.contains(&ruid) {
+            return errno(EPERM);
+        }
+        if euid != neg1 && !allowed.contains(&euid) {
+            return errno(EPERM);
+        }
+        if suid != neg1 && !allowed.contains(&suid) {
+            return errno(EPERM);
+        }
+    }
+
+    if ruid != neg1 { inner.real_uid = ruid; }
+    if euid != neg1 { inner.effective_uid = euid; }
+    if suid != neg1 { inner.saved_uid = suid; }
+    0
+}
+
+/// getresuid(ruid, euid, suid) - syscall 148
+pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let token = current_user_token();
+    let (r, e, s) = (inner.real_uid, inner.effective_uid, inner.saved_uid);
+    drop(inner);
+    drop(process);
+    let r_bytes = r.to_ne_bytes();
+    let e_bytes = e.to_ne_bytes();
+    let s_bytes = s.to_ne_bytes();
+    if !ruid.is_null() {
+        if copy_to_user(token, ruid as *mut u8, &r_bytes).is_err() { return errno(EFAULT); }
+    }
+    if !euid.is_null() {
+        if copy_to_user(token, euid as *mut u8, &e_bytes).is_err() { return errno(EFAULT); }
+    }
+    if !suid.is_null() {
+        if copy_to_user(token, suid as *mut u8, &s_bytes).is_err() { return errno(EFAULT); }
+    }
+    0
+}
+
+/// setresgid(rgid, egid, sgid) - syscall 149
+pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> isize {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let is_root = inner.effective_gid == 0;
+    let neg1 = u32::MAX;
+
+    if !is_root {
+        let allowed = [inner.real_gid, inner.effective_gid, inner.saved_gid];
+        if rgid != neg1 && !allowed.contains(&rgid) {
+            return errno(EPERM);
+        }
+        if egid != neg1 && !allowed.contains(&egid) {
+            return errno(EPERM);
+        }
+        if sgid != neg1 && !allowed.contains(&sgid) {
+            return errno(EPERM);
+        }
+    }
+
+    if rgid != neg1 { inner.real_gid = rgid; }
+    if egid != neg1 { inner.effective_gid = egid; }
+    if sgid != neg1 { inner.saved_gid = sgid; }
+    0
+}
+
+/// getresgid(rgid, egid, sgid) - syscall 150
+pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> isize {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let token = current_user_token();
+    let (r, e, s) = (inner.real_gid, inner.effective_gid, inner.saved_gid);
+    drop(inner);
+    drop(process);
+    let r_bytes = r.to_ne_bytes();
+    let e_bytes = e.to_ne_bytes();
+    let s_bytes = s.to_ne_bytes();
+    if !rgid.is_null() {
+        if copy_to_user(token, rgid as *mut u8, &r_bytes).is_err() { return errno(EFAULT); }
+    }
+    if !egid.is_null() {
+        if copy_to_user(token, egid as *mut u8, &e_bytes).is_err() { return errno(EFAULT); }
+    }
+    if !sgid.is_null() {
+        if copy_to_user(token, sgid as *mut u8, &s_bytes).is_err() { return errno(EFAULT); }
+    }
+    0
+}
+
+/// rt_sigsuspend(mask, sigsetsize) - syscall 133
+/// Replace the signal mask and suspend until a signal is delivered.
+pub fn sys_rt_sigsuspend(mask_ptr: *const usize, sigsetsize: usize) -> isize {
+    if mask_ptr.is_null() {
+        return errno(EFAULT);
+    }
+    if sigsetsize != core::mem::size_of::<usize>() {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
+    let user_mask = match read_from_user::<usize>(token, mask_ptr) {
+        Ok(v) => v,
+        Err(_) => return errno(EFAULT),
+    };
+    let new_mask = user_mask_to_flags(user_mask as u64);
+
+    // Save old mask, install new mask
+    let task = current_task().unwrap();
+    let old_mask = {
+        let mut inner = task.inner_exclusive_access();
+        let old = inner.signal_mask;
+        let mut m = new_mask;
+        m.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
+        inner.signal_mask = m;
+        old
+    };
+
+    // Wait for any unmasked signal
+    loop {
+        let has_signal = {
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            let task_inner = task.inner_exclusive_access();
+            let pending = inner.signal_pending | task_inner.signal_pending;
+            let mask = task_inner.signal_mask;
+            !(pending & !mask).is_empty()
+        };
+        if has_signal {
+            break;
+        }
+        suspend_current_and_run_next();
+        // Check if we were woken by a signal
+        let task_inner = task.inner_exclusive_access();
+        let cur_mask = task_inner.signal_mask;
+        drop(task_inner);
+        if cur_mask != new_mask {
+            // mask was changed (e.g. signal delivered and sigreturn restores old mask)
+            break;
+        }
+    }
+
+    // Restore old mask
+    {
+        let mut inner = task.inner_exclusive_access();
+        inner.signal_mask = old_mask;
+    }
+    errno(EINTR)
+}
+
+/// adjtimex(buf) - syscall 159
+/// Tune kernel clock. Stub: return TIME_OK (0) for valid modes, EINVAL for invalid.
+#[repr(C)]
+#[allow(dead_code)]
+struct Timex {
+    modes: u32,
+    offset: i64,
+    freq: i64,
+    maxerror: i64,
+    esterror: i64,
+    status: i32,
+    constant: i64,
+    precision: i64,
+    tolerance: i64,
+    time_sec: i64,
+    time_usec: i64,
+    tick: i64,
+    // more fields...
+    _pad: [u8; 128],
+}
+
+pub fn sys_adjtimex(buf: *mut u8) -> isize {
+    if buf.is_null() {
+        return errno(EFAULT);
+    }
+    // Read the modes field (first u32 in struct timex)
+    let token = current_user_token();
+    let modes = match read_from_user::<u32>(token, buf as *const u32) {
+        Ok(m) => m,
+        Err(_) => return errno(EFAULT),
+    };
+
+    // Any "set" operation requires CAP_SYS_TIME (root). modes == 0 is read-only.
+    if modes != 0 {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        if inner.effective_uid != 0 {
+            return errno(EPERM);
+        }
+        drop(inner);
+    }
+
+    // ADJ_ADJTIME (0x8000) without ADJ_OFFSET (0x0001) is invalid
+    if (modes & 0x8000) != 0 && (modes & 0x0001) == 0 {
+        return errno(EINVAL);
+    }
+
+    // ADJ_TICK (0x4000): validate tick range [9000, 11000] µs (at HZ=100)
+    // tick is at byte offset 88 in struct timex (64-bit ABI)
+    // modes(4)+pad(4)+offset(8)+freq(8)+maxerror(8)+esterror(8)+status(4)+pad(4)+
+    // constant(8)+precision(8)+tolerance(8)+time_sec(8)+time_usec(8) = 88
+    const TICK_OFFSET: usize = 88;
+    const ADJ_TICK: u32 = 0x4000;
+    if (modes & ADJ_TICK) != 0 {
+        let tick_ptr = unsafe { (buf as *const u8).add(TICK_OFFSET) } as *const i64;
+        let tick = match read_from_user::<i64>(token, tick_ptr) {
+            Ok(v) => v,
+            Err(_) => return errno(EFAULT),
+        };
+        // Only validate explicitly non-default tick values
+        if tick != 0 && (tick < 9000 || tick > 11000) {
+            return errno(EINVAL);
+        }
+    }
+
+    // Write sensible output fields so that modes=0 (read) returns current state.
+    // tick=10000 µs = 100Hz, status bits = 0 (TIME_OK).
+    let tick_ptr = unsafe { (buf as *mut u8).add(TICK_OFFSET) } as *mut i64;
+    let _ = copy_to_user(token, tick_ptr as *mut u8, &10000i64.to_ne_bytes());
+
+    // Return TIME_OK (0)
+    0
+}
+
+/// Capability header and data structs (Linux ABI)
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+const _LINUX_CAPABILITY_VERSION_1: u32 = 0x19980330;
+const _LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026;
+const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+
+/// capget(header, data) - syscall 90
+pub fn sys_capget(header_ptr: *mut u8, data_ptr: *mut u8) -> isize {
+    if header_ptr.is_null() {
+        return errno(EFAULT);
+    }
+    let token = current_user_token();
+
+    // Read header
+    let mut hdr = match read_from_user::<CapHeader>(token, header_ptr as *const CapHeader) {
+        Ok(v) => v,
+        Err(_) => return errno(EFAULT),
+    };
+
+    // Validate version; if invalid, set preferred and return EINVAL
+    let valid_versions = [
+        _LINUX_CAPABILITY_VERSION_1,
+        _LINUX_CAPABILITY_VERSION_2,
+        _LINUX_CAPABILITY_VERSION_3,
+    ];
+    if !valid_versions.contains(&hdr.version) {
+        hdr.version = _LINUX_CAPABILITY_VERSION_3;
+        let hdr_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &hdr as *const CapHeader as *const u8,
+                core::mem::size_of::<CapHeader>(),
+            )
+        };
+        let _ = copy_to_user(token, header_ptr, hdr_bytes);
+        return errno(EINVAL);
+    }
+
+    // Validate pid
+    if hdr.pid < 0 {
+        return errno(EINVAL);
+    }
+
+    // Check if target process exists (if pid != 0 and != current)
+    let cur_pid = current_process().pid.0 as i32;
+    if hdr.pid != 0 && hdr.pid != cur_pid {
+        // Check if process exists
+        if pid2process(hdr.pid as usize).is_none() {
+            return errno(ESRCH);
+        }
+    }
+
+    // If data_ptr is provided, fill capability data
+    if !data_ptr.is_null() {
+        // Determine data count (V2/V3 have 2 sets)
+        let data_count: usize = if hdr.version == _LINUX_CAPABILITY_VERSION_1 { 1 } else { 2 };
+
+        // Get caps for the target process
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        let (eff_lo, eff_hi) = ((inner.cap_effective & 0xFFFFFFFF) as u32,
+                                 ((inner.cap_effective >> 32) & 0xFFFFFFFF) as u32);
+        let (perm_lo, perm_hi) = ((inner.cap_permitted & 0xFFFFFFFF) as u32,
+                                   ((inner.cap_permitted >> 32) & 0xFFFFFFFF) as u32);
+        let (inh_lo, inh_hi) = ((inner.cap_inheritable & 0xFFFFFFFF) as u32,
+                                  ((inner.cap_inheritable >> 32) & 0xFFFFFFFF) as u32);
+        drop(inner);
+        drop(process);
+
+        let data0 = CapData { effective: eff_lo, permitted: perm_lo, inheritable: inh_lo };
+        let data_bytes0 = unsafe {
+            core::slice::from_raw_parts(
+                &data0 as *const CapData as *const u8,
+                core::mem::size_of::<CapData>(),
+            )
+        };
+        if copy_to_user(token, data_ptr, data_bytes0).is_err() {
+            return errno(EFAULT);
+        }
+
+        if data_count == 2 {
+            let data1 = CapData { effective: eff_hi, permitted: perm_hi, inheritable: inh_hi };
+            let data_bytes1 = unsafe {
+                core::slice::from_raw_parts(
+                    &data1 as *const CapData as *const u8,
+                    core::mem::size_of::<CapData>(),
+                )
+            };
+            let data_ptr1 = unsafe { data_ptr.add(core::mem::size_of::<CapData>()) };
+            if copy_to_user(token, data_ptr1, data_bytes1).is_err() {
+                return errno(EFAULT);
+            }
+        }
+    }
+
+    0
+}
+
+/// capset(header, data) - syscall 91
+pub fn sys_capset(header_ptr: *const u8, data_ptr: *const u8) -> isize {
+    if header_ptr.is_null() {
+        return errno(EFAULT);
+    }
+    let token = current_user_token();
+
+    let mut hdr = match read_from_user::<CapHeader>(token, header_ptr as *const CapHeader) {
+        Ok(v) => v,
+        Err(_) => return errno(EFAULT),
+    };
+
+    let valid_versions = [
+        _LINUX_CAPABILITY_VERSION_1,
+        _LINUX_CAPABILITY_VERSION_2,
+        _LINUX_CAPABILITY_VERSION_3,
+    ];
+    if !valid_versions.contains(&hdr.version) {
+        // Write preferred version back to header before returning EINVAL
+        hdr.version = _LINUX_CAPABILITY_VERSION_3;
+        let _ = copy_to_user(token, header_ptr as *mut u8,
+            unsafe { core::slice::from_raw_parts(&hdr as *const CapHeader as *const u8,
+                core::mem::size_of::<CapHeader>()) });
+        return errno(EINVAL);
+    }
+
+    if hdr.pid < 0 {
+        return errno(EINVAL);
+    }
+
+    // Only allow setting own capabilities
+    let cur_pid = current_process().pid.0 as i32;
+    if hdr.pid != 0 && hdr.pid != cur_pid {
+        return errno(EPERM);
+    }
+
+    if data_ptr.is_null() {
+        return errno(EFAULT);
+    }
+
+    let data_count: usize = if hdr.version == _LINUX_CAPABILITY_VERSION_1 { 1 } else { 2 };
+
+    let data0 = match read_from_user::<CapData>(token, data_ptr as *const CapData) {
+        Ok(v) => v,
+        Err(_) => return errno(EFAULT),
+    };
+
+    let mut data1 = CapData::default();
+    if data_count == 2 {
+        let data_ptr1 = unsafe { data_ptr.add(core::mem::size_of::<CapData>()) };
+        data1 = match read_from_user::<CapData>(token, data_ptr1 as *const CapData) {
+            Ok(v) => v,
+            Err(_) => return errno(EFAULT),
+        };
+    }
+
+    // Compute new capability sets
+    let new_effective = (data0.effective as u64) | ((data1.effective as u64) << 32);
+    let new_permitted = (data0.permitted as u64) | ((data1.permitted as u64) << 32);
+    let new_inheritable = (data0.inheritable as u64) | ((data1.inheritable as u64) << 32);
+
+    // Validate and update process capability sets
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+
+    // new_effective must be subset of new_permitted
+    if (new_effective & !new_permitted) != 0 {
+        return errno(EPERM);
+    }
+    // new_permitted must be subset of old_permitted (can't raise permitted)
+    if (new_permitted & !inner.cap_permitted) != 0 {
+        return errno(EPERM);
+    }
+    // new_inheritable must be subset of (old_inheritable | old_permitted), unless CAP_SETPCAP
+    // With CAP_SETPCAP, still bounded by bounding set
+    // CAP_SETPCAP = bit 8
+    const CAP_SETPCAP: u64 = 1 << 8;
+    if (new_inheritable & !(inner.cap_inheritable | inner.cap_permitted)) != 0 {
+        if (inner.cap_effective & CAP_SETPCAP) == 0 {
+            return errno(EPERM);
+        }
+        // Even with CAP_SETPCAP, can't exceed bounding set
+        if (new_inheritable & !inner.cap_bounding) != 0 {
+            return errno(EPERM);
+        }
+    }
+
+    inner.cap_effective = new_effective;
+    inner.cap_permitted = new_permitted;
+    inner.cap_inheritable = new_inheritable;
+    0
+}
+
+/// prctl(option, arg2, arg3, arg4, arg5) - syscall 167
+/// Process control operations.
+pub fn sys_prctl(option: usize, arg2: usize, _arg3: usize, _arg4: usize, _arg5: usize) -> isize {
+    const PR_SET_DUMPABLE: usize = 4;
+    const PR_GET_DUMPABLE: usize = 3;
+    const PR_SET_KEEPCAPS: usize = 8;
+    const PR_GET_KEEPCAPS: usize = 7;
+    const PR_SET_NAME: usize = 15;
+    const PR_GET_NAME: usize = 16;
+    const PR_CAPBSET_READ: usize = 23;
+    const PR_CAPBSET_DROP: usize = 24;
+    const PR_SET_SECCOMP: usize = 22;
+    const PR_GET_SECCOMP: usize = 21;
+
+    match option {
+        PR_SET_DUMPABLE | PR_SET_KEEPCAPS | PR_SET_SECCOMP => {
+            // Silently accept (don't track dumpable/keepcaps state for now)
+            0
+        }
+        PR_GET_DUMPABLE => {
+            // Return 1 (SUID_DUMP_USER) - process is dumpable
+            1
+        }
+        PR_GET_KEEPCAPS => {
+            0 // Not keeping caps across setuid
+        }
+        PR_GET_SECCOMP => {
+            0 // SECCOMP_MODE_DISABLED
+        }
+        PR_CAPBSET_READ => {
+            // Return 1 if cap is in bounding set, 0 if not
+            if arg2 >= 64 {
+                return errno(EINVAL);
+            }
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            if (inner.cap_bounding >> arg2) & 1 == 1 { 1 } else { 0 }
+        }
+        PR_CAPBSET_DROP => {
+            // Drop a capability from the bounding set
+            if arg2 >= 64 {
+                return errno(EINVAL);
+            }
+            let process = current_process();
+            let mut inner = process.inner_exclusive_access();
+            if inner.effective_uid != 0 {
+                return errno(EPERM);
+            }
+            inner.cap_bounding &= !(1u64 << arg2);
+            0
+        }
+        PR_SET_NAME => {
+            // Set process name (ignore for now)
+            0
+        }
+        PR_GET_NAME => {
+            // Get process name - return empty string
+            if arg2 != 0 {
+                let token = current_user_token();
+                let name_bytes = [0u8; 16];
+                let _ = copy_to_user(token, arg2 as *mut u8, &name_bytes);
+            }
+            0
+        }
+        _ => {
+            // Unknown prctl option - return EINVAL
+            errno(EINVAL)
+        }
+    }
 }
 
 pub fn sys_getrlimit(resource: usize, rlim: *mut RLimit) -> isize {

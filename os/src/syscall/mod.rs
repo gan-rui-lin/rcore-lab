@@ -10,6 +10,10 @@
 //! `sys_` then the name of the syscall. You can find functions like this in
 //! submodules, and you should also implement syscalls this way.
 
+/// capget syscall
+const SYSCALL_CAPGET: usize = 90;
+/// capset syscall
+const SYSCALL_CAPSET: usize = 91;
 /// getcwd syscall
 const SYSCALL_GETCWD: usize = 17;
 /// dup syscall
@@ -141,6 +145,8 @@ const SYSCALL_KILL: usize = 129;
 const SYSCALL_TKILL: usize = 130;
 /// tgkill syscall
 const SYSCALL_TGKILL: usize = 131;
+/// rt_sigsuspend syscall
+const SYSCALL_RT_SIGSUSPEND: usize = 133;
 /// sigaction syscall
 const SYSCALL_SIGACTION: usize = 134;
 /// sigprocmask syscall
@@ -151,10 +157,22 @@ const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
 const SYSCALL_SIGRETURN: usize = 139;
 /// setpriority syscall
 const SYSCALL_SET_PRIORITY: usize = 140;
+/// setregid syscall
+const SYSCALL_SETREGID: usize = 143;
 /// setgid syscall
 const SYSCALL_SETGID: usize = 144;
+/// setreuid syscall
+const SYSCALL_SETREUID: usize = 145;
 /// setuid syscall
 const SYSCALL_SETUID: usize = 146;
+/// setresuid syscall
+const SYSCALL_SETRESUID: usize = 147;
+/// getresuid syscall
+const SYSCALL_GETRESUID: usize = 148;
+/// setresgid syscall
+const SYSCALL_SETRESGID: usize = 149;
+/// getresgid syscall
+const SYSCALL_GETRESGID: usize = 150;
 /// times syscall
 const SYSCALL_TIMES: usize = 153;
 /// setpgid syscall
@@ -165,6 +183,9 @@ const SYSCALL_GETPGID: usize = 155;
 const SYSCALL_GETSID: usize = 156;
 /// setsid syscall
 const SYSCALL_SETSID: usize = 157;
+/// adjtimex syscall
+const SYSCALL_ADJTIMEX: usize = 171;
+const SYSCALL_PRCTL: usize = 167;
 /// uname syscall
 const SYSCALL_UNAME: usize = 160;
 /// getrlimit syscall
@@ -726,6 +747,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
         SYSCALL_TKILL => process::sys_tkill(args[0] as isize, args[1] as i32),
         SYSCALL_TGKILL => process::sys_tgkill(args[0] as isize, args[1] as isize, args[2] as i32),
+        SYSCALL_RT_SIGSUSPEND => process::sys_rt_sigsuspend(args[0] as *const usize, args[1]),
         SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
             args[0] as *const usize,
             args[1] as *mut usize,
@@ -758,12 +780,20 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CONDVAR_WAIT => sys_condvar_wait(args[0], args[1]),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETPPID => sys_getppid(),
+        SYSCALL_CAPGET => process::sys_capget(args[0] as *mut u8, args[1] as *mut u8),
+        SYSCALL_CAPSET => process::sys_capset(args[0] as *const u8, args[1] as *const u8),
         SYSCALL_GETUID => sys_getuid(),
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
+        SYSCALL_SETREGID => process::sys_setregid(args[0] as u32, args[1] as u32),
         SYSCALL_SETGID => sys_setgid(args[0] as u32),
+        SYSCALL_SETREUID => process::sys_setreuid(args[0] as u32, args[1] as u32),
         SYSCALL_SETUID => sys_setuid(args[0] as u32),
+        SYSCALL_SETRESUID => process::sys_setresuid(args[0] as u32, args[1] as u32, args[2] as u32),
+        SYSCALL_GETRESUID => process::sys_getresuid(args[0] as *mut u32, args[1] as *mut u32, args[2] as *mut u32),
+        SYSCALL_SETRESGID => process::sys_setresgid(args[0] as u32, args[1] as u32, args[2] as u32),
+        SYSCALL_GETRESGID => process::sys_getresgid(args[0] as *mut u32, args[1] as *mut u32, args[2] as *mut u32),
         SYSCALL_SETPGID => sys_setpgid(args[0] as isize, args[1] as isize),
         SYSCALL_GETPGID => sys_getpgid(args[0] as isize),
         SYSCALL_GETSID => sys_getsid(args[0] as isize),
@@ -824,6 +854,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2] as u32),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
+        SYSCALL_ADJTIMEX => process::sys_adjtimex(args[0] as *mut u8),
+        SYSCALL_PRCTL => process::sys_prctl(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0], args[1] as *mut TimeSpec),
@@ -847,8 +879,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SOCKETPAIR => crate::net::syscall::sys_socketpair(),
         SYSCALL_BIND => crate::net::syscall::sys_bind(args[0], args[1] as *const u8, args[2]),
         SYSCALL_LISTEN => crate::net::syscall::sys_listen(args[0], args[1]),
-        SYSCALL_ACCEPT | SYSCALL_ACCEPT4 => {
-            crate::net::syscall::sys_accept(args[0], args[1] as *mut u8, args[2] as *mut u32)
+        SYSCALL_ACCEPT => {
+            crate::net::syscall::sys_accept(args[0], args[1] as *mut u8, args[2] as *mut u32, 0)
+        }
+        SYSCALL_ACCEPT4 => {
+            crate::net::syscall::sys_accept(args[0], args[1] as *mut u8, args[2] as *mut u32, args[3])
         }
         SYSCALL_CONNECT => crate::net::syscall::sys_connect(args[0], args[1] as *const u8, args[2]),
         SYSCALL_GETSOCKNAME => {
