@@ -1031,7 +1031,13 @@ impl MapArea {
                 return;
             }
         }
-        let frame = frame_alloc().unwrap();
+        let frame = match frame_alloc() {
+            Some(f) => f,
+            None => {
+                error!("[map_one] frame_alloc OOM for vpn={:#x}", vpn.0);
+                return;
+            }
+        };
         let ppn: PhysPageNum = frame.ppn;
         // Zero the frame — anonymous mmap and BSS require zero-initialized pages.
         ppn.get_bytes_array().fill(0);

@@ -31,11 +31,12 @@ pub(super) fn handle_user_page_fault(addr: usize) {
     // Not COW-able: log and SIGSEGV
     let trap_cx = current_trap_cx();
     error!(
-        "[kernel] trap_handler: page fault addr={:#x} sepc={:#x} ra={:#x} sp={:#x}",
+        "[kernel] trap_handler: page fault addr={:#x} sepc={:#x} ra={:#x} sp={:#x} tp={:#x}",
         addr,
         trap_cx.sepc,
         trap_cx[TrapFrameArgs::RA],
-        trap_cx[TrapFrameArgs::SP]
+        trap_cx[TrapFrameArgs::SP],
+        trap_cx[TrapFrameArgs::TLS]
     );
     current_add_signal(SignalFlags::SIGSEGV);
 }

@@ -35,6 +35,7 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
 }
 
+#[allow(dead_code)]
 fn dump_user_bytes(tag: &str, token: usize, addr: usize, len: usize) {
     let page_table = PageTable::from_token(token);
     let end = addr.saturating_add(len);
@@ -788,24 +789,12 @@ pub fn sys_clone(
     if !stack.is_null() {
         new_trap_cx[TrapFrameArgs::SP] = stack as usize;
     }
-    if clone_flags.contains(CloneFlags::SETTLS) && !tls.is_null() {
+    if clone_flags.contains(CloneFlags::SETTLS) {
         new_trap_cx[TrapFrameArgs::TLS] = tls as usize;
-        let name = current_process().inner_exclusive_access().name.clone();
-        if name == "entry-static.exe" {
-            let token = current_user_token();
-            let tls_addr = tls as usize;
-            info!(
-                "[clone-tls] pid={} tid={} tls={:#x} stack={:#x}",
-                pid,
-                new_task_tid,
-                tls_addr,
-                stack as usize
-            );
-            let base = tls_addr.saturating_sub(256);
-            dump_user_bytes("tp-0x100", token, base, 128);
-            dump_user_bytes("tp-0x80", token, tls_addr.saturating_sub(128), 128);
-            dump_user_bytes("tp+0x0", token, tls_addr, 64);
-        }
+        info!(
+            "[clone-tls] pid={} tid={} tls={:#x} stack={:#x} SETTLS applied",
+            pid, new_task_tid, tls as usize, stack as usize
+        );
     }
     drop(new_task_inner);
     if clone_flags.contains(CloneFlags::CHILD_CLEARTID) && !ctid.is_null() {
@@ -1872,22 +1861,10 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     //         }
     //     }
     // }
+    let aligned_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     inner
         .memory_set
-        .remove_area_with_start_vpn(VirtAddr(start).floor());
-    // if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
-    //     let after = inner
-    //         .memory_set
-    //         .overlap_count(VirtAddr(start), VirtAddr(start + len));
-    //     trace!(
-    //         "[sys_munmap] pid={} name={} start={:#x} len={:#x} overlap_after={}",
-    //         pid,
-    //         inner.name,
-    //         start,
-    //         len,
-    //         after
-    //     );
-    // }
+        .unmap_range(VirtAddr(start), VirtAddr(start + aligned_len));
     0
 }
 
