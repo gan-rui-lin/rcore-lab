@@ -842,6 +842,18 @@ fn exec_image_cache_key(_path: &str) -> Option<&'static str> {
 }
 
 fn read_exec_image(path: &str, file: &Arc<dyn File>) -> Arc<[u8]> {
+    // TODO: Replace eager read_all() in exec with a file-backed Reader + lazy page loading.
+    // This keeps current behavior stable first; page-fault-driven loading can be added later.
+    if let Some(inode) = file.inode() {
+        let file_size = inode.size();
+        if file_size >= 8 * 1024 * 1024 {
+            info!(
+                "[exec-image] large file path={} size={} bytes",
+                path,
+                file_size
+            );
+        }
+    }
     if let Some(key) = exec_image_cache_key(path) {
         if let Some(cached) = EXEC_IMAGE_CACHE.exclusive_access().get(key).cloned() {
             return cached;

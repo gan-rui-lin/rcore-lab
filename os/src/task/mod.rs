@@ -38,6 +38,7 @@ pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
 pub use manager::{
     add_task, pid2process, pid2process_snapshot, ready_queue_snapshot, remove_from_pid2process,
     remove_task, wakeup_task, pid2process_len, ready_queue_len, pid2process_aggregate,
+    pid2process_fdtable_summary,
 };
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
