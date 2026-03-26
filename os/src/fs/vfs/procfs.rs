@@ -185,6 +185,20 @@ impl VfsInode for ProcPidDirInode {
         match name {
             "stat" => Some(ProcPidStatInode::new(self.pid)),
             "maps" => Some(ProcPidMapsInode::new(self.pid)),
+            // /proc/self/mounts, /proc/self/mountinfo, /proc/self/mountstats
+            "mounts" => Some(ProcFileInode::new(proc_mounts)),
+            "mountinfo" => Some(ProcFileInode::new(proc_mountinfo)),
+            "mountstats" => Some(ProcFileInode::new(|| String::from("device rootfs mounted on / with fstype rootfs\n"))),
+            // /proc/self/cgroup - needed by cgroup tests
+            "cgroup" => Some(ProcFileInode::new(|| String::from("0::/\n"))),
+            // /proc/self/status - needed by various tests
+            "status" => Some(ProcPidStatusInode::new(self.pid)),
+            // /proc/self/fd - file descriptor directory
+            "fd" => Some(ProcStaticDirInode::new(BTreeMap::new())),
+            // /proc/self/cmdline
+            "cmdline" => Some(ProcFileInode::new(|| String::from("\0"))),
+            // /proc/self/environ
+            "environ" => Some(ProcFileInode::new(|| String::from("\0"))),
             _ => None,
         }
     }
@@ -196,7 +210,18 @@ impl VfsInode for ProcPidDirInode {
     fn truncate(&self) {}
 
     fn list(&self) -> Vec<String> {
-        vec![String::from("maps"), String::from("stat")]
+        vec![
+            String::from("maps"),
+            String::from("stat"),
+            String::from("status"),
+            String::from("mounts"),
+            String::from("mountinfo"),
+            String::from("mountstats"),
+            String::from("cgroup"),
+            String::from("fd"),
+            String::from("cmdline"),
+            String::from("environ"),
+        ]
     }
 }
 
@@ -341,8 +366,87 @@ impl VfsInode for ProcPidStatInode {
     }
 }
 
+struct ProcPidStatusInode {
+    pid: usize,
+}
+
+impl ProcPidStatusInode {
+    fn new(pid: usize) -> Arc<Self> {
+        Arc::new(Self { pid })
+    }
+
+    fn render(&self) -> String {
+        let Some(process) = pid2process(self.pid) else {
+            return String::new();
+        };
+        let inner = process.inner_exclusive_access();
+        let name = inner.name.clone();
+        let pid = self.pid;
+        let uid = inner.effective_uid;
+        drop(inner);
+        format!(
+            "Name:\t{name}\n\
+             Pid:\t{pid}\n\
+             PPid:\t0\n\
+             Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n\
+             Gid:\t0\t0\t0\t0\n\
+             VmRSS:\t0 kB\n\
+             Threads:\t1\n"
+        )
+    }
+}
+
+impl VfsInode for ProcPidStatusInode {
+    fn kind(&self) -> VfsNodeKind {
+        VfsNodeKind::File
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let content = self.render();
+        let bytes = content.as_bytes();
+        if offset >= bytes.len() {
+            return 0;
+        }
+        let n = core::cmp::min(buf.len(), bytes.len() - offset);
+        buf[..n].copy_from_slice(&bytes[offset..offset + n]);
+        n
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        buf.len()
+    }
+
+    fn lookup(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
+        None
+    }
+
+    fn truncate(&self) {}
+
+    fn list(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn size(&self) -> usize {
+        self.render().as_bytes().len()
+    }
+}
+
 fn proc_mounts() -> String {
-    String::from("proc /proc proc rw 0 0\nrootfs / rootfs rw 0 0\n")
+    String::from(
+        "rootfs / rootfs rw 0 0\n\
+         proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n",
+    )
+}
+
+fn proc_mountinfo() -> String {
+    String::from(
+        "1 0 0:1 / / rw,relatime shared:1 - rootfs rootfs rw\n\
+         2 1 0:4 / /proc rw,nosuid,nodev,noexec,relatime shared:2 - proc proc rw\n",
+    )
 }
 
 fn proc_meminfo() -> String {
@@ -389,9 +493,30 @@ pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
         ProcStaticDirInode::new(kernel_entries),
     );
     entries.insert(String::from("mounts"), ProcFileInode::new(proc_mounts));
+    entries.insert(String::from("mountinfo"), ProcFileInode::new(proc_mountinfo));
     entries.insert(String::from("meminfo"), ProcFileInode::new(proc_meminfo));
     entries.insert(String::from("stat"), ProcFileInode::new(proc_stat));
     entries.insert(String::from("sys"), ProcStaticDirInode::new(sys_entries));
     entries.insert(String::from("uptime"), ProcFileInode::new(proc_uptime));
+    // /proc/cgroups - needed by cgroup tests (empty = no cgroup controllers)
+    entries.insert(
+        String::from("cgroups"),
+        ProcFileInode::new(|| {
+            String::from("#subsys_name\thierarchy\tnum_cgroups\tenabled\n")
+        }),
+    );
+    // /proc/filesystems - needed by various tests
+    entries.insert(
+        String::from("filesystems"),
+        ProcFileInode::new(|| {
+            String::from(
+                "nodev\tsysfs\n\
+                 nodev\ttmpfs\n\
+                 nodev\tproc\n\
+                 \text4\n\
+                 nodev\tdevtmpfs\n",
+            )
+        }),
+    );
     ProcRootInode::new(entries)
 }
