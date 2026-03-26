@@ -549,12 +549,20 @@ pub fn sys_setitimer(which: i32, new_value: *const u8, old_value: *mut u8) -> is
     if !old_value.is_null() {
         let inner = process.inner_exclusive_access();
         let now = get_time_ms();
-        let remaining = if inner.itimer_real_expire_ms > now {
-            inner.itimer_real_expire_ms - now
+        let expire = inner.itimer_real_expire_ms;
+        let interval = inner.itimer_real_interval_ms;
+        let remaining = if expire > now {
+            expire - now
         } else {
             0
         };
-        let (int_sec, int_usec) = ms_to_timeval(inner.itimer_real_interval_ms);
+        if remaining > 0 {
+            log::warn!(
+                "[setitimer] pid={} OLD remaining={}ms expire={} interval={} now={}",
+                process.pid.0, remaining, expire, interval, now
+            );
+        }
+        let (int_sec, int_usec) = ms_to_timeval(interval);
         let (val_sec, val_usec) = ms_to_timeval(remaining);
         drop(inner);
 

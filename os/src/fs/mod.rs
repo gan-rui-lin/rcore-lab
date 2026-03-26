@@ -210,6 +210,11 @@ pub fn ensure_basic_paths() {
     write_file_if_missing("/etc/group", "root:x:0:\n");
     write_file_if_missing("/etc/localtime", "");
     write_file_if_missing("/etc/adjtime", "");
+    // netperf needs /etc/protocols for getprotobyname()
+    write_file_if_missing(
+        "/etc/protocols",
+        "ip\t0\tIP\nicmp\t1\tICMP\ntcp\t6\tTCP\nudp\t17\tUDP\n",
+    );
 
     write_file_if_missing("/dev/null", "");
     write_file_if_missing("/dev/zero", "");
