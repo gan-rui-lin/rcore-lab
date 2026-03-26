@@ -211,6 +211,8 @@ const SYSCALL_EXEC: usize = 221;
 const SYSCALL_MMAP: usize = 222;
 /// mprotect syscall
 const SYSCALL_MPROTECT: usize = 226;
+/// madvise syscall
+const SYSCALL_MADVISE: usize = 233;
 /// waitpid syscall
 const SYSCALL_WAITPID: usize = 260;
 /// prlimit64 syscall
@@ -755,6 +757,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
+        SYSCALL_MADVISE => 0, // stub: madvise hints are advisory only
         SYSCALL_SBRK => sys_sbrk(args[0] as isize),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
