@@ -42,17 +42,38 @@ impl VfsFile {
 
     pub fn read_all(&self) -> Vec<u8> {
         let mut inner = self.inner.exclusive_access();
+        let file_size = inner.inode.size();
         let mut offset = 0usize;
-        let mut buf = [0u8; 512];
-        let mut out = Vec::new();
-        loop {
-            let n = inner.inode.read_at(offset, &mut buf);
-            if n == 0 {
-                break;
+        let out = if file_size > 0 {
+            // Pre-allocate exact size to avoid geometric Vec growth spikes
+            // when loading large ELF files in exec().
+            let mut data = Vec::with_capacity(file_size);
+            data.resize(file_size, 0);
+            const READ_ALL_CHUNK: usize = 16 * 1024;
+            while offset < file_size {
+                let end = core::cmp::min(offset + READ_ALL_CHUNK, file_size);
+                let n = inner.inode.read_at(offset, &mut data[offset..end]);
+                if n == 0 {
+                    break;
+                }
+                offset += n;
             }
-            out.extend_from_slice(&buf[..n]);
-            offset += n;
-        }
+            data.truncate(offset);
+            data
+        } else {
+            const READ_ALL_CHUNK: usize = 4096;
+            let mut data = Vec::new();
+            let mut buf = [0u8; READ_ALL_CHUNK];
+            loop {
+                let n = inner.inode.read_at(offset, &mut buf);
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n]);
+                offset += n;
+            }
+            data
+        };
         inner.offset = offset;
         out
     }

@@ -1,4 +1,5 @@
 DOCKER_NAME ?= rcore-docker
+LOG ?= OFF
 .PHONY: docker build_docker rv la all debug clean
 	
 docker:

@@ -2,7 +2,7 @@
 use super::{File, PollEvents};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
-use crate::task::suspend_current_and_run_next;
+use crate::task::{has_pending_unmasked_signal, suspend_current_and_run_next};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -120,6 +120,9 @@ impl File for PipeEnd {
                 if total > 0 {
                     return total;
                 }
+                if has_pending_unmasked_signal(true) {
+                    return usize::MAX; // EINTR sentinel
+                }
                 drop(pipe);
                 suspend_current_and_run_next();
             }
@@ -146,6 +149,9 @@ impl File for PipeEnd {
                 } else {
                     if total > 0 {
                         return total;
+                    }
+                    if has_pending_unmasked_signal(true) {
+                        return usize::MAX; // EINTR sentinel
                     }
                     drop(pipe);
                     suspend_current_and_run_next();

@@ -13,7 +13,7 @@ pub mod syscall {
     use super::ENOSYS;
 
     pub fn sys_socket(_domain: usize, _ty: usize, _protocol: usize) -> isize { -ENOSYS }
-    pub fn sys_socketpair() -> isize { -ENOSYS }
+    pub fn sys_socketpair(_domain: usize, _ty: usize, _protocol: usize, _sv: *mut i32) -> isize { -ENOSYS }
     pub fn sys_bind(_fd: usize, _addr: *const u8, _len: usize) -> isize { -ENOSYS }
     pub fn sys_listen(_fd: usize, _backlog: usize) -> isize { -ENOSYS }
     pub fn sys_accept(_fd: usize, _addr: *mut u8, _len: *mut u32) -> isize { -ENOSYS }
