@@ -397,22 +397,32 @@ fn run_suite(root: &str, suite: &str) -> i32 {
 /// Kill orphan daemon processes and reap zombies.
 fn reap_orphans() {
     let my_pid = user_lib::getpid();
-    for p in 2..256usize {
+    for p in 2..512usize {
         if p as isize != my_pid {
             let _ = kill(p, SIGKILL);
         }
     }
-    // Reap with WNOHANG to avoid blocking
+    // Reap with WNOHANG until ECHILD — give killed processes time to exit.
     let mut status: i32 = 0;
-    for _ in 0..100 {
+    let mut yields_without_reap = 0usize;
+    loop {
         let ret = user_lib::waitpid_nohang(-1i32 as usize, &mut status);
-        if ret > 0 { continue; } // reaped one
+        if ret > 0 {
+            // Reaped one zombie, reset counter and keep going
+            yields_without_reap = 0;
+            continue;
+        }
         if ret == 0 {
-            // children exist but none exited yet
+            // Children exist but none exited yet — yield and retry
+            yields_without_reap += 1;
+            if yields_without_reap > 500 {
+                // Safety valve: give up after many yields
+                break;
+            }
             user_lib::sys_yield();
             continue;
         }
-        break; // ECHILD or error
+        break; // ECHILD or error — no more children
     }
 }
 
