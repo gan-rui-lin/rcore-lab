@@ -13,6 +13,7 @@ use crate::mm::{translated_byte_buffer, translated_refmut};
 use crate::task::{current_process, current_task, current_user_token, suspend_current_and_run_next};
 
 use super::socket_file::{SocketFile, SocketType};
+use super::unix_socket::{unix_registry_has, unix_registry_insert, UnixSocketFile};
 use super::{alloc_ephemeral_port, poll_net, NET_STACK};
 
 /// Check if the current task has pending unmasked signals.
@@ -28,11 +29,13 @@ fn has_pending_signal() -> bool {
 }
 
 // Address family
+const AF_UNIX: usize = 1;
 const AF_INET: usize = 2;
 
 // Socket types
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
+const SOCK_SEQPACKET: usize = 5;
 const SOCK_NONBLOCK: usize = 0o4000;
 const SOCK_CLOEXEC: usize = 0o2000000;
 
@@ -58,6 +61,7 @@ const EADDRINUSE: isize = -98;
 const ENOTCONN: isize = -107;
 const ECONNREFUSED: isize = -111;
 const EFAULT: isize = -14;
+const EACCES: isize = -13;
 const EMFILE: isize = -24;
 const EMSGSIZE: isize = -90;
 const EOPNOTSUPP: isize = -95;
@@ -180,13 +184,30 @@ fn get_socket_extra(fd: usize) -> Result<(SocketHandle, SocketType, u16, bool), 
 
 /// sys_socket(domain, type, protocol) -> fd
 pub fn sys_socket(domain: usize, sock_type: usize, _protocol: usize) -> isize {
-    if domain != AF_INET {
-        return EAFNOSUPPORT;
-    }
-
     let base_type = sock_type & 0xFF;
     let nonblock = (sock_type & SOCK_NONBLOCK) != 0;
     let cloexec = (sock_type & SOCK_CLOEXEC) != 0;
+
+    // Handle AF_UNIX domain sockets
+    if domain == AF_UNIX {
+        let unix_type = match base_type {
+            SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET => base_type as u8,
+            _ => return EINVAL,
+        };
+        let sock = UnixSocketFile::new(unix_type, nonblock, cloexec);
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        let fd = match inner.alloc_fd() {
+            Some(fd) => fd,
+            None => return EMFILE,
+        };
+        inner.fd_table[fd] = Some(sock);
+        return fd as isize;
+    }
+
+    if domain != AF_INET {
+        return EAFNOSUPPORT;
+    }
 
     let st = match base_type {
         SOCK_STREAM => SocketType::Tcp,
@@ -252,9 +273,122 @@ fn endpoint_to_listen(ep: &IpEndpoint) -> IpListenEndpoint {
     }
 }
 
+/// Read the address family (first 2 bytes) from a user sockaddr.
+fn read_sockaddr_family(addr_ptr: *const u8, addr_len: usize, token: usize) -> Option<u16> {
+    if addr_ptr.is_null() || addr_len < 2 {
+        return None;
+    }
+    let bufs = translated_byte_buffer(token, addr_ptr, 2);
+    let mut raw = [0u8; 2];
+    let mut offset = 0;
+    for buf in bufs.iter() {
+        let n = buf.len().min(2 - offset);
+        raw[offset..offset + n].copy_from_slice(&buf[..n]);
+        offset += n;
+    }
+    Some(u16::from_ne_bytes(raw))
+}
+
+/// Read AF_UNIX sockaddr path from user memory.
+/// Returns (path_string, is_abstract).
+fn read_unix_sockaddr(addr_ptr: *const u8, addr_len: usize, token: usize) -> Option<(alloc::string::String, bool)> {
+    if addr_ptr.is_null() || addr_len < 3 {
+        return None;
+    }
+    // sockaddr_un: { sa_family: u16, sun_path: [u8; 108] }
+    let max_len = addr_len.min(110);
+    let bufs = translated_byte_buffer(token, addr_ptr, max_len);
+    let mut raw = vec![0u8; max_len];
+    let mut offset = 0;
+    for buf in bufs.iter() {
+        let n = buf.len().min(max_len - offset);
+        raw[offset..offset + n].copy_from_slice(&buf[..n]);
+        offset += n;
+    }
+    // raw[0..2] = family, raw[2..] = sun_path
+    let path_bytes = &raw[2..];
+    if path_bytes.is_empty() {
+        return Some((alloc::string::String::new(), false));
+    }
+    if path_bytes[0] == 0 {
+        // Abstract socket: name starts after the leading \0
+        let name_end = path_bytes.iter().position(|&b| b == 0 && path_bytes.iter().position(|&x| x == b).unwrap_or(0) != 0)
+            .unwrap_or(path_bytes.len());
+        let name = alloc::string::String::from_utf8_lossy(&path_bytes[1..name_end]).into_owned();
+        Some((name, true))
+    } else {
+        // Pathname socket: null-terminated
+        let end = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+        let path = alloc::string::String::from_utf8_lossy(&path_bytes[..end]).into_owned();
+        Some((path, false))
+    }
+}
+
 /// sys_bind(fd, addr, addrlen) -> 0
 pub fn sys_bind(fd: usize, addr: *const u8, addr_len: usize) -> isize {
     let token = current_user_token();
+
+    // Read address family first to dispatch properly
+    let family = match read_sockaddr_family(addr, addr_len, token) {
+        Some(f) => f,
+        None => return EINVAL,
+    };
+
+    // Check if fd is valid and get file
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return EBADF;
+        }
+        let file = match inner.fd_table[fd].as_ref() {
+            Some(f) => f.clone(),
+            None => return EBADF,
+        };
+        drop(inner);
+
+        // Handle AF_UNIX sockets
+        if file.is_unix_socket() {
+            if family != AF_UNIX as u16 {
+                return EINVAL; // Can't bind unix socket to non-unix addr
+            }
+            let (path, is_abstract) = match read_unix_sockaddr(addr, addr_len, token) {
+                Some(r) => r,
+                None => return EINVAL,
+            };
+
+            // Check for ENOTDIR: if path has a non-directory component
+            // The filesystem will handle this in open_file, but we need to detect it
+            if !is_abstract && !path.is_empty() {
+                // Check if path is accessible / if parent dir exists
+                // We'll do the bind and let open_file return the error
+            }
+
+            let registry_key = if is_abstract {
+                let mut k = alloc::string::String::from("\0");
+                k.push_str(&path);
+                k
+            } else {
+                path.clone()
+            };
+            if unix_registry_has(&registry_key) {
+                return EADDRINUSE;
+            }
+
+            let ret = file.unix_do_bind(path, is_abstract);
+            if ret == 0 {
+                unix_registry_insert(registry_key, file.clone());
+            }
+            return ret;
+        }
+
+        // For INET sockets bound to AF_UNIX addr → EAFNOSUPPORT
+        if family == AF_UNIX as u16 {
+            return EAFNOSUPPORT;
+        }
+    }
+
+    // Original INET bind logic
     let ep = match read_sockaddr(addr, addr_len, token) {
         Some(ep) => ep,
         None => return EINVAL,
@@ -266,6 +400,15 @@ pub fn sys_bind(fd: usize, addr: *const u8, addr_len: usize) -> isize {
     };
 
     let listen_ep = endpoint_to_listen(&ep);
+
+    // Check privileged port access (ports < 1024 require root)
+    if listen_ep.port > 0 && listen_ep.port < 1024 {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        if inner.effective_uid != 0 {
+            return EACCES;
+        }
+    }
 
     let mut net = NET_STACK.exclusive_access();
     let stack = match net.as_mut() {
@@ -353,8 +496,9 @@ pub fn sys_listen(fd: usize, _backlog: usize) -> isize {
     0
 }
 
-/// sys_accept(listen_fd, addr, addrlen) -> new_fd
-pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
+/// sys_accept(listen_fd, addr, addrlen, flags) -> new_fd
+/// flags: SOCK_CLOEXEC=0o2000000, SOCK_NONBLOCK=0o4000
+pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32, flags: usize) -> isize {
     let token = current_user_token();
     let (listen_handle, sock_type, bound_port, listening) = match get_socket_extra(listen_fd) {
         Ok(info) => info,
@@ -414,7 +558,12 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize 
 
             // Swap: the accepted connection keeps listen_handle,
             // but update the listen fd to point to new_listen_handle
-            let accepted_file = Arc::new(SocketFile::new(listen_handle, SocketType::Tcp));
+            let accepted_file = {
+                let mut sf = SocketFile::new(listen_handle, SocketType::Tcp);
+                sf.cloexec = (flags & SOCK_CLOEXEC) != 0;
+                sf.nonblock = (flags & SOCK_NONBLOCK) != 0;
+                Arc::new(sf)
+            };
 
             // Update listen fd to new listen socket
             let process = current_process();
