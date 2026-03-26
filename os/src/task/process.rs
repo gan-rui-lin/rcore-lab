@@ -604,12 +604,22 @@ impl ProcessControlBlock {
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
+        // info!(
+        //     "[fork-stage] pid={} start: children={} tasks={} fd_table_len={}",
+        //     self.pid.0,
+        //     parent.children.len(),
+        //     parent.tasks.iter().filter(|t| t.is_some()).count(),
+        //     parent.fd_table.len()
+        // );
+        // info!("[fork-stage] pid={} before memory_set clone", self.pid.0);
         let memory_set = MemorySet::from_existed_user(&mut parent.memory_set);
+        // info!("[fork-stage] pid={} after memory_set clone", self.pid.0);
 
         // TLS pages are already cloned via MemorySet::from_existed_user.
         let tls_area = parent.tls_area.clone();
 
         let pid = pid_alloc();
+        info!("[fork-stage] pid={} before fd_table clone", self.pid.0);
         let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
         for fd in parent.fd_table.iter() {
             if let Some(file) = fd {
@@ -618,6 +628,12 @@ impl ProcessControlBlock {
                 new_fd_table.push(None);
             }
         }
+        info!(
+            "[fork-stage] pid={} after fd_table clone new_len={}",
+            self.pid.0,
+            new_fd_table.len()
+        );
+        let _new_pid_value = pid.0;
         let child = Arc::new(Self {
             pid,
             inner: unsafe {
@@ -650,7 +666,9 @@ impl ProcessControlBlock {
                 })
             },
         });
+        // info!("[fork-stage] pid={} child pcb allocated new_pid={}", self.pid.0, new_pid_value);
         parent.children.push(Arc::clone(&child));
+        info!("[fork-stage] pid={} child linked to parent", self.pid.0);
         let ustack_base = parent
             .get_task(0)
             .inner_exclusive_access()
@@ -667,15 +685,19 @@ impl ProcessControlBlock {
             ustack_base,
             false,
         ));
+        // info!("[fork-stage] pid={} child task allocated", self.pid.0);
         let mut child_inner = child.inner_exclusive_access();
         child_inner.tasks.push(Some(Arc::clone(&task)));
+        // info!("[fork-stage] pid={} child task linked", self.pid.0);
         drop(child_inner);
         let mut task_inner = task.inner_exclusive_access();
         // 子进程继承父进程的信号掩码（Linux 语义：fork 继承 signal_mask）
         task_inner.signal_mask = parent_signal_mask;
         drop(task_inner);
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
+        // info!("[fork-stage] pid={} child inserted pid2process", self.pid.0);
         add_task(task);
+        // info!("[fork-stage] pid={} child added ready queue", self.pid.0);
         child
     }
 

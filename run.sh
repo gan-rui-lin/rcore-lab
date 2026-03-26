@@ -214,7 +214,7 @@ fi
 echo "启动QEMU模拟器..."
 qemu-system-riscv64 -machine virt \
     -kernel kernel-rv \
-  -m 128M \
+  -m 1024M \
   -nographic \
   -smp 1 \
   -bios default \
