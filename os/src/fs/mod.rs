@@ -7,7 +7,7 @@ mod vfs;
 use crate::mm::UserBuffer;
 #[cfg(feature = "ext4")]
 use alloc::ffi::CString;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 #[cfg(feature = "ext4")]
 use lwext4_rust::bindings::ext4_flink;
@@ -85,6 +85,40 @@ pub trait File: Send + Sync {
     fn set_connected_remote(&self, _addr: smoltcp::wire::IpEndpoint) {}
     /// Optional: get the connected remote endpoint for UDP sockets (used by getpeername()).
     fn get_connected_remote(&self) -> Option<smoltcp::wire::IpEndpoint> { None }
+    /// Returns true if this file is an AF_UNIX domain socket.
+    fn is_unix_socket(&self) -> bool { false }
+    /// For AF_UNIX sockets: get address family (always 1) and socket type.
+    fn unix_socket_type(&self) -> u8 { 0 }
+    /// For AF_UNIX sockets: bind to a path.
+    /// `path`: the sun_path bytes (null-terminated or abstract if first byte is \0).
+    /// Returns 0 on success, negative errno on failure.
+    fn unix_do_bind(&self, _path: alloc::string::String, _is_abstract: bool) -> isize { -88 }
+    /// For AF_UNIX sockets: get the bound path (None if unbound).
+    fn unix_bound_path(&self) -> Option<alloc::string::String> { None }
+    /// For AF_UNIX sockets: mark as listening with given backlog.
+    fn unix_do_listen(&self, _backlog: usize) -> isize { -95 } // EOPNOTSUPP
+    /// For AF_UNIX sockets: accept a pending connection. Returns new socket file or None.
+    fn unix_do_accept(&self) -> Option<alloc::sync::Arc<dyn File>> { None }
+    /// For AF_UNIX sockets: connect to a listening socket.
+    fn unix_do_connect(&self, _path: alloc::string::String, _is_abstract: bool) -> isize { -111 } // ECONNREFUSED
+    /// For AF_UNIX sockets: read data, returns bytes read.
+    fn unix_read(&self, _buf: &mut [u8]) -> isize { 0 }
+    /// For AF_UNIX sockets: write data, returns bytes written.
+    fn unix_write(&self, _buf: &[u8]) -> isize { -32 } // EPIPE
+    /// For AF_UNIX sockets: peek/check if readable.
+    fn unix_readable(&self) -> bool { false }
+    /// For AF_UNIX sockets: poll events.
+    fn unix_poll(&self, _events: PollEvents) -> PollEvents { PollEvents::empty() }
+    /// For AF_UNIX sockets: push bytes into receive queue (internal use).
+    fn unix_push_rx_bytes(&self, _data: &[u8]) -> usize { 0 }
+    /// For AF_UNIX sockets: push an accepted socket into listen backlog (internal use).
+    fn unix_push_backlog(&self, _sock: Arc<dyn File>) {}
+    /// For AF_UNIX sockets: set peer socket by dynamic weak pointer (internal use).
+    fn unix_set_peer_dyn(&self, _peer: Weak<dyn File>) {}
+    /// For AF_UNIX sockets: mark peer as closed (internal use).
+    fn unix_mark_peer_closed(&self) {}
+    /// For AF_UNIX sockets: get current internal state code.
+    fn unix_get_state_u8(&self) -> u8 { 0 }
 }
 
 /// Linux-compatible stat layout (riscv64, matches musl struct stat).
