@@ -188,7 +188,7 @@ echo "===================================="
 
 qemu-system-riscv64 -machine virt \
   -kernel kernel-qemu \
-  -m 128M \
+  -m 1024M \
   -nographic \
   -smp 1 \
   -bios default \

@@ -33,6 +33,13 @@ use crate::sync::UPIntrFreeCell;
 lazy_static! {
     static ref EXEC_IMAGE_CACHE: UPIntrFreeCell<BTreeMap<String, Arc<[u8]>>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref ITIMER_STATE: UPIntrFreeCell<[ITimerVal; 3]> =
+        unsafe { UPIntrFreeCell::new([ITimerVal::default(); 3]) };
+    static ref UMASK_STATE: UPIntrFreeCell<usize> =
+        unsafe { UPIntrFreeCell::new(0o022) };
+    /// Per-process ITIMER_REAL: pid → (deadline_us, interval_us). deadline=0 means disarmed.
+    static ref ITIMER_REAL_MAP: UPIntrFreeCell<BTreeMap<usize, (u64, u64)>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
 }
 
 #[allow(dead_code)]
@@ -76,11 +83,53 @@ pub struct TimeSpec {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct TimeValI64 {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ITimerVal {
+    pub it_interval: TimeValI64,
+    pub it_value: TimeValI64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Tms {
     pub tms_utime: i64,
     pub tms_stime: i64,
     pub tms_cutime: i64,
     pub tms_cstime: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RUsageTimeVal {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RUsage {
+    pub ru_utime: RUsageTimeVal,
+    pub ru_stime: RUsageTimeVal,
+    pub ru_maxrss: i64,
+    pub ru_ixrss: i64,
+    pub ru_idrss: i64,
+    pub ru_isrss: i64,
+    pub ru_minflt: i64,
+    pub ru_majflt: i64,
+    pub ru_nswap: i64,
+    pub ru_inblock: i64,
+    pub ru_oublock: i64,
+    pub ru_msgsnd: i64,
+    pub ru_msgrcv: i64,
+    pub ru_nsignals: i64,
+    pub ru_nvcsw: i64,
+    pub ru_nivcsw: i64,
 }
 
 #[repr(C)]
@@ -505,150 +554,6 @@ pub fn sys_getppid() -> isize {
     }
 }
 
-pub fn sys_getrusage(who: i32, usage: usize) -> isize {
-    let _ = who;
-    if usage == 0 {
-        return 0;
-    }
-    // Zero out the rusage struct (18 * 8 = 144 bytes)
-    let token = current_user_token();
-    let bufs = translated_byte_buffer(token, usage as *const u8, 144);
-    for buf in bufs {
-        buf.fill(0);
-    }
-    0
-}
-
-/// Linux itimerval: two timeval structs (each 16 bytes on 64-bit).
-/// struct itimerval { struct timeval it_interval; struct timeval it_value; }
-/// struct timeval { long tv_sec; long tv_usec; }
-fn timeval_to_ms(sec: i64, usec: i64) -> usize {
-    if sec == 0 && usec == 0 {
-        return 0;
-    }
-    (sec as usize) * 1000 + (usec as usize) / 1000
-}
-
-fn ms_to_timeval(ms: usize) -> (i64, i64) {
-    let sec = (ms / 1000) as i64;
-    let usec = ((ms % 1000) * 1000) as i64;
-    (sec, usec)
-}
-
-pub fn sys_setitimer(which: i32, new_value: *const u8, old_value: *mut u8) -> isize {
-    use crate::timer::get_time_ms;
-
-    // Only support ITIMER_REAL (0)
-    if which != 0 {
-        return 0; // silently ignore ITIMER_VIRTUAL/ITIMER_PROF
-    }
-
-    let token = current_user_token();
-    let process = current_process();
-
-    // Write old value if requested
-    if !old_value.is_null() {
-        let inner = process.inner_exclusive_access();
-        let now = get_time_ms();
-        let expire = inner.itimer_real_expire_ms;
-        let interval = inner.itimer_real_interval_ms;
-        let remaining = if expire > now {
-            expire - now
-        } else {
-            0
-        };
-        if remaining > 0 {
-            log::warn!(
-                "[setitimer] pid={} OLD remaining={}ms expire={} interval={} now={}",
-                process.pid.0, remaining, expire, interval, now
-            );
-        }
-        let (int_sec, int_usec) = ms_to_timeval(interval);
-        let (val_sec, val_usec) = ms_to_timeval(remaining);
-        drop(inner);
-
-        let mut buf = [0u8; 32];
-        buf[0..8].copy_from_slice(&int_sec.to_ne_bytes());
-        buf[8..16].copy_from_slice(&int_usec.to_ne_bytes());
-        buf[16..24].copy_from_slice(&val_sec.to_ne_bytes());
-        buf[24..32].copy_from_slice(&val_usec.to_ne_bytes());
-        let dst = translated_byte_buffer(token, old_value, 32);
-        let mut off = 0;
-        for slice in dst {
-            let n = slice.len().min(32 - off);
-            slice[..n].copy_from_slice(&buf[off..off + n]);
-            off += n;
-        }
-    }
-
-    // Read new value
-    if !new_value.is_null() {
-        let src = translated_byte_buffer(token, new_value, 32);
-        let mut buf = [0u8; 32];
-        let mut off = 0;
-        for slice in src {
-            let n = slice.len().min(32 - off);
-            buf[off..off + n].copy_from_slice(slice);
-            off += n;
-        }
-        let int_sec = i64::from_ne_bytes(buf[0..8].try_into().unwrap());
-        let int_usec = i64::from_ne_bytes(buf[8..16].try_into().unwrap());
-        let val_sec = i64::from_ne_bytes(buf[16..24].try_into().unwrap());
-        let val_usec = i64::from_ne_bytes(buf[24..32].try_into().unwrap());
-
-        let interval_ms = timeval_to_ms(int_sec, int_usec);
-        let value_ms = timeval_to_ms(val_sec, val_usec);
-
-        let now = get_time_ms();
-        log::warn!("[setitimer] pid={} val={}ms int={}ms expire_at={}ms now={}ms",
-            process.pid.0, value_ms, interval_ms, now + value_ms, now);
-        let mut inner = process.inner_exclusive_access();
-        inner.itimer_real_interval_ms = interval_ms;
-        if value_ms == 0 {
-            inner.itimer_real_expire_ms = 0; // disarm
-        } else {
-            inner.itimer_real_expire_ms = now + value_ms;
-        }
-    }
-
-    0
-}
-
-pub fn sys_getitimer(which: i32, curr_value: *mut u8) -> isize {
-    use crate::timer::get_time_ms;
-
-    if which != 0 || curr_value.is_null() {
-        return 0;
-    }
-
-    let token = current_user_token();
-    let process = current_process();
-    let inner = process.inner_exclusive_access();
-    let now = get_time_ms();
-    let remaining = if inner.itimer_real_expire_ms > now {
-        inner.itimer_real_expire_ms - now
-    } else {
-        0
-    };
-    let (int_sec, int_usec) = ms_to_timeval(inner.itimer_real_interval_ms);
-    let (val_sec, val_usec) = ms_to_timeval(remaining);
-    drop(inner);
-
-    let mut buf = [0u8; 32];
-    buf[0..8].copy_from_slice(&int_sec.to_ne_bytes());
-    buf[8..16].copy_from_slice(&int_usec.to_ne_bytes());
-    buf[16..24].copy_from_slice(&val_sec.to_ne_bytes());
-    buf[24..32].copy_from_slice(&val_usec.to_ne_bytes());
-    let dst = translated_byte_buffer(token, curr_value, 32);
-    let mut off = 0;
-    for slice in dst {
-        let n = slice.len().min(32 - off);
-        slice[..n].copy_from_slice(&buf[off..off + n]);
-        off += n;
-    }
-    0
-}
-
 pub fn sys_setsid() -> isize {
     let process = current_process();
     let pid = process.pid.0;
@@ -789,12 +694,24 @@ pub fn sys_clone(
     if !stack.is_null() {
         new_trap_cx[TrapFrameArgs::SP] = stack as usize;
     }
-    if clone_flags.contains(CloneFlags::SETTLS) {
+    if clone_flags.contains(CloneFlags::SETTLS) && !tls.is_null() {
         new_trap_cx[TrapFrameArgs::TLS] = tls as usize;
-        info!(
-            "[clone-tls] pid={} tid={} tls={:#x} stack={:#x} SETTLS applied",
-            pid, new_task_tid, tls as usize, stack as usize
-        );
+        let name = current_process().inner_exclusive_access().name.clone();
+        if name == "entry-static.exe" {
+            let token = current_user_token();
+            let tls_addr = tls as usize;
+            info!(
+                "[clone-tls] pid={} tid={} tls={:#x} stack={:#x}",
+                pid,
+                new_task_tid,
+                tls_addr,
+                stack as usize
+            );
+            let base = tls_addr.saturating_sub(256);
+            dump_user_bytes("tp-0x100", token, base, 128);
+            dump_user_bytes("tp-0x80", token, tls_addr.saturating_sub(128), 128);
+            dump_user_bytes("tp+0x0", token, tls_addr, 64);
+        }
     }
     drop(new_task_inner);
     if clone_flags.contains(CloneFlags::CHILD_CLEARTID) && !ctid.is_null() {
@@ -926,6 +843,18 @@ fn exec_image_cache_key(_path: &str) -> Option<&'static str> {
 }
 
 fn read_exec_image(path: &str, file: &Arc<dyn File>) -> Arc<[u8]> {
+    // TODO: Replace eager read_all() in exec with a file-backed Reader + lazy page loading.
+    // This keeps current behavior stable first; page-fault-driven loading can be added later.
+    if let Some(inode) = file.inode() {
+        let file_size = inode.size();
+        if file_size >= 8 * 1024 * 1024 {
+            info!(
+                "[exec-image] large file path={} size={} bytes",
+                path,
+                file_size
+            );
+        }
+    }
     if let Some(key) = exec_image_cache_key(path) {
         if let Some(cached) = EXEC_IMAGE_CACHE.exclusive_access().get(key).cloned() {
             return cached;
@@ -1363,7 +1292,9 @@ pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
         return errno(EFAULT);
     }
     match clock_id {
-        0 | 1 => {
+        // CLOCK_REALTIME/CLOCK_MONOTONIC and common glibc probes.
+        // We currently map them to the same wall-clock source.
+        0 | 1 | 4 | 5 | 6 | 7 | 8 | 9 | 11 => {
             let us = get_time_us();
             let spec = TimeSpec {
                 tv_sec: us / 1_000_000,
@@ -1382,6 +1313,162 @@ pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
             }
         }
         _ => errno(EINVAL),
+    }
+}
+
+pub fn sys_clock_getres(clock_id: usize, res: *mut TimeSpec) -> isize {
+    if res.is_null() {
+        return 0;
+    }
+    match clock_id {
+        0 | 1 | 4 | 5 | 6 | 7 | 8 | 9 | 11 => {
+            let spec = TimeSpec {
+                tv_sec: 0,
+                tv_nsec: 1000, // 1µs resolution
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&spec as *const TimeSpec) as *const u8,
+                    core::mem::size_of::<TimeSpec>(),
+                )
+            };
+            let token = current_user_token();
+            match copy_to_user(token, res as *mut u8, bytes) {
+                Ok(_) => 0,
+                Err(err) => err,
+            }
+        }
+        _ => errno(EINVAL),
+    }
+}
+
+const ITIMER_REAL: isize = 0;
+const ITIMER_VIRTUAL: isize = 1;
+const ITIMER_PROF: isize = 2;
+
+fn itimer_index(which: isize) -> Result<usize, isize> {
+    match which {
+        ITIMER_REAL => Ok(0),
+        ITIMER_VIRTUAL => Ok(1),
+        ITIMER_PROF => Ok(2),
+        _ => Err(errno(EINVAL)),
+    }
+}
+
+fn valid_timeval64(tv: &TimeValI64) -> bool {
+    tv.tv_sec >= 0 && (0..1_000_000).contains(&tv.tv_usec)
+}
+
+fn valid_itimerval(tv: &ITimerVal) -> bool {
+    valid_timeval64(&tv.it_interval) && valid_timeval64(&tv.it_value)
+}
+
+pub fn sys_getitimer(which: isize, curr_value: *mut ITimerVal) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_getitimer", pid);
+    }
+    if curr_value.is_null() {
+        return errno(EFAULT);
+    }
+    let idx = match itimer_index(which) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let val = ITIMER_STATE.exclusive_access()[idx];
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&val as *const ITimerVal) as *const u8,
+            core::mem::size_of::<ITimerVal>(),
+        )
+    };
+    let token = current_user_token();
+    match copy_to_user(token, curr_value as *mut u8, bytes) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
+}
+
+pub fn sys_setitimer(which: isize, new_value: *const ITimerVal, old_value: *mut ITimerVal) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_setitimer", pid);
+    }
+    if new_value.is_null() {
+        return errno(EFAULT);
+    }
+    let idx = match itimer_index(which) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let token = current_user_token();
+    let new_itv = match read_from_user(token, new_value) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !valid_itimerval(&new_itv) {
+        return errno(EINVAL);
+    }
+    // Return old value
+    let old_itv = {
+        let mut timers = ITIMER_STATE.exclusive_access();
+        let old = timers[idx];
+        timers[idx] = new_itv;
+        old
+    };
+    if !old_value.is_null() {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&old_itv as *const ITimerVal) as *const u8,
+                core::mem::size_of::<ITimerVal>(),
+            )
+        };
+        if let Err(err) = copy_to_user(token, old_value as *mut u8, bytes) {
+            return err;
+        }
+    }
+    // Arm/disarm the real ITIMER_REAL timer (per-process)
+    if which == ITIMER_REAL {
+        let value_us = new_itv.it_value.tv_sec as u64 * 1_000_000
+            + new_itv.it_value.tv_usec as u64;
+        let interval_us = new_itv.it_interval.tv_sec as u64 * 1_000_000
+            + new_itv.it_interval.tv_usec as u64;
+        let mut map = ITIMER_REAL_MAP.exclusive_access();
+        if value_us == 0 {
+            map.remove(&pid);
+        } else {
+            let now = get_time_us() as u64;
+            map.insert(pid, (now + value_us, interval_us));
+        }
+    }
+    0
+}
+
+/// Called from timer interrupt to check and deliver SIGALRM for ITIMER_REAL.
+pub fn check_itimer_real() {
+    let mut map = ITIMER_REAL_MAP.exclusive_access();
+    if map.is_empty() {
+        return;
+    }
+    let now = get_time_us() as u64;
+    let mut expired: Vec<(usize, u64)> = Vec::new();
+    for (&pid, &(deadline, interval)) in map.iter() {
+        if now >= deadline {
+            expired.push((pid, interval));
+        }
+    }
+    for (pid, interval) in expired {
+        // Deliver SIGALRM
+        if let Some(process) = pid2process(pid) {
+            let mut inner = process.inner_exclusive_access();
+            inner.signal_pending |= SignalFlags::SIGALRM;
+        }
+        // Reschedule or disarm
+        if interval > 0 {
+            map.insert(pid, (now + interval, interval));
+        } else {
+            map.remove(&pid);
+        }
     }
 }
 
@@ -1511,6 +1598,33 @@ pub fn sys_times(tms: *mut Tms) -> isize {
         }
     }
     ticks as isize
+}
+
+pub fn sys_getrusage(who: isize, usage: *mut RUsage) -> isize {
+    if usage.is_null() {
+        return errno(EFAULT);
+    }
+    // Linux accepts RUSAGE_SELF(0), RUSAGE_CHILDREN(-1), RUSAGE_THREAD(1).
+    if who != 0 && who != -1 && who != 1 {
+        return errno(EINVAL);
+    }
+    let us = get_time_us() as i64;
+    let mut ru = RUsage::default();
+    ru.ru_utime = RUsageTimeVal {
+        tv_sec: us / 1_000_000,
+        tv_usec: us % 1_000_000,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&ru as *const RUsage) as *const u8,
+            core::mem::size_of::<RUsage>(),
+        )
+    };
+    let token = current_user_token();
+    match copy_to_user(token, usage as *mut u8, bytes) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
 }
 
 pub fn sys_uname(uts: *mut UtsName) -> isize {
@@ -2380,6 +2494,18 @@ pub fn sys_getegid() -> isize {
     0
 }
 
+pub fn sys_umask(mask: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_umask", pid);
+    }
+    let new_mask = mask & 0o777;
+    let mut state = UMASK_STATE.exclusive_access();
+    let old = *state;
+    *state = new_mask;
+    old as isize
+}
+
 pub fn sys_getrlimit(resource: usize, rlim: *mut RLimit) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
@@ -2636,10 +2762,117 @@ pub fn sys_rt_sigtimedwait(
 }
 
 pub fn sys_membarrier(_cmd: isize, _flags: isize) -> isize {
-    // let pid = current_process().pid.0;
-    // if crate::syscall::should_trace_syscall(pid) {
-    //     syscall!("kernel:pid[{}] sys_membarrier flags={:#x}", pid, flags);
-    // }
-    // // For simplicity, we ignore the flags and just return success.
+    0
+}
+
+/// sched_setscheduler(pid, policy, param)
+/// Stub: accept and pretend success — we only support SCHED_OTHER (0).
+pub fn sys_sched_setscheduler(_pid: usize, _policy: i32, _param: *const u8) -> isize {
+    info!("[sched] sched_setscheduler: stub, returning 0");
+    0
+}
+
+/// sched_getscheduler(pid) -> policy
+/// Always return SCHED_OTHER (0).
+pub fn sys_sched_getscheduler(_pid: usize) -> isize {
+    0 // SCHED_OTHER
+}
+
+/// sched_getparam(pid, param)
+/// Write sched_priority = 0 (for SCHED_OTHER).
+pub fn sys_sched_getparam(_pid: usize, param: *mut u8) -> isize {
+    if param.is_null() {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
+    // struct sched_param { int sched_priority; }
+    let priority: i32 = 0;
+    match copy_to_user(token, param, &priority.to_le_bytes()) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+/// sched_setattr(pid, attr, flags)
+/// Stub: pretend success.
+pub fn sys_sched_setattr(_pid: usize, _attr: usize, _flags: usize) -> isize {
+    warn!("[sched] sched_setattr: stub, returning 0");
+    0
+}
+
+/// sched_getattr(pid, attr, size, flags)
+/// Return a sched_attr struct with SCHED_OTHER policy and priority 0.
+pub fn sys_sched_getattr(_pid: usize, attr: *mut u8, size: usize, _flags: usize) -> isize {
+    warn!("[sched] sched_getattr: called, size={}", size);
+    if attr.is_null() || size < 48 {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
+    // struct sched_attr (48 bytes minimum):
+    //   u32 size = 48
+    //   u32 sched_policy = 0 (SCHED_OTHER)
+    //   u64 sched_flags = 0
+    //   s32 sched_nice = 0
+    //   u32 sched_priority = 0
+    //   u64 sched_runtime = 0
+    //   u64 sched_deadline = 0
+    //   u64 sched_period = 0
+    let mut buf = [0u8; 48];
+    buf[0..4].copy_from_slice(&48u32.to_le_bytes()); // size = 48
+    // All other fields are 0 (SCHED_OTHER, no priority, etc.)
+    match copy_to_user(token, attr, &buf) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+/// sched_setaffinity(pid, cpusetsize, mask)
+/// Stub: accept and ignore — we are single-core, so any mask is fine.
+pub fn sys_sched_setaffinity(_pid: usize, _cpusetsize: usize, _mask: *const u8) -> isize {
+    info!("[sched] sched_setaffinity: stub, always success");
+    0
+}
+
+/// sched_getaffinity(pid, cpusetsize, mask)
+/// Return a single-CPU mask (bit 0 set) — we only have 1 core.
+pub fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask: *mut u8) -> isize {
+    let token = current_user_token();
+    if mask.is_null() || cpusetsize == 0 {
+        return errno(EINVAL);
+    }
+    // Build a mask with only CPU 0 set
+    let len = cpusetsize.min(128); // reasonable upper bound
+    let mut buf = vec![0u8; len];
+    buf[0] = 1; // CPU 0
+    match copy_to_user(token, mask, &buf) {
+        Ok(_) => len as isize, // Linux returns the number of bytes written
+        Err(e) => e,
+    }
+}
+
+/// get_mempolicy(mode, nodemask, maxnode, addr, flags)
+/// Stub: return MPOL_DEFAULT (0) — we have no NUMA.
+pub fn sys_get_mempolicy(
+    mode: *mut i32,
+    nodemask: *mut usize,
+    maxnode: usize,
+    _addr: usize,
+    _flags: usize,
+) -> isize {
+    let token = current_user_token();
+    // Write mode = MPOL_DEFAULT (0)
+    if !mode.is_null() {
+        let val: i32 = 0; // MPOL_DEFAULT
+        if let Err(e) = copy_to_user(token, mode as *mut u8, &val.to_le_bytes()) {
+            return e;
+        }
+    }
+    // Write nodemask = node 0
+    if !nodemask.is_null() && maxnode > 0 {
+        let val: usize = 1; // node 0
+        if let Err(e) = copy_to_user(token, nodemask as *mut u8, &val.to_le_bytes()) {
+            return e;
+        }
+    }
     0
 }

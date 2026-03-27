@@ -13,7 +13,7 @@ pub const USER_MMAP_TOP: usize = 0x6_0000_0000;
 /// kernel stack size
 pub const KERNEL_STACK_SIZE: usize = 4096 * 20;
 /// kernel heap size
-pub const KERNEL_HEAP_SIZE: usize = 0x200_0000;
+pub const KERNEL_HEAP_SIZE: usize = 64 * 1024 * 1024; // 64MB
 
 /// page size : 4KB
 pub const PAGE_SIZE: usize = 0x1000;

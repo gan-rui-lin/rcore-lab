@@ -21,7 +21,7 @@ const PATH_ENV: &[u8] = b"PATH=/bin:/usr/bin:/musl:/glibc\0";
 const LD_LIB_MUSL: &[u8] = b"LD_LIBRARY_PATH=/musl/lib\0";
 const LD_LIB_GLIBC: &[u8] = b"LD_LIBRARY_PATH=/glibc/lib\0";
 const TEST_LIBC_ROOTS: [&str; 2] = ["/musl", "/glibc"];
-const TEST_SUITES: [&str; 3] = [
+const TEST_SUITES: [&str; 4] = [
     // "basic",
     // "busybox",
     // "cyclictest",
@@ -29,7 +29,7 @@ const TEST_SUITES: [&str; 3] = [
     "iperf",
     "libcbench",
     // "libctest",
-    // "lmbench",
+    "lmbench",
     // "ltp",
     // "lua",
     "netperf",
@@ -113,6 +113,46 @@ fn force_link(link_path: &str, target_path: &str) {
     // }
 }
 
+fn run_busybox_mkdir_p(root: &str, busybox_path: &str, path: &str) -> isize {
+    let pid = fork();
+    if pid < 0 {
+        return -1;
+    }
+    if pid == 0 {
+        let _ = chdir("/\0");
+        let busybox = cstring(busybox_path);
+        let applet = cstring("mkdir");
+        let opt_p = cstring("-p");
+        let dir = cstring(path);
+        let argv = [
+            busybox.as_ptr(),
+            applet.as_ptr(),
+            opt_p.as_ptr(),
+            dir.as_ptr(),
+            core::ptr::null(),
+        ];
+        let ld_lib = if root == "/glibc" { LD_LIB_GLIBC } else { LD_LIB_MUSL };
+        let envp = [PATH_ENV.as_ptr(), ld_lib.as_ptr(), core::ptr::null()];
+        let ret = execve(
+            unsafe { core::str::from_utf8_unchecked(&busybox) },
+            &argv,
+            &envp,
+        );
+        exit(if ret < 0 { 127 } else { 0 });
+    }
+    let mut status = 0;
+    loop {
+        let ret = user_lib::waitpid(pid as usize, &mut status);
+        if ret == pid {
+            break;
+        }
+        if ret < 0 && ret != -2 {
+            break;
+        }
+    }
+    status as isize
+}
+
 fn select_busybox_for_root(root: &str) -> Option<&'static str> {
     match root {
         "/musl" => {
@@ -144,9 +184,52 @@ fn activate_runtime_profile(root: &str) -> bool {
     force_link("/bin/basename", busybox_path);
     force_link("/bin/ls", busybox_path);
     force_link("/bin/sleep", busybox_path);
+    force_link("/bin/mkdir", busybox_path);
+    force_link("/bin/rmdir", busybox_path);
+    force_link("/bin/cat", busybox_path);
+    force_link("/bin/echo", busybox_path);
+    force_link("/bin/grep", busybox_path);
+    force_link("/bin/rm", busybox_path);
+    force_link("/bin/cp", busybox_path);
+    force_link("/bin/mv", busybox_path);
+    force_link("/bin/ln", busybox_path);
+    force_link("/bin/chmod", busybox_path);
+    force_link("/bin/chown", busybox_path);
+    force_link("/bin/kill", busybox_path);
+    force_link("/bin/mount", busybox_path);
+    force_link("/bin/umount", busybox_path);
+    force_link("/bin/date", busybox_path);
+    force_link("/bin/dd", busybox_path);
+    force_link("/bin/df", busybox_path);
+    force_link("/bin/ps", busybox_path);
+    force_link("/bin/pwd", busybox_path);
+    force_link("/bin/sed", busybox_path);
+    force_link("/bin/awk", busybox_path);
     force_link("/usr/bin/basename", busybox_path);
     force_link("/usr/bin/ls", busybox_path);
     force_link("/usr/bin/sleep", busybox_path);
+    force_link("/usr/bin/wc", busybox_path);
+    force_link("/usr/bin/expr", busybox_path);
+    force_link("/usr/bin/head", busybox_path);
+    force_link("/usr/bin/tail", busybox_path);
+    force_link("/usr/bin/cut", busybox_path);
+    force_link("/usr/bin/tr", busybox_path);
+    force_link("/usr/bin/sort", busybox_path);
+    force_link("/usr/bin/uniq", busybox_path);
+    force_link("/usr/bin/find", busybox_path);
+    force_link("/usr/bin/xargs", busybox_path);
+    force_link("/usr/bin/test", busybox_path);
+    force_link("/usr/bin/printf", busybox_path);
+    force_link("/usr/bin/id", busybox_path);
+    force_link("/usr/bin/whoami", busybox_path);
+    force_link("/usr/bin/hostname", busybox_path);
+    force_link("/usr/bin/diff", busybox_path);
+    force_link("/usr/bin/seq", busybox_path);
+    force_link("/usr/bin/tee", busybox_path);
+    force_link("/usr/bin/touch", busybox_path);
+    force_link("/usr/bin/stat", busybox_path);
+
+    // TODO execve("/riscv/musl/busybox --install /bin");
 
     #[cfg(target_arch = "riscv64")]
     {
@@ -158,10 +241,15 @@ fn activate_runtime_profile(root: &str) -> bool {
             // glibc dynamic binaries need shared libs in default search path
             force_link("/lib/libc.so.6", "/glibc/lib/libc.so.6");
             force_link("/lib/libm.so.6", "/glibc/lib/libm.so.6");
+
+            let _ = run_busybox_mkdir_p("/glibc", busybox_path, "/code/lmbench_src/bin/build");
+            force_link("/code/lmbench_src/bin/build/lmbench_all", "/glibc/lmbench_all");
         } else {
             force_link("/lib/ld-linux-riscv64-lp64d.so.1", "/musl/lib/libc.so");
             force_link("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so");
             force_link("/lib/ld-musl-riscv64-sf.so.1", "/musl/lib/libc.so");
+            let _ = run_busybox_mkdir_p("/musl", busybox_path, "/code/lmbench_src/bin/build");
+            force_link("/code/lmbench_src/bin/build/lmbench_all", "/musl/lmbench_all");
         }
     }
 
@@ -172,9 +260,14 @@ fn activate_runtime_profile(root: &str) -> bool {
                 "/lib64/ld-linux-loongarch-lp64d.so.1",
                 "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
             );
+
+            let _ = run_busybox_mkdir_p("/glibc", busybox_path, "/code/lmbench_src/bin/build");
+            force_link("/code/lmbench_src/bin/build/lmbench_all", "/glibc/lmbench_all");
         } else {
             force_link("/lib64/ld-linux-loongarch-lp64d.so.1", "/musl/lib/libc.so");
             force_link("/lib64/ld-musl-loongarch-lp64d.so.1", "/musl/lib/libc.so");
+            let _ = run_busybox_mkdir_p("/musl", busybox_path, "/code/lmbench_src/bin/build");
+            force_link("/code/lmbench_src/bin/build/lmbench_all", "/musl/lmbench_all");
         }
     }
 

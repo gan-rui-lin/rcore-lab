@@ -136,11 +136,61 @@ fn proc_uptime() -> String {
     format!("{}.{} 0.00\n", sec, frac)
 }
 
+/// Build /proc/sys/kernel/ subtree with sched_rt_runtime_us etc.
+fn proc_sys_kernel() -> Arc<dyn VfsInode> {
+    let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    // cyclictest reads this to check if RT scheduling is available
+    entries.insert(
+        String::from("sched_rt_runtime_us"),
+        ProcFileInode::new(|| String::from("950000\n")),
+    );
+    entries.insert(
+        String::from("sched_rt_period_us"),
+        ProcFileInode::new(|| String::from("1000000\n")),
+    );
+    ProcDirInode::new(entries)
+}
+
+fn proc_sys() -> Arc<dyn VfsInode> {
+    let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    entries.insert(String::from("kernel"), proc_sys_kernel());
+    ProcDirInode::new(entries)
+}
+
+/// Generate /proc/self/smaps content
+fn proc_self_smaps() -> String {
+    // TODO: COW implementation removed shared_ppns tracking.
+    // Will need to re-implement smaps generation for new memory structure.
+    String::new()
+}
+
+/// Build /proc/self/ subtree
+fn proc_self_dir() -> Arc<dyn VfsInode> {
+    let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    entries.insert(
+        String::from("status"),
+        ProcFileInode::new(|| {
+            let pid = crate::task::current_process().pid.0;
+            format!(
+                "Name:\tunknown\nState:\tR (running)\nPid:\t{}\nPPid:\t1\nThreads:\t1\n",
+                pid
+            )
+        }),
+    );
+    entries.insert(
+        String::from("smaps"),
+        ProcFileInode::new(proc_self_smaps),
+    );
+    ProcDirInode::new(entries)
+}
+
 pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
     let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
     entries.insert(String::from("mounts"), ProcFileInode::new(proc_mounts));
     entries.insert(String::from("meminfo"), ProcFileInode::new(proc_meminfo));
     entries.insert(String::from("stat"), ProcFileInode::new(proc_stat));
     entries.insert(String::from("uptime"), ProcFileInode::new(proc_uptime));
+    entries.insert(String::from("sys"), proc_sys());
+    entries.insert(String::from("self"), proc_self_dir());
     ProcDirInode::new(entries)
 }
