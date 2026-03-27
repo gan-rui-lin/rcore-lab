@@ -38,10 +38,11 @@ pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
 pub use manager::{
     add_task, pid2process, pid2process_snapshot, ready_queue_snapshot, remove_from_pid2process,
     remove_task, wakeup_task, pid2process_len, ready_queue_len, pid2process_aggregate,
+    pid2process_fdtable_summary,
 };
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
-    current_user_token, run_tasks, schedule, take_current_task,
+    current_user_token, has_pending_unmasked_signal, run_tasks, schedule, take_current_task,
 };
 pub use process::{RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY};
 pub use signal::{
@@ -223,6 +224,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         if pid == IDLE_PID {
             shutdown();
         }
+        crate::syscall::cleanup_shm_for_process_exit(pid);
         remove_from_pid2process(pid);
         let mut process_inner = process.inner_exclusive_access();
         process_inner.is_zombie = true;

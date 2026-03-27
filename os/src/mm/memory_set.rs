@@ -89,6 +89,43 @@ impl MemorySet {
     ) {
         self.push(MapArea::new(start_va, end_va, permission), None);
     }
+    /// Insert a shared framed area (for SysV SHM)
+    /// Maps pre-allocated frames to a virtual address range
+    pub fn insert_shared_framed_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+        frames: Vec<Arc<FrameTracker>>,
+    ) -> bool {
+        let mut map_area = MapArea::new(start_va, end_va, permission);
+        let expected = map_area.vpn_range.get_end().0.saturating_sub(map_area.vpn_range.get_start().0);
+        if expected != frames.len() {
+            return false;
+        }
+        for (idx, vpn) in map_area.vpn_range.into_iter().enumerate() {
+            let ppn = frames[idx].ppn;
+            // Map the frame directly to the page table
+            // Convert MapPermission to PTEFlags
+            let mut flags = PTEFlags::V;
+            if permission.contains(MapPermission::R) {
+                flags |= PTEFlags::R;
+            }
+            if permission.contains(MapPermission::W) {
+                flags |= PTEFlags::W;
+            }
+            if permission.contains(MapPermission::X) {
+                flags |= PTEFlags::X;
+            }
+            if permission.contains(MapPermission::U) {
+                flags |= PTEFlags::U;
+            }
+            self.page_table.map(vpn, ppn, flags);
+            map_area.data_frames.insert(vpn, frames[idx].clone());
+        }
+        self.areas.push(map_area);
+        true
+    }
     /// remove a area
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some((idx, area)) = self
