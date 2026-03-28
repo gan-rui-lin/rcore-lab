@@ -1011,6 +1011,40 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
+    /// Check whether every page in `[start, start + len)` belongs to a user
+    /// area that is writable in VMA permission and currently mapped as a user page.
+    pub fn is_user_range_writable(&self, start: usize, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        let mut va = start;
+        while va < end {
+            let vpn = VirtAddr::from(va).floor();
+            let in_writable_user_area = self.areas.iter().any(|area| {
+                area.vpn_range.get_start() <= vpn
+                    && vpn < area.vpn_range.get_end()
+                    && area.map_perm.contains(MapPermission::U)
+                    && area.map_perm.contains(MapPermission::W)
+            });
+            if !in_writable_user_area {
+                return false;
+            }
+            let Some(pte) = self.page_table.translate(vpn) else {
+                return false;
+            };
+            let flags = pte.flags();
+            if !pte.is_valid() || !flags.contains(PTEFlags::U) {
+                return false;
+            }
+            let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
+            va = next_page.max(va + 1);
+        }
+        true
+    }
+
     /// Count mapped areas that overlap with [start, end).
     pub fn overlap_count(&self, start: VirtAddr, end: VirtAddr) -> usize {
         let start_vpn = start.floor();

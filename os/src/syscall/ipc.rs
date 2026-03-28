@@ -665,7 +665,7 @@ pub fn sys_shmat(shmid: i32, shmaddr: usize, _shmflg: i32) -> isize {
         );
         return errno(EINVAL);
     }
-    if !inner.memory_set.insert_shared_framed_area(
+    if !inner.memory_set.insert_shm_area(
         VirtAddr(attach_addr),
         VirtAddr(attach_end),
         map_perm,
