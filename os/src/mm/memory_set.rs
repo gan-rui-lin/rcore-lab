@@ -58,6 +58,12 @@ pub struct MemorySet {
     areas: Vec<MapArea>,
 }
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum MapAreaKind {
+    Private,
+    Shared,
+}
+
 impl MemorySet {
     #[cfg(target_arch = "riscv64")]
     #[inline]
@@ -98,7 +104,7 @@ impl MemorySet {
         permission: MapPermission,
         frames: Vec<Arc<FrameTracker>>,
     ) -> bool {
-        let mut map_area = MapArea::new(start_va, end_va, permission);
+        let mut map_area = MapArea::new_with_kind(start_va, end_va, permission, MapAreaKind::Shared);
         let expected = map_area.vpn_range.get_end().0.saturating_sub(map_area.vpn_range.get_start().0);
         if expected != frames.len() {
             return false;
@@ -712,6 +718,7 @@ impl MemorySet {
         for (idx, area) in parent_space.areas.iter_mut().enumerate() {
             // Create a new MapArea with the same permissions and VPN range
             let mut new_area = MapArea::from_another(area);
+            let is_shared = area.kind == MapAreaKind::Shared;
             for vpn in area.vpn_range {
                 let src_pte = match parent_space.page_table.translate(vpn) {
                     Some(pte) if pte.is_valid() => pte,
@@ -719,7 +726,7 @@ impl MemorySet {
                 };
                 let src_ppn = src_pte.ppn();
                 let src_flags = src_pte.flags();
-                let is_writable = area.map_perm.contains(MapPermission::W);
+                let is_writable = area.map_perm.contains(MapPermission::W) && !is_shared;
                 // Share the frame: clone the Arc
                 let shared_frame = if let Some(frame_arc) = area.data_frames.get(&vpn) {
                     frame_arc.clone()
@@ -745,6 +752,24 @@ impl MemorySet {
                     new_area.data_frames.insert(vpn, arc);
                     continue;
                 };
+
+                if is_shared {
+                    // SysV SHM semantics: keep parent/child mappings writable-shared.
+                    let mut shared_flags = src_flags;
+                    if area.map_perm.contains(MapPermission::W) {
+                        shared_flags |= PTEFlags::W;
+                        if !src_flags.contains(PTEFlags::W) {
+                            parent_space
+                                .page_table
+                                .change_pte_flags(vpn, shared_flags);
+                        }
+                    } else {
+                        shared_flags &= !PTEFlags::W;
+                    }
+                    child.page_table.map(vpn, shared_frame.ppn, shared_flags);
+                    new_area.data_frames.insert(vpn, shared_frame);
+                    continue;
+                }
 
                 if is_writable && src_flags.contains(PTEFlags::W) {
                     // Remove W from parent's PTE (defer copy to fault handler)
@@ -793,6 +818,16 @@ impl MemorySet {
             Some(pte) if pte.is_valid() && !pte.writable() => pte,
             _ => return false,
         };
+
+        if area.kind == MapAreaKind::Shared {
+            // Shared memory must not be privatized by COW fault handling.
+            // If a SHM PTE becomes read-only (e.g., due to legacy state),
+            // restore writability directly instead of allocating a private page.
+            let shared_flags = pte.flags() | PTEFlags::W;
+            self.page_table.change_pte_flags(fault_vpn, shared_flags);
+            flush_tlb();
+            return true;
+        }
 
         let old_ppn = pte.ppn();
         let old_flags = pte.flags();
@@ -1024,6 +1059,7 @@ pub struct MapArea {
     vpn_range: VPNRange,
     data_frames: BTreeMap<VirtPageNum, Arc<FrameTracker>>,
     map_perm: MapPermission,
+    kind: MapAreaKind,
 }
 
 impl MapArea {
@@ -1032,6 +1068,14 @@ impl MapArea {
         end_va: VirtAddr,
         map_perm: MapPermission,
     ) -> Self {
+        Self::new_with_kind(start_va, end_va, map_perm, MapAreaKind::Private)
+    }
+    fn new_with_kind(
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        map_perm: MapPermission,
+        kind: MapAreaKind,
+    ) -> Self {
         let start_vpn: VirtPageNum = start_va.floor();
         let end_vpn: VirtPageNum = end_va.ceil();
         Self {
@@ -1039,6 +1083,7 @@ impl MapArea {
             vpn_range: VPNRange::new(start_vpn, end_vpn),
             data_frames: BTreeMap::new(),
             map_perm,
+            kind,
         }
     }
     pub fn from_another(another: &Self) -> Self {
@@ -1047,6 +1092,7 @@ impl MapArea {
             vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
             data_frames: BTreeMap::new(),
             map_perm: another.map_perm,
+            kind: another.kind,
         }
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {

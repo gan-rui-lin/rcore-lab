@@ -1,4 +1,5 @@
 use super::super::core::{VfsInode, VfsNodeKind};
+use crate::sync::UPIntrFreeCell;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -11,11 +12,16 @@ const SEEK_SET: u32 = 0;
 pub struct Ext4Inode {
     path: String,
     kind: VfsNodeKind,
+    file: UPIntrFreeCell<Option<Ext4File>>,
 }
 
 impl Ext4Inode {
     pub(super) fn new(path: String, kind: VfsNodeKind) -> Self {
-        Self { path, kind }
+        Self {
+            path,
+            kind,
+            file: unsafe { UPIntrFreeCell::new(None) },
+        }
     }
 
     pub(super) fn new_dir(path: String) -> Self {
@@ -24,6 +30,58 @@ impl Ext4Inode {
 
     pub(super) fn new_file(path: String) -> Self {
         Self::new(path, VfsNodeKind::File)
+    }
+
+    fn open_data_file(&self, for_write: bool) -> Option<Ext4File> {
+        let mut file = ext4_open_file(
+            self.path.as_str(),
+            InodeTypes::EXT4_DE_REG_FILE,
+            if for_write { O_RDWR | O_CREAT } else { O_RDWR },
+        );
+        if file.is_none() && !for_write {
+            file = ext4_open_file(self.path.as_str(), InodeTypes::EXT4_DE_REG_FILE, O_RDONLY);
+        }
+        file
+    }
+
+    fn with_data_file<R, F>(&self, for_write: bool, mut f: F) -> Option<R>
+    where
+        F: FnMut(&mut Ext4File) -> Option<R>,
+    {
+        let mut slot = self.file.exclusive_access();
+        if slot.is_none() {
+            *slot = self.open_data_file(for_write);
+        }
+        if let Some(file) = slot.as_mut() {
+            if let Some(ret) = f(file) {
+                return Some(ret);
+            }
+        }
+        if let Some(mut stale) = slot.take() {
+            let _ = stale.file_close();
+        }
+        *slot = self.open_data_file(for_write);
+        slot.as_mut().and_then(|file| f(file))
+    }
+
+    fn close_cached_file(&self) {
+        let mut slot = self.file.exclusive_access();
+        if let Some(mut file) = slot.take() {
+            let _ = file.file_close();
+        }
+    }
+}
+
+impl Drop for Ext4Inode {
+    fn drop(&mut self) {
+        if self.kind != VfsNodeKind::File {
+            return;
+        }
+        if let Some(mut slot) = self.file.try_exclusive_access() {
+            if let Some(mut file) = slot.take() {
+                let _ = file.file_close();
+            }
+        }
     }
 }
 
@@ -79,47 +137,35 @@ impl VfsInode for Ext4Inode {
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
-        let mut file = match ext4_open_file(
-            self.path.as_str(),
-            InodeTypes::EXT4_DE_REG_FILE,
-            O_RDONLY,
-        ) {
-            Some(file) => file,
-            None => {
-                error!("ext4: open failed path={} (read)", self.path);
-                return 0;
-            }
-        };
-        let ret = file.file_seek(offset as i64, SEEK_SET);
-        if ret.is_err() {
-            let _ = file.file_close();
+        if self.kind != VfsNodeKind::File {
             return 0;
         }
-        let read_size = file.file_read(buf).unwrap_or(0);
-        let _ = file.file_close();
-        read_size as usize
+        self.with_data_file(false, |file| {
+            if file.file_seek(offset as i64, SEEK_SET).is_err() {
+                return None;
+            }
+            Some(file.file_read(buf).unwrap_or(0) as usize)
+        })
+        .unwrap_or_else(|| {
+            error!("ext4: open/seek failed path={} (read)", self.path);
+            0
+        })
     }
 
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
-        let mut file = match ext4_open_file(
-            self.path.as_str(),
-            InodeTypes::EXT4_DE_REG_FILE,
-            O_RDWR | O_CREAT,
-        ) {
-            Some(file) => file,
-            None => {
-                error!("ext4: open failed path={} (write)", self.path);
-                return 0;
-            }
-        };
-        let ret = file.file_seek(offset as i64, SEEK_SET);
-        if ret.is_err() {
-            let _ = file.file_close();
+        if self.kind != VfsNodeKind::File {
             return 0;
         }
-        let write_size = file.file_write(buf).unwrap_or(0);
-        let _ = file.file_close();
-        write_size as usize
+        self.with_data_file(true, |file| {
+            if file.file_seek(offset as i64, SEEK_SET).is_err() {
+                return None;
+            }
+            Some(file.file_write(buf).unwrap_or(0) as usize)
+        })
+        .unwrap_or_else(|| {
+            error!("ext4: open/seek failed path={} (write)", self.path);
+            0
+        })
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn VfsInode>> {
@@ -186,6 +232,7 @@ impl VfsInode for Ext4Inode {
         if self.kind != VfsNodeKind::File {
             return;
         }
+        self.close_cached_file();
         let mut file = match ext4_open_file(
             self.path.as_str(),
             InodeTypes::EXT4_DE_REG_FILE,
@@ -222,19 +269,10 @@ impl VfsInode for Ext4Inode {
         if self.kind != VfsNodeKind::File {
             return 0;
         }
-        let mut file = match ext4_open_file(
-            self.path.as_str(),
-            InodeTypes::EXT4_DE_REG_FILE,
-            O_RDONLY,
-        ) {
-            Some(file) => file,
-            None => {
+        self.with_data_file(false, |file| Some(file.file_size() as usize))
+            .unwrap_or_else(|| {
                 error!("ext4: open failed path={} (size)", self.path);
-                return 0;
-            }
-        };
-        let size = file.file_size() as usize;
-        let _ = file.file_close();
-        size
+                0
+            })
     }
 }
