@@ -84,6 +84,8 @@ const SYSCALL_STATX: usize = 291;
 const SYSCALL_RENAMEAT2: usize = 276;
 /// getrandom syscall
 const SYSCALL_GETRANDOM: usize = 278;
+/// memfd_create syscall
+const SYSCALL_MEMFD_CREATE: usize = 279;
 /// exit syscall
 const SYSCALL_EXIT: usize = 93;
 /// exit_group syscall
@@ -798,6 +800,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *mut RLimit,
         ),
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2] as u32),
+        SYSCALL_MEMFD_CREATE => sys_memfd_create(args[0] as *const u8, args[1] as u32),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),

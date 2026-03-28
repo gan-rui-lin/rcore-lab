@@ -1,7 +1,7 @@
 //! File and filesystem-related syscalls
 use crate::fs::{
     create_dir, make_pipe, open_file, path_is_dir, remove_path, DevNull, DevUrandom, DevZero,
-    OpenFlags, Stat, StatMode, PollEvents,
+    MemFdFile, OpenFlags, Stat, StatMode, PollEvents,
 };
 use crate::mm::{translated_byte_buffer, translated_ref, translated_str, translated_refmut, UserBuffer};
 #[allow(unused_imports)] // for debug
@@ -379,6 +379,18 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     //         full_path
     //     );
     // }
+    // O_TMPFILE (0x410000 on riscv64/loongarch64): create anonymous temp file in dir
+    const O_TMPFILE: u32 = 0x410000;
+    if (flags & O_TMPFILE) == O_TMPFILE {
+        let memfd: Arc<dyn crate::fs::File + Send + Sync> = Arc::new(MemFdFile::new());
+        let mut inner = process.inner_exclusive_access();
+        let fd = match inner.alloc_fd() {
+            Some(fd) => fd,
+            None => return errno(EMFILE),
+        };
+        inner.fd_table[fd] = Some(memfd);
+        return fd as isize;
+    }
     let flags = OpenFlags::from_bits_truncate(flags);
     if flags.contains(OpenFlags::DIRECTORY) && !path_is_dir(&full_path) {
         return errno(ENOTDIR);
@@ -1549,6 +1561,19 @@ pub fn sys_pipe2(fds: *mut i32, _flags: u32) -> isize {
         Ok(_) => 0,
         Err(err) => err,
     }
+}
+
+pub fn sys_memfd_create(_name: *const u8, _flags: u32) -> isize {
+    let memfd: Arc<dyn crate::fs::File + Send + Sync> = Arc::new(MemFdFile::new());
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = match inner.alloc_fd() {
+        Some(fd) => fd,
+        None => return errno(EMFILE),
+    };
+    inner.fd_table[fd] = Some(memfd);
+    warn!("[memfd] memfd_create -> fd={}", fd);
+    fd as isize
 }
 
 pub fn sys_mount(
