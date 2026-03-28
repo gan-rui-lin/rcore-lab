@@ -249,10 +249,22 @@ pub fn ensure_basic_paths() {
     append_line_if_missing("/etc/group", "nogroup:x:65534:\n");
     write_file_if_missing("/etc/localtime", "");
     write_file_if_missing("/etc/adjtime", "");
-    // netperf needs /etc/protocols for getprotobyname()
-    write_file_if_missing(
+    // Keep /etc/protocols deterministic for getprotobyname()-based tests.
+    write_file_overwrite(
         "/etc/protocols",
-        "ip\t0\tIP\nicmp\t1\tICMP\ntcp\t6\tTCP\nudp\t17\tUDP\n",
+        "ip\t0\tIP\n\
+hopopt\t0\tHOPOPT\n\
+icmp\t1\tICMP\n\
+tcp\t6\tTCP\n\
+udp\t17\tUDP\n\
+ipv6\t41\tIPv6\n\
+ipv6-route\t43\tIPv6-Route\n\
+ipv6-frag\t44\tIPv6-Frag\n\
+esp\t50\tIPSEC-ESP\n\
+ah\t51\tIPSEC-AH\n\
+ipv6-icmp\t58\tIPv6-ICMP\n\
+ipv6-nonxt\t59\tIPv6-NoNxt\n\
+ipv6-opts\t60\tIPv6-Opts\n",
     );
 
     write_file_if_missing("/dev/null", "");
@@ -270,6 +282,19 @@ fn write_file_if_missing(path: &str, content: &str) {
     if path_exists(path) {
         return;
     }
+    let Some(file) = open_file(
+        path,
+        OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY,
+    ) else {
+        return;
+    };
+    let Some(inode) = file.inode() else {
+        return;
+    };
+    let _ = inode.write_at(0, content.as_bytes());
+}
+
+fn write_file_overwrite(path: &str, content: &str) {
     let Some(file) = open_file(
         path,
         OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY,

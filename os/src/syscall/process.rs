@@ -13,7 +13,7 @@ use crate::{
     fs::{open_file, File, OpenFlags},
     mm::{
         translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
-        translated_str, MapPermission, MmapMeta, PageTable, ProtectError, VirtAddr,
+        translated_str, MapPermission, MmapMeta, PTEFlags, PageTable, ProtectError, VirtAddr,
     },
     task::{
         add_task, current_process, current_task, current_trap_cx, current_user_token,
@@ -241,14 +241,19 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
     } else {
         // COW fork marks writable user pages read-only until a write fault.
         // Some copy_to_user() paths (e.g., clock_gettime/capget) should still
-        // work for mapped user buffers. Keep strict "mapped" validation, but
-        // relax write-bit enforcement here to avoid false EFAULT.
+        // work for mapped user buffers. Keep strict user-mapping validation,
+        // but relax write-bit enforcement here to avoid false EFAULT.
         let page_table = PageTable::from_token(token);
         let start = dst as usize;
         let end = start.checked_add(data.len()).ok_or_else(|| errno(EFAULT))?;
         let mut va = start;
         while va < end {
-            if page_table.translate_va(VirtAddr::from(va)).is_none() {
+            let vpn = VirtAddr::from(va).floor();
+            let Some(pte) = page_table.translate(vpn) else {
+                return Err(errno(EFAULT));
+            };
+            let flags = pte.flags();
+            if !pte.is_valid() || !flags.contains(PTEFlags::U) {
                 return Err(errno(EFAULT));
             }
             let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
@@ -3142,6 +3147,19 @@ pub fn sys_capget(header_ptr: *mut u8, data_ptr: *mut u8) -> isize {
     if !data_ptr.is_null() {
         // Determine data count (V2/V3 have 2 sets)
         let data_count: usize = if hdr.version == _LINUX_CAPABILITY_VERSION_1 { 1 } else { 2 };
+        let data_bytes_len = data_count * core::mem::size_of::<CapData>();
+        // Accept regular writable mappings and COW read-only PTEs (writable VMA),
+        // but keep EFAULT for PROT_NONE/readonly user buffers.
+        if translated_byte_buffer_checked(token, data_ptr, data_bytes_len, true).is_none() {
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            if !inner
+                .memory_set
+                .is_user_range_writable(data_ptr as usize, data_bytes_len)
+            {
+                return errno(EFAULT);
+            }
+        }
 
         // Get caps for the target process
         let process = current_process();

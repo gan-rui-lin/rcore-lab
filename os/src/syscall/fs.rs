@@ -9,6 +9,7 @@ use crate::mm::{
     translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
     translated_str, translated_str_checked, UserBuffer,
 };
+use crate::net::unix_socket::unix_registry_remove;
 #[allow(unused_imports)] // for debug
 use crate::task::{
     current_process, current_task, current_user_token, suspend_current_and_run_next,
@@ -541,14 +542,30 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
     }
     if let Some(file) = &inner.fd_table[fd] {
         let file = file.clone();
+        let mut wait_readable = false;
         if !file.readable() {
-            return errno(EBADF);
+            if file.is_unix_socket() {
+                wait_readable = true;
+            } else {
+                return errno(EBADF);
+            }
         }
         if file.inode().map(|inode| inode.is_dir()).unwrap_or(false) {
             return errno(EISDIR);
         }
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
+        if wait_readable {
+            loop {
+                if file.readable() {
+                    break;
+                }
+                suspend_current_and_run_next();
+                if crate::task::has_pending_unmasked_signal(false) {
+                    return errno(EINTR);
+                }
+            }
+        }
         trace!("kernel: sys_read .. file.read");
         let Some(buffers) = translated_byte_buffer_checked(token, buf, len, true) else {
             return errno(EFAULT);
@@ -1584,6 +1601,7 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
     if remove_path(&path, is_dir) {
         path_mode_remove(&path);
         symlink_target_remove(&path);
+        unix_registry_remove(&path);
         0
     } else {
         errno(EIO)
