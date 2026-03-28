@@ -687,7 +687,13 @@ impl ProcessControlBlock {
 
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         let mut parent = self.inner_exclusive_access();
-        assert_eq!(parent.thread_count(), 1);
+        if parent.thread_count() != 1 {
+            warn!(
+                "[fork-stage] pid={} fork from multi-thread process (thread_count={}), continuing with single-thread child",
+                self.pid.0,
+                parent.thread_count()
+            );
+        }
         // info!(
         //     "[fork-stage] pid={} start: children={} tasks={} fd_table_len={}",
         //     self.pid.0,

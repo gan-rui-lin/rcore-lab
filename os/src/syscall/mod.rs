@@ -38,6 +38,8 @@ const SYSCALL_UMOUNT2: usize = 39;
 const SYSCALL_MOUNT: usize = 40;
 /// ftruncate syscall
 const SYSCALL_FTRUNCATE: usize = 46;
+/// fallocate syscall
+const SYSCALL_FALLOCATE: usize = 47;
 /// faccessat syscall
 const SYSCALL_FACCESSAT: usize = 48;
 /// fchmod syscall
@@ -296,6 +298,7 @@ const SYSCALL_SCHED_SETATTR: usize = 274;
 const SYSCALL_SCHED_GETATTR: usize = 275;
 const SYSCALL_GET_MEMPOLICY: usize = 236;
 const SYSCALL_MEMBARRIER: usize = 283;
+const SYSCALL_CLOSE_RANGE: usize = 436;
 
 mod errno;
 mod fs;
@@ -636,6 +639,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1] as i32, args[2]),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as isize),
+        SYSCALL_FALLOCATE => {
+            sys_fallocate(args[0], args[1] as u32, args[2] as isize, args[3] as isize)
+        }
         // fsync/fdatasync: no page cache to flush, return success
         82 | 83 => 0,
         SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut StatFs),
@@ -654,6 +660,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_CLOSE => sys_close(args[0]),
+        SYSCALL_CLOSE_RANGE => sys_close_range(args[0], args[1], args[2] as u32),
         SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut i32, args[1] as u32),
         SYSCALL_LINKAT => sys_linkat(
             args[0] as isize,

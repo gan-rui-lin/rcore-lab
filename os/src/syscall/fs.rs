@@ -7,7 +7,7 @@ use crate::fs::{
 };
 use crate::mm::{
     translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
-    translated_str, translated_str_checked, UserBuffer,
+    translated_str_checked, UserBuffer,
 };
 use crate::net::unix_socket::unix_registry_remove;
 #[allow(unused_imports)] // for debug
@@ -591,7 +591,9 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     }
     let process = current_process();
     let token = current_user_token();
-    let raw_path = translated_str(token, path);
+    let Some(raw_path) = translated_str_checked(token, path) else {
+        return errno(EFAULT);
+    };
     if raw_path.is_empty() {
         return errno(EINVAL);
     }
@@ -728,7 +730,9 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsize: usiz
     }
 
     let token = current_user_token();
-    let raw_path = translated_str(token, path);
+    let Some(raw_path) = translated_str_checked(token, path) else {
+        return errno(EFAULT);
+    };
     if raw_path.is_empty() {
         return errno(ENOENT);
     }
@@ -827,7 +831,9 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
         return errno(EFAULT);
     }
     let token = current_user_token();
-    let raw = translated_str(token, path);
+    let Some(raw) = translated_str_checked(token, path) else {
+        return errno(EFAULT);
+    };
     if raw.is_empty() {
         return errno(EINVAL);
     }
@@ -871,6 +877,26 @@ pub fn sys_close(fd: usize) -> isize {
     0
 }
 
+/// close_range system call - close all file descriptors in [first, last].
+pub fn sys_close_range(first: usize, last: usize, flags: u32) -> isize {
+    if flags != 0 {
+        return errno(EINVAL);
+    }
+    if first > last {
+        return errno(EINVAL);
+    }
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if inner.fd_table.is_empty() || first >= inner.fd_table.len() {
+        return 0;
+    }
+    let upper = last.min(inner.fd_table.len().saturating_sub(1));
+    for fd in first..=upper {
+        inner.fd_table[fd].take();
+    }
+    0
+}
+
 /// fstatat: stat by path, relative to dirfd.
 /// ! 暂时未使用 flags 参数
 pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> isize {
@@ -888,7 +914,9 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
     }
 
     let token = current_user_token();
-    let raw_path = translated_str(token, path);
+    let Some(raw_path) = translated_str_checked(token, path) else {
+        return errno(EFAULT);
+    };
     // AT_EMPTY_PATH: stat the fd itself when path is empty
     if raw_path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
@@ -1086,7 +1114,9 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const TimeSpec, _fla
         }
         return apply_utimensat_to_fd(dirfd as usize, times, token);
     }
-    let raw = translated_str(token, path);
+    let Some(raw) = translated_str_checked(token, path) else {
+        return errno(EFAULT);
+    };
     if raw.is_empty() {
         return errno(ENOENT);
     }
@@ -1330,7 +1360,9 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: i32, _mask: u32, buf: *mu
     }
 
     let token = current_user_token();
-    let raw_path = translated_str(token, path);
+    let Some(raw_path) = translated_str_checked(token, path) else {
+        return errno(EFAULT);
+    };
 
     let stat = if raw_path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
@@ -1469,8 +1501,12 @@ pub fn sys_linkat(
         return errno(EFAULT);
     }
     let token = current_user_token();
-    let old_raw = translated_str(token, old_name);
-    let new_raw = translated_str(token, new_name);
+    let Some(old_raw) = translated_str_checked(token, old_name) else {
+        return errno(EFAULT);
+    };
+    let Some(new_raw) = translated_str_checked(token, new_name) else {
+        return errno(EFAULT);
+    };
     if old_raw.is_empty() || new_raw.is_empty() {
         return errno(EINVAL);
     }
@@ -1530,8 +1566,12 @@ pub fn sys_symlinkat(target: *const u8, new_dirfd: isize, linkpath: *const u8) -
         return errno(EFAULT);
     }
     let token = current_user_token();
-    let target_raw = translated_str(token, target);
-    let link_raw = translated_str(token, linkpath);
+    let Some(target_raw) = translated_str_checked(token, target) else {
+        return errno(EFAULT);
+    };
+    let Some(link_raw) = translated_str_checked(token, linkpath) else {
+        return errno(EFAULT);
+    };
     if target_raw.is_empty() || link_raw.is_empty() {
         return errno(EINVAL);
     }
@@ -1573,7 +1613,9 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
         return errno(EFAULT);
     }
     let token = current_user_token();
-    let raw = translated_str(token, _name);
+    let Some(raw) = translated_str_checked(token, _name) else {
+        return errno(EFAULT);
+    };
     if raw.is_empty() {
         return errno(EINVAL);
     }
@@ -1627,8 +1669,12 @@ pub fn sys_renameat2(
         return errno(EFAULT);
     }
     let token = current_user_token();
-    let old_raw = translated_str(token, old_name);
-    let new_raw = translated_str(token, new_name);
+    let Some(old_raw) = translated_str_checked(token, old_name) else {
+        return errno(EFAULT);
+    };
+    let Some(new_raw) = translated_str_checked(token, new_name) else {
+        return errno(EFAULT);
+    };
     if old_raw.is_empty() || new_raw.is_empty() {
         return errno(EINVAL);
     }
@@ -2542,6 +2588,35 @@ pub fn sys_ftruncate(fd: usize, length: isize) -> isize {
         // File has no size (pipe, socket, etc.)
         errno(EINVAL)
     }
+}
+
+/// fallocate system call - reserve space for a file.
+///
+/// Minimal implementation for LTP compatibility:
+/// - validates descriptor/arguments
+/// - accepts mode=0 and returns success without preallocation
+pub fn sys_fallocate(fd: usize, mode: u32, offset: isize, len: isize) -> isize {
+    if mode != 0 {
+        return errno(ENOTSUP);
+    }
+    if offset < 0 || len < 0 {
+        return errno(EINVAL);
+    }
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+    if !file.writable() {
+        return errno(EBADF);
+    }
+    if file.inode().is_none() {
+        return errno(EINVAL);
+    }
+    0
 }
 
 pub fn sys_statfs(path: *const u8, buf: *mut StatFs) -> isize {
