@@ -78,13 +78,16 @@ const SYSCALL_SENDFILE: usize = 71;
 const SYSCALL_SPLICE: usize = 76;
 /// readlinkat syscall
 const SYSCALL_READLINKAT: usize = 78;
-/// ppoll syscall
+/// pselect6 syscall
 const SYSCALL_PSELECT6: usize = 72;
+/// ppoll syscall
 const SYSCALL_POLL: usize = 73;
 /// fstatat syscall
 const SYSCALL_FSTATAT: usize = 79;
 /// fstat syscall
 const SYSCALL_FSTAT: usize = 80;
+/// sync syscall
+const SYSCALL_SYNC: usize = 81;
 /// utimensat syscall
 const SYSCALL_UTIMENSAT: usize = 88;
 /// statx syscall
@@ -113,6 +116,16 @@ const SYSCALL_GETITIMER: usize = 102;
 const SYSCALL_SETITIMER: usize = 103;
 /// clock_nanosleep syscall
 const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
+/// sched_setscheduler syscall
+const SYSCALL_SCHED_SETSCHEDULER: usize = 119;
+/// sched_getscheduler syscall
+const SYSCALL_SCHED_GETSCHEDULER: usize = 120;
+/// sched_getparam syscall
+const SYSCALL_SCHED_GETPARAM: usize = 121;
+/// sched_setaffinity syscall
+const SYSCALL_SCHED_SETAFFINITY: usize = 122;
+/// sched_getaffinity syscall
+const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 /// yield syscall
 const SYSCALL_YIELD: usize = 124;
 /// thread_create syscall
@@ -190,6 +203,10 @@ const SYSCALL_PRCTL: usize = 167;
 const SYSCALL_UNAME: usize = 160;
 /// getrlimit syscall
 const SYSCALL_GETRLIMIT: usize = 163;
+/// getrusage syscall
+const SYSCALL_GETRUSAGE: usize = 165;
+/// umask syscall
+const SYSCALL_UMASK: usize = 166;
 /// statfs syscall
 const SYSCALL_STATFS: usize = 43;
 /// fstatfs syscall
@@ -198,8 +215,6 @@ const SYSCALL_FSTATFS: usize = 44;
 const SYSCALL_CLOCK_GETTIME: usize = 113;
 /// clock_getres syscall
 const SYSCALL_CLOCK_GETRES: usize = 114;
-/// sched_getaffinity syscall
-const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 /// syslog syscall
 const SYSCALL_SYSLOG: usize = 116;
 /// gettime syscall
@@ -216,8 +231,6 @@ const SYSCALL_GETEUID: usize = 175;
 const SYSCALL_GETGID: usize = 176;
 /// getegid syscall
 const SYSCALL_GETEGID: usize = 177;
-/// getrusage syscall
-const SYSCALL_GETRUSAGE: usize = 165;
 /// sysinfo syscall
 const SYSCALL_SYSINFO: usize = 179;
 /// msgget syscall
@@ -250,6 +263,8 @@ const SYSCALL_MMAP: usize = 222;
 const SYSCALL_MPROTECT: usize = 226;
 /// msync syscall
 const SYSCALL_MSYNC: usize = 227;
+/// madvise syscall
+const SYSCALL_MADVISE: usize = 233;
 /// waitpid syscall
 const SYSCALL_WAITPID: usize = 260;
 /// prlimit64 syscall
@@ -277,12 +292,15 @@ const SYSCALL_SHUTDOWN_SOCKET: usize = 210;
 const SYSCALL_SENDMSG: usize = 211;
 const SYSCALL_RECVMSG: usize = 212;
 const SYSCALL_ACCEPT4: usize = 242;
+const SYSCALL_SCHED_SETATTR: usize = 274;
+const SYSCALL_SCHED_GETATTR: usize = 275;
+const SYSCALL_GET_MEMPOLICY: usize = 236;
 const SYSCALL_MEMBARRIER: usize = 283;
 
 mod errno;
 mod fs;
 mod ipc;
-mod process;
+pub(crate) mod process;
 mod sync;
 mod thread;
 
@@ -563,6 +581,9 @@ pub fn should_trace_syscall(pid: usize) -> bool {
     if SYSCALL_TRACE_ALL.load(Ordering::Relaxed) {
         return true;
     }
+    if TRACE_PID.is_none() && TRACE_NAME.is_none() {
+        return false;
+    }
     if let Some(target) = TRACE_PID {
         if target != pid {
             return false;
@@ -574,6 +595,11 @@ pub fn should_trace_syscall(pid: usize) -> bool {
         return name == target;
     }
     true
+}
+
+/// Called by task-exit path to release per-process SHM attachment records.
+pub fn cleanup_shm_for_process_exit(pid: usize) {
+    ipc::cleanup_shm_attachments_for_pid(pid);
 }
 
 /// handle syscall exception with `syscall_id` and other arguments
@@ -610,6 +636,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1] as i32, args[2]),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as isize),
+        // fsync/fdatasync: no page cache to flush, return success
+        82 | 83 => 0,
         SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut StatFs),
         SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut StatFs),
         SYSCALL_FACCESSAT => sys_faccessat(
@@ -673,6 +701,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
+        SYSCALL_SYNC => 0,
         SYSCALL_READV => sys_readv(args[0], args[1] as *const usize, args[2]),
         SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const usize, args[2]),
         SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *const u8, args[2], args[3]),
@@ -685,6 +714,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *mut isize,
             args[4],
             args[5] as u32,
+        ),
+        SYSCALL_PSELECT6 => sys_pselect6(
+            args[0],
+            args[1] as *mut usize,
+            args[2] as *mut usize,
+            args[3] as *mut usize,
+            args[4] as *const TimeSpec,
+            args[5],
         ),
         SYSCALL_READLINKAT => sys_readlinkat(
             args[0] as isize,
@@ -730,19 +767,24 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4] as *mut i32,
             args[5] as i32,
         ),
-        SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const TimeSpec, args[1] as *mut TimeSpec),
-        SYSCALL_GETITIMER => sys_getitimer(args[0] as isize, args[1] as *mut process::ITimerVal),
+        SYSCALL_GETITIMER => sys_getitimer(args[0] as isize, args[1] as *mut ITimerVal),
         SYSCALL_SETITIMER => sys_setitimer(
             args[0] as isize,
-            args[1] as *const process::ITimerVal,
-            args[2] as *mut process::ITimerVal,
+            args[1] as *const ITimerVal,
+            args[2] as *mut ITimerVal,
         ),
+        SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const TimeSpec, args[1] as *mut TimeSpec),
         SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(
             args[0],
             args[1],
             args[2] as *const TimeSpec,
             args[3] as *mut TimeSpec,
         ),
+        SYSCALL_SCHED_SETSCHEDULER => sys_sched_setscheduler(args[0], args[1] as i32, args[2] as *const u8),
+        SYSCALL_SCHED_GETSCHEDULER => sys_sched_getscheduler(args[0]),
+        SYSCALL_SCHED_GETPARAM => sys_sched_getparam(args[0], args[1] as *mut u8),
+        SYSCALL_SCHED_SETAFFINITY => sys_sched_setaffinity(args[0], args[1], args[2] as *const u8),
+        SYSCALL_SCHED_GETAFFINITY => sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
         SYSCALL_TKILL => process::sys_tkill(args[0] as isize, args[1] as i32),
@@ -765,6 +807,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *mut usize,
             args[3],
         ),
+        // sigaltstack: stub for glibc compatibility
+        132 => 0,
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),
         SYSCALL_GETTID => sys_gettid(),
@@ -798,8 +842,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETPGID => sys_getpgid(args[0] as isize),
         SYSCALL_GETSID => sys_getsid(args[0] as isize),
         SYSCALL_SETSID => sys_setsid(),
-        SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1]),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut RLimit),
+        SYSCALL_GETRUSAGE => sys_getrusage(args[0] as isize, args[1] as *mut RUsage),
+        SYSCALL_UMASK => sys_umask(args[0]),
         SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut process::SysInfo),
         SYSCALL_MSGGET => sys_msgget(args[0] as i32, args[1] as i32),
         SYSCALL_MSGSND => sys_msgsnd(args[0] as i32, args[1], args[2], args[3] as i32),
@@ -859,24 +904,21 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0], args[1] as *mut TimeSpec),
-        SYSCALL_SCHED_GETAFFINITY => {
-            sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8)
-        }
         SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_GET_TIME => sys_get_time(args[0] as *mut TimeVal, args[1]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2]),
+        SYSCALL_MADVISE => 0, // stub: madvise hints are advisory only
         SYSCALL_SBRK => sys_sbrk(args[0] as isize),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
-        SYSCALL_PSELECT6 => sys_pselect6(args[0], args[1] as *mut u64, args[2] as *mut u64, args[3] as *mut u64, args[4] as *const TimeSpec, args[5]),
         SYSCALL_POLL => sys_ppoll(args[0] as *mut PollFd, args[1], args[2] as *const TimeSpec),
         SYSCALL_SHUTDOWN => sys_shutdown(),
         // ---- Network syscalls ----
         SYSCALL_SOCKET => crate::net::syscall::sys_socket(args[0], args[1], args[2]),
-        SYSCALL_SOCKETPAIR => crate::net::syscall::sys_socketpair(),
+        SYSCALL_SOCKETPAIR => crate::net::syscall::sys_socketpair(args[0], args[1], args[2], args[3] as *mut i32),
         SYSCALL_BIND => crate::net::syscall::sys_bind(args[0], args[1] as *const u8, args[2]),
         SYSCALL_LISTEN => crate::net::syscall::sys_listen(args[0], args[1]),
         SYSCALL_ACCEPT => {
@@ -927,6 +969,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         }
         SYSCALL_SENDMSG => crate::net::syscall::sys_sendmsg(),
         SYSCALL_RECVMSG => crate::net::syscall::sys_recvmsg(),
+        SYSCALL_SCHED_SETATTR => sys_sched_setattr(args[0], args[1], args[2]),
+        SYSCALL_SCHED_GETATTR => sys_sched_getattr(args[0], args[1] as *mut u8, args[2], args[3]),
+        SYSCALL_GET_MEMPOLICY => sys_get_mempolicy(args[0] as *mut i32, args[1] as *mut usize, args[2], args[3], args[4]),
         SYSCALL_MEMBARRIER => sys_membarrier(args[0] as isize, args[1] as isize),
         _ => {
             known = false;

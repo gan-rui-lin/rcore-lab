@@ -113,6 +113,30 @@ pub fn current_kstack_top() -> usize {
     current_task().unwrap().kstack.get_top()
 }
 
+/// Check if the current task has pending unmasked signals.
+///
+/// When `ignore_sigchld` is true, a pending SIGCHLD alone will not count as
+/// "having a pending signal". This prevents blocking I/O (pipe, socket) from
+/// being spuriously interrupted when a child exits, which would break wait()
+/// scenarios.
+pub fn has_pending_unmasked_signal(ignore_sigchld: bool) -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let process = match task.process.upgrade() {
+        Some(p) => p,
+        None => return false,
+    };
+    let process_inner = process.inner_exclusive_access();
+    let task_inner = task.inner_exclusive_access();
+    let mut pending =
+        (process_inner.signal_pending | task_inner.signal_pending) & !task_inner.signal_mask;
+    if ignore_sigchld {
+        pending &= !super::SignalFlags::SIGCHLD;
+    }
+    !pending.is_empty()
+}
+
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     let mut processor = PROCESSOR.exclusive_access();
     let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();

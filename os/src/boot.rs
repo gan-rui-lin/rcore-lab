@@ -56,7 +56,13 @@ fn rust_main_high() -> ! {
     crate::task::add_initproc();
     #[cfg(target_arch = "riscv64")]
     {
-        *crate::DEV_NON_BLOCKING_ACCESS.exclusive_access() = false;
+        // Keep polling mode as default; allow opt-in via compile-time env for perf experiments.
+        let use_non_blocking = option_env!("VIRTIO_BLK_NON_BLOCKING").is_some();
+        *crate::DEV_NON_BLOCKING_ACCESS.exclusive_access() = use_non_blocking;
+        info!(
+            "[block] virtio non-blocking mode={}",
+            if use_non_blocking { "on" } else { "off" }
+        );
     }
     crate::task::run_tasks();
     panic!("Unreachable in rust_main!");
