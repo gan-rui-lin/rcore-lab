@@ -10,10 +10,11 @@ use bitflags::bitflags;
 use lazy_static::lazy_static;
 
 use crate::{
-    fs::{open_file, File, OpenFlags},
+    fs::{open_file, path_exists, path_is_dir, File, OpenFlags},
     mm::{
         translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
-        translated_str, MapPermission, MmapMeta, PTEFlags, PageTable, ProtectError, VirtAddr,
+        translated_str_checked, MapPermission, MmapMeta, PTEFlags, PageTable, ProtectError,
+        VirtAddr,
     },
     task::{
         add_task, current_process, current_task, current_trap_cx, current_user_token,
@@ -877,6 +878,43 @@ fn resolve_relative_path(path: &str) -> String {
     }
 }
 
+const EXEC_PATH_MAX: usize = 4096;
+const EXEC_NAME_MAX: usize = 255;
+
+fn validate_exec_path(path: &str) -> Result<(), isize> {
+    if path.is_empty() {
+        return Err(errno(ENOENT));
+    }
+    if path.len() >= EXEC_PATH_MAX {
+        return Err(errno(ENAMETOOLONG));
+    }
+    if path
+        .split('/')
+        .any(|part| !part.is_empty() && part.len() > EXEC_NAME_MAX)
+    {
+        return Err(errno(ENAMETOOLONG));
+    }
+    Ok(())
+}
+
+fn has_non_dir_prefix(path: &str) -> bool {
+    let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    if comps.len() < 2 {
+        return false;
+    }
+    let mut prefix = String::from("/");
+    for (idx, comp) in comps.iter().enumerate() {
+        if idx > 0 && !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        prefix.push_str(comp);
+        if idx + 1 < comps.len() && path_exists(prefix.as_str()) && !path_is_dir(prefix.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
 fn build_exec_candidates(exec_path: &str, envs: &[String]) -> Vec<String> {
     // 绝对路径直接返回
     if exec_path.starts_with('/') {
@@ -1042,18 +1080,34 @@ fn sys_exec_internal(
         return errno(EFAULT);
     }
     let token = current_user_token();
-    let mut exec_path = translated_str(token, path);
+    let mut exec_path = match translated_str_checked(token, path) {
+        Some(s) => s,
+        None => return errno(EFAULT),
+    };
+    if let Err(e) = validate_exec_path(exec_path.as_str()) {
+        return e;
+    }
     let mut args: Vec<String> = Vec::new();
     if !argv.is_null() {
-        let mut argv = argv;
+        let mut argv_cur = argv;
         loop {
-            let arg_ptr = *translated_ref(token, argv);
+            let arg_ptr = match read_from_user::<usize>(token, argv_cur) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
             if arg_ptr == 0 {
                 break;
             }
-            args.push(translated_str(token, arg_ptr as *const u8));
+            let arg = match translated_str_checked(token, arg_ptr as *const u8) {
+                Some(s) => s,
+                None => return errno(EFAULT),
+            };
+            if arg.len() >= EXEC_PATH_MAX {
+                return errno(ENAMETOOLONG);
+            }
+            args.push(arg);
             unsafe {
-                argv = argv.add(1);
+                argv_cur = argv_cur.add(1);
             }
         }
     }
@@ -1062,15 +1116,25 @@ fn sys_exec_internal(
     }
     let mut envs: Vec<String> = Vec::new();
     if !envp.is_null() {
-        let mut envp = envp;
+        let mut envp_cur = envp;
         loop {
-            let env_ptr = *translated_ref(token, envp);
+            let env_ptr = match read_from_user::<usize>(token, envp_cur) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
             if env_ptr == 0 {
                 break;
             }
-            envs.push(translated_str(token, env_ptr as *const u8));
+            let env = match translated_str_checked(token, env_ptr as *const u8) {
+                Some(s) => s,
+                None => return errno(EFAULT),
+            };
+            if env.len() >= EXEC_PATH_MAX {
+                return errno(ENAMETOOLONG);
+            }
+            envs.push(env);
             unsafe {
-                envp = envp.add(1);
+                envp_cur = envp_cur.add(1);
             }
         }
     }
@@ -1118,6 +1182,11 @@ fn sys_exec_internal(
                     name,
                     exec_path
                 );
+            }
+            if (exec_path.starts_with('/') || exec_path.contains('/'))
+                && has_non_dir_prefix(candidates[0].as_str())
+            {
+                return errno(ENOTDIR);
             }
             return errno(ENOENT);
         };
