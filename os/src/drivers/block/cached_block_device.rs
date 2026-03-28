@@ -52,6 +52,8 @@ const CACHE_PAGE_CAPACITY: usize = cache_page_capacity_from_blocks(CACHE_SIZE_BL
 
 const TRACE_BLOCK_CACHE_STATS: bool = option_env!("TRACE_BLOCK_CACHE_STATS").is_some();
 const CACHE_STATS_LOG_EVERY_GETS: u64 = 20_000;
+const CACHE_PRESSURE_WARN_BURST: u64 = 3;
+const CACHE_PRESSURE_WARN_EVERY: u64 = 256;
 
 static CACHE_GET_CALLS: AtomicU64 = AtomicU64::new(0);
 static CACHE_HIT_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -61,6 +63,7 @@ static CACHE_DIRTY_EVICT_CALLS: AtomicU64 = AtomicU64::new(0);
 static CACHE_BACKEND_READS: AtomicU64 = AtomicU64::new(0);
 static CACHE_BACKEND_WRITES: AtomicU64 = AtomicU64::new(0);
 static CACHE_LAST_LOG_STEP: AtomicU64 = AtomicU64::new(0);
+static CACHE_FORCED_EVICT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn maybe_log_cache_stats() {
@@ -109,6 +112,17 @@ fn maybe_log_cache_stats() {
             }
             Err(actual) => prev = actual,
         }
+    }
+}
+
+#[inline]
+fn maybe_warn_cache_pressure() {
+    let forced = CACHE_FORCED_EVICT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if forced <= CACHE_PRESSURE_WARN_BURST || forced % CACHE_PRESSURE_WARN_EVERY == 0 {
+        warn!(
+            "Cache full with all pages recently used/in use, forcing eviction (count={})",
+            forced
+        );
     }
 }
 
@@ -292,7 +306,7 @@ impl CacheManager {
             return;
         }
 
-        warn!("Cache full with all pages recently used/in use, forcing eviction");
+        maybe_warn_cache_pressure();
         if let Some(candidate_id) = self.queue.pop_back() {
             if let Some(candidate) = self.pages.remove(&candidate_id) {
                 CACHE_EVICT_CALLS.fetch_add(1, Ordering::Relaxed);
