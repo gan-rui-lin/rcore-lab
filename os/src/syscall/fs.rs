@@ -1848,6 +1848,36 @@ pub fn sys_chdir(_path: *const u8) -> isize {
     }
 }
 
+pub fn sys_fchdir(fd: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_fchdir", pid);
+    }
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+    let Some(inode) = file.inode() else {
+        return errno(ENOTDIR);
+    };
+    if !inode.is_dir() {
+        return errno(ENOTDIR);
+    }
+    let Some(path) = file.path() else {
+        return errno(ENOTDIR);
+    };
+    let uid = inner.effective_uid;
+    if let Err(err) = access_allowed(path, 0o1, uid) {
+        return err;
+    }
+    inner.cwd = String::from(path);
+    0
+}
+
 pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
