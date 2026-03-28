@@ -234,64 +234,119 @@ if let Some(pa) = page_table.translate_va(VirtAddr::from(tls_addr.wrapping_sub(2
 
 ---
 
-## 3. 根因分析
+## 3. 根因分析（已解决 ✅）
 
-### musl 的线程链表管理流程
+### 真正的根因：`sys_set_tid_address` 返回 TID=0
 
-musl 的全局线程链表通过 `__tl_lock` 保护，由 `prev/next` 字段维护双向链表。正常 Linux 上的流程：
+经过深入的二进制反汇编分析，发现崩溃的根本原因是**内核的 `sys_set_tid_address` 和 `sys_gettid` 对主线程返回 TID=0**。
 
-1. `pthread_create`：`__tl_lock()` → 增加计数 → `clone()` → 在 clone 返回后（父线程侧）**链入新线程**
-2. 新线程 `start()`：等待 startlock → 执行用户函数 → `__pthread_exit()`
-3. `__pthread_exit()`：`__tl_lock()` → 从链表摘除 → 减少计数 → `__tl_unlock()`
+#### musl 的 `__tl_lock` 实现
 
-但在我们的 musl libc-bench 二进制中，步骤 1 的"链入新线程"代码**不存在于反汇编中**。可能原因：
+musl 的线程链表锁 `__tl_lock` 使用 CAS 原子操作保护全局链表：
 
-1. **编译器优化**：该 musl 版本使用了不同的链入路径（可能在 `__clone` 返回后的条件分支中）
-2. **musl 版本差异**：某些旧版 musl 在 `start()` 函数中由新线程自己链入，但该版本的 `start()` 也没有这段代码
-3. **COW 交互**：libcbench 中 `fork()` 产生的子进程中，全局线程链表位于 COW 页上。`pthread_create` 的链入写操作触发 COW fault，但链入代码使用的原子操作（`lr.w/sc.w`）与 COW fault 交互可能导致写入丢失
+```c
+// musl __tl_lock 核心逻辑（从二进制反汇编还原）
+void __tl_lock(void) {
+    int tid = self->tid;           // 从 TLS 读取线程 TID
+    if (count && lock == tid) {    // 重入检测：count>0 且 lock 值等于自己的 TID
+        ++count;
+        return;                    // 认为自己已持有锁，跳过 CAS
+    }
+    while (a_cas(&lock, 0, tid))   // CAS: 期望 0（未锁），写入 tid（已锁）
+        __wait(&lock, 0, tid, 0);
+    count = 1;
+}
+```
+
+**关键设计假设**：`0` 是"未锁"哨兵值，TID 必须 > 0。Linux 上所有线程的 TID 都是正整数（主线程 TID = PID）。
+
+#### 我们的内核返回 TID=0 的后果
+
+1. **互斥失效**：主线程 `CAS(&lock, 0, 0)` → lock 值仍为 0 → 其他线程看不出锁已被持有 → `CAS(&lock, 0, N)` 成功 → 两个线程同时进入临界区
+
+2. **重入误判**：当 PID 与某个新线程的 internal_tid 碰撞时（例如 pid=4 的主线程 TID=4 和第 4 个创建的线程 internal_tid=4），`__tl_lock` 的重入检测 `count && lock == tid` 误判为重入 → 新线程跳过 CAS → 无锁进入临界区
+
+#### 崩溃链
+
+```
+主线程 __tl_lock(tid=0)              新线程 __pthread_exit
+   CAS(&lock, 0, 0) → 成功               ↓
+   lock = 0 (看起来仍未锁!)          __tl_lock(tid=N)
+   ↓                                     CAS(&lock, 0, N) → 成功!(lock=0=未锁)
+   clone() → 创建新线程                  ↓
+   [尚未执行链入代码]                 ld a4, *(tp-200)  → a4 = next = 0
+                                      sd a5, 16(a4)     → *(0 + 16) = prev
+                                                         → PAGE FAULT at addr=0x10!
+```
 
 ### 为什么 glibc 不受影响
 
-glibc 的 `pthread_create` 实现不同——它在线程库初始化时就建立了正确的链表结构，且使用 `NPTL` 而非 musl 的轻量级实现。glibc 的 `__pthread_exit` 路径不依赖 `prev/next` 在 TLS 中的特定偏移。
+glibc 的 `NPTL` 实现不依赖 `__tl_lock` 的 CAS(0, tid) 模式。NPTL 使用不同的内部锁和线程管理机制，不会因为 TID=0 而破坏互斥。
 
 ### 为什么 `b_pthread_uselesslock` 不受影响
 
 `b_pthread_uselesslock` 创建线程后只做 `pthread_mutex_lock/unlock`，**不调用 `pthread_join`**。线程退出时通过 `exit_group` 直接终止整个进程，不走 `__pthread_exit` 的 unlink 路径。
 
----
+### 为什么 `serial1` 比 `serial2` 更容易通过
 
-## 4. 当前状态
-
-| 项 | 状态 |
-|----|------|
-| 崩溃点定位 | ✅ `__pthread_exit` 中 `prev=NULL` 的 NULL deref |
-| TLS 布局确认 | ✅ `tp = pthread + 224`，`prev` 在 `tp-200`，`next` 在 `tp-208` |
-| clone 时字段值 | ✅ 确认 clone 时 `prev=0, next=0`，musl 未初始化 |
-| 简单修复（prev=self） | ❌ 消除 SIGSEGV 但导致死锁 |
-| glibc 版本 | ✅ 不受影响，pthread 测试全部通过 |
+- `serial1`：每次只有 1 个活跃线程。主线程的 TID 与线程 TID 碰撞概率低（仅当 PID == internal_tid）
+- `serial2`：同时创建 50 个线程（TID 1~50），当 PID 落在 1~50 范围内时必然碰撞
 
 ---
 
-## 5. 后续方向
+## 4. 修复方案
 
-### 方案 A：深入分析 musl 链入路径（推荐）
+### 修复内容
 
-1. 获取 musl 源码（对应 sdcard 上 libc-bench 链接的版本），确认 `pthread_create` 中链入代码的精确位置
-2. 对比正常 Linux 上 musl 的 clone 前/后行为
-3. 可能需要在 `__clone` 返回后的分支中查找链入代码——当前反汇编可能遗漏了 `pthread_create` 返回路径中的链表操作
+使用 `system_tid = internal_tid + 1` 作为所有线程的系统 TID，确保 TID > 0 且进程内唯一：
 
-### 方案 B：在 fork 后预热 TLS 页
+| 文件 | 改动 |
+|------|------|
+| `os/src/syscall/thread.rs` | `sys_gettid` 返回 `internal_tid + 1`；`sys_set_tid_address` 返回 `internal_tid + 1` |
+| `os/src/syscall/process.rs` | `sys_clone` 的 `PARENT_SETTID`/`CHILD_SETTID` 写入 `internal_tid + 1`；`sys_clone` 返回值改为 `system_tid`；`sys_tkill` 将系统 TID 映射回内部索引（`-1`） |
 
-在 `sys_fork` 中，对子进程主线程的 TLS 区域预先触发 COW 拷贝，确保后续 `pthread_create` 中对全局线程链表的原子写操作不会被 COW fault 干扰。
+### 为什么这样做
 
-### 方案 C：在 `__pthread_exit` 路径中容忍 prev=0
+- `internal_tid + 1` 保证所有 TID ≥ 1（主线程 0→1，线程 1→2，…），不会与 CAS 哨兵值 0 碰撞
+- 同一进程内 internal_tid 唯一 → `+1` 后仍唯一，不会触发 `__tl_lock` 重入误判
+- 改动最小（仅 3 个 syscall），不需要修改 PID 分配器或 TaskControlBlock 结构
 
-修改内核的 page fault handler：当 fault 地址在 0x0-0x1000 范围且 sepc 指向已知的 `__pthread_exit` unlink 路径时，直接跳过 fault 指令（`sepc += 4`）。这是 hack 方案，不推荐。
+### 效果
+
+| 测试 | 修复前 | 修复后 |
+|------|--------|--------|
+| musl `b_pthread_createjoin_serial1` | SIGSEGV (0分) | ✅ 通过 (5.0s) |
+| musl `b_pthread_createjoin_serial2` | SIGSEGV (0分) | ✅ 通过 (5.0s) |
+| musl `b_pthread_create_serial1` | SIGSEGV (0分) | ✅ 通过 (1.2s) |
+| glibc pthread×3 | ✅ 通过 | ✅ 通过（无回归） |
+| RV + LA 双架构 | ❌ 3项×2arch=6项失败 | ✅ 全部通过 |
+
+分支：`fix/libcbench-score`，commit `657fcca`
+
+---
+
+## 5. 完整调试过程总结
+
+### 5.1 反汇编分析路径
+
+1. 从 sdcard 提取 musl `libc-bench` 二进制
+2. 反汇编 `__pthread_exit`（0x1c6a4）→ 确认 `__tl_lock` 在读取 `next` 之前调用
+3. 反汇编 `pthread_create`（0x1c93c）→ 找到父线程链入代码（0x1cc14-0x1cc2c），确认在 clone 返回后执行
+4. 反汇编线程 `start` 函数（0x1c860）→ 发现 joinable 线程**没有 startlock 同步**，直接执行用户函数
+5. 分析 `__tl_lock`（0x1c570）→ 确认使用 `self->tid` 作为锁值，0 = 未锁哨兵
+
+### 5.2 关键转折点
+
+- 第一轮诊断（addr=0x10, next=0x0）→ 初步认为是 prev/next 未初始化
+- 设置 `prev=self` 修复 → 消除 SIGSEGV 但引入死锁 → 排除简单初始化方案
+- 添加 TLS 诊断到 page fault handler → 发现 `self->tid` 值与 crash 模式的关联
+- 发现 TID=0 → 理解 `__tl_lock` 的 CAS 哨兵设计 → 确认 TID=0 破坏互斥
+- PID 碰撞问题（TID=PID=4 vs internal_tid=4）→ 改为 `+1` 方案彻底消除碰撞
 
 ---
 
 ## 6. 影响评估
 
-- musl pthread×3 在 RV 和 LA 上各损失 3 项 × 1.0+ 分 ≈ **6 分**
-- 总 libcbench 满分 108 分（27项 × 2.0 × 2libc × 2arch），当前约 **~70 分**（扣除 musl pthread 6 分 + 部分性能未达标项）
-- 与之前的 91 分相比，修复 memfd/O_TMPFILE/TLB 后已提升约 **+49 分**
+- 修复 memfd/O_TMPFILE/TLB + pthread TID 后，libcbench **0 分项从 14 个降为 0 个**
+- musl pthread×3 在 RV 和 LA 上恢复，每项约 1.0+ 分 ≈ **+6 分**
+- 总计本次修复（含 0.1 memfd + 0.2 TLB + 本次 pthread）提升约 **+55 分**
