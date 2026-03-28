@@ -11,7 +11,7 @@ fn console_getchar() -> usize {
         None => 0,
     }
 }
-use crate::task::suspend_current_and_run_next;
+use crate::task::{has_pending_unmasked_signal, suspend_current_and_run_next};
 
 static URANDOM_SEED: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
 
@@ -74,6 +74,9 @@ impl File for Stdin {
         loop {
             c = console_getchar();
             if c == 0 {
+                if has_pending_unmasked_signal(true) {
+                    return usize::MAX; // EINTR sentinel
+                }
                 suspend_current_and_run_next();
                 continue;
             } else {

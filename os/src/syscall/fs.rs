@@ -496,7 +496,12 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
             return errno(EFAULT);
         };
         let written = match file.write_user_buffer(UserBuffer::new(buffers)) {
-            Ok(written) => written as isize,
+            Ok(written) => {
+                if written == usize::MAX {
+                    return errno(EINTR); // interrupted by signal
+                }
+                written as isize
+            }
             Err(err) => return err,
         };
         // let name = process.inner_exclusive_access().name.clone();
@@ -548,7 +553,11 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
         let Some(buffers) = translated_byte_buffer_checked(token, buf, len, true) else {
             return errno(EFAULT);
         };
-        file.read(UserBuffer::new(buffers)) as isize
+        let raw = file.read(UserBuffer::new(buffers));
+        if raw == usize::MAX {
+            return errno(EINTR); // interrupted by signal
+        }
+        raw as isize
     } else {
         errno(EBADF)
     }
@@ -851,9 +860,15 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_fstatat", pid);
     }
-    if path.is_null() {
+    if path.is_null() || st.is_null() {
         return errno(EFAULT);
     }
+    // Linux fstatat/newfstatat accepts these flags; reject unknown bits.
+    let supported_flags = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT;
+    if flags & !supported_flags != 0 {
+        return errno(EINVAL);
+    }
+
     let token = current_user_token();
     let raw_path = translated_str(token, path);
     // AT_EMPTY_PATH: stat the fd itself when path is empty
@@ -886,7 +901,7 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
     //     full_path
     // );
 
-    // Check for path traversal through non-directory (e.g. /dev/null/invalid)
+        // Check for path traversal through non-directory (e.g. /dev/null/invalid)
     let comps: Vec<&str> = full_path.split('/').filter(|s| !s.is_empty()).collect();
     for i in 0..comps.len().saturating_sub(1) {
         let partial = format!("/{}", comps[..=i].join("/"));
@@ -928,6 +943,15 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
         stat.size = size as i64;
         stat.blksize = 512;
         stat.blocks = ((size + 511) / 512) as i64;
+    }
+    // Generate unique (dev, ino) so glibc ld-linux doesn't confuse different files
+    stat.dev = 1;
+    if !full_path.is_empty() {
+        let mut h: u64 = 5381;
+        for b in full_path.bytes() {
+            h = h.wrapping_mul(33).wrapping_add(b as u64);
+        }
+        stat.ino = h & 0x7FFF_FFFF;
     }
     fill_stat_timestamps(&mut stat, None);
     let bytes = unsafe {
@@ -1139,6 +1163,15 @@ fn stat_from_fd(fd: usize) -> Result<Stat, isize> {
         stat.blocks = ((size + 511) / 512) as i64;
     }
     stat.nlink = 1;
+    // Generate unique (dev, ino) so glibc ld-linux doesn't confuse different files
+    stat.dev = 1;
+    if !path.is_empty() {
+        let mut h: u64 = 5381;
+        for b in path.bytes() {
+            h = h.wrapping_mul(33).wrapping_add(b as u64);
+        }
+        stat.ino = h & 0x7FFF_FFFF;
+    }
     fill_stat_timestamps(&mut stat, file.ts_id());
     Ok(stat)
 }
@@ -2042,6 +2075,9 @@ pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 
         let buffers = translated_byte_buffer(token, base as *const u8, len);
         let read = file.read(UserBuffer::new(buffers));
+        if read == usize::MAX {
+            return if total_read > 0 { total_read } else { errno(EINTR) };
+        }
         total_read += read as isize;
         if read < len {
             break;
@@ -2139,7 +2175,12 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 
         let buffers = translated_byte_buffer(token, base as *const u8, len);
         let written = match file.write_user_buffer(UserBuffer::new(buffers)) {
-            Ok(written) => written,
+            Ok(written) => {
+                if written == usize::MAX {
+                    return if total_written > 0 { total_written } else { errno(EINTR) };
+                }
+                written
+            }
             Err(err) => {
                 if total_written > 0 {
                     return total_written;
@@ -2704,6 +2745,231 @@ pub struct PollFd {
     revents: PollEvents,
 }
 
+fn read_user_bytes(token: usize, src: *const u8, len: usize) -> Result<Vec<u8>, isize> {
+    if src.is_null() {
+        return Err(errno(EFAULT));
+    }
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = vec![0u8; len];
+    let mut offset = 0usize;
+    let slices = translated_byte_buffer(token, src, len);
+    for slice in slices {
+        let n = slice.len().min(len - offset);
+        out[offset..offset + n].copy_from_slice(&slice[..n]);
+        offset += n;
+        if offset >= len {
+            break;
+        }
+    }
+    if offset < len {
+        return Err(errno(EFAULT));
+    }
+    Ok(out)
+}
+
+#[inline]
+fn fdset_len_bytes(nfds: usize) -> usize {
+    let bits_per_word = core::mem::size_of::<usize>() * 8;
+    nfds
+        .saturating_add(bits_per_word - 1)
+        / bits_per_word
+        * core::mem::size_of::<usize>()
+}
+
+#[inline]
+fn fdset_test(set: &[u8], fd: usize) -> bool {
+    let bits_per_word = core::mem::size_of::<usize>() * 8;
+    let word_size = core::mem::size_of::<usize>();
+    let word_idx = fd / bits_per_word;
+    let bit = fd % bits_per_word;
+    let off = word_idx * word_size;
+    if off + word_size > set.len() {
+        return false;
+    }
+    let mut raw = [0u8; core::mem::size_of::<usize>()];
+    raw.copy_from_slice(&set[off..off + word_size]);
+    let word = usize::from_ne_bytes(raw);
+    (word & (1usize << bit)) != 0
+}
+
+#[inline]
+fn fdset_set(set: &mut [u8], fd: usize) {
+    let bits_per_word = core::mem::size_of::<usize>() * 8;
+    let word_size = core::mem::size_of::<usize>();
+    let word_idx = fd / bits_per_word;
+    let bit = fd % bits_per_word;
+    let off = word_idx * word_size;
+    if off + word_size > set.len() {
+        return;
+    }
+    let mut raw = [0u8; core::mem::size_of::<usize>()];
+    raw.copy_from_slice(&set[off..off + word_size]);
+    let mut word = usize::from_ne_bytes(raw);
+    word |= 1usize << bit;
+    set[off..off + word_size].copy_from_slice(&word.to_ne_bytes());
+}
+
+pub fn sys_pselect6(
+    nfds: usize,
+    readfds: *mut usize,
+    writefds: *mut usize,
+    exceptfds: *mut usize,
+    timeout: *const TimeSpec,
+    _sigmask: usize,
+) -> isize {
+    let token = current_user_token();
+    let fdset_len = fdset_len_bytes(nfds);
+
+    let in_read = if readfds.is_null() {
+        None
+    } else {
+        match read_user_bytes(token, readfds as *const u8, fdset_len) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    };
+    let in_write = if writefds.is_null() {
+        None
+    } else {
+        match read_user_bytes(token, writefds as *const u8, fdset_len) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    };
+    let in_except = if exceptfds.is_null() {
+        None
+    } else {
+        match read_user_bytes(token, exceptfds as *const u8, fdset_len) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    };
+
+    let deadline = if timeout.is_null() {
+        None
+    } else {
+        let raw = match read_user_bytes(
+            token,
+            timeout as *const u8,
+            core::mem::size_of::<TimeSpec>(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let spec = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const TimeSpec) };
+        if spec.tv_nsec >= 1_000_000_000 {
+            return errno(EINVAL);
+        }
+        let timeout_ms = spec
+            .tv_sec
+            .saturating_mul(1000)
+            .saturating_add(spec.tv_nsec / 1_000_000);
+        Some(get_time_ms().saturating_add(timeout_ms))
+    };
+
+    loop {
+        let mut out_read = vec![0u8; fdset_len];
+        let mut out_write = vec![0u8; fdset_len];
+        let mut out_except = vec![0u8; fdset_len];
+        let mut ready_count = 0isize;
+
+        for fd in 0..nfds {
+            let watch_read = in_read
+                .as_ref()
+                .map(|set| fdset_test(set.as_slice(), fd))
+                .unwrap_or(false);
+            let watch_write = in_write
+                .as_ref()
+                .map(|set| fdset_test(set.as_slice(), fd))
+                .unwrap_or(false);
+            let watch_except = in_except
+                .as_ref()
+                .map(|set| fdset_test(set.as_slice(), fd))
+                .unwrap_or(false);
+            if !watch_read && !watch_write && !watch_except {
+                continue;
+            }
+
+            let file = {
+                let process = current_process();
+                let inner = process.inner_exclusive_access();
+                if fd >= inner.fd_table.len() {
+                    return errno(EBADF);
+                }
+                let Some(file) = &inner.fd_table[fd] else {
+                    return errno(EBADF);
+                };
+                file.clone()
+            };
+
+            let ready = file.poll(
+                PollEvents::POLLIN
+                    | PollEvents::POLLOUT
+                    | PollEvents::POLLPRI
+                    | PollEvents::POLLERR
+                    | PollEvents::POLLHUP,
+            );
+
+            let mut fd_ready = false;
+            if watch_read && ready.intersects(PollEvents::POLLIN | PollEvents::POLLHUP | PollEvents::POLLERR) {
+                fdset_set(out_read.as_mut_slice(), fd);
+                fd_ready = true;
+            }
+            if watch_write && ready.intersects(PollEvents::POLLOUT | PollEvents::POLLERR) {
+                fdset_set(out_write.as_mut_slice(), fd);
+                fd_ready = true;
+            }
+            if watch_except && ready.contains(PollEvents::POLLPRI) {
+                fdset_set(out_except.as_mut_slice(), fd);
+                fd_ready = true;
+            }
+            if fd_ready {
+                ready_count += 1;
+            }
+        }
+
+        if ready_count > 0 {
+            if !readfds.is_null() {
+                if let Err(e) = copy_to_user(token, readfds as *mut u8, out_read.as_slice()) {
+                    return e;
+                }
+            }
+            if !writefds.is_null() {
+                if let Err(e) = copy_to_user(token, writefds as *mut u8, out_write.as_slice()) {
+                    return e;
+                }
+            }
+            if !exceptfds.is_null() {
+                if let Err(e) = copy_to_user(token, exceptfds as *mut u8, out_except.as_slice()) {
+                    return e;
+                }
+            }
+            return ready_count;
+        }
+
+        if let Some(deadline) = deadline {
+            if get_time_ms() >= deadline {
+                if !readfds.is_null() && fdset_len > 0 {
+                    let _ = copy_to_user(token, readfds as *mut u8, out_read.as_slice());
+                }
+                if !writefds.is_null() && fdset_len > 0 {
+                    let _ = copy_to_user(token, writefds as *mut u8, out_write.as_slice());
+                }
+                if !exceptfds.is_null() && fdset_len > 0 {
+                    let _ = copy_to_user(token, exceptfds as *mut u8, out_except.as_slice());
+                }
+                return 0;
+            }
+        }
+        suspend_current_and_run_next();
+        if crate::task::has_pending_unmasked_signal(false) {
+            return errno(EINTR);
+        }
+    }
+}
+
 pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: *const TimeSpec) -> isize {
     if fds.is_null() {
         return errno(EFAULT);
@@ -2771,125 +3037,9 @@ pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: *const TimeSpec) -> isi
             }
         }
         suspend_current_and_run_next();
-    }
-}
-
-/// pselect6 (syscall 72) — select()-style I/O multiplexing
-///
-/// Translates fd_set bitmasks into poll() calls internally.
-pub fn sys_pselect6(
-    nfds: usize,
-    readfds: *mut u64,
-    writefds: *mut u64,
-    exceptfds: *mut u64,
-    timeout: *const TimeSpec,
-    _sigmask: usize,
-) -> isize {
-    let token = current_user_token();
-
-    let deadline = if timeout.is_null() {
-        None
-    } else {
-        let spec = *translated_ref(token, timeout);
-        if spec.tv_nsec >= 1_000_000_000 {
-            return errno(EINVAL);
+        if crate::task::has_pending_unmasked_signal(false) {
+            return errno(EINTR);
         }
-        let timeout_ms = spec
-            .tv_sec
-            .saturating_mul(1000)
-            .saturating_add(spec.tv_nsec / 1_000_000);
-        Some(get_time_ms().saturating_add(timeout_ms))
-    };
-
-    let nfds = core::cmp::min(nfds, 1024);
-    // Number of u64 words needed for nfds bits
-    let nwords = (nfds + 63) / 64;
-
-    // Helper: read fd_set bitmask from user space
-    let read_fdset = |ptr: *mut u64| -> Vec<u64> {
-        if ptr.is_null() {
-            vec![0u64; nwords]
-        } else {
-            (0..nwords)
-                .map(|i| *translated_ref(token, unsafe { ptr.add(i) }))
-                .collect()
-        }
-    };
-    let write_fdset = |ptr: *mut u64, bits: &[u64]| {
-        if !ptr.is_null() {
-            for (i, &val) in bits.iter().enumerate() {
-                *translated_refmut(token, unsafe { ptr.add(i) }) = val;
-            }
-        }
-    };
-
-    let rfds = read_fdset(readfds);
-    let wfds = read_fdset(writefds);
-    let efds = read_fdset(exceptfds);
-
-    loop {
-        let mut out_r = vec![0u64; nwords];
-        let mut out_w = vec![0u64; nwords];
-        let mut out_e = vec![0u64; nwords];
-        let mut total = 0i32;
-
-        for fd in 0..nfds {
-            let word = fd / 64;
-            let bit = 1u64 << (fd % 64);
-            let want_r = rfds[word] & bit != 0;
-            let want_w = wfds[word] & bit != 0;
-            let want_e = efds[word] & bit != 0;
-            if !want_r && !want_w && !want_e {
-                continue;
-            }
-
-            let file = {
-                let process = current_process();
-                let inner = process.inner_exclusive_access();
-                if fd >= inner.fd_table.len() {
-                    continue;
-                }
-                match &inner.fd_table[fd] {
-                    Some(f) => f.clone(),
-                    None => continue,
-                }
-            };
-
-            let mut req = PollEvents::empty();
-            if want_r { req |= PollEvents::POLLIN; }
-            if want_w { req |= PollEvents::POLLOUT; }
-            req |= PollEvents::POLLERR | PollEvents::POLLHUP;
-            let ready = file.poll(req);
-
-            if want_r && ready.intersects(PollEvents::POLLIN | PollEvents::POLLHUP | PollEvents::POLLERR) {
-                out_r[word] |= bit;
-                total += 1;
-            }
-            if want_w && ready.intersects(PollEvents::POLLOUT | PollEvents::POLLERR) {
-                out_w[word] |= bit;
-                total += 1;
-            }
-            if want_e && ready.contains(PollEvents::POLLERR) {
-                out_e[word] |= bit;
-                total += 1;
-            }
-        }
-
-        if total > 0 {
-            write_fdset(readfds, &out_r);
-            write_fdset(writefds, &out_w);
-            write_fdset(exceptfds, &out_e);
-            return total as isize;
-        }
-        if let Some(deadline) = deadline {
-            if get_time_ms() >= deadline {
-                write_fdset(readfds, &out_r);
-                write_fdset(writefds, &out_w);
-                write_fdset(exceptfds, &out_e);
-                return 0;
-            }
-        }
-        suspend_current_and_run_next();
     }
 }
 

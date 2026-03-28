@@ -10,7 +10,11 @@
 #![allow(dead_code)]
 
 use super::errno::*;
-use crate::task::current_user_token;
+use crate::{
+    config::PAGE_SIZE,
+    mm::{frame_alloc, FrameTracker, MapPermission, VirtAddr},
+    task::{current_process, current_user_token},
+};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -132,21 +136,30 @@ pub struct ShmSegment {
     pub key: IpcKey,
     pub id: IpcId,
     pub size: usize,
-    pub data: Vec<u8>,
+    pub frames: Vec<Arc<FrameTracker>>,
     pub permissions: u32,
     pub attach_count: usize,
+    pub marked_for_delete: bool,
 }
 
 impl ShmSegment {
-    pub fn new(key: IpcKey, id: IpcId, size: usize, permissions: u32) -> Self {
-        Self {
+    pub fn new(key: IpcKey, id: IpcId, size: usize, permissions: u32) -> Result<Self, isize> {
+        let aligned_size = align_up(size, PAGE_SIZE);
+        let page_count = aligned_size / PAGE_SIZE;
+        let mut frames = Vec::with_capacity(page_count);
+        for _ in 0..page_count {
+            let frame = frame_alloc().ok_or(errno(ENOMEM))?;
+            frames.push(Arc::new(frame));
+        }
+        Ok(Self {
             key,
             id,
-            size,
-            data: alloc::vec![0u8; size],
+            size: aligned_size,
+            frames,
             permissions,
             attach_count: 0,
-        }
+            marked_for_delete: false,
+        })
     }
 }
 
@@ -154,6 +167,7 @@ impl ShmSegment {
 pub struct IpcManager {
     message_queues: BTreeMap<IpcId, Arc<Mutex<MessageQueue>>>,
     shm_segments: BTreeMap<IpcId, Arc<Mutex<ShmSegment>>>,
+    shm_attachments: BTreeMap<(usize, usize), (IpcId, usize)>,
     next_msgid: IpcId,
     next_shmid: IpcId,
 }
@@ -163,6 +177,7 @@ impl IpcManager {
         Self {
             message_queues: BTreeMap::new(),
             shm_segments: BTreeMap::new(),
+            shm_attachments: BTreeMap::new(),
             next_msgid: 1,
             next_shmid: 1,
         }
@@ -193,12 +208,15 @@ impl IpcManager {
         self.message_queues.remove(&id).is_some()
     }
 
-    pub fn create_shm(&mut self, key: IpcKey, size: usize, permissions: u32) -> IpcId {
+    pub fn create_shm(&mut self, key: IpcKey, size: usize, permissions: u32) -> Result<IpcId, isize> {
+        if self.shm_segments.len() >= SHMMNI {
+            return Err(errno(ENOMEM));
+        }
         let id = self.next_shmid;
         self.next_shmid += 1;
-        let shm = Arc::new(Mutex::new(ShmSegment::new(key, id, size, permissions)));
+        let shm = Arc::new(Mutex::new(ShmSegment::new(key, id, size, permissions)?));
         self.shm_segments.insert(id, shm);
-        id
+        Ok(id)
     }
 
     pub fn get_shm(&self, id: IpcId) -> Option<Arc<Mutex<ShmSegment>>> {
@@ -207,7 +225,8 @@ impl IpcManager {
 
     pub fn find_shm_by_key(&self, key: IpcKey) -> Option<(IpcId, Arc<Mutex<ShmSegment>>)> {
         for (id, shm) in self.shm_segments.iter() {
-            if shm.lock().key == key {
+            let shm_locked = shm.lock();
+            if shm_locked.key == key && !shm_locked.marked_for_delete {
                 return Some((*id, shm.clone()));
             }
         }
@@ -215,8 +234,42 @@ impl IpcManager {
     }
 
     pub fn remove_shm(&mut self, id: IpcId) -> bool {
-        self.shm_segments.remove(&id).is_some()
+        let removed = self.shm_segments.remove(&id).is_some();
+        if removed {
+            self.shm_attachments.retain(|_, (shmid, _)| *shmid != id);
+        }
+        removed
     }
+
+    pub fn attachment_count_of_pid(&self, pid: usize) -> usize {
+        self.shm_attachments
+            .keys()
+            .filter(|(owner_pid, _)| *owner_pid == pid)
+            .count()
+    }
+
+    pub fn add_attachment(
+        &mut self,
+        pid: usize,
+        addr: usize,
+        shmid: IpcId,
+        size: usize,
+    ) -> Result<(), isize> {
+        if self.shm_attachments.contains_key(&(pid, addr)) {
+            return Err(errno(EINVAL));
+        }
+        self.shm_attachments.insert((pid, addr), (shmid, size));
+        Ok(())
+    }
+
+    pub fn remove_attachment(&mut self, pid: usize, addr: usize) -> Option<(IpcId, usize)> {
+        self.shm_attachments.remove(&(pid, addr))
+    }
+}
+
+#[inline]
+fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
 }
 
 /// Global IPC manager instance
@@ -467,8 +520,10 @@ pub fn sys_shmget(key: IpcKey, size: usize, shmflg: i32) -> isize {
     // Check if we're creating a private segment
     if key == IPC_PRIVATE {
         let permissions = (shmflg & 0o777) as u32;
-        let id = manager.create_shm(key, size, permissions);
-        return id as isize;
+        return match manager.create_shm(key, size, permissions) {
+            Ok(id) => id as isize,
+            Err(e) => e,
+        };
     }
 
     // Try to find existing segment with this key
@@ -494,8 +549,10 @@ pub fn sys_shmget(key: IpcKey, size: usize, shmflg: i32) -> isize {
 
     // Create new segment
     let permissions = (shmflg & 0o777) as u32;
-    let id = manager.create_shm(key, size, permissions);
-    id as isize
+    match manager.create_shm(key, size, permissions) {
+        Ok(id) => id as isize,
+        Err(e) => e,
+    }
 }
 
 /// shmat - Attach shared memory segment
@@ -509,33 +566,133 @@ pub fn sys_shmget(key: IpcKey, size: usize, shmflg: i32) -> isize {
 /// - Success: attached address
 /// - Failure: -errno
 pub fn sys_shmat(shmid: i32, shmaddr: usize, _shmflg: i32) -> isize {
-    let manager = IPC_MANAGER.lock();
+    const SHM_RDONLY: i32 = 0o10000;
+    const SHM_RND: i32 = 0o20000;
+    const SHM_EXEC: i32 = 0o100000;
+
+    let process = current_process();
+    let pid = process.pid.0;
+    let mut manager = IPC_MANAGER.lock();
     let shm = match manager.get_shm(shmid) {
         Some(s) => s,
-        None => return errno(EINVAL),
+        None => {
+            error!("[shm] shmat invalid shmid={} pid={}", shmid, pid);
+            return errno(EINVAL);
+        }
+    };
+    if manager.attachment_count_of_pid(pid) >= SHMSEG {
+        error!(
+            "[shm] shmat pid={} exceeds attachment limit {}",
+            pid, SHMSEG
+        );
+        return errno(EMFILE);
+    }
+
+    let (size, frames) = {
+        let shm_locked = shm.lock();
+        if shm_locked.marked_for_delete {
+            error!(
+                "[shm] shmat on deleted segment shmid={} pid={}",
+                shmid, pid
+            );
+            return errno(EINVAL);
+        }
+        (shm_locked.size, shm_locked.frames.clone())
     };
 
+    let mut map_perm = MapPermission::U | MapPermission::R;
+    if _shmflg & SHM_RDONLY == 0 {
+        map_perm |= MapPermission::W;
+    }
+    if _shmflg & SHM_EXEC != 0 {
+        map_perm |= MapPermission::X;
+    }
+
+    let mut inner = process.inner_exclusive_access();
+    let mmap_base_before = inner.mmap_base;
+    let attach_addr = if shmaddr == 0 {
+        let base = align_up(inner.mmap_base, PAGE_SIZE);
+        inner.mmap_base = match base.checked_add(size) {
+            Some(v) => v,
+            None => {
+                error!(
+                    "[shm] shmat mmap_base overflow pid={} base={:#x} size={:#x}",
+                    pid, base, size
+                );
+                return errno(ENOMEM);
+            }
+        };
+        base
+    } else {
+        if (shmaddr & (PAGE_SIZE - 1)) != 0 {
+            if _shmflg & SHM_RND != 0 {
+                shmaddr & !(PAGE_SIZE - 1)
+            } else {
+                error!(
+                    "[shm] shmat misaligned addr without SHM_RND pid={} shmid={} addr={:#x}",
+                    pid, shmid, shmaddr
+                );
+                return errno(EINVAL);
+            }
+        } else {
+            shmaddr
+        }
+    };
+    let attach_end = match attach_addr.checked_add(size) {
+        Some(v) => v,
+        None => {
+            error!(
+                "[shm] shmat attach_end overflow pid={} shmid={} addr={:#x} size={:#x}",
+                pid, shmid, attach_addr, size
+            );
+            return errno(ENOMEM);
+        }
+    };
+
+    let overlap = inner
+        .memory_set
+        .overlap_count(VirtAddr(attach_addr), VirtAddr(attach_end));
+    if overlap > 0 {
+        error!(
+            "[shm] shmat overlap pid={} shmid={} addr=[{:#x},{:#x}) overlap={} mmap_base_before={:#x} mmap_base_after={:#x}",
+            pid,
+            shmid,
+            attach_addr,
+            attach_end,
+            overlap,
+            mmap_base_before,
+            inner.mmap_base
+        );
+        return errno(EINVAL);
+    }
+    if !inner.memory_set.insert_shared_framed_area(
+        VirtAddr(attach_addr),
+        VirtAddr(attach_end),
+        map_perm,
+        frames,
+    ) {
+        error!(
+            "[shm] shmat map failed pid={} shmid={} addr=[{:#x},{:#x})",
+            pid, shmid, attach_addr, attach_end
+        );
+        return errno(EINVAL);
+    }
+    drop(inner);
+
+    if manager.add_attachment(pid, attach_addr, shmid, size).is_err() {
+        let mut inner = process.inner_exclusive_access();
+        inner
+            .memory_set
+            .remove_area_with_start_vpn(VirtAddr(attach_addr).floor());
+        error!(
+            "[shm] shmat attachment table conflict pid={} shmid={} addr={:#x}",
+            pid, shmid, attach_addr
+        );
+        return errno(EINVAL);
+    }
     let mut shm_locked = shm.lock();
     shm_locked.attach_count += 1;
-    let _size = shm_locked.size;
-
-    drop(shm_locked);
-    drop(manager);
-
-    // For simplicity, we'll use mmap to attach the shared memory
-    // In a full implementation, we would map the shared memory data
-    // into the process's address space
-
-    // If shmaddr is 0, let the system choose the address
-    if shmaddr == 0 {
-        // Use mmap-like allocation
-        // For now, return a fixed address in high memory
-        let addr = 0x2000_0000 + (shmid as usize * SHMMAX);
-        addr as isize
-    } else {
-        // User specified address (for simplicity, just accept it)
-        shmaddr as isize
-    }
+    attach_addr as isize
 }
 
 /// shmdt - Detach shared memory segment
@@ -547,25 +704,35 @@ pub fn sys_shmat(shmid: i32, shmaddr: usize, _shmflg: i32) -> isize {
 /// - Success: 0
 /// - Failure: -errno
 pub fn sys_shmdt(shmaddr: usize) -> isize {
-    // For simplicity, we'll just return success
-    // In a full implementation, we would:
-    // 1. Find which segment this address belongs to
-    // 2. Decrement attach_count
-    // 3. Unmap the memory from the process
-
     if shmaddr == 0 {
         return errno(EINVAL);
     }
 
-    // Estimate which shmid this might be
-    let estimated_id = ((shmaddr - 0x2000_0000) / SHMMAX) as i32;
+    let process = current_process();
+    let pid = process.pid.0;
+    let mut manager = IPC_MANAGER.lock();
+    let (shmid, _size) = match manager.remove_attachment(pid, shmaddr) {
+        Some(v) => v,
+        None => return errno(EINVAL),
+    };
 
-    let manager = IPC_MANAGER.lock();
-    if let Some(shm) = manager.get_shm(estimated_id) {
+    {
+        let mut inner = process.inner_exclusive_access();
+        inner
+            .memory_set
+            .remove_area_with_start_vpn(VirtAddr(shmaddr).floor());
+    }
+
+    let mut should_remove = false;
+    if let Some(shm) = manager.get_shm(shmid) {
         let mut shm_locked = shm.lock();
         if shm_locked.attach_count > 0 {
             shm_locked.attach_count -= 1;
         }
+        should_remove = shm_locked.marked_for_delete && shm_locked.attach_count == 0;
+    }
+    if should_remove {
+        manager.remove_shm(shmid);
     }
 
     0
@@ -586,8 +753,14 @@ pub fn sys_shmctl(shmid: i32, cmd: i32, _buf: usize) -> isize {
 
     match cmd {
         IPC_RMID => {
-            // Remove shared memory segment
-            if manager.remove_shm(shmid) {
+            if let Some(shm) = manager.get_shm(shmid) {
+                let mut shm_locked = shm.lock();
+                shm_locked.marked_for_delete = true;
+                let should_remove = shm_locked.attach_count == 0;
+                drop(shm_locked);
+                if should_remove {
+                    manager.remove_shm(shmid);
+                }
                 0
             } else {
                 errno(EINVAL)
@@ -603,5 +776,33 @@ pub fn sys_shmctl(shmid: i32, cmd: i32, _buf: usize) -> isize {
             }
         }
         _ => errno(EINVAL),
+    }
+}
+
+/// Cleanup all SHM attachments that belong to a process when it exits.
+/// This prevents stale `(pid, addr)` attachment records from causing
+/// false conflicts after pid reuse.
+pub fn cleanup_shm_attachments_for_pid(pid: usize) {
+    let mut manager = IPC_MANAGER.lock();
+    let addrs: Vec<usize> = manager
+        .shm_attachments
+        .keys()
+        .filter_map(|(owner_pid, addr)| if *owner_pid == pid { Some(*addr) } else { None })
+        .collect();
+    for addr in addrs {
+        let Some((shmid, _size)) = manager.remove_attachment(pid, addr) else {
+            continue;
+        };
+        let mut should_remove = false;
+        if let Some(shm) = manager.get_shm(shmid) {
+            let mut shm_locked = shm.lock();
+            if shm_locked.attach_count > 0 {
+                shm_locked.attach_count -= 1;
+            }
+            should_remove = shm_locked.marked_for_delete && shm_locked.attach_count == 0;
+        }
+        if should_remove {
+            manager.remove_shm(shmid);
+        }
     }
 }

@@ -218,7 +218,7 @@ if [[ ! -f "$KERNEL_IMAGE" ]]; then
 fi
 qemu-system-riscv64 -machine virt \
     -kernel "$KERNEL_IMAGE" \
-  -m 128M \
+  -m 1024M \
   -nographic \
   -smp 1 \
   -bios default \

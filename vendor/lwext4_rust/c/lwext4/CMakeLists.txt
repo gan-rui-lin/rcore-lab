@@ -12,6 +12,14 @@ set(BLOCKDEV_TYPE  none)
 add_definitions(-DCONFIG_USE_DEFAULT_CONFIG=0)
 add_definitions(-DVERSION="${VERSION}")
 
+# Allow overriding lwext4 internal block cache size from environment for benchmarking.
+# Default stays 16 to preserve existing behavior when env is not provided.
+if(DEFINED ENV{LWEXT4_BLOCK_DEV_CACHE_SIZE})
+    set(CONFIG_BLOCK_DEV_CACHE_SIZE_VALUE $ENV{LWEXT4_BLOCK_DEV_CACHE_SIZE})
+else()
+    set(CONFIG_BLOCK_DEV_CACHE_SIZE_VALUE 16)
+endif()
+
 #Examples
 if    (CMAKE_SYSTEM_PROCESSOR STREQUAL  cortex-m0)
     #...
@@ -34,7 +42,7 @@ elseif(LIB_ONLY)
     add_definitions(-DCONFIG_DEBUG_ASSERT=0)
     add_definitions(-DCONFIG_HAVE_OWN_OFLAGS=1)
     add_definitions(-DCONFIG_HAVE_OWN_ERRNO=0)
-    add_definitions(-DCONFIG_BLOCK_DEV_CACHE_SIZE=16)
+    add_definitions(-DCONFIG_BLOCK_DEV_CACHE_SIZE=${CONFIG_BLOCK_DEV_CACHE_SIZE_VALUE})
 else()
     #Generic example target
     if (WIN32)
@@ -51,7 +59,7 @@ else()
     add_definitions(-DCONFIG_HAVE_OWN_OFLAGS=1)
     add_definitions(-DCONFIG_HAVE_OWN_ERRNO=1)
     add_definitions(-DCONFIG_USE_USER_MALLOC=0)
-    add_definitions(-DCONFIG_BLOCK_DEV_CACHE_SIZE=16)
+    add_definitions(-DCONFIG_BLOCK_DEV_CACHE_SIZE=${CONFIG_BLOCK_DEV_CACHE_SIZE_VALUE})
 
     add_subdirectory(fs_test)
 endif()

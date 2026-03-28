@@ -36,8 +36,11 @@ use crate::sync::UPIntrFreeCell;
 lazy_static! {
     static ref EXEC_IMAGE_CACHE: UPIntrFreeCell<BTreeMap<String, Arc<[u8]>>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref UMASK_STATE: UPIntrFreeCell<usize> =
+        unsafe { UPIntrFreeCell::new(0o022) };
 }
 
+#[allow(dead_code)]
 fn dump_user_bytes(tag: &str, token: usize, addr: usize, len: usize) {
     let page_table = PageTable::from_token(token);
     let end = addr.saturating_add(len);
@@ -95,6 +98,34 @@ pub struct Tms {
     pub tms_stime: i64,
     pub tms_cutime: i64,
     pub tms_cstime: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RUsageTimeVal {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RUsage {
+    pub ru_utime: RUsageTimeVal,
+    pub ru_stime: RUsageTimeVal,
+    pub ru_maxrss: i64,
+    pub ru_ixrss: i64,
+    pub ru_idrss: i64,
+    pub ru_isrss: i64,
+    pub ru_minflt: i64,
+    pub ru_majflt: i64,
+    pub ru_nswap: i64,
+    pub ru_inblock: i64,
+    pub ru_oublock: i64,
+    pub ru_msgsnd: i64,
+    pub ru_msgrcv: i64,
+    pub ru_nsignals: i64,
+    pub ru_nvcsw: i64,
+    pub ru_nivcsw: i64,
 }
 
 #[repr(C)]
@@ -204,8 +235,27 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
         return Err(errno(EFAULT));
     }
     let mut offset = 0usize;
-    let slices = translated_byte_buffer_checked(token, dst, data.len(), true)
-        .ok_or_else(|| errno(EFAULT))?;
+    let slices = if let Some(slices) = translated_byte_buffer_checked(token, dst, data.len(), true)
+    {
+        slices
+    } else {
+        // COW fork marks writable user pages read-only until a write fault.
+        // Some copy_to_user() paths (e.g., clock_gettime/capget) should still
+        // work for mapped user buffers. Keep strict "mapped" validation, but
+        // relax write-bit enforcement here to avoid false EFAULT.
+        let page_table = PageTable::from_token(token);
+        let start = dst as usize;
+        let end = start.checked_add(data.len()).ok_or_else(|| errno(EFAULT))?;
+        let mut va = start;
+        while va < end {
+            if page_table.translate_va(VirtAddr::from(va)).is_none() {
+                return Err(errno(EFAULT));
+            }
+            let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
+            va = next_page.max(va + 1);
+        }
+        translated_byte_buffer(token, dst, data.len())
+    };
     for slice in slices {
         let len = slice.len().min(data.len() - offset);
         slice[..len].copy_from_slice(&data[offset..offset + len]);
@@ -573,20 +623,6 @@ pub fn sys_getppid() -> isize {
     }
 }
 
-pub fn sys_getrusage(who: i32, usage: usize) -> isize {
-    let _ = who;
-    if usage == 0 {
-        return 0;
-    }
-    // Zero out the rusage struct (18 * 8 = 144 bytes)
-    let token = current_user_token();
-    let bufs = translated_byte_buffer(token, usage as *const u8, 144);
-    for buf in bufs {
-        buf.fill(0);
-    }
-    0
-}
-
 pub fn sys_setsid() -> isize {
     let process = current_process();
     let pid = process.pid.0;
@@ -873,6 +909,18 @@ fn exec_image_cache_key(_path: &str) -> Option<&'static str> {
 }
 
 fn read_exec_image(path: &str, file: &Arc<dyn File>) -> Arc<[u8]> {
+    // TODO: Replace eager read_all() in exec with a file-backed Reader + lazy page loading.
+    // This keeps current behavior stable first; page-fault-driven loading can be added later.
+    if let Some(inode) = file.inode() {
+        let file_size = inode.size();
+        if file_size >= 8 * 1024 * 1024 {
+            info!(
+                "[exec-image] large file path={} size={} bytes",
+                path,
+                file_size
+            );
+        }
+    }
     if let Some(key) = exec_image_cache_key(path) {
         if let Some(cached) = EXEC_IMAGE_CACHE.exclusive_access().get(key).cloned() {
             return cached;
@@ -1381,7 +1429,9 @@ pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
         return errno(EFAULT);
     }
     match clock_id {
-        0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 => {
+        // CLOCK_REALTIME/CLOCK_MONOTONIC and common glibc probes.
+        // We currently map them to the same wall-clock source.
+        0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 => {
             let us = get_time_us();
             let spec = TimeSpec {
                 tv_sec: us / 1_000_000,
@@ -1403,19 +1453,19 @@ pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
     }
 }
 
-pub fn sys_clock_getres(clock_id: usize, ts: *mut TimeSpec) -> isize {
+pub fn sys_clock_getres(clock_id: usize, res: *mut TimeSpec) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_clock_getres", pid);
     }
-    if ts.is_null() {
-        return errno(EFAULT);
+    if res.is_null() {
+        return 0;
     }
     match clock_id {
-        0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 => {
+        0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 => {
             let spec = TimeSpec {
                 tv_sec: 0,
-                tv_nsec: 1_000_000,
+                tv_nsec: 1000, // 1µs resolution
             };
             let bytes = unsafe {
                 core::slice::from_raw_parts(
@@ -1424,7 +1474,7 @@ pub fn sys_clock_getres(clock_id: usize, ts: *mut TimeSpec) -> isize {
                 )
             };
             let token = current_user_token();
-            match copy_to_user(token, ts as *mut u8, bytes) {
+            match copy_to_user(token, res as *mut u8, bytes) {
                 Ok(_) => 0,
                 Err(err) => err,
             }
@@ -1696,6 +1746,33 @@ pub fn sys_times(tms: *mut Tms) -> isize {
         }
     }
     ticks as isize
+}
+
+pub fn sys_getrusage(who: isize, usage: *mut RUsage) -> isize {
+    if usage.is_null() {
+        return errno(EFAULT);
+    }
+    // Linux accepts RUSAGE_SELF(0), RUSAGE_CHILDREN(-1), RUSAGE_THREAD(1).
+    if who != 0 && who != -1 && who != 1 {
+        return errno(EINVAL);
+    }
+    let us = get_time_us() as i64;
+    let mut ru = RUsage::default();
+    ru.ru_utime = RUsageTimeVal {
+        tv_sec: us / 1_000_000,
+        tv_usec: us % 1_000_000,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&ru as *const RUsage) as *const u8,
+            core::mem::size_of::<RUsage>(),
+        )
+    };
+    let token = current_user_token();
+    match copy_to_user(token, usage as *mut u8, bytes) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
 }
 
 pub fn sys_uname(uts: *mut UtsName) -> isize {
@@ -2017,18 +2094,23 @@ pub fn sys_mmap(
         .memory_set
         .overlap_count(VirtAddr(start), VirtAddr(start + len));
     if overlap > 0 {
-        if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
-            let ranges = inner
-                .memory_set
-                .overlap_ranges(VirtAddr(start), VirtAddr(start + len));
-            for (idx, (r_start, r_end)) in ranges.into_iter().enumerate() {
-                trace!(
-                    "[sys_mmap] pid={} overlap[{}]=[{:#x},{:#x})",
-                    pid,
-                    idx,
-                    r_start.0,
-                    r_end.0
-                );
+        if is_fixed {
+            // MAP_FIXED: unmap overlapping pages in the target range.
+            inner.memory_set.unmap_range(VirtAddr(start), VirtAddr(start + len));
+        } else {
+            if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
+                let ranges = inner
+                    .memory_set
+                    .overlap_ranges(VirtAddr(start), VirtAddr(start + len));
+                for (idx, (r_start, r_end)) in ranges.into_iter().enumerate() {
+                    trace!(
+                        "[sys_mmap] pid={} overlap[{}]=[{:#x},{:#x})",
+                        pid,
+                        idx,
+                        r_start.0,
+                        r_end.0
+                    );
+                }
             }
         }
     }
@@ -2111,22 +2193,10 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     //         }
     //     }
     // }
+    let aligned_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     inner
         .memory_set
-        .unmap_range(VirtAddr(start), VirtAddr(start + len));
-    // if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
-    //     let after = inner
-    //         .memory_set
-    //         .overlap_count(VirtAddr(start), VirtAddr(start + len));
-    //     trace!(
-    //         "[sys_munmap] pid={} name={} start={:#x} len={:#x} overlap_after={}",
-    //         pid,
-    //         inner.name,
-    //         start,
-    //         len,
-    //         after
-    //     );
-    // }
+        .unmap_range(VirtAddr(start), VirtAddr(start + aligned_len));
     0
 }
 
@@ -3278,6 +3348,18 @@ pub fn sys_prctl(option: usize, arg2: usize, _arg3: usize, _arg4: usize, _arg5: 
     }
 }
 
+pub fn sys_umask(mask: usize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_umask", pid);
+    }
+    let new_mask = mask & 0o777;
+    let mut state = UMASK_STATE.exclusive_access();
+    let old = *state;
+    *state = new_mask;
+    old as isize
+}
+
 pub fn sys_getrlimit(resource: usize, rlim: *mut RLimit) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
@@ -3559,10 +3641,100 @@ pub fn sys_rt_sigtimedwait(
 }
 
 pub fn sys_membarrier(_cmd: isize, _flags: isize) -> isize {
-    // let pid = current_process().pid.0;
-    // if crate::syscall::should_trace_syscall(pid) {
-    //     syscall!("kernel:pid[{}] sys_membarrier flags={:#x}", pid, flags);
-    // }
-    // // For simplicity, we ignore the flags and just return success.
+    0
+}
+
+/// sched_setscheduler(pid, policy, param)
+/// Stub: accept and pretend success — we only support SCHED_OTHER (0).
+pub fn sys_sched_setscheduler(_pid: usize, _policy: i32, _param: *const u8) -> isize {
+    info!("[sched] sched_setscheduler: stub, returning 0");
+    0
+}
+
+/// sched_getscheduler(pid) -> policy
+/// Always return SCHED_OTHER (0).
+pub fn sys_sched_getscheduler(_pid: usize) -> isize {
+    0 // SCHED_OTHER
+}
+
+/// sched_getparam(pid, param)
+/// Write sched_priority = 0 (for SCHED_OTHER).
+pub fn sys_sched_getparam(_pid: usize, param: *mut u8) -> isize {
+    if param.is_null() {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
+    // struct sched_param { int sched_priority; }
+    let priority: i32 = 0;
+    match copy_to_user(token, param, &priority.to_le_bytes()) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+/// sched_setattr(pid, attr, flags)
+/// Stub: pretend success.
+pub fn sys_sched_setattr(_pid: usize, _attr: usize, _flags: usize) -> isize {
+    warn!("[sched] sched_setattr: stub, returning 0");
+    0
+}
+
+/// sched_getattr(pid, attr, size, flags)
+/// Return a sched_attr struct with SCHED_OTHER policy and priority 0.
+pub fn sys_sched_getattr(_pid: usize, attr: *mut u8, size: usize, _flags: usize) -> isize {
+    warn!("[sched] sched_getattr: called, size={}", size);
+    if attr.is_null() || size < 48 {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
+    // struct sched_attr (48 bytes minimum):
+    //   u32 size = 48
+    //   u32 sched_policy = 0 (SCHED_OTHER)
+    //   u64 sched_flags = 0
+    //   s32 sched_nice = 0
+    //   u32 sched_priority = 0
+    //   u64 sched_runtime = 0
+    //   u64 sched_deadline = 0
+    //   u64 sched_period = 0
+    let mut buf = [0u8; 48];
+    buf[0..4].copy_from_slice(&48u32.to_le_bytes()); // size = 48
+    // All other fields are 0 (SCHED_OTHER, no priority, etc.)
+    match copy_to_user(token, attr, &buf) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+/// sched_setaffinity(pid, cpusetsize, mask)
+/// Stub: accept and ignore — we are single-core, so any mask is fine.
+pub fn sys_sched_setaffinity(_pid: usize, _cpusetsize: usize, _mask: *const u8) -> isize {
+    info!("[sched] sched_setaffinity: stub, always success");
+    0
+}
+
+/// get_mempolicy(mode, nodemask, maxnode, addr, flags)
+/// Stub: return MPOL_DEFAULT (0) — we have no NUMA.
+pub fn sys_get_mempolicy(
+    mode: *mut i32,
+    nodemask: *mut usize,
+    maxnode: usize,
+    _addr: usize,
+    _flags: usize,
+) -> isize {
+    let token = current_user_token();
+    // Write mode = MPOL_DEFAULT (0)
+    if !mode.is_null() {
+        let val: i32 = 0; // MPOL_DEFAULT
+        if let Err(e) = copy_to_user(token, mode as *mut u8, &val.to_le_bytes()) {
+            return e;
+        }
+    }
+    // Write nodemask = node 0
+    if !nodemask.is_null() && maxnode > 0 {
+        let val: usize = 1; // node 0
+        if let Err(e) = copy_to_user(token, nodemask as *mut u8, &val.to_le_bytes()) {
+            return e;
+        }
+    }
     0
 }

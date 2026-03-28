@@ -249,6 +249,11 @@ pub fn ensure_basic_paths() {
     append_line_if_missing("/etc/group", "nogroup:x:65534:\n");
     write_file_if_missing("/etc/localtime", "");
     write_file_if_missing("/etc/adjtime", "");
+    // netperf needs /etc/protocols for getprotobyname()
+    write_file_if_missing(
+        "/etc/protocols",
+        "ip\t0\tIP\nicmp\t1\tICMP\ntcp\t6\tTCP\nudp\t17\tUDP\n",
+    );
 
     write_file_if_missing("/dev/null", "");
     write_file_if_missing("/dev/zero", "");
@@ -370,23 +375,33 @@ pub fn ensure_busybox_links() {
 
     #[cfg(target_arch = "riscv64")]
     if open_file("/glibc/lib/ld-linux-riscv64-lp64d.so.1", OpenFlags::empty()).is_some() {
-        ensure_hardlink(
-            "/lib/ld-linux-riscv64-lp64d.so.1",
-            "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
-        );
+        ensure_hardlink("/lib/ld-linux-riscv64-lp64d.so.1", "/glibc/lib/ld-linux-riscv64-lp64d.so.1");
+        // glibc ld.so searches /lib/ for shared libraries; create hardlinks so it finds them
+        // RV sdcard may have libc.so (no .6 suffix) or libc.so.6 — handle both
+        for (soname, candidates) in [
+            ("libc.so.6", &["/glibc/lib/libc.so.6", "/glibc/lib/libc.so"][..]),
+            ("libm.so.6", &["/glibc/lib/libm.so.6", "/glibc/lib/libm.so"][..]),
+        ] {
+            for src in candidates {
+                if open_file(src, OpenFlags::empty()).is_some() {
+                    let dst = alloc::format!("/lib/{}", soname);
+                    ensure_hardlink(&dst, src);
+                    break;
+                }
+            }
+        }
     }
 
     #[cfg(target_arch = "loongarch64")]
-    if open_file(
-        "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
-        OpenFlags::empty(),
-    )
-    .is_some()
-    {
-        ensure_hardlink(
-            "/lib64/ld-linux-loongarch-lp64d.so.1",
-            "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
-        );
+    if open_file("/glibc/lib/ld-linux-loongarch-lp64d.so.1", OpenFlags::empty()).is_some() {
+        ensure_hardlink("/lib64/ld-linux-loongarch-lp64d.so.1", "/glibc/lib/ld-linux-loongarch-lp64d.so.1");
+        // glibc ld.so searches /lib64/ for shared libraries; create hardlinks so it finds them
+        if open_file("/glibc/lib/libc.so.6", OpenFlags::empty()).is_some() {
+            ensure_hardlink("/lib64/libc.so.6", "/glibc/lib/libc.so.6");
+        }
+        if open_file("/glibc/lib/libm.so.6", OpenFlags::empty()).is_some() {
+            ensure_hardlink("/lib64/libm.so.6", "/glibc/lib/libm.so.6");
+        }
     }
 
     if open_file("/bin/sh", OpenFlags::empty()).is_none() {
@@ -412,6 +427,6 @@ pub fn ensure_busybox_links() {
     if open_file("/bin/sh", OpenFlags::empty()).is_some() {
         debug!("[ext4] /bin/sh ready");
     } else {
-        error!("[ext4] /bin/sh missing after link attempt");
+        debug!("[ext4] /bin/sh not created (both musl and glibc busybox present, deferred to initcode)");
     }
 }

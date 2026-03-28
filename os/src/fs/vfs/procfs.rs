@@ -480,23 +480,37 @@ fn proc_uptime() -> String {
     format!("{}.{} 0.00\n", sec, frac)
 }
 
-pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
+/// Build /proc/sys/kernel/ subtree with sched_rt_runtime_us etc.
+fn proc_sys_kernel() -> Arc<dyn VfsInode> {
     let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
-    let mut kernel_entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
-    kernel_entries.insert(
+    entries.insert(
         String::from("pid_max"),
         ProcFileInode::new(|| String::from("32768\n")),
     );
-    let mut sys_entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
-    sys_entries.insert(
-        String::from("kernel"),
-        ProcStaticDirInode::new(kernel_entries),
+    // cyclictest reads this to check if RT scheduling is available
+    entries.insert(
+        String::from("sched_rt_runtime_us"),
+        ProcFileInode::new(|| String::from("950000\n")),
     );
+    entries.insert(
+        String::from("sched_rt_period_us"),
+        ProcFileInode::new(|| String::from("1000000\n")),
+    );
+    ProcStaticDirInode::new(entries)
+}
+
+fn proc_sys() -> Arc<dyn VfsInode> {
+    let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    entries.insert(String::from("kernel"), proc_sys_kernel());
+    ProcStaticDirInode::new(entries)
+}
+
+pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
+    let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
     entries.insert(String::from("mounts"), ProcFileInode::new(proc_mounts));
     entries.insert(String::from("mountinfo"), ProcFileInode::new(proc_mountinfo));
     entries.insert(String::from("meminfo"), ProcFileInode::new(proc_meminfo));
     entries.insert(String::from("stat"), ProcFileInode::new(proc_stat));
-    entries.insert(String::from("sys"), ProcStaticDirInode::new(sys_entries));
     entries.insert(String::from("uptime"), ProcFileInode::new(proc_uptime));
     // /proc/cgroups - needed by cgroup tests (empty = no cgroup controllers)
     entries.insert(
@@ -518,5 +532,6 @@ pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
             )
         }),
     );
+    entries.insert(String::from("sys"), proc_sys());
     ProcRootInode::new(entries)
 }

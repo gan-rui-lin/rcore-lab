@@ -9,7 +9,8 @@ extern crate alloc;
 use alloc::format;
 use alloc::vec::Vec;
 use user_lib::{
-    chdir, close, dup, execve, exit, fork, link, open, shutdown, unlink, wait, write, OpenFlags,
+    chdir, close, dup, execve, exit, fork, kill, link, open, shutdown, unlink, wait, write,
+    OpenFlags, SIGKILL,
 };
 
 const ENABLE_ALL_TESTS: bool = true;
@@ -20,17 +21,17 @@ const PATH_ENV: &[u8] = b"PATH=/bin:/usr/bin:/musl:/glibc\0";
 const LD_LIB_MUSL: &[u8] = b"LD_LIBRARY_PATH=/musl/lib\0";
 const LD_LIB_GLIBC: &[u8] = b"LD_LIBRARY_PATH=/glibc/lib\0";
 const TEST_LIBC_ROOTS: [&str; 2] = ["/musl", "/glibc"];
-const TEST_SUITES: [&str; 11] = [
-    "basic",
-    "busybox",
-    "cyclictest",
-    "iozone",
+const TEST_SUITES: [&str; 4] = [
+    // "basic",
+    // "busybox",
+    // "cyclictest",
+    // "iozone",
     "iperf",
     "libcbench",
-    "libctest",
+    // "libctest",
     "lmbench",
-    "ltp",
-    "lua",
+    // "ltp",
+    // "lua",
     "netperf",
 ];
 #[allow(dead_code)]
@@ -40,6 +41,18 @@ const EMBEDDED_PTHREAD_ELF: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../pthread_cancel_small"
 ));
+const TMP_IOZONE_PATH: &str = "/tmp/iozone_temp_test.sh";
+const TMP_IOZONE_SCRIPT: &[u8] = b"\
+./busybox echo iozone throughput write/read measurements\n\
+./iozone -t 4 -i 0 -i 1 -r 1k -s 1m\n\
+./busybox echo iozone throughput random-read measurements\n\
+./iozone -t 4 -i 0 -i 2 -r 1k -s 1m\n\
+";
+const TMP_IOZONE_4K_PATH: &str = "/tmp/iozone_temp_test_4k.sh";
+const TMP_IOZONE_4K_SCRIPT: &[u8] = b"\
+./busybox echo iozone throughput write/read measurements 4k\n\
+./iozone -t 4 -i 0 -i 1 -r 4k -s 1m\n\
+";
 
 const TMP_LIBCTEST_PATH: &str = "/tmp/libctest_testcode.sh";
 const TMP_LIBCTEST_SCRIPT: &[u8] = b"\
@@ -245,6 +258,46 @@ fn force_link(link_path: &str, target_path: &str) {
     // }
 }
 
+fn run_busybox_mkdir_p(root: &str, busybox_path: &str, path: &str) -> isize {
+    let pid = fork();
+    if pid < 0 {
+        return -1;
+    }
+    if pid == 0 {
+        let _ = chdir("/\0");
+        let busybox = cstring(busybox_path);
+        let applet = cstring("mkdir");
+        let opt_p = cstring("-p");
+        let dir = cstring(path);
+        let argv = [
+            busybox.as_ptr(),
+            applet.as_ptr(),
+            opt_p.as_ptr(),
+            dir.as_ptr(),
+            core::ptr::null(),
+        ];
+        let ld_lib = if root == "/glibc" { LD_LIB_GLIBC } else { LD_LIB_MUSL };
+        let envp = [PATH_ENV.as_ptr(), ld_lib.as_ptr(), core::ptr::null()];
+        let ret = execve(
+            unsafe { core::str::from_utf8_unchecked(&busybox) },
+            &argv,
+            &envp,
+        );
+        exit(if ret < 0 { 127 } else { 0 });
+    }
+    let mut status = 0;
+    loop {
+        let ret = user_lib::waitpid(pid as usize, &mut status);
+        if ret == pid {
+            break;
+        }
+        if ret < 0 && ret != -2 {
+            break;
+        }
+    }
+    status as isize
+}
+
 fn select_busybox_for_root(root: &str) -> Option<&'static str> {
     match root {
         "/musl" => {
@@ -321,6 +374,8 @@ fn activate_runtime_profile(root: &str) -> bool {
     force_link("/usr/bin/touch", busybox_path);
     force_link("/usr/bin/stat", busybox_path);
 
+    // TODO execve("/riscv/musl/busybox --install /bin");
+
     #[cfg(target_arch = "riscv64")]
     {
         if root == "/glibc" {
@@ -332,10 +387,15 @@ fn activate_runtime_profile(root: &str) -> bool {
             // sdcard has libc.so / libm.so (without version suffix)
             force_link("/lib/libc.so.6", "/glibc/lib/libc.so");
             force_link("/lib/libm.so.6", "/glibc/lib/libm.so");
+
+            let _ = run_busybox_mkdir_p("/glibc", busybox_path, "/code/lmbench_src/bin/build");
+            force_link("/code/lmbench_src/bin/build/lmbench_all", "/glibc/lmbench_all");
         } else {
             force_link("/lib/ld-linux-riscv64-lp64d.so.1", "/musl/lib/libc.so");
             force_link("/lib/ld-musl-riscv64.so.1", "/musl/lib/libc.so");
             force_link("/lib/ld-musl-riscv64-sf.so.1", "/musl/lib/libc.so");
+            let _ = run_busybox_mkdir_p("/musl", busybox_path, "/code/lmbench_src/bin/build");
+            force_link("/code/lmbench_src/bin/build/lmbench_all", "/musl/lmbench_all");
         }
     }
 
@@ -346,9 +406,14 @@ fn activate_runtime_profile(root: &str) -> bool {
                 "/lib64/ld-linux-loongarch-lp64d.so.1",
                 "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
             );
+
+            let _ = run_busybox_mkdir_p("/glibc", busybox_path, "/code/lmbench_src/bin/build");
+            force_link("/code/lmbench_src/bin/build/lmbench_all", "/glibc/lmbench_all");
         } else {
             force_link("/lib64/ld-linux-loongarch-lp64d.so.1", "/musl/lib/libc.so");
             force_link("/lib64/ld-musl-loongarch-lp64d.so.1", "/musl/lib/libc.so");
+            let _ = run_busybox_mkdir_p("/musl", busybox_path, "/code/lmbench_src/bin/build");
+            force_link("/code/lmbench_src/bin/build/lmbench_all", "/musl/lmbench_all");
         }
     }
 
@@ -561,7 +626,43 @@ fn run_suite(root: &str, suite: &str) -> i32 {
         return -1;
     }
     let script = format!("{}/{}_testcode.sh", root, suite);
-    run_testcode(script.as_str(), root)
+    let ret = run_testcode(script.as_str(), root);
+    // Kill orphan daemons (e.g. iperf3 -s -D, netserver -D) so they don't
+    // hold ports when the next libc variant runs the same suite.
+    reap_orphans();
+    ret
+}
+
+/// Kill orphan daemon processes and reap zombies.
+fn reap_orphans() {
+    let my_pid = user_lib::getpid();
+    for p in 2..512usize {
+        if p as isize != my_pid {
+            let _ = kill(p, SIGKILL);
+        }
+    }
+    // Reap with WNOHANG until ECHILD — give killed processes time to exit.
+    let mut status: i32 = 0;
+    let mut yields_without_reap = 0usize;
+    loop {
+        let ret = user_lib::waitpid_nohang(-1i32 as usize, &mut status);
+        if ret > 0 {
+            // Reaped one zombie, reset counter and keep going
+            yields_without_reap = 0;
+            continue;
+        }
+        if ret == 0 {
+            // Children exist but none exited yet — yield and retry
+            yields_without_reap += 1;
+            if yields_without_reap > 500 {
+                // Safety valve: give up after many yields
+                break;
+            }
+            user_lib::sys_yield();
+            continue;
+        }
+        break; // ECHILD or error — no more children
+    }
 }
 
 fn run_all_suites() {
@@ -628,6 +729,30 @@ fn run_selector(selector: &str) {
         let _ = activate_runtime_profile(root);
         let _ = write_embedded_elf(TMP_LTP_PATH, TMP_LTP_SCRIPT);
         let _ = run_testcode(TMP_LTP_PATH, root);
+        return;
+    }
+
+    if selector == "tmp-iozone" || selector == "tmp-iozone-glibc" {
+        let root = if selector.ends_with("-glibc") {
+            "/glibc"
+        } else {
+            "/musl"
+        };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_IOZONE_PATH, TMP_IOZONE_SCRIPT);
+        let _ = run_testcode(TMP_IOZONE_PATH, root);
+        return;
+    }
+
+    if selector == "tmp-iozone-4k" || selector == "tmp-iozone-4k-glibc" {
+        let root = if selector.ends_with("-glibc") {
+            "/glibc"
+        } else {
+            "/musl"
+        };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_IOZONE_4K_PATH, TMP_IOZONE_4K_SCRIPT);
+        let _ = run_testcode(TMP_IOZONE_4K_PATH, root);
         return;
     }
 

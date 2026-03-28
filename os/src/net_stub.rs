@@ -15,7 +15,7 @@ pub mod syscall {
     pub fn sys_socket(_domain: usize, _ty: usize, _protocol: usize) -> isize {
         -ENOSYS
     }
-    pub fn sys_socketpair() -> isize {
+    pub fn sys_socketpair(_domain: usize, _ty: usize, _protocol: usize, _sv: *mut i32) -> isize {
         -ENOSYS
     }
     pub fn sys_bind(_fd: usize, _addr: *const u8, _len: usize) -> isize {

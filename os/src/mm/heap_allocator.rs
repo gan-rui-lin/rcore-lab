@@ -9,6 +9,11 @@ static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
 #[alloc_error_handler]
 /// panic when heap allocation error occurs
 pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
+    println!(
+        "[kernel] alloc_error layout: size={} align={}",
+        layout.size(),
+        layout.align()
+    );
     let proc_len = crate::task::pid2process_len();
     let ready_len = crate::task::ready_queue_len();
     let live_tasks = crate::task::live_task_count();
@@ -28,6 +33,7 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
         total_sem_waiters,
         total_cond_waiters,
     ) = crate::task::pid2process_aggregate();
+    let (total_fd_slots, max_fd_slots, max_fd_pid) = crate::task::pid2process_fdtable_summary();
     println!(
         "[kernel] alloc_error diag: pid2pcb_len={} ready_queue_len={} timer_len={} live_tasks={}",
         proc_len, ready_len, timer_len, live_tasks
@@ -55,6 +61,12 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
         top_pid_count,
         min_pid,
         max_pid
+    );
+    println!(
+        "[kernel] alloc_error diag5: total_fd_slots={} max_fd_slots={} max_fd_pid={}",
+        total_fd_slots,
+        max_fd_slots,
+        max_fd_pid
     );
     panic!("Heap allocation error, layout = {:?}", layout);
 }

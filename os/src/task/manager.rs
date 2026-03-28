@@ -159,3 +159,22 @@ pub fn pid2process_aggregate() -> (
         total_cond_waiters,
     )
 }
+
+#[allow(dead_code)]
+pub fn pid2process_fdtable_summary() -> (usize, usize, usize) {
+    let map = PID2PCB.exclusive_access();
+    let mut total_fd_slots = 0usize;
+    let mut max_fd_slots = 0usize;
+    let mut max_fd_pid = 0usize;
+    for (pid, process) in map.iter() {
+        if let Some(inner) = process.try_inner_exclusive_access() {
+            let fd_len = inner.fd_table.len();
+            total_fd_slots += fd_len;
+            if fd_len > max_fd_slots {
+                max_fd_slots = fd_len;
+                max_fd_pid = *pid;
+            }
+        }
+    }
+    (total_fd_slots, max_fd_slots, max_fd_pid)
+}
