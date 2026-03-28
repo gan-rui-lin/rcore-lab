@@ -1,7 +1,7 @@
 use arch::{TrapContext, TrapFrameArgs};
 use crate::{
     syscall::errno::{errno, EAGAIN, ECHILD},
-    task::{TaskControlBlock, add_task, current_process, current_task},
+    task::{TaskControlBlock, add_task, current_task},
 };
 use alloc::sync::Arc;
 
@@ -39,30 +39,37 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     new_task_tid as isize
 }
 
+/// Return the caller's TID.
+/// CRITICAL: musl's __tl_lock uses CAS(&lock, 0, tid) with 0 as "unlocked"
+/// sentinel. TID must be > 0 and unique within the process.
+/// We return internal_tid + 1 to guarantee > 0 and avoid collision.
 pub fn sys_gettid() -> isize {
-    current_task()
-        .unwrap()
-        .inner_exclusive_access()
-        .res
-        .as_ref()
-        .unwrap()
-        .tid as isize
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    let tid = inner.res.as_ref().unwrap().tid;
+    drop(inner);
+    (tid + 1) as isize
 }
 
+/// Save clear_child_tid pointer and return the caller's TID.
+/// CRITICAL: musl's __tl_lock uses CAS(&lock, 0, tid) with 0 as "unlocked"
+/// sentinel. TID must be > 0 and unique within the process.
+/// We return internal_tid + 1 to guarantee > 0 and avoid collision.
 pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
     let task = current_task().unwrap();
     let mut task_inner = task.inner_exclusive_access();
-    let tid = task_inner.res.as_ref().unwrap().tid as i32;
+    let tid = task_inner.res.as_ref().unwrap().tid;
     task_inner.clear_child_tid = tidptr as usize;
     drop(task_inner);
     // Linux set_tid_address: only saves the pointer for clear_child_tid on exit,
     // and returns the caller's TID. It does NOT write to *tidptr.
-    // Writing TID to a user pointer is CLONE_CHILD_SETTID's job in clone().
+    let system_tid = tid + 1;
     info!(
-        "[sys_set_tid_address] pid={} tid={} tidptr={:#x}",
-        current_process().pid.0, tid, tidptr as usize
+        "[sys_set_tid_address] pid={} tid={}→{} tidptr={:#x}",
+        current_task().unwrap().process.upgrade().unwrap().pid.0,
+        tid, system_tid, tidptr as usize
     );
-    tid as isize
+    system_tid as isize
 }
 
 /// thread does not exist, return -ECHILD

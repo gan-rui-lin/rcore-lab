@@ -725,45 +725,30 @@ pub fn sys_clone(
         );
     }
 
+    // System TID = internal_tid + 1, ensuring TID > 0 and unique within process.
+    // CRITICAL: musl's __tl_lock uses CAS(&lock, 0, tid) — tid=0 breaks the lock.
+    let system_tid = (new_task_tid + 1) as i32;
     if clone_flags.contains(CloneFlags::PARENT_SETTID) && !ptid.is_null() {
         let token = current_user_token();
-        let ptid_addr = ptid as usize;
-        let pt = PageTable::from_token(token);
-        let vpn = VirtAddr::from(ptid_addr).floor();
-        match pt.translate(vpn) {
-            Some(pte) => info!(
-                "[clone] ptid addr={:#x} vpn={:?} pte_valid={} flags={:?}",
-                ptid_addr,
-                vpn,
-                pte.is_valid(),
-                pte.flags()
-            ),
-            None => info!("[clone] ptid addr={:#x} vpn={:?} pte=None", ptid_addr, vpn),
-        }
-        *translated_refmut(token, ptid) = new_task_tid as i32;
+        info!(
+            "[clone] PARENT_SETTID ptid={:#x} system_tid={}",
+            ptid as usize, system_tid
+        );
+        *translated_refmut(token, ptid) = system_tid;
     }
     if clone_flags.contains(CloneFlags::CHILD_SETTID) && !ctid.is_null() {
         let token = new_task.get_user_token();
-        let ctid_addr = ctid as usize;
-        let pt = PageTable::from_token(token);
-        let vpn = VirtAddr::from(ctid_addr).floor();
-        match pt.translate(vpn) {
-            Some(pte) => info!(
-                "[clone] ctid addr={:#x} vpn={:?} pte_valid={} flags={:?}",
-                ctid_addr,
-                vpn,
-                pte.is_valid(),
-                pte.flags()
-            ),
-            None => info!("[clone] ctid addr={:#x} vpn={:?} pte=None", ctid_addr, vpn),
-        }
-        *translated_refmut(token, ctid) = new_task_tid as i32;
+        info!(
+            "[clone] CHILD_SETTID ctid={:#x} system_tid={}",
+            ctid as usize, system_tid
+        );
+        *translated_refmut(token, ctid) = system_tid;
     }
 
     // Queue the child only after its trap context/TLS/tid pointers are fully initialized.
     add_task(Arc::clone(&new_task));
 
-    new_task_tid as isize
+    system_tid as isize
 }
 
 /// Maximum depth for shebang recursion to prevent infinite loops
@@ -2149,11 +2134,12 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
     }
     let process = current_process();
     let inner = process.inner_exclusive_access();
-    let tid = tid as usize;
-    if tid >= inner.tasks.len() || inner.tasks[tid].is_none() {
+    // Map system TID (internal_tid + 1) back to internal index.
+    let internal_tid = (tid as usize).wrapping_sub(1);
+    if internal_tid >= inner.tasks.len() || inner.tasks[internal_tid].is_none() {
         return errno(ESRCH);
     }
-    if let Some(task) = inner.tasks[tid].as_ref() {
+    if let Some(task) = inner.tasks[internal_tid].as_ref() {
         let mut task_inner = task.inner_exclusive_access();
         if signum == 32 || signum == 33 {
             let target_tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);

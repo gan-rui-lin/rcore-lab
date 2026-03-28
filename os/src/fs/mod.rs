@@ -1,5 +1,6 @@
 //! File trait & inode(dir, file, pipe, stdin, stdout)
 
+mod memfd;
 mod pipe;
 mod stdio;
 mod vfs;
@@ -189,6 +190,7 @@ pub use vfs::{
     create_dir, list_apps, mount_easyfs, mount_fat32, mount_fat32_auto, mount_procfs, open_file,
     path_exists, path_is_dir, remove_path,
 };
+pub use memfd::MemFdFile;
 pub use pipe::make_pipe;
 pub use stdio::{DevNull, DevUrandom, DevZero, Stdin, Stdout};
 

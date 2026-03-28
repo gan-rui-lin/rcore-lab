@@ -7,7 +7,7 @@ mod procfs;
 mod ext4;
 mod fat32;
 
-pub use core::VfsInode;
+pub use core::{VfsInode, VfsNodeKind};
 pub use file::{create_dir, list_apps, open_file, path_exists, path_is_dir, remove_path};
 pub use mount::{mount_easyfs, mount_fat32, mount_fat32_auto, mount_procfs};
 #[cfg(feature = "ext4")]
