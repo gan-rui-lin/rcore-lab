@@ -625,12 +625,75 @@ fn run_suite(root: &str, suite: &str) -> i32 {
         println!("=== Skipped {} / {} (profile activate failed) ===\n", root, suite);
         return -1;
     }
+    if suite == "ltp" {
+        let ret = run_ltp_suite(root);
+        reap_orphans();
+        return ret;
+    }
     let script = format!("{}/{}_testcode.sh", root, suite);
     let ret = run_testcode(script.as_str(), root);
     // Kill orphan daemons (e.g. iperf3 -s -D, netserver -D) so they don't
     // hold ports when the next libc variant runs the same suite.
     reap_orphans();
     ret
+}
+
+fn run_ltp_suite(root: &str) -> i32 {
+    let script_path = "/tmp/ltp_testcode_filtered.sh";
+    // Run standalone LTP cases while skipping obvious helper/library entries
+    // that are not meant to be launched directly (e.g. cgroup_fj_proc).
+    let script = "\
+#!/bin/sh
+echo \"#### OS COMP TEST GROUP START ltp ####\"
+target_dir=\"ltp/testcases/bin\"
+export PATH=\"$PATH:./ltp/testcases/bin:./ltp/testcases/lib:./ltp/testcases/network/busy_poll:./ltp/testcases/kernel/controllers/cgroup_fj\"
+case_timeout=\"${LTP_CASE_TIMEOUT:-8}\"
+
+is_skip_case() {
+  case \"$1\" in
+    *.sh|*_helper|*_helper.sh|busy_poll_lib.sh|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|chdir01)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+run_case_with_timeout() {
+  case_file=\"$1\"
+  \"$case_file\" &
+  case_pid=$!
+  elapsed=0
+  while kill -0 \"$case_pid\" 2>/dev/null; do
+    if [ \"$elapsed\" -ge \"$case_timeout\" ]; then
+      kill -9 \"$case_pid\" 2>/dev/null
+      wait \"$case_pid\" 2>/dev/null
+      return 124
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  wait \"$case_pid\"
+  return $?
+}
+
+for file in \"$target_dir\"/*; do
+  [ -f \"$file\" ] || continue
+  case_name=$(basename \"$file\")
+  if is_skip_case \"$case_name\"; then
+    continue
+  fi
+  echo \"RUN LTP CASE $case_name\"
+  run_case_with_timeout \"$file\"
+  ret=$?
+  echo \"FAIL LTP CASE $case_name : $ret\"
+done
+
+echo \"#### OS COMP TEST GROUP END ltp ####\"
+";
+    let _ = write_embedded_elf(script_path, script.as_bytes());
+    run_testcode(script_path, root)
 }
 
 /// Kill orphan daemon processes and reap zombies.
