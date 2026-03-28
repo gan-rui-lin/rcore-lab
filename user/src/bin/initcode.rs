@@ -21,11 +21,11 @@ const PATH_ENV: &[u8] = b"PATH=/bin:/usr/bin:/musl:/glibc\0";
 const LD_LIB_MUSL: &[u8] = b"LD_LIBRARY_PATH=/musl/lib\0";
 const LD_LIB_GLIBC: &[u8] = b"LD_LIBRARY_PATH=/glibc/lib\0";
 const TEST_LIBC_ROOTS: [&str; 2] = ["/musl", "/glibc"];
-const TEST_SUITES: [&str; 3] = [
+const TEST_SUITES: [&str; 5] = [
     // "basic",
     // "busybox",
-    // "cyclictest",
-    // "iozone",
+    "cyclictest",
+    "iozone",
     "iperf",
     // "libcbench",
     // "libctest",
@@ -41,6 +41,18 @@ const EMBEDDED_PTHREAD_ELF: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../pthread_cancel_small"
 ));
+const TMP_IOZONE_PATH: &str = "/tmp/iozone_temp_test.sh";
+const TMP_IOZONE_SCRIPT: &[u8] = b"\
+./busybox echo iozone throughput write/read measurements\n\
+./iozone -t 4 -i 0 -i 1 -r 1k -s 1m\n\
+./busybox echo iozone throughput random-read measurements\n\
+./iozone -t 4 -i 0 -i 2 -r 1k -s 1m\n\
+";
+const TMP_IOZONE_4K_PATH: &str = "/tmp/iozone_temp_test_4k.sh";
+const TMP_IOZONE_4K_SCRIPT: &[u8] = b"\
+./busybox echo iozone throughput write/read measurements 4k\n\
+./iozone -t 4 -i 0 -i 1 -r 4k -s 1m\n\
+";
 
 fn cstring(s: &str) -> Vec<u8> {
     let mut v = Vec::from(s.as_bytes());
@@ -562,6 +574,30 @@ fn run_selector(selector: &str) {
 
     if selector == "single-elf" {
         run_single_elf_suite();
+        return;
+    }
+
+    if selector == "tmp-iozone" || selector == "tmp-iozone-glibc" {
+        let root = if selector.ends_with("-glibc") {
+            "/glibc"
+        } else {
+            "/musl"
+        };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_IOZONE_PATH, TMP_IOZONE_SCRIPT);
+        let _ = run_testcode(TMP_IOZONE_PATH, root);
+        return;
+    }
+
+    if selector == "tmp-iozone-4k" || selector == "tmp-iozone-4k-glibc" {
+        let root = if selector.ends_with("-glibc") {
+            "/glibc"
+        } else {
+            "/musl"
+        };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_IOZONE_4K_PATH, TMP_IOZONE_4K_SCRIPT);
+        let _ = run_testcode(TMP_IOZONE_4K_PATH, root);
         return;
     }
 

@@ -41,7 +41,8 @@ fn main() {
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let lwext4_lib = &format!("lwext4-{}", arch);
     let lwext4_lib_path = manifest_dir.join(format!("c/lwext4/lib{}.a", lwext4_lib));
-    if !lwext4_lib_path.exists() {
+    let force_rebuild_lwext4 = env::var("LWEXT4_BLOCK_DEV_CACHE_SIZE").is_ok();
+    if force_rebuild_lwext4 || !lwext4_lib_path.exists() {
         let status = Command::new("make")
             .args(&[
                 "musl-generic",
@@ -92,6 +93,7 @@ fn main() {
         manifest_dir.join("c/wrapper.h").to_str().unwrap()
     );
     println!("cargo:rerun-if-changed={}", c_path.to_str().unwrap());
+    println!("cargo:rerun-if-env-changed=LWEXT4_BLOCK_DEV_CACHE_SIZE");
 }
 
 fn generates_bindings_to_rust(manifest_dir: &Path, mpath: &str) {
