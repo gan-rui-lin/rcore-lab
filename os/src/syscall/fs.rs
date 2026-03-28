@@ -69,6 +69,7 @@ const AT_STATX_SYNC_TYPE: u32 = AT_STATX_FORCE_SYNC | AT_STATX_DONT_SYNC;
 const UTIME_NOW: isize = 0x3fffffff;
 const UTIME_OMIT: isize = 0x3ffffffe;
 const PATH_MAX: usize = 4096;
+const NAME_MAX: usize = 255;
 const MS_RDONLY: u32 = 1;
 
 /// Per-file stored timestamps (atime, mtime).
@@ -1754,9 +1755,20 @@ pub fn sys_chdir(_path: *const u8) -> isize {
         return errno(EFAULT);
     }
     let token = current_user_token();
-    let raw = translated_str(token, _path);
+    let Some(raw) = translated_str_checked(token, _path) else {
+        return errno(EFAULT);
+    };
     if raw.is_empty() {
-        return errno(EINVAL);
+        return errno(ENOENT);
+    }
+    if raw.len() >= PATH_MAX {
+        return errno(ENAMETOOLONG);
+    }
+    if raw
+        .split('/')
+        .any(|component| !component.is_empty() && component.len() > NAME_MAX)
+    {
+        return errno(ENAMETOOLONG);
     }
     let process = current_process();
     // let proc_name = process.inner_exclusive_access().name.clone();
@@ -2541,7 +2553,9 @@ pub fn sys_statfs(path: *const u8, buf: *mut StatFs) -> isize {
         return errno(EFAULT);
     }
     let token = current_user_token();
-    let raw = translated_str(token, path);
+    let Some(raw) = translated_str_checked(token, path) else {
+        return errno(EFAULT);
+    };
     if raw.is_empty() {
         return errno(EINVAL);
     }
@@ -3169,9 +3183,18 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32, _flags: u32) -> is
         return errno(EFAULT);
     }
     let token = current_user_token();
-    let raw_path = translated_str(token, path);
+    let Some(raw_path) = translated_str_checked(token, path) else {
+        return errno(EFAULT);
+    };
     if raw_path.is_empty() {
-        return errno(EINVAL);
+        return errno(ENOENT);
+    }
+    if raw_path.len() >= PATH_MAX
+        || raw_path
+            .split('/')
+            .any(|component| !component.is_empty() && component.len() > NAME_MAX)
+    {
+        return errno(ENAMETOOLONG);
     }
     let full_path = if raw_path.starts_with('/') {
         normalize_path(&raw_path)
@@ -3182,10 +3205,15 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32, _flags: u32) -> is
         };
         resolve_path(&base, &raw_path)
     };
-    let exists =
-        is_char_device(&full_path) || open_file(full_path.as_str(), OpenFlags::empty()).is_some() || path_is_dir(&full_path);
-    if !exists {
+    let full_path = match resolve_access_path(&full_path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if !path_exists_for_access(&full_path) {
         return errno(ENOENT);
+    }
+    if readonly_mount_contains(&full_path) {
+        return errno(EROFS);
     }
     path_mode_set(&full_path, mode);
     0
