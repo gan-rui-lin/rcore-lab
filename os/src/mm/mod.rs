@@ -14,7 +14,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 pub use arch::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, VPNRange};
 pub use arch::{PTEFlags, translated_byte_buffer, translated_ref, translated_refmut, translated_str};
 pub use arch::{PageTable, PageTableEntry, UserBuffer, UserBufferIterator};
-pub use frame_allocator::{frame_alloc, frame_alloc_more, frame_dealloc, FrameTracker};
+pub use frame_allocator::{
+    frame_alloc, frame_alloc_more, frame_allocator_stats, frame_dealloc, FrameTracker,
+};
 pub use memory_set::remap_test;
 pub use memory_set::{kernel_token, MapPermission, MemorySet, KERNEL_SPACE};
 
