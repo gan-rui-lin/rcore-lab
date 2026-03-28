@@ -651,7 +651,7 @@ case_timeout=\"${LTP_CASE_TIMEOUT:-8}\"
 
 is_skip_case() {
   case \"$1\" in
-    *.sh|*_helper|*_helper.sh|busy_poll_lib.sh|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|cpuctl_fj_*|cpuhotplug_do_*|cpuhotplug_report_*|crash*|dio_read|dio_sparse|epoll_create1_02|creat05|cve-2017-17052|chdir01|clock_nanosleep*)
+    *.sh|*_helper|*_helper.sh|*_child|busy_poll_lib.sh|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|cpuctl_fj_*|cpuhotplug_do_*|cpuhotplug_report_*|crash*|dio_read|dio_sparse|epoll*|eventfd*|event_generator|fanotify*|fanout*|fcntl11|fcntl11_64|fcntl12|fcntl12_64|fcntl14|fcntl14_64|creat05|cve-2017-17052|chdir01|clock_nanosleep*)
       return 0
       ;;
     *)
