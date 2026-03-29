@@ -52,8 +52,8 @@ const CACHE_PAGE_CAPACITY: usize = cache_page_capacity_from_blocks(CACHE_SIZE_BL
 
 const TRACE_BLOCK_CACHE_STATS: bool = option_env!("TRACE_BLOCK_CACHE_STATS").is_some();
 const CACHE_STATS_LOG_EVERY_GETS: u64 = 20_000;
-const CACHE_PRESSURE_WARN_BURST: u64 = 3;
-const CACHE_PRESSURE_WARN_EVERY: u64 = 256;
+const CACHE_PRESSURE_WARN_BURST: u64 = 1;
+const CACHE_PRESSURE_WARN_EVERY: u64 = 4096;
 
 static CACHE_GET_CALLS: AtomicU64 = AtomicU64::new(0);
 static CACHE_HIT_CALLS: AtomicU64 = AtomicU64::new(0);
