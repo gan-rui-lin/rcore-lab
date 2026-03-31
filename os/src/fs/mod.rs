@@ -179,6 +179,8 @@ bitflags! {
         const TRUNC = 1 << 9;
         /// append
         const APPEND = 1 << 10;
+        /// direct I/O
+        const DIRECT = 1 << 14;
         /// must be a directory
         const DIRECTORY = 1 << 16;
         /// close-on-exec
@@ -252,8 +254,7 @@ pub fn ensure_basic_paths() {
     // Keep /etc/protocols deterministic for getprotobyname()-based tests.
     write_file_overwrite(
         "/etc/protocols",
-        "ip\t0\tIP\n\
-hopopt\t0\tHOPOPT\n\
+        "hopopt\t0\tHOPOPT\tip\tIP\n\
 icmp\t1\tICMP\n\
 tcp\t6\tTCP\n\
 udp\t17\tUDP\n\

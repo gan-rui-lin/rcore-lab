@@ -245,6 +245,18 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             parent_inner.signal_pending |= SignalFlags::SIGCHLD;
         }
         let process_inner = process.inner_exclusive_access();
+        if let Some(vfork_parent) = process_inner.vfork_vm_parent.as_ref().and_then(|p| p.upgrade()) {
+            let mut parent_inner = vfork_parent.inner_exclusive_access();
+            let copied = parent_inner
+                .memory_set
+                .sync_user_writable_from(&process_inner.memory_set);
+            trace!(
+                "[vfork] sync child pid={} -> parent pid={} copied_pages={}",
+                pid,
+                vfork_parent.pid.0,
+                copied
+            );
+        }
         {
             let mut initproc_inner = INITPROC.inner_exclusive_access();
             for child in process_inner.children.iter() {

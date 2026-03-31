@@ -43,3 +43,4 @@ ltp-full/
 user/build-user/
 user/target-user/
 user/__pycache__/
+*.err

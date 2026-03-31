@@ -176,7 +176,8 @@ pub fn list_apps() {
 pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<dyn File>> {
     let path = normalize_path(path);
     let (mut readable, mut writable) = flags.read_write();
-    let status_flags = flags.bits() & OpenFlags::PATH.bits();
+    let status_flags =
+        flags.bits() & (OpenFlags::PATH | OpenFlags::APPEND | OpenFlags::DIRECT).bits();
     if flags.contains(OpenFlags::PATH) {
         readable = false;
         writable = false;
@@ -197,6 +198,11 @@ pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<dyn File>> {
         }
         let (parent, name) = vfs.resolve_parent(&path)?;
         let inode = parent.create(&name)?;
+        // Keep O_CREAT|O_TRUNC semantics even if create() returns an
+        // existing inode (some backends may take that path).
+        if flags.contains(OpenFlags::TRUNC) {
+            inode.truncate();
+        }
         Some(Arc::new(VfsFile::new_with_flags(
             readable,
             writable,

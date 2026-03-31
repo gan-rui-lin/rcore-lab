@@ -850,6 +850,38 @@ impl MemorySet {
         child
     }
 
+    /// Best-effort synchronization for clone(CLONE_VM|CLONE_VFORK):
+    /// copy writable user pages from `src` back into `self`.
+    pub fn sync_user_writable_from(&mut self, src: &Self) -> usize {
+        let mut copied_pages = 0usize;
+        for area in src.areas.iter() {
+            if !area.map_perm.contains(MapPermission::U) || !area.map_perm.contains(MapPermission::W) {
+                continue;
+            }
+            for vpn in area.vpn_range {
+                let Some(src_pte) = src.page_table.translate(vpn) else {
+                    continue;
+                };
+                let Some(dst_pte) = self.page_table.translate(vpn) else {
+                    continue;
+                };
+                if !src_pte.is_valid() || !dst_pte.is_valid() {
+                    continue;
+                }
+                let src_ppn = src_pte.ppn();
+                let dst_ppn = dst_pte.ppn();
+                if src_ppn == dst_ppn {
+                    continue;
+                }
+                dst_ppn
+                    .get_bytes_array()
+                    .copy_from_slice(src_ppn.get_bytes_array());
+                copied_pages += 1;
+            }
+        }
+        copied_pages
+    }
+
     /// Handle a COW page fault at `addr`.
     /// Returns `true` if the fault was a COW fault and was resolved,
     /// `false` if it's a genuine page fault (caller should send SIGSEGV).

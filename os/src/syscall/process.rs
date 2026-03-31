@@ -39,6 +39,8 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
     static ref UMASK_STATE: UPIntrFreeCell<usize> =
         unsafe { UPIntrFreeCell::new(0o022) };
+    static ref REALTIME_OFFSET_US: UPIntrFreeCell<i64> =
+        unsafe { UPIntrFreeCell::new(0) };
 }
 
 #[allow(dead_code)]
@@ -208,6 +210,7 @@ bitflags! {
         const FS = 0x0000_0200;
         const FILES = 0x0000_0400;
         const SIGHAND = 0x0000_0800;
+        const PARENT = 0x0000_8000;
         const VFORK = 0x0000_4000;
         const THREAD = 0x0001_0000;
         const SYSVSEM = 0x0004_0000;
@@ -235,6 +238,11 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
     if dst.is_null() {
         return Err(errno(EFAULT));
     }
+    let start = dst as usize;
+    let end = start.checked_add(data.len()).ok_or_else(|| errno(EFAULT))?;
+    if start >= USER_ADDR_MAX || end > USER_ADDR_MAX {
+        return Err(errno(EFAULT));
+    }
     let mut offset = 0usize;
     let slices = if let Some(slices) = translated_byte_buffer_checked(token, dst, data.len(), true)
     {
@@ -245,8 +253,6 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
         // work for mapped user buffers. Keep strict user-mapping validation,
         // but relax write-bit enforcement here to avoid false EFAULT.
         let page_table = PageTable::from_token(token);
-        let start = dst as usize;
-        let end = start.checked_add(data.len()).ok_or_else(|| errno(EFAULT))?;
         let mut va = start;
         while va < end {
             let vpn = VirtAddr::from(va).floor();
@@ -254,7 +260,7 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
                 return Err(errno(EFAULT));
             };
             let flags = pte.flags();
-            if !pte.is_valid() || !flags.contains(PTEFlags::U) {
+            if !pte.is_valid() || !flags.contains(PTEFlags::U) || !flags.contains(PTEFlags::R) {
                 return Err(errno(EFAULT));
             }
             let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
@@ -726,14 +732,94 @@ pub fn sys_clone(
         tls as usize,
         ctid as usize
     );
+    let parent_cx = *current_trap_cx();
 
     if !clone_flags.contains(CloneFlags::THREAD) {
-        return sys_fork();
+        let has_extended_clone_semantics =
+            clone_flags.intersects(
+                CloneFlags::PARENT
+                    | CloneFlags::VFORK
+                    | CloneFlags::PARENT_SETTID
+                    | CloneFlags::CHILD_CLEARTID
+                    | CloneFlags::CHILD_SETTID
+                    | CloneFlags::SETTLS
+                    | CloneFlags::VM
+                    | CloneFlags::FS
+                    | CloneFlags::FILES
+                    | CloneFlags::SIGHAND
+                    | CloneFlags::SYSVSEM,
+            ) || !stack.is_null();
+        if !has_extended_clone_semantics {
+            return sys_fork();
+        }
+
+        let current = current_process();
+        let new_process = current.fork();
+        let new_pid = new_process.pid.0;
+        if clone_flags.contains(CloneFlags::VM) && clone_flags.contains(CloneFlags::VFORK) {
+            new_process.inner_exclusive_access().vfork_vm_parent = Some(Arc::downgrade(&current));
+        }
+
+        let new_task = new_process.inner_exclusive_access().get_task(0);
+        {
+            let new_task_inner = new_task.inner_exclusive_access();
+            let trap_cx = new_task_inner.get_trap_cx();
+            *trap_cx = parent_cx;
+            trap_cx[TrapFrameArgs::RET] = 0;
+            if !stack.is_null() {
+                trap_cx[TrapFrameArgs::SP] = stack as usize;
+            }
+        }
+
+        if clone_flags.contains(CloneFlags::CHILD_CLEARTID) && !ctid.is_null() {
+            let mut inner = new_task.inner_exclusive_access();
+            inner.clear_child_tid = ctid as usize;
+        }
+
+        if clone_flags.contains(CloneFlags::PARENT_SETTID) && !ptid.is_null() {
+            let parent_token = current_user_token();
+            *translated_refmut(parent_token, ptid) = new_pid as i32;
+            // Make sure child can observe the same value as Linux clone semantics.
+            let child_token = new_process.inner_exclusive_access().memory_set.token();
+            *translated_refmut(child_token, ptid) = new_pid as i32;
+        }
+        if clone_flags.contains(CloneFlags::CHILD_SETTID) && !ctid.is_null() {
+            let child_token = new_process.inner_exclusive_access().memory_set.token();
+            *translated_refmut(child_token, ctid) = new_pid as i32;
+        }
+
+        if clone_flags.contains(CloneFlags::PARENT) {
+            let parent_weak = current.inner_exclusive_access().parent.clone();
+            {
+                let mut cur_inner = current.inner_exclusive_access();
+                cur_inner.children.retain(|c| c.pid.0 != new_pid);
+            }
+            {
+                let mut child_inner = new_process.inner_exclusive_access();
+                child_inner.parent = parent_weak.clone();
+            }
+            if let Some(parent) = parent_weak.and_then(|p| p.upgrade()) {
+                parent
+                    .inner_exclusive_access()
+                    .children
+                    .push(Arc::clone(&new_process));
+            }
+        }
+
+        if clone_flags.contains(CloneFlags::VFORK) {
+            loop {
+                if new_process.inner_exclusive_access().is_zombie {
+                    break;
+                }
+                suspend_current_and_run_next();
+            }
+        }
+
+        return new_pid as isize;
     }
 
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
-    let parent_cx = *current_trap_cx();
 
     let parent_task_inner = task.inner_exclusive_access();
     let ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base;
@@ -1494,6 +1580,48 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
     }
 }
 
+fn realtime_now_us() -> i64 {
+    (get_time_us() as i64).saturating_add(*REALTIME_OFFSET_US.exclusive_access())
+}
+
+pub fn sys_clock_settime(clock_id: usize, ts: *const TimeSpec) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_clock_settime", pid);
+    }
+    if clock_id != 0 {
+        return errno(EINVAL);
+    }
+    if ts.is_null() {
+        return errno(EFAULT);
+    }
+    let process = current_process();
+    let euid = process.inner_exclusive_access().effective_uid;
+    if euid != 0 {
+        return errno(EPERM);
+    }
+    let token = current_user_token();
+    let spec = match read_from_user(token, ts) {
+        Ok(spec) => spec,
+        Err(err) => return err,
+    };
+    if spec.tv_nsec >= 1_000_000_000 {
+        return errno(EINVAL);
+    }
+    let target_us = match spec
+        .tv_sec
+        .checked_mul(1_000_000)
+        .and_then(|v| v.checked_add(spec.tv_nsec / 1_000))
+        .and_then(|v| i64::try_from(v).ok())
+    {
+        Some(v) => v,
+        None => return errno(EINVAL),
+    };
+    let now_us = get_time_us() as i64;
+    *REALTIME_OFFSET_US.exclusive_access() = target_us.saturating_sub(now_us);
+    0
+}
+
 pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
@@ -1506,7 +1634,11 @@ pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
         // CLOCK_REALTIME/CLOCK_MONOTONIC and common glibc probes.
         // We currently map them to the same wall-clock source.
         0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 => {
-            let us = get_time_us();
+            let us = if matches!(clock_id, 0 | 5 | 8) {
+                realtime_now_us().max(0) as usize
+            } else {
+                get_time_us()
+            };
             let spec = TimeSpec {
                 tv_sec: us / 1_000_000,
                 tv_nsec: (us % 1_000_000) * 1_000,
@@ -1532,11 +1664,11 @@ pub fn sys_clock_getres(clock_id: usize, res: *mut TimeSpec) -> isize {
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_clock_getres", pid);
     }
-    if res.is_null() {
-        return 0;
-    }
     match clock_id {
         0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 => {
+            if res.is_null() {
+                return 0;
+            }
             let spec = TimeSpec {
                 tv_sec: 0,
                 tv_nsec: 1000, // 1µs resolution
@@ -3055,14 +3187,6 @@ pub fn sys_rt_sigsuspend(mask_ptr: *const usize, sigsetsize: usize) -> isize {
             break;
         }
         suspend_current_and_run_next();
-        // Check if we were woken by a signal
-        let task_inner = task.inner_exclusive_access();
-        let cur_mask = task_inner.signal_mask;
-        drop(task_inner);
-        if cur_mask != new_mask {
-            // mask was changed (e.g. signal delivered and sigreturn restores old mask)
-            break;
-        }
     }
 
     // Restore old mask

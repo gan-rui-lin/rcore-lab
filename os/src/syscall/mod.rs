@@ -24,6 +24,8 @@ const SYSCALL_DUP3: usize = 24;
 const SYSCALL_FCNTL: usize = 25;
 /// ioctl syscall
 const SYSCALL_IOCTL: usize = 29;
+/// flock syscall
+const SYSCALL_FLOCK: usize = 32;
 /// unlinkat syscall
 const SYSCALL_UNLINKAT: usize = 35;
 /// mkdirat syscall
@@ -44,6 +46,8 @@ const SYSCALL_FALLOCATE: usize = 47;
 const SYSCALL_FACCESSAT: usize = 48;
 /// fchdir syscall
 const SYSCALL_FCHDIR: usize = 50;
+/// chroot syscall
+const SYSCALL_CHROOT: usize = 51;
 /// fchmod syscall
 const SYSCALL_FCHMOD: usize = 52;
 /// fchmodat syscall
@@ -217,6 +221,8 @@ const SYSCALL_STATFS: usize = 43;
 const SYSCALL_FSTATFS: usize = 44;
 /// clock_gettime syscall
 const SYSCALL_CLOCK_GETTIME: usize = 113;
+/// clock_settime syscall
+const SYSCALL_CLOCK_SETTIME: usize = 112;
 /// clock_getres syscall
 const SYSCALL_CLOCK_GETRES: usize = 114;
 /// syslog syscall
@@ -637,8 +643,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     let ret = match syscall_id {
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_DUP => sys_dup(args[0]),
-        SYSCALL_DUP3 => sys_dup3(args[0], args[1]),
+        SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2] as u32),
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1] as i32, args[2]),
+        SYSCALL_FLOCK => sys_flock(args[0], args[1] as i32),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as isize),
         SYSCALL_FALLOCATE => {
@@ -692,6 +699,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
         SYSCALL_FCHDIR => sys_fchdir(args[0]),
+        SYSCALL_CHROOT => sys_chroot(args[0] as *const u8),
         SYSCALL_FCHMOD => sys_fchmod(args[0], args[1] as u32),
         SYSCALL_FCHMODAT => sys_fchmodat(
             args[0] as isize,
@@ -912,6 +920,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_ADJTIMEX => process::sys_adjtimex(args[0] as *mut u8),
         SYSCALL_PRCTL => process::sys_prctl(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
+        SYSCALL_CLOCK_SETTIME => sys_clock_settime(args[0], args[1] as *const TimeSpec),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0], args[1] as *mut TimeSpec),
         SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
