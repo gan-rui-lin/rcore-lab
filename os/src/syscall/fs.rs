@@ -71,6 +71,7 @@ const UTIME_OMIT: isize = 0x3ffffffe;
 const PATH_MAX: usize = 4096;
 const NAME_MAX: usize = 255;
 const MS_RDONLY: u32 = 1;
+const DIRECT_IO_ALIGN: usize = 4096;
 
 /// Per-file stored timestamps (atime, mtime).
 #[derive(Clone, Copy, Debug)]
@@ -90,13 +91,24 @@ lazy_static! {
     static ref TS_NEXT_ID: UPSafeCell<usize> = unsafe { UPSafeCell::new(1) };
     static ref PATH_MODES: UPSafeCell<BTreeMap<String, u32>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
+    static ref PATH_OWNERS: UPSafeCell<BTreeMap<String, (u32, u32)>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
     static ref SYMLINK_TARGETS: UPSafeCell<BTreeMap<String, String>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
     static ref READONLY_MOUNTS: UPSafeCell<BTreeSet<String>> =
         unsafe { UPSafeCell::new(BTreeSet::new()) };
+    static ref FD_FLAGS: UPSafeCell<BTreeMap<(usize, usize), u32>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
+    static ref FLOCK_LOCKS: UPSafeCell<BTreeMap<String, (usize, usize)>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
+    static ref PATH_LINK_GROUP: UPSafeCell<BTreeMap<String, u64>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
+    static ref LINK_GROUP_COUNT: UPSafeCell<BTreeMap<u64, u32>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
 }
 
 static GETRANDOM_STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+static NEXT_LINK_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[allow(dead_code)]
 fn ts_alloc_id() -> usize {
@@ -143,6 +155,123 @@ fn path_mode_remove(path: &str) {
     PATH_MODES.exclusive_access().remove(path);
 }
 
+fn path_owner_get(path: &str) -> Option<(u32, u32)> {
+    PATH_OWNERS.exclusive_access().get(path).copied()
+}
+
+fn path_owner_set(path: &str, uid: u32, gid: u32) {
+    PATH_OWNERS
+        .exclusive_access()
+        .insert(String::from(path), (uid, gid));
+}
+
+fn path_owner_remove(path: &str) {
+    PATH_OWNERS.exclusive_access().remove(path);
+}
+
+fn path_nlink_get(path: &str) -> u32 {
+    let gid = PATH_LINK_GROUP.exclusive_access().get(path).copied();
+    if let Some(gid) = gid {
+        LINK_GROUP_COUNT
+            .exclusive_access()
+            .get(&gid)
+            .copied()
+            .unwrap_or(1)
+    } else {
+        1
+    }
+}
+
+fn ensure_link_group_for_path(path: &str) -> u64 {
+    if let Some(gid) = PATH_LINK_GROUP.exclusive_access().get(path).copied() {
+        return gid;
+    }
+    let gid = NEXT_LINK_GROUP_ID.fetch_add(1, AtomicOrdering::Relaxed);
+    PATH_LINK_GROUP
+        .exclusive_access()
+        .insert(String::from(path), gid);
+    LINK_GROUP_COUNT.exclusive_access().insert(gid, 1);
+    gid
+}
+
+fn path_link_add(old_path: &str, new_path: &str) {
+    let gid = ensure_link_group_for_path(old_path);
+    {
+        let mut counts = LINK_GROUP_COUNT.exclusive_access();
+        let cnt = counts.entry(gid).or_insert(1);
+        *cnt = cnt.saturating_add(1);
+    }
+    PATH_LINK_GROUP
+        .exclusive_access()
+        .insert(String::from(new_path), gid);
+}
+
+fn path_link_remove(path: &str) {
+    let gid = PATH_LINK_GROUP.exclusive_access().remove(path);
+    let Some(gid) = gid else {
+        return;
+    };
+    let mut counts = LINK_GROUP_COUNT.exclusive_access();
+    if let Some(cnt) = counts.get_mut(&gid) {
+        if *cnt > 0 {
+            *cnt -= 1;
+        }
+        if *cnt == 0 {
+            counts.remove(&gid);
+        }
+    }
+}
+
+fn path_link_move(old_path: &str, new_path: &str) {
+    let mut groups = PATH_LINK_GROUP.exclusive_access();
+    if let Some(gid) = groups.remove(old_path) {
+        groups.insert(String::from(new_path), gid);
+    }
+}
+
+fn fd_flags_get(pid: usize, fd: usize) -> u32 {
+    FD_FLAGS
+        .exclusive_access()
+        .get(&(pid, fd))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn fd_flags_set(pid: usize, fd: usize, flags: u32) {
+    let mut map = FD_FLAGS.exclusive_access();
+    if flags == 0 {
+        map.remove(&(pid, fd));
+    } else {
+        map.insert((pid, fd), flags);
+    }
+}
+
+fn fd_flags_remove(pid: usize, fd: usize) {
+    FD_FLAGS.exclusive_access().remove(&(pid, fd));
+}
+
+fn flock_unlock_owner(pid: usize, fd: usize) {
+    let mut locks = FLOCK_LOCKS.exclusive_access();
+    let keys: Vec<String> = locks
+        .iter()
+        .filter_map(|(path, owner)| {
+            if *owner == (pid, fd) {
+                Some(path.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for key in keys {
+        locks.remove(&key);
+    }
+}
+
+fn effective_path_owner(path: &str) -> (u32, u32) {
+    // No tracked owner means root-owned.
+    path_owner_get(path).unwrap_or((0, 0))
+}
+
 fn symlink_target_get(path: &str) -> Option<String> {
     SYMLINK_TARGETS.exclusive_access().get(path).cloned()
 }
@@ -177,6 +306,7 @@ fn path_exists_for_access(path: &str) -> bool {
     is_char_device(path) || symlink_target_get(path).is_some() || open_file(path, OpenFlags::empty()).is_some() || path_is_dir(path)
 }
 
+#[allow(dead_code)]
 fn resolve_final_symlink(path: &str) -> String {
     let mut current = String::from(path);
     for _ in 0..8 {
@@ -321,6 +451,47 @@ fn access_allowed(full_path: &str, mode: u32, uid: u32) -> Result<(), isize> {
     Ok(())
 }
 
+fn apply_chown_to_path(path: &str, owner: u32, group: u32) {
+    let (mut uid, mut gid) = effective_path_owner(path);
+    if owner != u32::MAX {
+        uid = owner;
+    }
+    if group != u32::MAX {
+        gid = group;
+    }
+    path_owner_set(path, uid, gid);
+}
+
+fn apply_mode_side_effects_after_chown(path: &str) {
+    // Linux clears S_ISUID on chown(). S_ISGID is cleared when the file is
+    // group-executable; otherwise it may be preserved (e.g. mode 02700).
+    if path_is_dir(path) || is_char_device(path) {
+        return;
+    }
+    let old_mode = effective_path_mode(path);
+    let mut new_mode = old_mode & !0o4000;
+    if (old_mode & 0o0010) != 0 {
+        new_mode &= !0o2000;
+    }
+    if new_mode != old_mode {
+        path_mode_set(path, new_mode);
+    }
+}
+
+fn can_unprivileged_chown(path: &str, owner: u32, group: u32, euid: u32, rgid: u32, egid: u32, sgid: u32) -> bool {
+    if owner != u32::MAX {
+        return false;
+    }
+    let (file_uid, file_gid) = effective_path_owner(path);
+    if file_uid != euid {
+        return false;
+    }
+    if group == u32::MAX || group == file_gid {
+        return true;
+    }
+    group == rgid || group == egid || group == sgid
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StatFs {
@@ -404,6 +575,27 @@ fn resolve_path(base: &str, path: &str) -> String {
         normalize_path(&format!("/{}", path))
     } else {
         normalize_path(&format!("{}/{}", base.trim_end_matches('/'), path))
+    }
+}
+
+fn current_root_dir() -> String {
+    let process = current_process();
+    let root = process.inner_exclusive_access().root_dir.clone();
+    root
+}
+
+fn resolve_user_path(base: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        let root = current_root_dir();
+        if root == "/" {
+            normalize_path(path)
+        } else if path == "/" {
+            root
+        } else {
+            resolve_path(&root, path.trim_start_matches('/'))
+        }
+    } else {
+        resolve_path(base, path)
     }
 }
 
@@ -529,6 +721,18 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
         let file = file.clone();
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
+        if len > 0
+            && (file.status_flags() & OpenFlags::DIRECT.bits()) != 0
+            && file.inode().is_some()
+        {
+            let off = file.get_offset().unwrap_or(0);
+            if (buf as usize) % DIRECT_IO_ALIGN != 0
+                || len % DIRECT_IO_ALIGN != 0
+                || off % DIRECT_IO_ALIGN != 0
+            {
+                return errno(EINVAL);
+            }
+        }
         let Some(buffers) = translated_byte_buffer_checked(token, buf, len, false) else {
             return errno(EFAULT);
         };
@@ -591,6 +795,18 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
         }
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
+        if len > 0
+            && (file.status_flags() & OpenFlags::DIRECT.bits()) != 0
+            && file.inode().is_some()
+        {
+            let off = file.get_offset().unwrap_or(0);
+            if (buf as usize) % DIRECT_IO_ALIGN != 0
+                || len % DIRECT_IO_ALIGN != 0
+                || off % DIRECT_IO_ALIGN != 0
+            {
+                return errno(EINVAL);
+            }
+        }
         if wait_readable {
             loop {
                 if file.readable() {
@@ -632,16 +848,22 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     if raw_path.is_empty() {
         return errno(EINVAL);
     }
-    let full_path = if raw_path.starts_with('/') {
-        normalize_path(&raw_path)
-    } else {
-        let base = match dirfd_base(dirfd) {
-            Ok(base) => base,
-            Err(err) => return err,
-        };
-        resolve_path(&base, &raw_path)
+    if raw_path.len() >= PATH_MAX
+        || raw_path
+            .split('/')
+            .any(|component| !component.is_empty() && component.len() > NAME_MAX)
+    {
+        return errno(ENAMETOOLONG);
+    }
+    let base = match dirfd_base(dirfd) {
+        Ok(base) => base,
+        Err(err) => return err,
     };
-    let full_path = resolve_final_symlink(&full_path);
+    let full_path = resolve_user_path(&base, &raw_path);
+    let full_path = match resolve_access_path(&full_path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
     let proc_name = process.inner_exclusive_access().name.clone();
     let trace_so_open =
         proc_name == "entry-dynamic.exe" && (raw_path.contains(".so") || full_path.contains(".so"));
@@ -665,15 +887,53 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     // }
     let flags = OpenFlags::from_bits_truncate(flags);
     let existed = path_exists(&full_path);
+    if flags.contains(OpenFlags::CREATE) && path_is_dir(&full_path) {
+        return errno(EISDIR);
+    }
     if flags.contains(OpenFlags::DIRECTORY) && !path_is_dir(&full_path) {
         return errno(ENOTDIR);
     }
+    if (flags.contains(OpenFlags::CREATE) || flags.contains(OpenFlags::TRUNC))
+        && readonly_mount_contains(&full_path)
+    {
+        return errno(EROFS);
+    }
     // Special device files
     let (readable, writable) = flags.read_write();
+    let inner_for_perm = process.inner_exclusive_access();
+    let euid = inner_for_perm.effective_uid;
+    drop(inner_for_perm);
+    if flags.contains(OpenFlags::CREATE) && !existed {
+        if let Some((parent, _)) = full_path.rsplit_once('/') {
+            let parent = if parent.is_empty() { "/" } else { parent };
+            if !path_is_dir(parent) {
+                return errno(ENOENT);
+            }
+            if euid != 0 {
+                if let Err(err) = access_allowed(parent, 0o3, euid) {
+                    return err;
+                }
+            }
+        } else {
+            return errno(ENOENT);
+        }
+    } else if euid != 0 {
+        let mut req = 0u32;
+        if readable {
+            req |= 0o4;
+        }
+        if writable {
+            req |= 0o2;
+        }
+        if let Err(err) = access_allowed(&full_path, req, euid) {
+            return err;
+        }
+    }
     let dev_file: Option<Arc<dyn crate::fs::File + Send + Sync>> = match full_path.as_str() {
-        "/dev/null" => Some(Arc::new(DevNull::new(readable, writable))),
-        "/dev/zero" => Some(Arc::new(DevZero::new(readable, writable))),
-        "/dev/urandom" | "/dev/random" => Some(Arc::new(DevUrandom::new(readable, writable))),
+        "/dev/null" => Some(Arc::new(DevNull::new(readable, writable, "/dev/null"))),
+        "/dev/zero" => Some(Arc::new(DevZero::new(readable, writable, "/dev/zero"))),
+        "/dev/urandom" => Some(Arc::new(DevUrandom::new(readable, writable, "/dev/urandom"))),
+        "/dev/random" => Some(Arc::new(DevUrandom::new(readable, writable, "/dev/random"))),
         _ => None,
     };
     if let Some(file) = dev_file {
@@ -686,8 +946,16 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         return fd as isize;
     }
     if let Some(inode) = open_file(full_path.as_str(), flags) {
+        if flags.contains(OpenFlags::TRUNC) {
+            if let Some(vfs_inode) = inode.inode() {
+                vfs_inode.truncate();
+            }
+        }
         if flags.contains(OpenFlags::CREATE) && !existed {
             path_mode_set(&full_path, _mode);
+            let inner = process.inner_exclusive_access();
+            path_owner_set(&full_path, inner.effective_uid, inner.effective_gid);
+            drop(inner);
         }
         let mut inner = process.inner_exclusive_access();
         let fd = match inner.alloc_fd() {
@@ -736,11 +1004,7 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: u32, _flags: u32) -> i
         Ok(base) => base,
         Err(err) => return err,
     };
-    let full_path = if raw_path.starts_with('/') {
-        normalize_path(&raw_path)
-    } else {
-        resolve_path(&base, &raw_path)
-    };
+    let full_path = resolve_user_path(&base, &raw_path);
     let full_path = match resolve_access_path(&full_path) {
         Ok(path) => path,
         Err(err) => return err,
@@ -886,6 +1150,9 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
     }
     if create_dir(&full_path) {
         path_mode_set(&full_path, _mode);
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        path_owner_set(&full_path, inner.effective_uid, inner.effective_gid);
         0
     } else {
         errno(EIO)
@@ -909,25 +1176,42 @@ pub fn sys_close(fd: usize) -> isize {
         return errno(EBADF);
     }
     inner.fd_table[fd].take();
+    fd_flags_remove(pid, fd);
+    flock_unlock_owner(pid, fd);
     0
 }
 
 /// close_range system call - close all file descriptors in [first, last].
 pub fn sys_close_range(first: usize, last: usize, flags: u32) -> isize {
-    if flags != 0 {
+    const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
+    const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+    const FD_CLOEXEC: u32 = 1;
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
         return errno(EINVAL);
     }
     if first > last {
         return errno(EINVAL);
     }
     let process = current_process();
+    let pid = process.pid.0;
     let mut inner = process.inner_exclusive_access();
     if inner.fd_table.is_empty() || first >= inner.fd_table.len() {
         return 0;
     }
     let upper = last.min(inner.fd_table.len().saturating_sub(1));
-    for fd in first..=upper {
-        inner.fd_table[fd].take();
+    if (flags & CLOSE_RANGE_CLOEXEC) != 0 {
+        for fd in first..=upper {
+            if inner.fd_table[fd].is_some() {
+                let cur = fd_flags_get(pid, fd);
+                fd_flags_set(pid, fd, cur | FD_CLOEXEC);
+            }
+        }
+    } else {
+        for fd in first..=upper {
+            inner.fd_table[fd].take();
+            fd_flags_remove(pid, fd);
+            flock_unlock_owner(pid, fd);
+        }
     }
     0
 }
@@ -961,17 +1245,17 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
         return sys_fstat(dirfd as usize, st);
     }
     let base = if raw_path.starts_with('/') {
-        String::new()
+        String::from("/")
     } else {
         match dirfd_base(dirfd) {
             Ok(base) => base,
             Err(err) => return err,
         }
     };
-    let full_path = if raw_path.starts_with('/') {
-        normalize_path(&raw_path)
-    } else {
-        resolve_path(&base, &raw_path)
+    let full_path = resolve_user_path(&base, &raw_path);
+    let full_path = match resolve_access_path(&full_path) {
+        Ok(path) => path,
+        Err(err) => return err,
     };
     // trace!(
     //     "[sys_fstatat] pid={} dirfd={} flags={:#x} path={} full={}",
@@ -997,6 +1281,8 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
         stat.mode = StatMode::CHR.bits() | 0o666;
         stat.nlink = 1;
         stat.rdev = rdev_for_path(&full_path);
+        stat.uid = 0;
+        stat.gid = 0;
     } else {
         let open_flags = if path_is_dir(&full_path) {
             OpenFlags::DIRECTORY
@@ -1020,10 +1306,13 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
             (StatMode::FILE.bits() | 0o666, 0)
         };
         stat.mode = mode_bits;
-        stat.nlink = 1;
+        stat.nlink = path_nlink_get(&full_path);
         stat.size = size as i64;
         stat.blksize = 512;
         stat.blocks = ((size + 511) / 512) as i64;
+        let (uid, gid) = effective_path_owner(&full_path);
+        stat.uid = uid;
+        stat.gid = gid;
     }
     // Generate unique (dev, ino) so glibc ld-linux doesn't confuse different files
     stat.dev = 1;
@@ -1226,6 +1515,8 @@ fn stat_from_fd(fd: usize) -> Result<Stat, isize> {
     if is_char_device(path) {
         stat.mode = StatMode::CHR.bits() | 0o666;
         stat.rdev = rdev_for_path(path);
+        stat.uid = 0;
+        stat.gid = 0;
     } else {
         let (mode_bits, size) = if let Some(inode) = file.inode() {
             let mode = if inode.is_dir() {
@@ -1244,8 +1535,15 @@ fn stat_from_fd(fd: usize) -> Result<Stat, isize> {
         stat.size = size as i64;
         stat.blksize = 512;
         stat.blocks = ((size + 511) / 512) as i64;
+        let (uid, gid) = effective_path_owner(path);
+        stat.uid = uid;
+        stat.gid = gid;
     }
-    stat.nlink = 1;
+    stat.nlink = if is_char_device(path) {
+        1
+    } else {
+        path_nlink_get(path)
+    };
     // Generate unique (dev, ino) so glibc ld-linux doesn't confuse different files
     stat.dev = 1;
     if !path.is_empty() {
@@ -1265,6 +1563,8 @@ fn stat_from_path(full_path: &str) -> Result<Stat, isize> {
         stat.mode = StatMode::CHR.bits() | 0o666;
         stat.nlink = 1;
         stat.rdev = rdev_for_path(full_path);
+        stat.uid = 0;
+        stat.gid = 0;
         fill_stat_timestamps(&mut stat, None);
         return Ok(stat);
     }
@@ -1290,10 +1590,13 @@ fn stat_from_path(full_path: &str) -> Result<Stat, isize> {
         (StatMode::FILE.bits() | 0o666, 0)
     };
     stat.mode = mode_bits;
-    stat.nlink = 1;
+    stat.nlink = path_nlink_get(full_path);
     stat.size = size as i64;
     stat.blksize = 512;
     stat.blocks = ((size + 511) / 512) as i64;
+    let (uid, gid) = effective_path_owner(full_path);
+    stat.uid = uid;
+    stat.gid = gid;
     stat.dev = 1;
     // Generate unique inode from path
     let mut h: u64 = 5381;
@@ -1327,6 +1630,8 @@ pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
     if is_char_device(path) {
         stat.mode = StatMode::CHR.bits() | 0o666;
         stat.rdev = rdev_for_path(path);
+        stat.uid = 0;
+        stat.gid = 0;
     } else {
         let (mode_bits, size) = if let Some(inode) = file.inode() {
             let mode = if inode.is_dir() {
@@ -1345,8 +1650,15 @@ pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
         stat.size = size as i64;
         stat.blksize = 512;
         stat.blocks = ((size + 511) / 512) as i64;
+        let (uid, gid) = effective_path_owner(path);
+        stat.uid = uid;
+        stat.gid = gid;
     }
-    stat.nlink = 1;
+    stat.nlink = if is_char_device(path) {
+        1
+    } else {
+        path_nlink_get(path)
+    };
     // Generate unique (dev, ino) so glibc ld-linux doesn't confuse different files
     stat.dev = 1; // non-zero device
     let path_for_ino = file.path().unwrap_or("");
@@ -1493,13 +1805,18 @@ pub fn sys_dup(fd: usize) -> isize {
         None => return errno(EMFILE),
     };
     inner.fd_table[new_fd] = inner.fd_table[fd].clone();
+    fd_flags_set(pid, new_fd, 0);
     new_fd as isize
 }
 
-pub fn sys_dup3(oldfd: usize, newfd: usize) -> isize {
+pub fn sys_dup3(oldfd: usize, newfd: usize, flags: u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_dup3", pid);
+    }
+    const O_CLOEXEC: u32 = 1 << 19;
+    if flags & !O_CLOEXEC != 0 {
+        return errno(EINVAL);
     }
     if oldfd == newfd {
         return errno(EINVAL);
@@ -1517,6 +1834,8 @@ pub fn sys_dup3(oldfd: usize, newfd: usize) -> isize {
         inner.fd_table.resize_with(newfd + 1, || None);
     }
     inner.fd_table[newfd] = inner.fd_table[oldfd].clone();
+    let new_flags = if (flags & O_CLOEXEC) != 0 { 1 } else { 0 };
+    fd_flags_set(pid, newfd, new_flags);
     newfd as isize
 }
 
@@ -1571,16 +1890,17 @@ pub fn sys_linkat(
     }
     #[cfg(feature = "ext4")]
     {
-        let old_c = match CString::new(old_path) {
+        let old_c = match CString::new(old_path.clone()) {
             Ok(c) => c,
             Err(_) => return errno(EINVAL),
         };
-        let new_c = match CString::new(new_path) {
+        let new_c = match CString::new(new_path.clone()) {
             Ok(c) => c,
             Err(_) => return errno(EINVAL),
         };
         let rc = unsafe { ext4_flink(old_c.as_ptr(), new_c.as_ptr()) };
         if rc == 0 {
+            path_link_add(old_path.as_str(), new_path.as_str());
             0
         } else {
             errno(EIO)
@@ -1677,7 +1997,9 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
         return errno(EISDIR);
     }
     if remove_path(&path, is_dir) {
+        path_link_remove(&path);
         path_mode_remove(&path);
+        path_owner_remove(&path);
         symlink_target_remove(&path);
         unix_registry_remove(&path);
         0
@@ -1746,6 +2068,7 @@ pub fn sys_renameat2(
         if !remove_path(&old_path, true) {
             return errno(EIO);
         }
+        path_link_move(&old_path, &new_path);
         return 0;
     }
 
@@ -1765,6 +2088,9 @@ pub fn sys_renameat2(
         if !remove_path(&new_path, false) {
             return errno(EIO);
         }
+        path_link_remove(&new_path);
+        path_mode_remove(&new_path);
+        path_owner_remove(&new_path);
     }
 
     let new_file = match open_file(
@@ -1799,6 +2125,15 @@ pub fn sys_renameat2(
 
     if !remove_path(&old_path, false) {
         return errno(EIO);
+    }
+    path_link_move(&old_path, &new_path);
+    if let Some(mode) = path_mode_get(&old_path) {
+        path_mode_set(&new_path, mode);
+        path_mode_remove(&old_path);
+    }
+    if let Some((uid, gid)) = path_owner_get(&old_path) {
+        path_owner_set(&new_path, uid, gid);
+        path_owner_remove(&old_path);
     }
     0
 }
@@ -1910,6 +2245,61 @@ pub fn sys_fchdir(fd: usize) -> isize {
         return err;
     }
     inner.cwd = String::from(path);
+    0
+}
+
+pub fn sys_chroot(path: *const u8) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_chroot", pid);
+    }
+    if path.is_null() {
+        return errno(EFAULT);
+    }
+    let token = current_user_token();
+    let Some(raw_path) = translated_str_checked(token, path) else {
+        return errno(EFAULT);
+    };
+    if raw_path.is_empty() {
+        return errno(ENOENT);
+    }
+    if raw_path.len() >= PATH_MAX
+        || raw_path
+            .split('/')
+            .any(|component| !component.is_empty() && component.len() > NAME_MAX)
+    {
+        return errno(ENAMETOOLONG);
+    }
+    let process = current_process();
+    let cwd = process.inner_exclusive_access().cwd.clone();
+    let full_path = resolve_user_path(&cwd, &raw_path);
+    let full_path = match resolve_access_path(&full_path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if !path_exists_for_access(&full_path) {
+        return errno(ENOENT);
+    }
+    if !path_is_dir(&full_path) {
+        return errno(ENOTDIR);
+    }
+    let euid = process.inner_exclusive_access().effective_uid;
+    if euid != 0 {
+        if let Err(err) = access_allowed(&full_path, 0o1, euid) {
+            return err;
+        }
+        return errno(EPERM);
+    }
+    let mut inner = process.inner_exclusive_access();
+    inner.root_dir = full_path.clone();
+    if !(inner.cwd == full_path
+        || inner
+            .cwd
+            .strip_prefix(&full_path)
+            .is_some_and(|rest| rest.starts_with('/')))
+    {
+        inner.cwd = full_path;
+    }
     0
 }
 
@@ -2098,6 +2488,22 @@ pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> isize {
     let Some(file) = &inner.fd_table[fd] else {
         return errno(EBADF);
     };
+
+    if file.inode().is_none() {
+        if let Some(path) = file.path() {
+            if is_char_device(path) {
+                let new_offset = match whence {
+                    SEEK_SET => offset,
+                    SEEK_CUR | SEEK_END => offset,
+                    _ => return errno(EINVAL),
+                };
+                if new_offset < 0 {
+                    return errno(EINVAL);
+                }
+                return new_offset;
+            }
+        }
+    }
 
     // Check if this is a pipe or other non-seekable file
     if file.inode().is_none() {
@@ -2364,7 +2770,8 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 /// * On success: depends on command
 /// * On error: -errno
 pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
-    let pid = current_process().pid.0;
+    let process = current_process();
+    let pid = process.pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         syscall!(
             "kernel:pid[{}] sys_fcntl fd={} cmd={} arg={}",
@@ -2381,73 +2788,81 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     const F_SETFD: i32 = 2;
     const F_GETFL: i32 = 3;
     const F_SETFL: i32 = 4;
+    const F_GETLK: i32 = 5;
+    const F_SETLK: i32 = 6;
+    const F_SETLKW: i32 = 7;
+    const FD_CLOEXEC: u32 = 1;
+    const SEEK_SET: i16 = 0;
+    const SEEK_CUR: i16 = 1;
+    const SEEK_END: i16 = 2;
+    const F_UNLCK: i16 = 2;
 
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Flock {
+        l_type: i16,
+        l_whence: i16,
+        l_start: i64,
+        l_len: i64,
+        l_pid: i32,
     }
 
-    let Some(_file) = &inner.fd_table[fd] else {
-        return errno(EBADF);
+    let file = {
+        let inner = process.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return errno(EBADF);
+        }
+        let Some(file) = &inner.fd_table[fd] else {
+            return errno(EBADF);
+        };
+        file.clone()
     };
 
-    // if inner.name == "busybox" && (cmd == F_GETFD || cmd == F_SETFD) {
-    //     trace!(
-    //         "[sys_fcntl] pid={} name={} fd={} cmd={} arg={}",
-    //         pid,
-    //         inner.name,
-    //         fd,
-    //         cmd,
-    //         arg
-    //     );
-    // }
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             // Duplicate fd to the lowest numbered available fd >= arg
-            let new_fd = if arg < inner.fd_table.len() {
-                let mut found = None;
-                for i in arg..inner.fd_table.len() {
-                    if inner.fd_table[i].is_none() {
-                        found = Some(i);
-                        break;
-                    }
+            let mut inner = process.inner_exclusive_access();
+            let limit = inner.rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize;
+            if arg >= limit {
+                return errno(EINVAL);
+            }
+            let mut new_fd = None;
+            for i in arg..inner.fd_table.len() {
+                if inner.fd_table[i].is_none() {
+                    new_fd = Some(i);
+                    break;
                 }
-                if let Some(i) = found {
-                    i
-                } else {
-                    inner.fd_table.len()
-                }
-            } else {
-                inner.fd_table.len()
-            };
-
+            }
+            let new_fd = new_fd.unwrap_or(arg.max(inner.fd_table.len()));
+            if new_fd >= limit {
+                return errno(EMFILE);
+            }
             if new_fd >= inner.fd_table.len() {
                 inner.fd_table.resize_with(new_fd + 1, || None);
             }
-            inner.fd_table[new_fd] = inner.fd_table[fd].clone();
+            inner.fd_table[new_fd] = Some(file);
+            let cloexec = if cmd == F_DUPFD_CLOEXEC {
+                FD_CLOEXEC
+            } else {
+                0
+            };
+            fd_flags_set(pid, new_fd, cloexec);
             new_fd as isize
         }
         F_GETFD => {
             // Get file descriptor flags (FD_CLOEXEC)
-            let file = inner.fd_table[fd].as_ref().unwrap();
-            file.fd_flags() as isize
+            let flags = (file.fd_flags() | fd_flags_get(pid, fd)) & FD_CLOEXEC;
+            flags as isize
         }
         F_SETFD => {
             // Set file descriptor flags
-            // For simplicity, accept but ignore
+            fd_flags_set(pid, fd, (arg as u32) & FD_CLOEXEC);
             0
         }
         F_GETFL => {
             // Get file status flags
-            let file = &inner.fd_table[fd].as_ref().unwrap();
-            let custom_flags = file.status_flags();
-            if custom_flags != 0 {
-                return custom_flags as isize;
-            }
-            // Default: derive from readable/writable
-            let mut flags = 0u32;
+            // Access mode bits
+            let mut flags = file.status_flags();
             if file.readable() && file.writable() {
                 flags |= 0b10; // O_RDWR
             } else if file.writable() {
@@ -2460,7 +2875,99 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
             // For simplicity, accept but ignore (would need to modify File trait)
             0
         }
+        F_GETLK => {
+            let token = current_user_token();
+            let ptr = arg as *mut Flock;
+            if ptr.is_null() {
+                return errno(EFAULT);
+            }
+            let size = core::mem::size_of::<Flock>();
+            if translated_byte_buffer_checked(token, ptr as *const u8, size, false).is_none() {
+                return errno(EFAULT);
+            }
+            let mut flock = *translated_ref(token, ptr as *const Flock);
+            if !matches!(flock.l_whence, SEEK_SET | SEEK_CUR | SEEK_END) {
+                return errno(EINVAL);
+            }
+            flock.l_type = F_UNLCK;
+            let bytes = unsafe {
+                core::slice::from_raw_parts((&flock as *const Flock) as *const u8, size)
+            };
+            if translated_byte_buffer_checked(token, ptr as *const u8, size, true).is_none() {
+                return errno(EFAULT);
+            }
+            match copy_to_user(token, ptr as *mut u8, bytes) {
+                Ok(_) => 0,
+                Err(err) => err,
+            }
+        }
+        F_SETLK | F_SETLKW => {
+            let token = current_user_token();
+            let ptr = arg as *const Flock;
+            if ptr.is_null() {
+                return errno(EFAULT);
+            }
+            let size = core::mem::size_of::<Flock>();
+            if translated_byte_buffer_checked(token, ptr as *const u8, size, false).is_none() {
+                return errno(EFAULT);
+            }
+            let flock = *translated_ref(token, ptr);
+            if !matches!(flock.l_whence, SEEK_SET | SEEK_CUR | SEEK_END) {
+                return errno(EINVAL);
+            }
+            0
+        }
         _ => errno(EINVAL),
+    }
+}
+
+pub fn sys_flock(fd: usize, operation: i32) -> isize {
+    const LOCK_SH: i32 = 1;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    const LOCK_UN: i32 = 8;
+
+    let pid = current_process().pid.0;
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+    let Some(path) = file.path() else {
+        return errno(EBADF);
+    };
+    let path = String::from(path);
+    drop(inner);
+
+    if (operation & LOCK_UN) != 0 {
+        let mut locks = FLOCK_LOCKS.exclusive_access();
+        if locks.get(&path).copied() == Some((pid, fd)) {
+            locks.remove(&path);
+        }
+        return 0;
+    }
+
+    if (operation & (LOCK_SH | LOCK_EX)) == 0 {
+        return errno(EINVAL);
+    }
+
+    let mut locks = FLOCK_LOCKS.exclusive_access();
+    match locks.get(&path).copied() {
+        None => {
+            locks.insert(path, (pid, fd));
+            0
+        }
+        Some((owner_pid, owner_fd)) if owner_pid == pid && owner_fd == fd => 0,
+        Some(_) => {
+            if (operation & LOCK_NB) != 0 {
+                errno(EAGAIN)
+            } else {
+                errno(EAGAIN)
+            }
+        }
     }
 }
 
@@ -2659,14 +3166,19 @@ pub fn sys_ftruncate(fd: usize, length: isize) -> isize {
 ///
 /// Minimal implementation for LTP compatibility:
 /// - validates descriptor/arguments
-/// - accepts mode=0 and returns success without preallocation
+/// - for mode=0, extends file size quickly via one tail write
 pub fn sys_fallocate(fd: usize, mode: u32, offset: isize, len: isize) -> isize {
-    if mode != 0 {
+    const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+    if mode & !FALLOC_FL_KEEP_SIZE != 0 {
         return errno(ENOTSUP);
     }
     if offset < 0 || len < 0 {
         return errno(EINVAL);
     }
+    let end = match (offset as usize).checked_add(len as usize) {
+        Some(v) => v,
+        None => return errno(EINVAL),
+    };
     let process = current_process();
     let inner = process.inner_exclusive_access();
     if fd >= inner.fd_table.len() {
@@ -2678,8 +3190,20 @@ pub fn sys_fallocate(fd: usize, mode: u32, offset: isize, len: isize) -> isize {
     if !file.writable() {
         return errno(EBADF);
     }
-    if file.inode().is_none() {
+    let Some(inode) = file.inode() else {
         return errno(EINVAL);
+    };
+
+    if (mode & FALLOC_FL_KEEP_SIZE) == 0 {
+        let size = inode.size();
+        if end > size {
+            // Sparse grow: writing a single tail byte makes file length visible
+            // to userspace without a huge zero-fill loop.
+            let wrote = inode.write_at(end - 1, &[0u8]);
+            if wrote != 1 {
+                return errno(EIO);
+            }
+        }
     }
     0
 }
@@ -3355,6 +3879,17 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32, _flags: u32) -> is
     if readonly_mount_contains(&full_path) {
         return errno(EROFS);
     }
+    let process = current_process();
+    let euid = process.inner_exclusive_access().effective_uid;
+    if euid != 0 {
+        if let Err(err) = access_allowed(&full_path, 0, euid) {
+            return err;
+        }
+        let (uid, _) = effective_path_owner(&full_path);
+        if uid != euid {
+            return errno(EPERM);
+        }
+    }
     path_mode_set(&full_path, mode);
     0
 }
@@ -3372,23 +3907,120 @@ pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
     let Some(path) = file.path() else {
         return errno(EBADF);
     };
+    if readonly_mount_contains(path) {
+        return errno(EROFS);
+    }
+    if inner.effective_uid != 0 {
+        let (uid, _) = effective_path_owner(path);
+        if uid != inner.effective_uid {
+            return errno(EPERM);
+        }
+    }
     path_mode_set(path, mode);
     0
 }
 
-/// sys_fchownat (syscall 54) - stub: always succeed
-/// LTP framework uses chown on tmp directories during setup
 pub fn sys_fchownat(
-    _dirfd: isize,
-    _path: *const u8,
-    _owner: u32,
-    _group: u32,
-    _flags: u32,
+    dirfd: isize,
+    path: *const u8,
+    owner: u32,
+    group: u32,
+    flags: u32,
 ) -> isize {
+    if path.is_null() {
+        return errno(EFAULT);
+    }
+    let supported_flags = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+    if flags & !supported_flags != 0 {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
+    let Some(raw_path) = translated_str_checked(token, path) else {
+        return errno(EFAULT);
+    };
+    if raw_path.is_empty() {
+        if flags & AT_EMPTY_PATH != 0 {
+            if dirfd < 0 {
+                return errno(EBADF);
+            }
+            return sys_fchown(dirfd as usize, owner, group);
+        }
+        return errno(ENOENT);
+    }
+    if raw_path.len() >= PATH_MAX
+        || raw_path
+            .split('/')
+            .any(|component| !component.is_empty() && component.len() > NAME_MAX)
+    {
+        return errno(ENAMETOOLONG);
+    }
+    let full_path = if raw_path.starts_with('/') {
+        normalize_path(&raw_path)
+    } else {
+        let base = match dirfd_base(dirfd) {
+            Ok(base) => base,
+            Err(err) => return err,
+        };
+        resolve_path(&base, &raw_path)
+    };
+    let full_path = match resolve_access_path(&full_path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if !path_exists_for_access(&full_path) {
+        return errno(ENOENT);
+    }
+    if readonly_mount_contains(&full_path) {
+        return errno(EROFS);
+    }
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let euid = inner.effective_uid;
+    let egid = inner.effective_gid;
+    let rgid = inner.real_gid;
+    let sgid = inner.saved_gid;
+    drop(inner);
+    if euid != 0 {
+        if let Err(err) = access_allowed(&full_path, 0, euid) {
+            return err;
+        }
+        if !can_unprivileged_chown(&full_path, owner, group, euid, rgid, egid, sgid) {
+            return errno(EPERM);
+        }
+    }
+    apply_chown_to_path(&full_path, owner, group);
+    apply_mode_side_effects_after_chown(&full_path);
     0
 }
 
-/// sys_fchown (syscall 55) - stub: always succeed
-pub fn sys_fchown(_fd: usize, _owner: u32, _group: u32) -> isize {
+pub fn sys_fchown(fd: usize, owner: u32, group: u32) -> isize {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+    let Some(path) = file.path() else {
+        return errno(EBADF);
+    };
+    let path = String::from(path);
+    let euid = inner.effective_uid;
+    let egid = inner.effective_gid;
+    let rgid = inner.real_gid;
+    let sgid = inner.saved_gid;
+    drop(inner);
+
+    if readonly_mount_contains(&path) {
+        return errno(EROFS);
+    }
+    if euid != 0 {
+        if !can_unprivileged_chown(&path, owner, group, euid, rgid, egid, sgid) {
+            return errno(EPERM);
+        }
+    }
+    apply_chown_to_path(&path, owner, group);
+    apply_mode_side_effects_after_chown(&path);
     0
 }

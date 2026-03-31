@@ -99,6 +99,8 @@ impl Ext4File {
         let cstr = match flags {
             O_RDONLY => "rb",
             O_RDWR => "r+",
+            0x201 => "wb", // O_WRONLY | O_TRUNC
+            0x202 => "w+", // O_RDWR | O_TRUNC
             0x241 => "wb", // O_WRONLY | O_CREAT | O_TRUNC
             0x441 => "ab", // O_WRONLY | O_CREAT | O_APPEND
             0x242 => "w+", // O_RDWR | O_CREAT | O_TRUNC

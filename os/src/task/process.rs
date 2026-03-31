@@ -110,6 +110,7 @@ pub struct ProcessControlBlockInner {
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
     pub name: String,
     pub cwd: String,
+    pub root_dir: String,
     pub real_uid: u32,
     pub effective_uid: u32,
     pub saved_uid: u32,
@@ -133,6 +134,8 @@ pub struct ProcessControlBlockInner {
     pub itimer_real_expire_ms: usize,
     /// ITIMER_REAL: interval for repeating timer in ms, 0 = one-shot.
     pub itimer_real_interval_ms: usize,
+    /// Parent process waiting on clone(CLONE_VM|CLONE_VFORK) synchronization.
+    pub vfork_vm_parent: Option<Weak<ProcessControlBlock>>,
 }
 
 impl ProcessControlBlockInner {
@@ -284,6 +287,7 @@ impl ProcessControlBlock {
                     condvar_list: Vec::new(),
                     name: String::from("initproc"),
                     cwd: String::from("/"),
+                    root_dir: String::from("/"),
                     real_uid: 0,
                     effective_uid: 0,
                     saved_uid: 0,
@@ -304,6 +308,7 @@ impl ProcessControlBlock {
                     pgid: 0,
                     itimer_real_expire_ms: 0,
                     itimer_real_interval_ms: 0,
+                    vfork_vm_parent: None,
                 })
             },
         });
@@ -744,6 +749,7 @@ impl ProcessControlBlock {
                     condvar_list: Vec::new(),
                     name: parent.name.clone(),
                     cwd: parent.cwd.clone(),
+                    root_dir: parent.root_dir.clone(),
                     real_uid: parent.real_uid,
                     effective_uid: parent.effective_uid,
                     saved_uid: parent.saved_uid,
@@ -764,6 +770,7 @@ impl ProcessControlBlock {
                     pgid: parent.pgid,
                     itimer_real_expire_ms: 0,
                     itimer_real_interval_ms: 0,
+                    vfork_vm_parent: None,
                 })
             },
         });

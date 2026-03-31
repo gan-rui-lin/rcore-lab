@@ -12,7 +12,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 use spin::Mutex;
 
 use crate::fs::{open_file, path_is_dir, OpenFlags};
-use crate::mm::{translated_byte_buffer, translated_refmut};
+use crate::mm::{translated_byte_buffer, translated_byte_buffer_checked, translated_refmut};
 use crate::task::{current_process, current_user_token, has_pending_unmasked_signal, suspend_current_and_run_next};
 
 use super::socket_file::{SocketFile, SocketType};
@@ -53,6 +53,7 @@ const ENOTSOCK: isize = -88;
 const EAFNOSUPPORT: isize = -97;
 const EADDRINUSE: isize = -98;
 const EADDRNOTAVAIL: isize = -99;
+const EISCONN: isize = -106;
 const ENOTCONN: isize = -107;
 const ECONNREFUSED: isize = -111;
 const EFAULT: isize = -14;
@@ -93,6 +94,48 @@ fn read_sockaddr(addr_ptr: *const u8, addr_len: usize, token: usize) -> Option<I
     let port = u16::from_be_bytes([raw[2], raw[3]]);
     let ip = Ipv4Address::new(raw[4], raw[5], raw[6], raw[7]);
     Some(IpEndpoint::new(IpAddress::Ipv4(ip), port))
+}
+
+/// Read IPv4 sockaddr with errno-precise validation for connect().
+fn read_sockaddr_for_connect(
+    addr_ptr: *const u8,
+    addr_len: usize,
+    token: usize,
+) -> Result<IpEndpoint, isize> {
+    if addr_ptr.is_null() {
+        return Err(EFAULT);
+    }
+    if addr_len < core::mem::size_of::<SockAddrIn>() {
+        return Err(EINVAL);
+    }
+    if (addr_ptr as usize) >= 0x4000_0000_0000 {
+        return Err(EFAULT);
+    }
+    let size = core::mem::size_of::<SockAddrIn>();
+    if translated_byte_buffer_checked(token, addr_ptr, size, false).is_none() {
+        return Err(EFAULT);
+    }
+    let bufs = translated_byte_buffer(token, addr_ptr, size);
+    let mut raw = [0u8; 16];
+    let mut offset = 0usize;
+    for buf in bufs.iter() {
+        let n = buf.len().min(size - offset);
+        raw[offset..offset + n].copy_from_slice(&buf[..n]);
+        offset += n;
+        if offset >= size {
+            break;
+        }
+    }
+    if offset < size {
+        return Err(EFAULT);
+    }
+    let family = u16::from_ne_bytes([raw[0], raw[1]]);
+    if family != AF_INET as u16 && family != 0 {
+        return Err(EAFNOSUPPORT);
+    }
+    let port = u16::from_be_bytes([raw[2], raw[3]]);
+    let ip = Ipv4Address::new(raw[4], raw[5], raw[6], raw[7]);
+    Ok(IpEndpoint::new(IpAddress::Ipv4(ip), port))
 }
 
 /// Write smoltcp IpEndpoint back to user-space sockaddr.
@@ -757,9 +800,9 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
         }
     }
 
-    let remote = match read_sockaddr(addr, addr_len, token) {
-        Some(ep) => ep,
-        None => return EINVAL,
+    let remote = match read_sockaddr_for_connect(addr, addr_len, token) {
+        Ok(ep) => ep,
+        Err(err) => return err,
     };
 
     let (handle, sock_type) = match get_socket_info(fd) {
@@ -802,7 +845,10 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
                 let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
                 if let Err(e) = socket.connect(cx, connect_remote, local_port) {
                     warn!("[net] TCP connect failed: {:?}", e);
-                    return ECONNREFUSED;
+                    return match e {
+                        tcp::ConnectError::InvalidState => EISCONN,
+                        _ => ECONNREFUSED,
+                    };
                 }
             }
 

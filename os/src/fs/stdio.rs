@@ -19,38 +19,53 @@ static URANDOM_SEED: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
 pub struct DevNull {
     readable: bool,
     writable: bool,
+    path: &'static str,
 }
 
 /// /dev/zero device: reads return zero bytes, writes succeed silently
 pub struct DevZero {
     readable: bool,
     writable: bool,
+    path: &'static str,
 }
 
 /// /dev/urandom and /dev/random device: reads return pseudorandom bytes
 pub struct DevUrandom {
     readable: bool,
     writable: bool,
+    path: &'static str,
 }
 
 impl DevNull {
     /// Create a `/dev/null` handle with the requested access mode.
-    pub fn new(readable: bool, writable: bool) -> Self {
-        Self { readable, writable }
+    pub fn new(readable: bool, writable: bool, path: &'static str) -> Self {
+        Self {
+            readable,
+            writable,
+            path,
+        }
     }
 }
 
 impl DevZero {
     /// Create a `/dev/zero` handle with the requested access mode.
-    pub fn new(readable: bool, writable: bool) -> Self {
-        Self { readable, writable }
+    pub fn new(readable: bool, writable: bool, path: &'static str) -> Self {
+        Self {
+            readable,
+            writable,
+            path,
+        }
     }
 }
 
 impl DevUrandom {
     /// Create a `/dev/urandom` handle with the requested access mode.
-    pub fn new(readable: bool, writable: bool) -> Self {
-        Self { readable, writable }
+    pub fn new(readable: bool, writable: bool, path: &'static str) -> Self {
+        Self {
+            readable,
+            writable,
+            path,
+        }
     }
 }
 
@@ -146,6 +161,9 @@ impl File for DevNull {
     }
     fn read(&self, _user_buf: UserBuffer) -> usize { 0 }
     fn write(&self, user_buf: UserBuffer) -> usize { user_buf.len() }
+    fn path(&self) -> Option<&str> {
+        Some(self.path)
+    }
 }
 
 impl File for DevZero {
@@ -164,6 +182,9 @@ impl File for DevZero {
         total
     }
     fn write(&self, user_buf: UserBuffer) -> usize { user_buf.len() }
+    fn path(&self) -> Option<&str> {
+        Some(self.path)
+    }
 }
 
 impl File for DevUrandom {
@@ -191,5 +212,8 @@ impl File for DevUrandom {
     }
     fn write(&self, user_buf: UserBuffer) -> usize {
         user_buf.len()
+    }
+    fn path(&self) -> Option<&str> {
+        Some(self.path)
     }
 }
