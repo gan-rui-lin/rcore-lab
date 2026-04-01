@@ -1,6 +1,4 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
-#[cfg(target_arch = "loongarch64")]
-use super::PhysAddr;
 use super::{frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysPageNum, VirtAddr, VirtPageNum};
