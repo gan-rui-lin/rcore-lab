@@ -21,18 +21,18 @@ const PATH_ENV: &[u8] = b"PATH=/bin:/usr/bin:/musl:/glibc\0";
 const LD_LIB_MUSL: &[u8] = b"LD_LIBRARY_PATH=/musl/lib\0";
 const LD_LIB_GLIBC: &[u8] = b"LD_LIBRARY_PATH=/glibc/lib\0";
 const TEST_LIBC_ROOTS: [&str; 2] = ["/musl", "/glibc"];
-const TEST_SUITES: [&str; 4] = [
+const TEST_SUITES: [&str; 1] = [
     // "basic",
     // "busybox",
     // "cyclictest",
     // "iozone",
-    "iperf",
-    "libcbench",
+    // "iperf",
+    // "libcbench",
     // "libctest",
-    "lmbench",
-    // "ltp",
+    // "lmbench",
+    "ltp",
     // "lua",
-    "netperf",
+    // "netperf",
 ];
 #[allow(dead_code)]
 const RUN_EMBEDDED_PTHREAD: bool = option_env!("RUN_EMBEDDED_PTHREAD").is_some();
