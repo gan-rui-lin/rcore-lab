@@ -707,6 +707,23 @@ pub fn handle_signals() {
                     "[signal] pid={} name={} default handler for signal {} -> terminate",
                     pid, process_inner.name, signum
                 );
+                // Fatal default signals should terminate the whole thread group.
+                // Otherwise one thread can die while siblings keep waiting (e.g. futex join),
+                // and the process hangs instead of exiting by signal.
+                for other_task in process_inner.tasks.iter().filter_map(|t| t.as_ref()) {
+                    if !Arc::ptr_eq(other_task, &task) {
+                        let mut other_inner = other_task.inner_exclusive_access();
+                        other_inner.signal_pending.insert(flag);
+                        other_inner.signal_mask.remove(flag);
+                        if other_inner.task_status == TaskStatus::Blocked {
+                            futex_remove_waiter_any(other_task);
+                            other_inner.interrupted_by_signal = true;
+                            other_inner.task_status = TaskStatus::Ready;
+                            drop(other_inner);
+                            add_task(other_task.clone());
+                        }
+                    }
+                }
                 drop(task_inner);
                 drop(process_inner);
                 exit_current_and_run_next(-(signum as i32));
