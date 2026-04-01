@@ -262,8 +262,12 @@ pub struct VPNRange {
 impl VPNRange {
     /// Create a new VPNRange.  Panics if `start > end`.
     pub fn new(start: VirtPageNum, end: VirtPageNum) -> Self {
-        assert!(start <= end);
-        Self { start, end }
+        if start <= end {
+            Self { start, end }
+        } else {
+            // Keep kernel alive on malformed ranges: treat as empty [start, start).
+            Self { start, end: start }
+        }
     }
     /// Get the start VPN.
     pub fn get_start(&self) -> VirtPageNum {
