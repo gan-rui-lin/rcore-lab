@@ -5,8 +5,6 @@ use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, USER_STACK_SIZE};
 use crate::mm::{frame_alloc, FrameTracker};
 use crate::mm::{MapPermission, PhysPageNum, VirtAddr};
 use crate::sync::UPIntrFreeCell;
-#[cfg(target_arch = "loongarch64")]
-use alloc::vec;
 use alloc::{
     sync::{Arc, Weak},
     vec,

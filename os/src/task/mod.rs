@@ -13,8 +13,6 @@ mod signal;
 #[allow(rustdoc::private_intra_doc_links)]
 mod task;
 mod tls;
-#[cfg(target_arch = "loongarch64")]
-use crate::config::PAGE_SIZE;
 use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
 #[cfg_attr(
     all(debug_assertions, target_arch = "riscv64"),
