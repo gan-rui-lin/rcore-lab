@@ -3078,10 +3078,10 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> isize {
 pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
     let process = current_process();
     let inner = process.inner_exclusive_access();
-    let token = current_user_token();
     let (r, e, s) = (inner.real_uid, inner.effective_uid, inner.saved_uid);
     drop(inner);
     drop(process);
+    let token = current_user_token();
     let r_bytes = r.to_ne_bytes();
     let e_bytes = e.to_ne_bytes();
     let s_bytes = s.to_ne_bytes();
@@ -3127,10 +3127,10 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> isize {
 pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> isize {
     let process = current_process();
     let inner = process.inner_exclusive_access();
-    let token = current_user_token();
     let (r, e, s) = (inner.real_gid, inner.effective_gid, inner.saved_gid);
     drop(inner);
     drop(process);
+    let token = current_user_token();
     let r_bytes = r.to_ne_bytes();
     let e_bytes = e.to_ne_bytes();
     let s_bytes = s.to_ne_bytes();
@@ -3591,6 +3591,8 @@ pub fn sys_getrlimit(resource: usize, rlim: *mut RLimit) -> isize {
             core::mem::size_of::<RLimit>(),
         )
     };
+    drop(inner);
+    drop(process);
     let token = current_user_token();
     match copy_to_user(token, rlim as *mut u8, bytes) {
         Ok(_) => 0,
