@@ -138,10 +138,83 @@ fn read_sockaddr_for_connect(
     Ok(IpEndpoint::new(IpAddress::Ipv4(ip), port))
 }
 
+fn read_user_u32(token: usize, ptr: *const u32) -> Result<u32, isize> {
+    let Some(bufs) =
+        translated_byte_buffer_checked(token, ptr as *const u8, core::mem::size_of::<u32>(), false)
+    else {
+        return Err(EFAULT);
+    };
+    let mut raw = [0u8; 4];
+    let mut offset = 0usize;
+    for buf in bufs.iter() {
+        let n = buf.len().min(4 - offset);
+        raw[offset..offset + n].copy_from_slice(&buf[..n]);
+        offset += n;
+        if offset >= 4 {
+            break;
+        }
+    }
+    if offset < 4 {
+        return Err(EFAULT);
+    }
+    Ok(u32::from_ne_bytes(raw))
+}
+
+fn write_user_u32(token: usize, ptr: *mut u32, val: u32) -> Result<(), isize> {
+    let Some(bufs) =
+        translated_byte_buffer_checked(token, ptr as *const u8, core::mem::size_of::<u32>(), true)
+    else {
+        return Err(EFAULT);
+    };
+    let bytes = val.to_ne_bytes();
+    let mut offset = 0usize;
+    for buf in bufs.iter() {
+        let n = buf.len().min(4 - offset);
+        let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, n) };
+        dst.copy_from_slice(&bytes[offset..offset + n]);
+        offset += n;
+        if offset >= 4 {
+            break;
+        }
+    }
+    if offset < 4 {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+
+fn copy_to_user(token: usize, dst_ptr: *mut u8, src: &[u8]) -> Result<(), isize> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    let Some(bufs) = translated_byte_buffer_checked(token, dst_ptr, src.len(), true) else {
+        return Err(EFAULT);
+    };
+    let mut offset = 0usize;
+    for buf in bufs.iter() {
+        let n = buf.len().min(src.len() - offset);
+        let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, n) };
+        dst.copy_from_slice(&src[offset..offset + n]);
+        offset += n;
+        if offset >= src.len() {
+            break;
+        }
+    }
+    if offset < src.len() {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+
 /// Write smoltcp IpEndpoint back to user-space sockaddr.
-fn write_sockaddr(ep: &IpEndpoint, addr_ptr: *mut u8, addrlen_ptr: *mut u32, token: usize) {
-    if addr_ptr.is_null() {
-        return;
+fn write_sockaddr(
+    ep: &IpEndpoint,
+    addr_ptr: *mut u8,
+    addrlen_ptr: *mut u32,
+    token: usize,
+) -> Result<(), isize> {
+    if addr_ptr.is_null() || addrlen_ptr.is_null() {
+        return Err(EFAULT);
     }
     let mut raw = [0u8; 16];
     raw[0] = AF_INET as u8;
@@ -156,20 +229,14 @@ fn write_sockaddr(ep: &IpEndpoint, addr_ptr: *mut u8, addrlen_ptr: *mut u32, tok
     raw[6] = octets[2];
     raw[7] = octets[3];
 
-    let bufs = translated_byte_buffer(token, addr_ptr, 16);
-    let mut offset = 0;
-    for buf in bufs.iter() {
-        let n = buf.len().min(16 - offset);
-        // Safety: translated_byte_buffer gives mutable kernel-mapped slices
-        let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, n) };
-        dst.copy_from_slice(&raw[offset..offset + n]);
-        offset += n;
+    let user_len = read_user_u32(token, addrlen_ptr as *const u32)?;
+    if (user_len as i32) < 0 {
+        return Err(EINVAL);
     }
-
-    if !addrlen_ptr.is_null() {
-        let len_ref = translated_refmut(token, addrlen_ptr);
-        *len_ref = 16;
-    }
+    let copy_len = core::cmp::min(raw.len(), user_len as usize);
+    copy_to_user(token, addr_ptr, &raw[..copy_len])?;
+    write_user_u32(token, addrlen_ptr, raw.len() as u32)?;
+    Ok(())
 }
 
 /// Helper: get socket handle and type from fd.
@@ -416,7 +483,15 @@ fn read_unix_sockaddr(addr_ptr: *const u8, addr_len: usize, token: usize) -> Opt
 }
 
 /// Write AF_UNIX sockaddr to user memory.
-fn write_unix_sockaddr(path: &str, addr_ptr: *mut u8, addrlen_ptr: *mut u32, token: usize) {
+fn write_unix_sockaddr(
+    path: &str,
+    addr_ptr: *mut u8,
+    addrlen_ptr: *mut u32,
+    token: usize,
+) -> Result<(), isize> {
+    if addr_ptr.is_null() || addrlen_ptr.is_null() {
+        return Err(EFAULT);
+    }
     let mut raw = [0u8; 110];
     raw[0] = AF_UNIX as u8;
     raw[1] = 0;
@@ -432,24 +507,14 @@ fn write_unix_sockaddr(path: &str, addr_ptr: *mut u8, addrlen_ptr: *mut u32, tok
         used_len += 1;
     }
 
-    if !addr_ptr.is_null() {
-        let bufs = translated_byte_buffer(token, addr_ptr, used_len);
-        let mut offset = 0;
-        for buf in bufs.iter() {
-            let n = buf.len().min(used_len - offset);
-            let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, n) };
-            dst.copy_from_slice(&raw[offset..offset + n]);
-            offset += n;
-            if offset >= used_len {
-                break;
-            }
-        }
+    let user_len = read_user_u32(token, addrlen_ptr as *const u32)?;
+    if (user_len as i32) < 0 {
+        return Err(EINVAL);
     }
-
-    if !addrlen_ptr.is_null() {
-        let len_ref = translated_refmut(token, addrlen_ptr);
-        *len_ref = used_len as u32;
-    }
+    let copy_to = core::cmp::min(used_len, user_len as usize);
+    copy_to_user(token, addr_ptr, &raw[..copy_to])?;
+    write_user_u32(token, addrlen_ptr, used_len as u32)?;
+    Ok(())
 }
 
 /// sys_bind(fd, addr, addrlen) -> 0
@@ -686,7 +751,9 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32, flags: us
             // Write peer address to user space
             if let Some(ep) = remote_ep {
                 if !addr.is_null() {
-                    write_sockaddr(&ep, addr, addr_len, token);
+                    if let Err(e) = write_sockaddr(&ep, addr, addr_len, token) {
+                        return e;
+                    }
                 }
             }
 
@@ -936,8 +1003,10 @@ pub fn sys_getsockname(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
         if file.is_unix_socket() {
             let path = file.unix_bound_path().unwrap_or_else(alloc::string::String::new);
             drop(inner);
-            write_unix_sockaddr(&path, addr, addr_len, token);
-            return 0;
+            return match write_unix_sockaddr(&path, addr, addr_len, token) {
+                Ok(()) => 0,
+                Err(e) => e,
+            };
         }
     }
 
@@ -971,8 +1040,10 @@ pub fn sys_getsockname(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
     };
     drop(net);
 
-    write_sockaddr(&ep, addr, addr_len, token);
-    0
+    match write_sockaddr(&ep, addr, addr_len, token) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
 }
 
 /// sys_getpeername(fd, addr, addrlen) -> 0
@@ -996,8 +1067,10 @@ pub fn sys_getpeername(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
                 None => return ENOTCONN,
             };
             drop(net);
-            write_sockaddr(&ep, addr, addr_len, token);
-            0
+            match write_sockaddr(&ep, addr, addr_len, token) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
         }
         SocketType::Udp => {
             // Return the connected remote endpoint if set
@@ -1007,8 +1080,10 @@ pub fn sys_getpeername(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
                 if let Some(ref file) = inner.fd_table[fd] {
                     if let Some(ep) = file.get_connected_remote() {
                         drop(inner);
-                        write_sockaddr(&ep, addr, addr_len, token);
-                        return 0;
+                        return match write_sockaddr(&ep, addr, addr_len, token) {
+                            Ok(()) => 0,
+                            Err(e) => e,
+                        };
                     }
                 }
             }
@@ -1239,7 +1314,11 @@ pub fn sys_recvfrom(
                         off += copy;
                     }
                     // Return AF_UNIX family. For bind05 this is enough; sendto falls back to connected peer.
-                    write_unix_sockaddr("", src_addr, addr_len, token);
+                    if !src_addr.is_null() {
+                        if let Err(e) = write_unix_sockaddr("", src_addr, addr_len, token) {
+                            return e;
+                        }
+                    }
                     return n as isize;
                 }
 
@@ -1327,7 +1406,11 @@ pub fn sys_recvfrom(
                             off += copy;
                         }
                         // Write source address
-                        write_sockaddr(&endpoint.endpoint, src_addr, addr_len, token);
+                        if !src_addr.is_null() {
+                            if let Err(e) = write_sockaddr(&endpoint.endpoint, src_addr, addr_len, token) {
+                                return e;
+                            }
+                        }
                         return n as isize;
                     }
                     Err(_) => return EINVAL,

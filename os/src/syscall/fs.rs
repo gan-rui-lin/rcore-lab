@@ -72,6 +72,7 @@ const PATH_MAX: usize = 4096;
 const NAME_MAX: usize = 255;
 const MS_RDONLY: u32 = 1;
 const DIRECT_IO_ALIGN: usize = 4096;
+const LINUX_DIRENT64_MIN_RECLEN: usize = 24;
 
 /// Per-file stored timestamps (atime, mtime).
 #[derive(Clone, Copy, Debug)]
@@ -2311,6 +2312,9 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> isize {
     if buf.is_null() {
         return errno(EFAULT);
     }
+    if len < LINUX_DIRENT64_MIN_RECLEN {
+        return errno(EINVAL);
+    }
     let token = current_user_token();
     let process = current_process();
     let inner = process.inner_exclusive_access();
@@ -2320,8 +2324,17 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> isize {
     let Some(file) = &inner.fd_table[fd] else {
         return errno(EBADF);
     };
+    if !file.readable() {
+        return errno(EBADF);
+    }
     let file = file.clone();
     drop(inner);
+    if let Some(path) = file.path() {
+        // `getdents02` expects ENOENT when a directory fd points to an unlinked path.
+        if !path_exists_for_access(path) {
+            return errno(ENOENT);
+        }
+    }
     let Some(inode) = file.inode() else {
         return errno(ENOTDIR);
     };
