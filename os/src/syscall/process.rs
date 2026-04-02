@@ -192,6 +192,7 @@ bitflags! {
         const FUTEX_WAIT = 0;
         const FUTEX_WAKE = 1;
         const FUTEX_REQUEUE = 3;
+        const FUTEX_CMP_REQUEUE = 4;
         const FUTEX_WAIT_BITSET = 9;
         const FUTEX_WAKE_BITSET = 10;
     }
@@ -474,6 +475,41 @@ pub fn sys_futex(
                 requeued,
                 uaddr2 as usize,
                 pa2.0
+            );
+            requeued
+        }
+        FutexCmd::FUTEX_CMP_REQUEUE => {
+            // val3 contains expected value for comparison
+            // val = max_wake, timeout (as usize) = max_requeue
+            if uaddr2.is_null() {
+                return errno(EINVAL);
+            }
+            let futex_word = translated_ref(token, uaddr1);
+            if *futex_word != val3 {
+                trace!(
+                    "[sys_futex] pid={} cmp_requeue mismatch word={} expected={}",
+                    pid_now,
+                    *futex_word,
+                    val3
+                );
+                return errno(EAGAIN);
+            }
+            let pa2 = match page_table.translate_va(VirtAddr::from(uaddr2 as usize)) {
+                Some(pa) => pa,
+                None => return errno(EFAULT),
+            };
+            let new_key = FutexKey::new(pa2, pid);
+            // For CMP_REQUEUE: val = max_wake, timeout (cast to usize) = max_requeue
+            let max_requeue = timeout as usize as i32;
+            let requeued = futex_requeue(key, val, new_key, max_requeue) as isize;
+            trace!(
+                "[sys_futex] pid={} cmp_requeue n={} uaddr2={:#x} pa2={:#x} max_wake={} max_requeue={}",
+                pid_now,
+                requeued,
+                uaddr2 as usize,
+                pa2.0,
+                val,
+                max_requeue
             );
             requeued
         }
