@@ -649,7 +649,7 @@ echo \"#### OS COMP TEST GROUP START ltp-glibc ####\"
 target_dir=\"ltp/testcases/bin\"
 export PATH=\"$PATH:./ltp/testcases/bin:./ltp/testcases/lib:./ltp/testcases/network/busy_poll:./ltp/testcases/kernel/controllers/cgroup_fj\"
 case_timeout=\"${LTP_CASE_TIMEOUT:-8}\"
-case_limit=\"${LTP_CASE_LIMIT:-10}\"
+case_limit=\"${LTP_CASE_LIMIT:-10000}\"
 case_count=0
 
 is_skip_case() {
