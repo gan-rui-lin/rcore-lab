@@ -22,7 +22,7 @@ use crate::{
         futex_remove_waiter_any, futex_requeue, futex_wait, futex_wait_bitset, futex_wake,
         futex_wake_bitset, pid2process, suspend_current_and_run_next, user_mask_to_flags, FutexKey,
         IntervalTimerState, RLimit, SignalAction, SignalFlags, TaskControlBlock, TaskStatus,
-        UserContext, MAX_SIG, RLIMIT_NLIMITS, SIGKILL, SIGSTOP,
+        UserContext, MAX_SIG, RLIMIT_NLIMITS, SIGCHLD, SIGKILL, SIGSTOP,
     },
     timer::{add_timer, get_time, get_time_ms, get_time_us, remove_timer},
 };
@@ -330,7 +330,15 @@ pub fn sys_futex(
     };
     let private = opt.contains(FutexOpt::FUTEX_PRIVATE_FLAG);
     let pid = if private { current_process().pid.0 } else { 0 };
-    let key = FutexKey::new(pa, pid);
+    // For private futexes, key by user virtual address within the process.
+    // Physical page can change due to COW after fork/threads, which would
+    // otherwise break wakeup matching for the same uaddr.
+    let key_addr = if private {
+        crate::mm::PhysAddr::from(uaddr1 as usize)
+    } else {
+        pa
+    };
+    let key = FutexKey::new(key_addr, pid);
     let name = current_process().inner_exclusive_access().name.clone();
     if matches!(cmd, FutexCmd::FUTEX_WAIT | FutexCmd::FUTEX_WAIT_BITSET)
         && name == "entry-static.exe"
@@ -467,7 +475,12 @@ pub fn sys_futex(
                 Some(pa) => pa,
                 None => return errno(EFAULT),
             };
-            let new_key = FutexKey::new(pa2, pid);
+            let new_key_addr = if private {
+                crate::mm::PhysAddr::from(uaddr2 as usize)
+            } else {
+                pa2
+            };
+            let new_key = FutexKey::new(new_key_addr, pid);
             let requeued = futex_requeue(key, val, new_key, val3) as isize;
             trace!(
                 "[sys_futex] pid={} requeue n={} uaddr2={:#x} pa2={:#x}",
@@ -498,7 +511,12 @@ pub fn sys_futex(
                 Some(pa) => pa,
                 None => return errno(EFAULT),
             };
-            let new_key = FutexKey::new(pa2, pid);
+            let new_key_addr = if private {
+                crate::mm::PhysAddr::from(uaddr2 as usize)
+            } else {
+                pa2
+            };
+            let new_key = FutexKey::new(new_key_addr, pid);
             // For CMP_REQUEUE: val = max_wake, timeout (cast to usize) = max_requeue
             let max_requeue = timeout as usize as i32;
             let requeued = futex_requeue(key, val, new_key, max_requeue) as isize;
@@ -1516,6 +1534,8 @@ fn encode_wait_status(exit_code: i32) -> i32 {
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
     const WNOHANG: i32 = 1;
     let my_pid = current_process().getpid();
+    const SIG_DFL: usize = 0;
+    const SIG_IGN: usize = 1;
     loop {
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
@@ -1550,7 +1570,11 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
         suspend_current_and_run_next();
 
         // Check for pending signals that have a user handler -> return EINTR.
-        // Signals with SIG_DFL (default-ignore, like SIGCHLD) should NOT cause EINTR.
+        // Signals with SIG_DFL/SIG_IGN (e.g. default-ignore SIGCHLD) should NOT cause EINTR.
+        //
+        // IMPORTANT: do not "restart" waitpid() inside kernel based on SA_RESTART.
+        // We must return to user mode so signal handlers can run; otherwise timeout
+        // paths (e.g. SIGALRM-driven watchdog in LTP) can loop in-kernel forever.
         {
             let process = current_process();
             let process_inner = process.inner_exclusive_access();
@@ -1559,10 +1583,8 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
             let unmasked = (process_inner.signal_pending | task_inner.signal_pending)
                 & !task_inner.signal_mask;
             if !unmasked.is_empty() {
-                // Only return EINTR if at least one pending signal has a user
-                // handler WITHOUT SA_RESTART. Signals with SIG_DFL/SIG_IGN don't
-                // cause EINTR. Signals with SA_RESTART cause the syscall to be
-                // restarted (we just continue the loop).
+                // Return EINTR only if at least one pending signal has a user handler
+                // without SA_RESTART. SIGCHLD should not interrupt waitpid.
                 use crate::task::SA_RESTART;
                 let actions = &process_inner.signal_actions;
                 let raw = unmasked.bits();
@@ -1572,8 +1594,24 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
                         let signum = bit as usize + 1;
                         if signum < actions.table.len() {
                             let action = &actions.table[signum];
-                            if action.handler <= 1 { continue; } // SIG_DFL/SIG_IGN
-                            if (action.flags & SA_RESTART) != 0 { continue; }
+                            if action.handler == SIG_DFL {
+                                continue;
+                            }
+                            if action.handler == SIG_IGN || signum == SIGCHLD {
+                                continue;
+                            }
+                            // Interval-timer signals drive LTP timeout paths.
+                            // Force EINTR so we return to user mode and run handlers.
+                            if signum == crate::task::SIGALRM
+                                || signum == crate::task::SIGVTALRM
+                                || signum == crate::task::SIGPROF
+                            {
+                                needs_eintr = true;
+                                break;
+                            }
+                            if (action.flags & SA_RESTART) != 0 {
+                                continue;
+                            }
                             needs_eintr = true;
                             break;
                         }
@@ -1735,6 +1773,9 @@ pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
         Ok(v) => v,
         Err(e) => return e,
     };
+    if req.tv_nsec >= 1_000_000_000 {
+        return errno(EINVAL);
+    }
     let sleep_us = req
         .tv_sec
         .saturating_mul(1_000_000)
@@ -1793,7 +1834,9 @@ pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
                         core::mem::size_of::<TimeSpec>(),
                     )
                 };
-                let _ = copy_to_user(token, rem as *mut u8, bytes);
+                if let Err(err) = copy_to_user(token, rem as *mut u8, bytes) {
+                    return err;
+                }
             }
             return errno(EINTR);
         }
@@ -1950,8 +1993,8 @@ pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: *mut u8) -> is
 }
 
 pub fn sys_clock_nanosleep(
-    _clock_id: usize,
-    _flags: usize,
+    clock_id: usize,
+    flags: usize,
     req: *const TimeSpec,
     rem: *mut TimeSpec,
 ) -> isize {
@@ -1959,7 +2002,18 @@ pub fn sys_clock_nanosleep(
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_clock_nanosleep", pid);
     }
-    // libc pthread paths only need relative sleep behavior here.
+    // Support common clocks; reject thread CPU clock like Linux.
+    match clock_id {
+        0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 => {}
+        _ => return errno(EINVAL),
+    }
+    if clock_id == 3 {
+        return errno(ENOTSUP);
+    }
+    // Only relative sleep is supported for now.
+    if flags != 0 {
+        return errno(EINVAL);
+    }
     sys_nanosleep(req, rem)
 }
 

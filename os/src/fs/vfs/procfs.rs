@@ -184,6 +184,7 @@ impl VfsInode for ProcPidDirInode {
     fn lookup(&self, name: &str) -> Option<Arc<dyn VfsInode>> {
         match name {
             "stat" => Some(ProcPidStatInode::new(self.pid)),
+            "task" => Some(ProcPidTaskDirInode::new(self.pid)),
             "maps" => Some(ProcPidMapsInode::new(self.pid)),
             // /proc/self/mounts, /proc/self/mountinfo, /proc/self/mountstats
             "mounts" => Some(ProcFileInode::new(proc_mounts)),
@@ -213,6 +214,7 @@ impl VfsInode for ProcPidDirInode {
         vec![
             String::from("maps"),
             String::from("stat"),
+            String::from("task"),
             String::from("status"),
             String::from("mounts"),
             String::from("mountinfo"),
@@ -222,6 +224,199 @@ impl VfsInode for ProcPidDirInode {
             String::from("cmdline"),
             String::from("environ"),
         ]
+    }
+}
+
+struct ProcPidTaskDirInode {
+    pid: usize,
+}
+
+impl ProcPidTaskDirInode {
+    fn new(pid: usize) -> Arc<Self> {
+        Arc::new(Self { pid })
+    }
+}
+
+impl VfsInode for ProcPidTaskDirInode {
+    fn kind(&self) -> VfsNodeKind {
+        VfsNodeKind::Dir
+    }
+
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        buf.len()
+    }
+
+    fn lookup(&self, name: &str) -> Option<Arc<dyn VfsInode>> {
+        let tid = name.parse::<usize>().ok()?;
+        let process = pid2process(self.pid)?;
+        let inner = process.inner_exclusive_access();
+        let (task_idx, _) = inner
+            .tasks
+            .iter()
+            .enumerate()
+            .find(|(idx, t)| {
+                t.is_some() && ((if *idx == 0 { self.pid } else { self.pid + *idx }) == tid)
+            })?;
+        Some(ProcPidTaskTidDirInode::new(self.pid, task_idx))
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
+        None
+    }
+
+    fn truncate(&self) {}
+
+    fn list(&self) -> Vec<String> {
+        let Some(process) = pid2process(self.pid) else {
+            return Vec::new();
+        };
+        let inner = process.inner_exclusive_access();
+        let mut out: Vec<String> = inner
+            .tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, t)| {
+                if t.is_some() {
+                    Some(if idx == 0 { self.pid } else { self.pid + idx })
+                } else {
+                    None
+                }
+            })
+            .map(|tid| format!("{}", tid))
+            .collect();
+        out.sort();
+        out
+    }
+}
+
+struct ProcPidTaskTidDirInode {
+    pid: usize,
+    task_idx: usize,
+}
+
+impl ProcPidTaskTidDirInode {
+    fn new(pid: usize, task_idx: usize) -> Arc<Self> {
+        Arc::new(Self { pid, task_idx })
+    }
+}
+
+impl VfsInode for ProcPidTaskTidDirInode {
+    fn kind(&self) -> VfsNodeKind {
+        VfsNodeKind::Dir
+    }
+
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        buf.len()
+    }
+
+    fn lookup(&self, name: &str) -> Option<Arc<dyn VfsInode>> {
+        match name {
+            "stat" => Some(ProcPidTaskStatInode::new(self.pid, self.task_idx)),
+            _ => None,
+        }
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
+        None
+    }
+
+    fn truncate(&self) {}
+
+    fn list(&self) -> Vec<String> {
+        vec![String::from("stat")]
+    }
+}
+
+struct ProcPidTaskStatInode {
+    pid: usize,
+    task_idx: usize,
+}
+
+impl ProcPidTaskStatInode {
+    fn new(pid: usize, task_idx: usize) -> Arc<Self> {
+        Arc::new(Self { pid, task_idx })
+    }
+
+    fn render(&self) -> String {
+        let Some(process) = pid2process(self.pid) else {
+            return String::new();
+        };
+        let inner = process.inner_exclusive_access();
+        let comm = inner.name.clone();
+        let mut state = if inner.is_zombie { 'Z' } else { 'R' };
+        if !inner.is_zombie {
+            if let Some(Some(task)) = inner.tasks.get(self.task_idx) {
+                if let Some(task_inner) = task.try_inner_exclusive_access() {
+                state = match task_inner.task_status {
+                    TaskStatus::Blocked => 'S',
+                    TaskStatus::Running => 'R',
+                    TaskStatus::Ready => {
+                        if task_inner.last_syscall == SYSCALL_WAITPID {
+                            'S'
+                        } else {
+                            'R'
+                        }
+                    }
+                };
+                }
+            }
+        }
+        let tid = if self.task_idx == 0 {
+            self.pid
+        } else {
+            self.pid + self.task_idx
+        };
+        format!(
+            "{} ({}) {} 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+            tid, comm, state
+        )
+    }
+}
+
+impl VfsInode for ProcPidTaskStatInode {
+    fn kind(&self) -> VfsNodeKind {
+        VfsNodeKind::File
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let content = self.render();
+        let bytes = content.as_bytes();
+        if offset >= bytes.len() {
+            return 0;
+        }
+        let n = core::cmp::min(buf.len(), bytes.len() - offset);
+        buf[..n].copy_from_slice(&bytes[offset..offset + n]);
+        n
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        buf.len()
+    }
+
+    fn lookup(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
+        None
+    }
+
+    fn truncate(&self) {}
+
+    fn list(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn size(&self) -> usize {
+        self.render().as_bytes().len()
     }
 }
 
@@ -299,24 +494,23 @@ impl ProcPidStatInode {
         };
         let inner = process.inner_exclusive_access();
         let comm = inner.name.clone();
-        let mut state = if inner.is_zombie { 'Z' } else { 'S' };
-        for task in inner.tasks.iter().filter_map(|task| task.as_ref()) {
-            if let Some(task_inner) = task.try_inner_exclusive_access() {
-                match task_inner.task_status {
-                    TaskStatus::Running => {
-                        state = 'R';
-                        break;
-                    }
-                    TaskStatus::Blocked => {
-                        state = 'S';
-                    }
-                    TaskStatus::Ready => {
-                        if task_inner.last_syscall == SYSCALL_WAITPID {
-                            state = 'S';
-                        } else if state != 'Z' {
-                            state = 'R';
+        // /proc/<pid>/stat should reflect the thread-group leader state.
+        // LTP's TST_PROCESS_STATE_WAIT() relies on this for parent process sleep detection.
+        let mut state = if inner.is_zombie { 'Z' } else { 'R' };
+        if !inner.is_zombie {
+            if let Some(Some(leader)) = inner.tasks.get(0) {
+                if let Some(task_inner) = leader.try_inner_exclusive_access() {
+                    state = match task_inner.task_status {
+                        TaskStatus::Blocked => 'S',
+                        TaskStatus::Running => 'R',
+                        TaskStatus::Ready => {
+                            if task_inner.last_syscall == SYSCALL_WAITPID {
+                                'S'
+                            } else {
+                                'R'
+                            }
                         }
-                    }
+                    };
                 }
             }
         }
