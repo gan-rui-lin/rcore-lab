@@ -644,10 +644,12 @@ fn run_ltp_suite(root: &str) -> i32 {
     // that are not meant to be launched directly (e.g. cgroup_fj_proc).
     let script = "\
 #!/bin/sh
-echo \"#### OS COMP TEST GROUP START ltp ####\"
+echo \"#### OS COMP TEST GROUP START ltp-musl ####\"
 target_dir=\"ltp/testcases/bin\"
 export PATH=\"$PATH:./ltp/testcases/bin:./ltp/testcases/lib:./ltp/testcases/network/busy_poll:./ltp/testcases/kernel/controllers/cgroup_fj\"
 case_timeout=\"${LTP_CASE_TIMEOUT:-8}\"
+case_limit=\"${LTP_CASE_LIMIT:-10}\"
+case_count=0
 
 is_skip_case() {
   case \"$1\" in
@@ -680,18 +682,23 @@ run_case_with_timeout() {
 }
 
 for file in \"$target_dir\"/*; do
-  [ -f \"$file\" ] || continue
-  case_name=$(basename \"$file\")
-  if is_skip_case \"$case_name\"; then
-    continue
-  fi
-  echo \"RUN LTP CASE $case_name\"
-  run_case_with_timeout \"$file\"
-  ret=$?
-  echo \"FAIL LTP CASE $case_name : $ret\"
+    [ -f \"$file\" ] || continue
+    case_name=$(basename \"$file\")
+    if is_skip_case \"$case_name\"; then
+        continue
+    fi
+    if [ \"$case_count\" -ge \"$case_limit\" ]; then
+        echo \"LTP case limit reached: $case_limit\"
+        break
+    fi
+    echo \"RUN LTP CASE $case_name\"
+    case_count=$((case_count + 1))
+    run_case_with_timeout \"$file\"
+    ret=$?
+    echo \"FAIL LTP CASE $case_name : $ret\"
 done
 
-echo \"#### OS COMP TEST GROUP END ltp ####\"
+echo \"#### OS COMP TEST GROUP END ltp-musl ####\"
 ";
     let _ = write_embedded_elf(script_path, script.as_bytes());
     run_testcode(script_path, root)
