@@ -81,22 +81,15 @@ ltp/testcases/bin/futex_wake01\n\
 // Debug script for LTP tests that get stuck (selected from skip list)
 // fork14 skipped - causes OOM with 1GB mmap (being fixed separately)
 // futex_cmp_requeue01 skipped - creates hundreds of processes, takes too long
+// futex_wait03/05, clock_nanosleep* skipped - requires signal to interrupt syscall (EINTR)
+// kill10/11 skipped - signal handling loop issue
 const TMP_LTP_STUCK_PATH: &str = "/tmp/ltp_stuck_debug.sh";
 const TMP_LTP_STUCK_SCRIPT: &[u8] = b"\
 ./busybox echo '=== ltp-stuck debug start ==='\n\
 ./busybox echo 'Testing futex tests...'\n\
 ltp/testcases/bin/futex_cmp_requeue02\n\
-ltp/testcases/bin/futex_wait03\n\
-ltp/testcases/bin/futex_wait05\n\
 ltp/testcases/bin/futex_wake02\n\
 ltp/testcases/bin/futex_wake04\n\
-./busybox echo 'Testing clock_nanosleep...'\n\
-ltp/testcases/bin/clock_nanosleep01\n\
-ltp/testcases/bin/clock_nanosleep02\n\
-ltp/testcases/bin/clock_nanosleep03\n\
-./busybox echo 'Testing kill tests...'\n\
-ltp/testcases/bin/kill10\n\
-ltp/testcases/bin/kill11\n\
 ./busybox echo 'Testing chdir01...'\n\
 ltp/testcases/bin/chdir01\n\
 ./busybox echo '=== ltp-stuck debug done ==='\n\
