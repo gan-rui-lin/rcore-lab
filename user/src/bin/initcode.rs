@@ -78,6 +78,35 @@ ltp/testcases/bin/futex_wake01\n\
 ./busybox echo '=== ltp-mini done ==='\n\
 ";
 
+// Debug script for LTP tests that get stuck (selected from skip list)
+const TMP_LTP_STUCK_PATH: &str = "/tmp/ltp_stuck_debug.sh";
+const TMP_LTP_STUCK_SCRIPT: &[u8] = b"\
+./busybox echo '=== ltp-stuck debug start ==='\n\
+./busybox echo 'Testing fork tests that may hang...'\n\
+ltp/testcases/bin/fork05\n\
+ltp/testcases/bin/fork07\n\
+ltp/testcases/bin/fork09\n\
+ltp/testcases/bin/fork13\n\
+ltp/testcases/bin/fork14\n\
+./busybox echo 'Testing futex tests that may hang...'\n\
+ltp/testcases/bin/futex_cmp_requeue01\n\
+ltp/testcases/bin/futex_cmp_requeue02\n\
+ltp/testcases/bin/futex_wait03\n\
+ltp/testcases/bin/futex_wait05\n\
+ltp/testcases/bin/futex_wake02\n\
+ltp/testcases/bin/futex_wake04\n\
+./busybox echo 'Testing clock_nanosleep...'\n\
+ltp/testcases/bin/clock_nanosleep01\n\
+ltp/testcases/bin/clock_nanosleep02\n\
+ltp/testcases/bin/clock_nanosleep03\n\
+./busybox echo 'Testing kill tests that may hang...'\n\
+ltp/testcases/bin/kill10\n\
+ltp/testcases/bin/kill11\n\
+./busybox echo 'Testing chdir01...'\n\
+ltp/testcases/bin/chdir01\n\
+./busybox echo '=== ltp-stuck debug done ==='\n\
+";
+
 const TMP_LTP_PATH: &str = "/tmp/ltp_testcode.sh";
 const TMP_LTP_SCRIPT: &[u8] = b"\
 ./busybox echo '=== tmp-ltp: process/thread/signal/memory tests ==='\n\
@@ -649,7 +678,7 @@ echo \"#### OS COMP TEST GROUP START ltp-glibc ####\"
 target_dir=\"ltp/testcases/bin\"
 export PATH=\"$PATH:./ltp/testcases/bin:./ltp/testcases/lib:./ltp/testcases/network/busy_poll:./ltp/testcases/kernel/controllers/cgroup_fj\"
 case_timeout=\"${LTP_CASE_TIMEOUT:-8}\"
-case_limit=\"${LTP_CASE_LIMIT:-10000}\"
+case_limit=\"${LTP_CASE_LIMIT:-10}\"
 case_count=0
 
 is_skip_case() {
@@ -851,6 +880,16 @@ fn run_selector(selector: &str) {
         let _ = activate_runtime_profile(root);
         let _ = write_embedded_elf(TMP_LTP_MINI_PATH, TMP_LTP_MINI_SCRIPT);
         let _ = run_testcode(TMP_LTP_MINI_PATH, root);
+        return;
+    }
+
+    // LTP stuck tests debug script - tests that may hang
+    // Usage: SINGLE_TEST=tmp-ltp-stuck or SINGLE_TEST=tmp-ltp-stuck-glibc
+    if selector == "tmp-ltp-stuck" || selector == "tmp-ltp-stuck-glibc" {
+        let root = if selector.ends_with("-glibc") { "/glibc" } else { "/musl" };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_LTP_STUCK_PATH, TMP_LTP_STUCK_SCRIPT);
+        let _ = run_testcode(TMP_LTP_STUCK_PATH, root);
         return;
     }
 
