@@ -96,6 +96,17 @@ ltp/testcases/bin/chdir01\n\
 ./busybox echo '=== ltp-stuck debug done ==='\n\
 ";
 
+// Quick test for recent fixes (clone07, accept4)
+const TMP_FIXES_PATH: &str = "/tmp/test_fixes.sh";
+const TMP_FIXES_SCRIPT: &[u8] = b"\
+./busybox echo '=== Testing recent fixes ==='\n\
+./busybox echo 'Test 1: clone07 (waitpid with pid=0)'\n\
+ltp/testcases/bin/clone07\n\
+./busybox echo 'Test 2: accept4_01 (NULL addr handling)'\n\
+ltp/testcases/bin/accept4_01\n\
+./busybox echo '=== Tests completed ==='\n\
+";
+
 const TMP_LTP_PATH: &str = "/tmp/ltp_testcode.sh";
 const TMP_LTP_SCRIPT: &[u8] = b"\
 ./busybox echo '=== tmp-ltp: process/thread/signal/memory tests ==='\n\
@@ -879,6 +890,16 @@ fn run_selector(selector: &str) {
         let _ = activate_runtime_profile(root);
         let _ = write_embedded_elf(TMP_LTP_STUCK_PATH, TMP_LTP_STUCK_SCRIPT);
         let _ = run_testcode(TMP_LTP_STUCK_PATH, root);
+        return;
+    }
+
+    // Recent fixes test - clone07, accept4
+    // Usage: SINGLE_TEST=tmp-fixes or SINGLE_TEST=tmp-fixes-glibc
+    if selector == "tmp-fixes" || selector == "tmp-fixes-glibc" {
+        let root = if selector.ends_with("-glibc") { "/glibc" } else { "/musl" };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_FIXES_PATH, TMP_FIXES_SCRIPT);
+        let _ = run_testcode(TMP_FIXES_PATH, root);
         return;
     }
 

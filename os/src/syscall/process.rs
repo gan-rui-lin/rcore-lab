@@ -1534,16 +1534,37 @@ fn encode_wait_status(exit_code: i32) -> i32 {
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
     const WNOHANG: i32 = 1;
     let my_pid = current_process().getpid();
+    let my_pgid = current_process().inner_exclusive_access().pgid;
     const SIG_DFL: usize = 0;
     const SIG_IGN: usize = 1;
+    
+    // Helper: check if child matches the pid criteria
+    let matches_pid = |child_pid: usize, child_pgid: usize| -> bool {
+        match pid {
+            -1 => true,  // Any child
+            0 => child_pgid == my_pgid,  // Same process group
+            p if p > 0 => child_pid == p as usize,  // Specific PID
+            p => child_pgid == (-p) as usize,  // Specific process group (pid < -1)
+        }
+    };
+    
     loop {
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-        if !inner.children.iter().any(|p| pid == -1 || pid as usize == p.getpid()) {
+        
+        // Check if any child matches the criteria
+        let has_matching_child = inner.children.iter().any(|p| {
+            let child_inner = p.inner_exclusive_access();
+            matches_pid(p.getpid(), child_inner.pgid)
+        });
+        
+        if !has_matching_child {
             return errno(ECHILD);
         }
+        
         let pair = inner.children.iter().enumerate().find(|(_, p)| {
-            p.inner_exclusive_access().is_zombie && (pid == -1 || pid as usize == p.getpid())
+            let child_inner = p.inner_exclusive_access();
+            child_inner.is_zombie && matches_pid(p.getpid(), child_inner.pgid)
         });
         if let Some((idx, _)) = pair {
             let child = inner.children.remove(idx);
