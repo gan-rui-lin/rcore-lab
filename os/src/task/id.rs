@@ -12,6 +12,31 @@ use alloc::{
 };
 use lazy_static::*;
 
+// ---------------------------------------------------------------------------
+// Kernel-stack object pool
+// ---------------------------------------------------------------------------
+// Re-uses freed kstack backing Vecs instead of returning them to the buddy
+// allocator.  This avoids repeated 64KB buddy alloc/free cycles and the
+// associated fragmentation pressure.
+const KSTACK_POOL_CAPACITY: usize = 16;
+
+lazy_static! {
+    static ref KSTACK_POOL: UPIntrFreeCell<Vec<Vec<u128>>> =
+        unsafe { UPIntrFreeCell::new(Vec::new()) };
+}
+
+fn pool_pop() -> Option<Vec<u128>> {
+    KSTACK_POOL.exclusive_access().pop()
+}
+
+fn pool_push(words: Vec<u128>) {
+    let mut pool = KSTACK_POOL.exclusive_access();
+    if pool.len() < KSTACK_POOL_CAPACITY {
+        pool.push(words);
+    }
+    // If pool is full the Vec is simply dropped here and returned to heap.
+}
+
 pub struct RecycleAllocator {
     current: usize,
     recycled: Vec<usize>,
@@ -71,19 +96,38 @@ impl Drop for PidHandle {
     }
 }
 
-/// Kernel stack for a process(task)
+/// Kernel stack for a process(task).
+/// `inner` is wrapped in `ManuallyDrop` so that `Drop` can move it out and
+/// attempt to recycle the backing storage via the pool.
 pub struct KernelStack {
-    inner: Arc<Vec<u128>>,
+    inner: core::mem::ManuallyDrop<Vec<u128>>,
 }
 
 /// allocate a new kernel stack
 pub fn kstack_alloc() -> KernelStack {
-    let mut words = vec![KSTACK_FILL_MAGIC; KERNEL_STACK_SIZE / core::mem::size_of::<u128>()];
+    // Try to reuse a pooled stack to avoid buddy-allocator pressure.
+    let mut words = pool_pop().unwrap_or_else(|| {
+        vec![KSTACK_FILL_MAGIC; KERNEL_STACK_SIZE / core::mem::size_of::<u128>()]
+    });
+    // (Re-)initialise fill and guard pattern regardless of source (pool entry
+    // may have been written to during its previous lifetime).
+    for slot in words.iter_mut() {
+        *slot = KSTACK_FILL_MAGIC;
+    }
     for (i, slot) in words.iter_mut().take(KSTACK_GUARD_WORDS).enumerate() {
         *slot = KSTACK_GUARD_MAGIC ^ (i as u128);
     }
     KernelStack {
-        inner: Arc::new(words),
+        inner: core::mem::ManuallyDrop::new(words),
+    }
+}
+
+impl Drop for KernelStack {
+    fn drop(&mut self) {
+        // SAFETY: we are inside drop(); `inner` will never be accessed again.
+        // We move the Vec out and try to return it to the pool.
+        let words = unsafe { core::mem::ManuallyDrop::take(&mut self.inner) };
+        pool_push(words);
     }
 }
 
