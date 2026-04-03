@@ -3770,7 +3770,7 @@ pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: *const TimeSpec) -> isi
 }
 
 /// sys_pread64 (syscall 67) - read at a given offset without changing file position
-pub fn sys_pread64(fd: usize, buf: *const u8, count: usize, offset: usize) -> isize {
+pub fn sys_pread64(fd: usize, buf: *const u8, count: usize, offset: isize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         syscall!(
@@ -3798,15 +3798,23 @@ pub fn sys_pread64(fd: usize, buf: *const u8, count: usize, offset: usize) -> is
     let Some(inode) = file.inode() else {
         return errno(ESPIPE);
     };
+    if offset < 0 {
+        return errno(EINVAL);
+    }
+    let Some(slices) = translated_byte_buffer_checked(token, buf, count, true) else {
+        return errno(EFAULT);
+    };
     let mut total = 0usize;
-    let mut off = offset;
-    let slices = translated_byte_buffer(token, buf, count);
+    let mut off = offset as usize;
     for slice in slices {
         let n = inode.read_at(off, slice);
         if n == 0 {
             break;
         }
-        off += n;
+        let Some(next_off) = off.checked_add(n) else {
+            return errno(EINVAL);
+        };
+        off = next_off;
         total += n;
         if n < slice.len() {
             break;
@@ -3816,7 +3824,7 @@ pub fn sys_pread64(fd: usize, buf: *const u8, count: usize, offset: usize) -> is
 }
 
 /// sys_pwrite64 (syscall 68) - write at a given offset without changing file position
-pub fn sys_pwrite64(fd: usize, buf: *const u8, count: usize, offset: usize) -> isize {
+pub fn sys_pwrite64(fd: usize, buf: *const u8, count: usize, offset: isize) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         syscall!(
@@ -3844,15 +3852,23 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, count: usize, offset: usize) -> i
     let Some(inode) = file.inode() else {
         return errno(ESPIPE);
     };
+    if offset < 0 {
+        return errno(EINVAL);
+    }
+    let Some(slices) = translated_byte_buffer_checked(token, buf, count, false) else {
+        return errno(EFAULT);
+    };
     let mut total = 0usize;
-    let mut off = offset;
-    let slices = translated_byte_buffer(token, buf, count);
+    let mut off = offset as usize;
     for slice in slices {
         let n = inode.write_at(off, slice);
         if n == 0 {
             break;
         }
-        off += n;
+        let Some(next_off) = off.checked_add(n) else {
+            return errno(EINVAL);
+        };
+        off = next_off;
         total += n;
         if n < slice.len() {
             break;
