@@ -80,6 +80,8 @@ const SYSCALL_WRITEV: usize = 66;
 const SYSCALL_PREAD64: usize = 67;
 /// pwrite64 syscall
 const SYSCALL_PWRITE64: usize = 68;
+/// pwritev syscall
+const SYSCALL_PWRITEV: usize = 70;
 /// sendfile syscall
 const SYSCALL_SENDFILE: usize = 71;
 /// splice syscall
@@ -277,6 +279,8 @@ const SYSCALL_FORK: usize = 220;
 const SYSCALL_EXEC: usize = 221;
 /// mmap syscall
 const SYSCALL_MMAP: usize = 222;
+/// fadvise64 syscall
+const SYSCALL_FADVISE64: usize = 223;
 /// mprotect syscall
 const SYSCALL_MPROTECT: usize = 226;
 /// msync syscall
@@ -732,6 +736,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const usize, args[2]),
         SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *const u8, args[2], args[3] as isize),
         SYSCALL_PWRITE64 => sys_pwrite64(args[0], args[1] as *const u8, args[2], args[3] as isize),
+        SYSCALL_PWRITEV => sys_pwritev(args[0], args[1] as *const usize, args[2], args[3] as isize),
+        SYSCALL_FADVISE64 => {
+            sys_posix_fadvise(args[0], args[1] as isize, args[2] as isize, args[3] as i32)
+        }
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut isize, args[3]),
         SYSCALL_SPLICE => sys_splice(
             args[0],
