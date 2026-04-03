@@ -2947,6 +2947,54 @@ pub fn sys_getegid() -> isize {
     gid
 }
 
+/// Set filesystem user ID.
+/// Linux semantics: always returns previous fsuid, never fails.
+pub fn sys_setfsuid(uid: u32) -> isize {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let prev = inner.fs_uid;
+    let neg1 = u32::MAX;
+
+    if uid == neg1 {
+        return prev as isize;
+    }
+
+    let is_privileged = inner.effective_uid == 0;
+    if is_privileged
+        || uid == inner.real_uid
+        || uid == inner.effective_uid
+        || uid == inner.saved_uid
+        || uid == inner.fs_uid
+    {
+        inner.fs_uid = uid;
+    }
+    prev as isize
+}
+
+/// Set filesystem group ID.
+/// Linux semantics: always returns previous fsgid, never fails.
+pub fn sys_setfsgid(gid: u32) -> isize {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let prev = inner.fs_gid;
+    let neg1 = u32::MAX;
+
+    if gid == neg1 {
+        return prev as isize;
+    }
+
+    let is_privileged = inner.effective_uid == 0;
+    if is_privileged
+        || gid == inner.real_gid
+        || gid == inner.effective_gid
+        || gid == inner.saved_gid
+        || gid == inner.fs_gid
+    {
+        inner.fs_gid = gid;
+    }
+    prev as isize
+}
+
 /// Set user ID with minimal Linux-like semantics needed by LTP.
 pub fn sys_setuid(uid: u32) -> isize {
     let process = current_process();
@@ -2958,10 +3006,12 @@ pub fn sys_setuid(uid: u32) -> isize {
     if inner.effective_uid == 0 {
         inner.real_uid = uid;
         inner.effective_uid = uid;
+        inner.fs_uid = uid;
         return 0;
     }
     if uid == inner.real_uid || uid == inner.effective_uid {
         inner.effective_uid = uid;
+        inner.fs_uid = uid;
         return 0;
     }
     errno(EPERM)
@@ -2978,10 +3028,12 @@ pub fn sys_setgid(gid: u32) -> isize {
     if inner.effective_gid == 0 {
         inner.real_gid = gid;
         inner.effective_gid = gid;
+        inner.fs_gid = gid;
         return 0;
     }
     if gid == inner.real_gid || gid == inner.effective_gid {
         inner.effective_gid = gid;
+        inner.fs_gid = gid;
         return 0;
     }
     errno(EPERM)
@@ -3011,6 +3063,7 @@ pub fn sys_setregid(rgid: u32, egid: u32) -> isize {
     }
     if egid != neg1 {
         inner.effective_gid = egid;
+        inner.fs_gid = egid;
     }
     // Update saved_gid if effective changes
     if rgid != neg1 {
@@ -3040,6 +3093,7 @@ pub fn sys_setreuid(ruid: u32, euid: u32) -> isize {
     }
     if euid != neg1 {
         inner.effective_uid = euid;
+        inner.fs_uid = euid;
     }
     if ruid != neg1 {
         inner.saved_uid = inner.effective_uid;
@@ -3069,7 +3123,10 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> isize {
     }
 
     if ruid != neg1 { inner.real_uid = ruid; }
-    if euid != neg1 { inner.effective_uid = euid; }
+    if euid != neg1 {
+        inner.effective_uid = euid;
+        inner.fs_uid = euid;
+    }
     if suid != neg1 { inner.saved_uid = suid; }
     0
 }
@@ -3118,7 +3175,10 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> isize {
     }
 
     if rgid != neg1 { inner.real_gid = rgid; }
-    if egid != neg1 { inner.effective_gid = egid; }
+    if egid != neg1 {
+        inner.effective_gid = egid;
+        inner.fs_gid = egid;
+    }
     if sgid != neg1 { inner.saved_gid = sgid; }
     0
 }

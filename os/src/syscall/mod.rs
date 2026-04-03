@@ -194,6 +194,10 @@ const SYSCALL_GETRESUID: usize = 148;
 const SYSCALL_SETRESGID: usize = 149;
 /// getresgid syscall
 const SYSCALL_GETRESGID: usize = 150;
+/// setfsuid syscall
+const SYSCALL_SETFSUID: usize = 151;
+/// setfsgid syscall
+const SYSCALL_SETFSGID: usize = 152;
 /// times syscall
 const SYSCALL_TIMES: usize = 153;
 /// setpgid syscall
@@ -856,6 +860,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETRESUID => process::sys_getresuid(args[0] as *mut u32, args[1] as *mut u32, args[2] as *mut u32),
         SYSCALL_SETRESGID => process::sys_setresgid(args[0] as u32, args[1] as u32, args[2] as u32),
         SYSCALL_GETRESGID => process::sys_getresgid(args[0] as *mut u32, args[1] as *mut u32, args[2] as *mut u32),
+        SYSCALL_SETFSUID => process::sys_setfsuid(args[0] as u32),
+        SYSCALL_SETFSGID => process::sys_setfsgid(args[0] as u32),
         SYSCALL_SETPGID => sys_setpgid(args[0] as isize, args[1] as isize),
         SYSCALL_GETPGID => sys_getpgid(args[0] as isize),
         SYSCALL_GETSID => sys_getsid(args[0] as isize),
