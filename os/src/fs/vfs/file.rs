@@ -115,6 +115,10 @@ impl File for VfsFile {
 
     fn write(&self, buf: UserBuffer) -> usize {
         let mut inner = self.inner.exclusive_access();
+        if (self.status_flags & OpenFlags::APPEND.bits()) != 0 {
+            // O_APPEND: each write starts at current EOF.
+            inner.offset = inner.inode.size();
+        }
         let mut total = 0usize;
         for slice in buf.buffers.iter() {
             let n = inner.inode.write_at(inner.offset, *slice);

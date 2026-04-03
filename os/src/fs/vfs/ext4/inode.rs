@@ -141,6 +141,10 @@ impl VfsInode for Ext4Inode {
             return 0;
         }
         self.with_data_file(false, |file| {
+            let size = file.file_size() as usize;
+            if offset >= size {
+                return Some(0);
+            }
             if file.file_seek(offset as i64, SEEK_SET).is_err() {
                 return None;
             }
@@ -157,6 +161,23 @@ impl VfsInode for Ext4Inode {
             return 0;
         }
         self.with_data_file(true, |file| {
+            let size = file.file_size() as usize;
+            if offset > size {
+                if file.file_seek(size as i64, SEEK_SET).is_err() {
+                    return None;
+                }
+                const ZERO_PAD_CHUNK: usize = 4096;
+                let zeros = [0u8; ZERO_PAD_CHUNK];
+                let mut remain = offset - size;
+                while remain > 0 {
+                    let n = remain.min(ZERO_PAD_CHUNK);
+                    match file.file_write(&zeros[..n]) {
+                        Ok(written) if written == n => {}
+                        _ => return None,
+                    }
+                    remain -= n;
+                }
+            }
             if file.file_seek(offset as i64, SEEK_SET).is_err() {
                 return None;
             }

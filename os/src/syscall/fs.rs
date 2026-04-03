@@ -3461,9 +3461,9 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut isize, count: usiz
 
 pub fn sys_splice(
     fd_in: usize,
-    _off_in: *mut isize,
+    off_in: *mut isize,
     fd_out: usize,
-    _off_out: *mut isize,
+    off_out: *mut isize,
     len: usize,
     _flags: u32,
 ) -> isize {
@@ -3484,6 +3484,14 @@ pub fn sys_splice(
     };
     if !file_in.readable() || !file_out.writable() {
         return errno(EBADF);
+    }
+    // Linux semantics: when a descriptor refers to a pipe, the corresponding
+    // offset pointer must be NULL.
+    if !off_in.is_null() && file_in.inode().is_none() {
+        return errno(ESPIPE);
+    }
+    if !off_out.is_null() && file_out.inode().is_none() {
+        return errno(ESPIPE);
     }
 
     // Minimal compatibility for invalid descriptor combinations exercised by splice07.
