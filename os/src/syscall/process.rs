@@ -13,8 +13,8 @@ use crate::{
     fs::{open_file, path_exists, path_is_dir, File, OpenFlags},
     mm::{
         translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
-        translated_str_checked, MapPermission, MmapMeta, PTEFlags, PageTable, ProtectError,
-        VirtAddr,
+        translated_str_checked, MapAreaType, MapPermission, MmapMeta, PTEFlags, PageTable,
+        ProtectError, VirtAddr,
     },
     task::{
         add_task, current_process, current_task, current_trap_cx, current_user_token,
@@ -2434,6 +2434,11 @@ pub fn sys_mmap(
     }
 
     // 在进程的内存空间里插入一个新的映射区域，起始地址为 start，长度为 len，权限为 map_perm。
+    let area_type = if is_anon {
+        MapAreaType::MmapAnon
+    } else {
+        MapAreaType::MmapFile
+    };
     inner.memory_set.insert_mmap_area(
         VirtAddr(start),
         VirtAddr(start + len),
@@ -2446,6 +2451,7 @@ pub fn sys_mmap(
                 .map(|(_, writable)| *writable)
                 .unwrap_or(true),
         },
+        area_type,
     );
     drop(inner);
 
@@ -2569,24 +2575,13 @@ pub fn sys_sbrk(arg: isize) -> isize {
     let result = if delta == 0 {
         true
     } else if delta < 0 {
+        // Shrink heap using type-based lookup
+        inner.memory_set.shrink_heap_to(VirtAddr(new_brk))
+    } else {
+        // Expand heap using type-based lookup
         inner
             .memory_set
-            .shrink_to(VirtAddr(heap_bottom), VirtAddr(new_brk))
-    } else {
-        // LoongArch musl uses mmap(PROT_NONE, MAP_FIXED) in heap region which can
-        // corrupt the heap area. Use append_to_heap which validates permissions.
-        #[cfg(target_arch = "loongarch64")]
-        {
-            inner
-                .memory_set
-                .append_to_heap(VirtAddr(heap_bottom), VirtAddr(new_brk))
-        }
-        #[cfg(not(target_arch = "loongarch64"))]
-        {
-            inner
-                .memory_set
-                .append_to(VirtAddr(heap_bottom), VirtAddr(new_brk))
-        }
+            .append_heap_to(VirtAddr(new_brk), VirtAddr(heap_bottom))
     };
     if result {
         inner.program_brk = new_brk;

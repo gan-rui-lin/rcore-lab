@@ -75,6 +75,27 @@ enum MapAreaKind {
     Shared,
 }
 
+/// Type of memory area, used for precise identification and protection.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum MapAreaType {
+    /// Kernel mapping (identical mapping)
+    Kernel,
+    /// ELF program segment (code, data, BSS)
+    ElfSegment,
+    /// Heap area (managed by sbrk/brk)
+    Heap,
+    /// User stack
+    Stack,
+    /// Anonymous mmap
+    MmapAnon,
+    /// File-backed mmap
+    MmapFile,
+    /// SysV shared memory
+    Shm,
+    /// Other/unknown
+    Other,
+}
+
 impl MemorySet {
     #[cfg(target_arch = "riscv64")]
     #[inline]
@@ -128,6 +149,7 @@ impl MemorySet {
         end_va: VirtAddr,
         permission: MapPermission,
         meta: MmapMeta,
+        area_type: MapAreaType,
     ) {
         let area = if meta.shared {
             MapArea::new_with_kind(
@@ -139,8 +161,10 @@ impl MemorySet {
             )
             .with_mmap_meta(meta)
             .with_shared_frames()
+            .with_area_type(area_type)
         } else {
-            MapArea::new(start_va, end_va, MapType::Framed, permission).with_mmap_meta(meta)
+            MapArea::new_with_type(start_va, end_va, MapType::Framed, permission, area_type)
+                .with_mmap_meta(meta)
         };
         if meta.shared {
             self.push(area, None);
@@ -157,7 +181,8 @@ impl MemorySet {
         permission: MapPermission,
         frames: Vec<Arc<FrameTracker>>,
     ) -> bool {
-        let mut map_area = MapArea::new_with_kind(start_va, end_va, MapType::Framed, permission, MapAreaKind::Shared);
+        let mut map_area = MapArea::new_with_kind(start_va, end_va, MapType::Framed, permission, MapAreaKind::Shared)
+            .with_area_type(MapAreaType::Shm);
         let expected = map_area.vpn_range.get_end().0.saturating_sub(map_area.vpn_range.get_start().0);
         if expected != frames.len() {
             return false;
@@ -198,6 +223,7 @@ impl MemorySet {
         }
     }
     /// Unmap a user range `[start, end)`, keeping unaffected portions intact.
+    /// Protected areas (Heap, Stack) are skipped to prevent accidental corruption.
     pub fn unmap_range(&mut self, start: VirtAddr, end: VirtAddr) {
         let start_vpn = start.floor();
         let end_vpn = end.ceil();
@@ -208,6 +234,25 @@ impl MemorySet {
         while idx < self.areas.len() {
             let area_start = self.areas[idx].vpn_range.get_start();
             let area_end = self.areas[idx].vpn_range.get_end();
+            let area_type = self.areas[idx].area_type;
+            
+            // Skip protected areas (Heap, Stack, ElfSegment)
+            if area_type == MapAreaType::Heap 
+                || area_type == MapAreaType::Stack
+                || area_type == MapAreaType::ElfSegment
+            {
+                if area_end > start_vpn && area_start < end_vpn {
+                    warn!(
+                        "[unmap_range] skipping protected {:?} area: [{:#x},{:#x})",
+                        area_type,
+                        VirtAddr::from(area_start).0,
+                        VirtAddr::from(area_end).0
+                    );
+                }
+                idx += 1;
+                continue;
+            }
+            
             if area_end <= start_vpn || area_start >= end_vpn {
                 idx += 1;
                 continue;
@@ -436,7 +481,13 @@ impl MemorySet {
                 if ph_flags.is_execute() {
                     map_perm |= MapPermission::X;
                 }
-                let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
+                let map_area = MapArea::new_with_type(
+                    start_va,
+                    end_va,
+                    MapType::Framed,
+                    map_perm,
+                    MapAreaType::ElfSegment,
+                );
                 max_end_vpn = map_area.vpn_range.get_end();
                 let file_data = &elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize];
                 memory_set.push(map_area, Some(file_data));
@@ -542,12 +593,14 @@ impl MemorySet {
         let heap_bottom: usize = max_end_va.into();
         let (user_stack_bottom, user_stack_top) =
             (USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_TOP);
+        // Map user stack with Stack type
         memory_set.push(
-            MapArea::new(
+            MapArea::new_with_type(
                 user_stack_bottom.into(),
                 user_stack_top.into(),
                 MapType::Framed,
                 MapPermission::R | MapPermission::W | MapPermission::U,
+                MapAreaType::Stack,
             ),
             None,
         );
@@ -603,12 +656,14 @@ impl MemorySet {
                 pte.bits
             );
         }
+        // Map heap with Heap type (initially zero-sized)
         memory_set.push(
-            MapArea::new(
+            MapArea::new_with_type(
                 heap_bottom.into(),
                 heap_bottom.into(),
                 MapType::Framed,
                 MapPermission::R | MapPermission::W | MapPermission::U,
+                MapAreaType::Heap,
             ),
             None,
         );
@@ -1112,6 +1167,51 @@ impl MemorySet {
         self.areas.clear();
     }
 
+    /// Find heap area index by type
+    fn find_heap_index(&self) -> Option<usize> {
+        self.areas.iter().position(|area| area.area_type == MapAreaType::Heap)
+    }
+
+    /// shrink the heap area to new_end
+    pub fn shrink_heap_to(&mut self, new_end: VirtAddr) -> bool {
+        if let Some(idx) = self.find_heap_index() {
+            self.areas[idx].shrink_to(&mut self.page_table, new_end.ceil());
+            true
+        } else {
+            warn!("[shrink_heap_to] no Heap area found");
+            false
+        }
+    }
+
+    /// append the heap area to new_end using type-based lookup
+    pub fn append_heap_to(&mut self, new_end: VirtAddr, heap_bottom: VirtAddr) -> bool {
+        if let Some(idx) = self.find_heap_index() {
+            trace!(
+                "[append_heap_to] found heap: start={:#x} old_end={:#x} new_end={:#x}",
+                VirtAddr::from(self.areas[idx].vpn_range.get_start()).0,
+                VirtAddr::from(self.areas[idx].vpn_range.get_end()).0,
+                new_end.0
+            );
+            self.areas[idx].append_to(&mut self.page_table, new_end.ceil());
+            return true;
+        }
+        
+        // No heap area found - create one
+        info!(
+            "[append_heap_to] creating new heap: start={:#x} end={:#x}",
+            heap_bottom.0, new_end.0
+        );
+        let map_area = MapArea::new_with_type(
+            heap_bottom,
+            new_end,
+            MapType::Framed,
+            MapPermission::R | MapPermission::W | MapPermission::U,
+            MapAreaType::Heap,
+        );
+        self.push(map_area, None);
+        true
+    }
+
     /// shrink the area to new_end
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
         if let Some(area) = self
@@ -1127,6 +1227,7 @@ impl MemorySet {
     }
 
     /// append the area to new_end
+    #[allow(dead_code)]
     pub fn append_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
         let start_vpn = start.floor();
         if let Some(area) = self
@@ -1154,6 +1255,7 @@ impl MemorySet {
 
     /// append the heap area to new_end, creating a new heap area if the original was corrupted
     /// Returns true if successful, false otherwise
+    #[allow(dead_code)]
     pub fn append_to_heap(&mut self, heap_bottom: VirtAddr, new_end: VirtAddr) -> bool {
         let start_vpn = heap_bottom.floor();
         let expected_perm = MapPermission::R | MapPermission::W | MapPermission::U;
@@ -1338,6 +1440,7 @@ pub struct MapArea {
     shared_frames: bool,
     mmap_meta: Option<MmapMeta>,
     kind: MapAreaKind,
+    area_type: MapAreaType,
 }
 
 impl MapArea {
@@ -1347,7 +1450,29 @@ impl MapArea {
         map_type: MapType,
         map_perm: MapPermission,
     ) -> Self {
-        Self::new_with_kind(start_va, end_va, map_type, map_perm, MapAreaKind::Private)
+        Self::new_with_type(start_va, end_va, map_type, map_perm, MapAreaType::Other)
+    }
+    /// Create a new MapArea with explicit type
+    pub fn new_with_type(
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        map_type: MapType,
+        map_perm: MapPermission,
+        area_type: MapAreaType,
+    ) -> Self {
+        let start_vpn: VirtPageNum = start_va.floor();
+        let end_vpn: VirtPageNum = end_va.ceil();
+        Self {
+            start_va,
+            vpn_range: VPNRange::new(start_vpn, end_vpn),
+            data_frames: BTreeMap::new(),
+            map_type,
+            map_perm,
+            shared_frames: false,
+            mmap_meta: None,
+            kind: MapAreaKind::Private,
+            area_type,
+        }
     }
     fn new_with_kind(
         start_va: VirtAddr,
@@ -1367,6 +1492,7 @@ impl MapArea {
             shared_frames: false,
             mmap_meta: None,
             kind,
+            area_type: MapAreaType::Other,
         }
     }
     pub fn from_another(another: &Self) -> Self {
@@ -1379,6 +1505,7 @@ impl MapArea {
             shared_frames: another.shared_frames,
             mmap_meta: another.mmap_meta,
             kind: another.kind,
+            area_type: another.area_type,
         }
     }
     fn with_shared_frames(mut self) -> Self {
@@ -1388,6 +1515,15 @@ impl MapArea {
     fn with_mmap_meta(mut self, meta: MmapMeta) -> Self {
         self.mmap_meta = Some(meta);
         self
+    }
+    #[allow(dead_code)]
+    fn with_area_type(mut self, area_type: MapAreaType) -> Self {
+        self.area_type = area_type;
+        self
+    }
+    /// Get the area type
+    pub fn area_type(&self) -> MapAreaType {
+        self.area_type
     }
     #[allow(dead_code)]
     fn shares_frames(&self) -> bool {
@@ -1411,6 +1547,7 @@ impl MapArea {
             shared_frames: self.shared_frames,
             mmap_meta: self.mmap_meta,
             kind: self.kind,
+            area_type: self.area_type,
         };
         self.vpn_range = VPNRange::new(start_vpn, split_vpn);
         new_area
