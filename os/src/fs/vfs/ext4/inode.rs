@@ -161,25 +161,25 @@ impl VfsInode for Ext4Inode {
             return 0;
         }
         self.with_data_file(true, |file| {
-            let size = file.file_size() as usize;
-            if offset > size {
-                if file.file_seek(size as i64, SEEK_SET).is_err() {
+            if file.file_seek(offset as i64, SEEK_SET).is_err() {
+                // Some lwext4 backends reject SEEK_SET beyond EOF with EINVAL.
+                // Extend the file first, then seek again to emulate sparse growth.
+                let size = file.file_size() as usize;
+                if offset <= size {
                     return None;
                 }
-                const ZERO_PAD_CHUNK: usize = 4096;
-                let zeros = [0u8; ZERO_PAD_CHUNK];
-                let mut remain = offset - size;
-                while remain > 0 {
-                    let n = remain.min(ZERO_PAD_CHUNK);
-                    match file.file_write(&zeros[..n]) {
-                        Ok(written) if written == n => {}
-                        _ => return None,
-                    }
-                    remain -= n;
+                let new_size = offset.checked_add(buf.len())?;
+                if file.file_truncate(new_size as u64).is_err() {
+                    return None;
                 }
-            }
-            if file.file_seek(offset as i64, SEEK_SET).is_err() {
-                return None;
+                // For sparse-zero extension (e.g. fallocate emulation), truncate
+                // already guarantees visible zeros without requiring a large seek+write.
+                if buf.iter().all(|&b| b == 0) {
+                    return Some(buf.len());
+                }
+                if file.file_seek(offset as i64, SEEK_SET).is_err() {
+                    return None;
+                }
             }
             Some(file.file_write(buf).unwrap_or(0) as usize)
         })
