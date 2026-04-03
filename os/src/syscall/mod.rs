@@ -722,8 +722,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SYNC => 0,
         SYSCALL_READV => sys_readv(args[0], args[1] as *const usize, args[2]),
         SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const usize, args[2]),
-        SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *const u8, args[2], args[3]),
-        SYSCALL_PWRITE64 => sys_pwrite64(args[0], args[1] as *const u8, args[2], args[3]),
+        SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *const u8, args[2], args[3] as isize),
+        SYSCALL_PWRITE64 => sys_pwrite64(args[0], args[1] as *const u8, args[2], args[3] as isize),
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut isize, args[3]),
         SYSCALL_SPLICE => sys_splice(
             args[0],

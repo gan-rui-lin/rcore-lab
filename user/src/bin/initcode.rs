@@ -648,6 +648,12 @@ echo \"#### OS COMP TEST GROUP START ltp ####\"
 target_dir=\"ltp/testcases/bin\"
 export PATH=\"$PATH:./ltp/testcases/bin:./ltp/testcases/lib:./ltp/testcases/network/busy_poll:./ltp/testcases/kernel/controllers/cgroup_fj\"
 case_timeout=\"${LTP_CASE_TIMEOUT:-8}\"
+start_from=\"${LTP_START_FROM:-}\"
+started=1
+if [ -n \"$start_from\" ]; then
+  started=0
+  echo \"LTP start marker enabled: $start_from\"
+fi
 
 is_skip_case() {
   case \"$1\" in
@@ -682,6 +688,14 @@ run_case_with_timeout() {
 for file in \"$target_dir\"/*; do
   [ -f \"$file\" ] || continue
   case_name=$(basename \"$file\")
+  if [ \"$started\" -eq 0 ]; then
+    if [ \"$case_name\" = \"$start_from\" ]; then
+      started=1
+      echo \"LTP start marker matched: $case_name\"
+    else
+      continue
+    fi
+  fi
   if is_skip_case \"$case_name\"; then
     continue
   fi
