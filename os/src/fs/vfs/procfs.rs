@@ -674,6 +674,41 @@ fn proc_uptime() -> String {
     format!("{}.{} 0.00\n", sec, frac)
 }
 
+/// Generate /proc/cpuinfo content (architecture-specific)
+fn proc_cpuinfo() -> String {
+    #[cfg(target_arch = "riscv64")]
+    {
+        // RISC-V cpuinfo format (single core)
+        String::from(
+            "processor\t: 0\n\
+             hart\t\t: 0\n\
+             isa\t\t: rv64imafdc\n\
+             mmu\t\t: sv39\n\
+             uarch\t\t: qemu,virt\n\
+             \n",
+        )
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        // LoongArch cpuinfo format (single core)
+        String::from(
+            "system type\t: generic-loongson-machine\n\
+             processor\t: 0\n\
+             package\t\t: 0\n\
+             core\t\t: 0\n\
+             cpu family\t: Loongson-64bit\n\
+             model name\t: Loongson-3A5000-QEMU\n\
+             CPU MHz\t\t: 2000.00\n\
+             BogoMIPS\t: 4000.00\n\
+             tlb_entries\t: 2112\n\
+             address sizes\t: 48 bits physical, 48 bits virtual\n\
+             isa\t\t: loongarch64\n\
+             features\t: cpucfg lam ual fpu\n\
+             \n",
+        )
+    }
+}
+
 /// Build /proc/sys/kernel/ subtree with sched_rt_runtime_us etc.
 fn proc_sys_kernel() -> Arc<dyn VfsInode> {
     let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
@@ -706,6 +741,7 @@ pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
     entries.insert(String::from("meminfo"), ProcFileInode::new(proc_meminfo));
     entries.insert(String::from("stat"), ProcFileInode::new(proc_stat));
     entries.insert(String::from("uptime"), ProcFileInode::new(proc_uptime));
+    entries.insert(String::from("cpuinfo"), ProcFileInode::new(proc_cpuinfo));
     // /proc/cgroups - needed by cgroup tests (empty = no cgroup controllers)
     entries.insert(
         String::from("cgroups"),

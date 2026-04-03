@@ -2373,11 +2373,12 @@ pub fn sys_mmap(
             .memory_set
             .overlap_count(VirtAddr(start), VirtAddr(start + len));
         trace!(
-            "[sys_mmap] pid={} name={} req={:#x} len={:#x} flags={:#x} -> start={:#x} overlap={} fixed={}",
+            "[sys_mmap] pid={} name={} req={:#x} len={:#x} prot={:#x} flags={:#x} -> start={:#x} overlap={} fixed={}",
             pid,
             inner.name,
             req_start,
             len,
+            prot,
             flags,
             start,
             overlap,
@@ -2572,9 +2573,20 @@ pub fn sys_sbrk(arg: isize) -> isize {
             .memory_set
             .shrink_to(VirtAddr(heap_bottom), VirtAddr(new_brk))
     } else {
-        inner
-            .memory_set
-            .append_to(VirtAddr(heap_bottom), VirtAddr(new_brk))
+        // LoongArch musl uses mmap(PROT_NONE, MAP_FIXED) in heap region which can
+        // corrupt the heap area. Use append_to_heap which validates permissions.
+        #[cfg(target_arch = "loongarch64")]
+        {
+            inner
+                .memory_set
+                .append_to_heap(VirtAddr(heap_bottom), VirtAddr(new_brk))
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            inner
+                .memory_set
+                .append_to(VirtAddr(heap_bottom), VirtAddr(new_brk))
+        }
     };
     if result {
         inner.program_brk = new_brk;

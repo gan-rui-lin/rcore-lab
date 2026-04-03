@@ -183,6 +183,7 @@ fn path_nlink_get(path: &str) -> u32 {
     }
 }
 
+#[allow(dead_code)]
 fn ensure_link_group_for_path(path: &str) -> u64 {
     if let Some(gid) = PATH_LINK_GROUP.exclusive_access().get(path).copied() {
         return gid;
@@ -195,6 +196,7 @@ fn ensure_link_group_for_path(path: &str) -> u64 {
     gid
 }
 
+#[allow(dead_code)]
 fn path_link_add(old_path: &str, new_path: &str) {
     let gid = ensure_link_group_for_path(old_path);
     {

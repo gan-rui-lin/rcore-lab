@@ -1128,16 +1128,83 @@ impl MemorySet {
 
     /// append the area to new_end
     pub fn append_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
+        let start_vpn = start.floor();
         if let Some(area) = self
             .areas
             .iter_mut()
-            .find(|area| area.vpn_range.get_start() == start.floor())
+            .find(|area| area.vpn_range.get_start() == start_vpn)
         {
+            trace!(
+                "[append_to] found area: start={:#x} old_end={:#x} new_end={:#x} perm={:?}",
+                start.0,
+                area.vpn_range.get_end().0 * PAGE_SIZE,
+                new_end.0,
+                area.map_perm
+            );
             area.append_to(&mut self.page_table, new_end.ceil());
             true
         } else {
+            warn!(
+                "[append_to] area not found: start={:#x} new_end={:#x}",
+                start.0, new_end.0
+            );
             false
         }
+    }
+
+    /// append the heap area to new_end, creating a new heap area if the original was corrupted
+    /// Returns true if successful, false otherwise
+    pub fn append_to_heap(&mut self, heap_bottom: VirtAddr, new_end: VirtAddr) -> bool {
+        let start_vpn = heap_bottom.floor();
+        let expected_perm = MapPermission::R | MapPermission::W | MapPermission::U;
+        
+        // Find a heap-like area (R|W|U permissions) starting at heap_bottom
+        if let Some(area) = self
+            .areas
+            .iter_mut()
+            .find(|area| {
+                area.vpn_range.get_start() == start_vpn && 
+                area.map_perm == expected_perm
+            })
+        {
+            trace!(
+                "[append_to_heap] found heap: start={:#x} old_end={:#x} new_end={:#x}",
+                heap_bottom.0,
+                area.vpn_range.get_end().0 * PAGE_SIZE,
+                new_end.0
+            );
+            area.append_to(&mut self.page_table, new_end.ceil());
+            return true;
+        }
+        
+        // No valid heap area found at heap_bottom
+        // Check if there's a corrupted area (mmap replaced it)
+        if let Some(area) = self
+            .areas
+            .iter()
+            .find(|area| area.vpn_range.get_start() == start_vpn)
+        {
+            warn!(
+                "[append_to_heap] heap corrupted at {:#x}: found perm={:?}, expected {:?}",
+                heap_bottom.0,
+                area.map_perm,
+                expected_perm
+            );
+        }
+        
+        // Create a new heap area
+        info!(
+            "[append_to_heap] creating new heap: start={:#x} end={:#x}",
+            heap_bottom.0, new_end.0
+        );
+        let map_area = MapArea::new(
+            heap_bottom,
+            new_end,
+            MapType::Framed,
+            expected_perm,
+        );
+        self.push(map_area, None);
+        true
     }
 
     /// COW remap: replace the mapping of `vpn` with `new_frame` and `new_flags`.
