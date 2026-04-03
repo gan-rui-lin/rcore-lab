@@ -1,6 +1,6 @@
 //! File and filesystem-related syscalls
 use super::errno::*;
-use super::process::TimeSpec;
+use super::process::{get_current_umask, TimeSpec};
 use crate::fs::{
     create_dir, make_pipe, open_file, path_exists, path_is_dir, remove_path, DevNull, DevUrandom,
     DevZero, OpenFlags, PollEvents, Stat, StatMode,
@@ -150,6 +150,11 @@ fn path_mode_set(path: &str, mode: u32) {
     PATH_MODES
         .exclusive_access()
         .insert(String::from(path), mode & 0o7777);
+}
+
+fn apply_umask(mode: u32) -> u32 {
+    let umask = (get_current_umask() as u32) & 0o777;
+    (mode & 0o7777) & !umask
 }
 
 fn path_mode_remove(path: &str) {
@@ -958,7 +963,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
             }
         }
         if flags.contains(OpenFlags::CREATE) && !existed {
-            path_mode_set(&full_path, _mode);
+            path_mode_set(&full_path, apply_umask(_mode));
             let inner = process.inner_exclusive_access();
             path_owner_set(&full_path, inner.effective_uid, inner.effective_gid);
             drop(inner);
@@ -1155,7 +1160,7 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
         return errno(EEXIST);
     }
     if create_dir(&full_path) {
-        path_mode_set(&full_path, _mode);
+        path_mode_set(&full_path, apply_umask(_mode));
         let process = current_process();
         let inner = process.inner_exclusive_access();
         path_owner_set(&full_path, inner.effective_uid, inner.effective_gid);
