@@ -119,6 +119,8 @@ pub struct ProcessControlBlockInner {
     pub effective_gid: u32,
     pub saved_gid: u32,
     pub fs_gid: u32,
+    /// Nice value in Linux range [-20, 19], default 0.
+    pub nice: i32,
     /// Capability sets (bit mask, Linux kernel format)
     pub cap_permitted: u64,
     pub cap_effective: u64,
@@ -132,6 +134,10 @@ pub struct ProcessControlBlockInner {
     pub itimers: [IntervalTimerState; 3],
     pub session_id: usize,
     pub pgid: usize,
+    /// Set by ptrace(PTRACE_TRACEME).
+    pub ptrace_traceme: bool,
+    /// Pending ptrace stop signal to be reported by waitpid.
+    pub ptrace_stop_signal: Option<i32>,
     /// ITIMER_REAL: absolute expire time in ms, 0 = inactive.
     pub itimer_real_expire_ms: usize,
     /// ITIMER_REAL: interval for repeating timer in ms, 0 = one-shot.
@@ -298,6 +304,7 @@ impl ProcessControlBlock {
                     effective_gid: 0,
                     saved_gid: 0,
                     fs_gid: 0,
+                    nice: 0,
                     cap_permitted: u64::MAX,
                     cap_effective: u64::MAX,
                     cap_inheritable: 0,
@@ -310,6 +317,8 @@ impl ProcessControlBlock {
                     itimers: [IntervalTimerState::default(); 3],
                     session_id: 0,
                     pgid: 0,
+                    ptrace_traceme: false,
+                    ptrace_stop_signal: None,
                     itimer_real_expire_ms: 0,
                     itimer_real_interval_ms: 0,
                     vfork_vm_parent: None,
@@ -762,6 +771,7 @@ impl ProcessControlBlock {
                     effective_gid: parent.effective_gid,
                     saved_gid: parent.saved_gid,
                     fs_gid: parent.fs_gid,
+                    nice: parent.nice,
                     cap_permitted: parent.cap_permitted,
                     cap_effective: parent.cap_effective,
                     cap_inheritable: parent.cap_inheritable,
@@ -774,6 +784,8 @@ impl ProcessControlBlock {
                     itimers: [IntervalTimerState::default(); 3],
                     session_id: parent.session_id,
                     pgid: parent.pgid,
+                    ptrace_traceme: false,
+                    ptrace_stop_signal: None,
                     itimer_real_expire_ms: 0,
                     itimer_real_interval_ms: 0,
                     vfork_vm_parent: None,
