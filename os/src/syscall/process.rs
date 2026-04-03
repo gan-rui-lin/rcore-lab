@@ -20,9 +20,9 @@ use crate::{
         add_task, current_process, current_task, current_trap_cx, current_user_token,
         exit_current_and_run_next, flags_to_user_mask, futex_remove_waiter,
         futex_remove_waiter_any, futex_requeue, futex_wait, futex_wait_bitset, futex_wake,
-        futex_wake_bitset, pid2process, suspend_current_and_run_next, user_mask_to_flags, FutexKey,
-        IntervalTimerState, RLimit, SignalAction, SignalFlags, TaskControlBlock, TaskStatus,
-        UserContext, MAX_SIG, RLIMIT_NLIMITS, SIGKILL, SIGSTOP,
+        futex_wake_bitset, pid2process, pid2process_snapshot, suspend_current_and_run_next,
+        user_mask_to_flags, FutexKey, IntervalTimerState, RLimit, SignalAction, SignalFlags,
+        TaskControlBlock, TaskStatus, UserContext, MAX_SIG, RLIMIT_NLIMITS, SIGKILL, SIGSTOP,
     },
     timer::{add_timer, get_time, get_time_ms, get_time_us, remove_timer},
 };
@@ -1486,6 +1486,33 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
         if !inner.children.iter().any(|p| pid == -1 || pid as usize == p.getpid()) {
             return errno(ECHILD);
         }
+        // ptrace-traced child reports stopped state via waitpid.
+        let stopped = inner.children.iter().find_map(|p| {
+            if pid != -1 && pid as usize != p.getpid() {
+                return None;
+            }
+            let mut child_inner = p.inner_exclusive_access();
+            child_inner
+                .ptrace_stop_signal
+                .take()
+                .map(|sig| (p.getpid(), sig))
+        });
+        if let Some((found_pid, stop_sig)) = stopped {
+            if !exit_code_ptr.is_null() {
+                let stop_sig = if (1..=(MAX_SIG as i32)).contains(&stop_sig) {
+                    stop_sig
+                } else {
+                    SIGSTOP as i32
+                };
+                let status = ((stop_sig & 0xff) << 8) | 0x7f;
+                *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
+            }
+            trace!(
+                "[sys_waitpid] pid={} observed traced-stop child pid={} sig={}",
+                my_pid, found_pid, stop_sig
+            );
+            return found_pid as isize;
+        }
         let pair = inner.children.iter().enumerate().find(|(_, p)| {
             p.inner_exclusive_access().is_zombie && (pid == -1 || pid as usize == p.getpid())
         });
@@ -2507,13 +2534,207 @@ pub fn sys_spawn(_path: *const u8) -> isize {
     errno(ENOSYS)
 }
 
-// YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_process().pid.0
-    );
-    errno(ENOSYS)
+const PRIO_PROCESS: isize = 0;
+const PRIO_PGRP: isize = 1;
+const PRIO_USER: isize = 2;
+const PTRACE_TRACEME: usize = 0;
+const PTRACE_CONT: usize = 7;
+const PTRACE_KILL: usize = 8;
+
+fn clamp_nice(prio: isize) -> i32 {
+    prio.clamp(-20, 19) as i32
+}
+
+fn collect_priority_target_pids(which: isize, who: isize) -> Result<Vec<usize>, isize> {
+    let current = current_process();
+    let (self_pid, self_pgid, self_euid) = {
+        let inner = current.inner_exclusive_access();
+        (current.getpid(), inner.pgid, inner.effective_uid)
+    };
+    match which {
+        PRIO_PROCESS => {
+            if who < 0 {
+                return Err(errno(ESRCH));
+            }
+            let target_pid = if who == 0 { self_pid } else { who as usize };
+            if pid2process(target_pid).is_some() {
+                Ok(vec![target_pid])
+            } else {
+                Err(errno(ESRCH))
+            }
+        }
+        PRIO_PGRP => {
+            if who < 0 {
+                return Err(errno(ESRCH));
+            }
+            let target_pgid = if who == 0 { self_pgid } else { who as usize };
+            let mut pids = Vec::new();
+            for (pid, process) in pid2process_snapshot() {
+                let inner = process.inner_exclusive_access();
+                if inner.pgid == target_pgid {
+                    pids.push(pid);
+                }
+            }
+            if pids.is_empty() {
+                Err(errno(ESRCH))
+            } else {
+                Ok(pids)
+            }
+        }
+        PRIO_USER => {
+            if who < 0 {
+                return Err(errno(ESRCH));
+            }
+            let target_uid = if who == 0 { self_euid } else { who as u32 };
+            let mut pids = Vec::new();
+            for (pid, process) in pid2process_snapshot() {
+                let inner = process.inner_exclusive_access();
+                if inner.effective_uid == target_uid {
+                    pids.push(pid);
+                }
+            }
+            if pids.is_empty() {
+                Err(errno(ESRCH))
+            } else {
+                Ok(pids)
+            }
+        }
+        _ => Err(errno(EINVAL)),
+    }
+}
+
+/// setpriority(which, who, prio)
+pub fn sys_set_priority(which: isize, who: isize, prio: isize) -> isize {
+    let caller = current_process();
+    let caller_euid = caller.inner_exclusive_access().effective_uid;
+    let is_privileged = caller_euid == 0;
+    let target_pids = match collect_priority_target_pids(which, who) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let new_nice = clamp_nice(prio);
+
+    for pid in target_pids.iter().copied() {
+        let Some(target) = pid2process(pid) else {
+            continue;
+        };
+        let target_inner = target.inner_exclusive_access();
+        if !is_privileged {
+            // Unprivileged caller can only modify its own processes.
+            if target_inner.effective_uid != caller_euid {
+                return errno(EPERM);
+            }
+            // Unprivileged caller cannot lower nice value (raise priority).
+            if new_nice < target_inner.nice {
+                return errno(EACCES);
+            }
+        }
+    }
+
+    let mut applied = false;
+    for pid in target_pids {
+        if let Some(target) = pid2process(pid) {
+            target.inner_exclusive_access().nice = new_nice;
+            applied = true;
+        }
+    }
+    if applied {
+        0
+    } else {
+        errno(ESRCH)
+    }
+}
+
+/// getpriority(which, who)
+///
+/// Linux raw syscall returns `20 - nice` in range [1, 40].
+/// libc wrapper converts this back to the public nice value [-20, 19].
+pub fn sys_get_priority(which: isize, who: isize) -> isize {
+    let target_pids = match collect_priority_target_pids(which, who) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut best_nice: Option<i32> = None;
+    for pid in target_pids {
+        let Some(target) = pid2process(pid) else {
+            continue;
+        };
+        let nice = target.inner_exclusive_access().nice;
+        best_nice = Some(best_nice.map(|old| old.min(nice)).unwrap_or(nice));
+    }
+    let Some(nice) = best_nice else {
+        return errno(ESRCH);
+    };
+    (20 - nice) as isize
+}
+
+/// ptrace(request, pid, addr, data)
+///
+/// Minimal support for LTP ptrace01/ptrace05:
+/// - PTRACE_TRACEME
+/// - PTRACE_CONT
+/// - PTRACE_KILL
+pub fn sys_ptrace(request: usize, pid: isize, _addr: usize, _data: usize) -> isize {
+    match request {
+        PTRACE_TRACEME => {
+            let process = current_process();
+            let mut inner = process.inner_exclusive_access();
+            if inner.ptrace_traceme {
+                return errno(EPERM);
+            }
+            inner.ptrace_traceme = true;
+            inner.ptrace_stop_signal = None;
+            0
+        }
+        PTRACE_CONT | PTRACE_KILL => {
+            if pid <= 0 {
+                return errno(ESRCH);
+            }
+            let pid = pid as usize;
+            let Some(target) = pid2process(pid) else {
+                return errno(ESRCH);
+            };
+            let current_pid = current_process().getpid();
+            let traced_by_me = {
+                let inner = target.inner_exclusive_access();
+                if !inner.ptrace_traceme {
+                    false
+                } else {
+                    match inner.parent.as_ref().and_then(|p| p.upgrade()) {
+                        Some(parent) => parent.getpid() == current_pid,
+                        None => false,
+                    }
+                }
+            };
+            if !traced_by_me {
+                return errno(EPERM);
+            }
+            if request == PTRACE_CONT {
+                target.inner_exclusive_access().ptrace_stop_signal = None;
+                let tasks = {
+                    let inner = target.inner_exclusive_access();
+                    inner
+                        .tasks
+                        .iter()
+                        .filter_map(|t| t.as_ref().cloned())
+                        .collect::<Vec<_>>()
+                };
+                for task in tasks {
+                    let mut task_inner = task.inner_exclusive_access();
+                    if task_inner.task_status == TaskStatus::Blocked {
+                        task_inner.task_status = TaskStatus::Ready;
+                        drop(task_inner);
+                        add_task(task);
+                    }
+                }
+                0
+            } else {
+                // Keep behavior consistent with signal path: traced task gets SIGKILL.
+                sys_kill(pid, SIGKILL as i32)
+            }
+        }
+        _ => errno(ENOSYS),
+    }
 }
 
 pub fn sys_kill(pid: usize, signum: i32) -> isize {
