@@ -592,6 +592,16 @@ pub fn handle_signals() {
         task_inner.signal_pending.remove(flag);
     }
 
+    // For ptrace(PTRACE_TRACEME), signal delivery stops the tracee and
+    // reports WIFSTOPPED to parent waitpid(), except for SIGKILL.
+    if process_inner.ptrace_traceme && signum != signal::SIGKILL {
+        process_inner.ptrace_stop_signal = Some(signum as i32);
+        drop(task_inner);
+        drop(process_inner);
+        block_current_and_run_next();
+        return;
+    }
+
     // 9. 处理内核信号（SIGSTOP、SIGKILL）
     if signum == signal::SIGSTOP {
         drop(task_inner);

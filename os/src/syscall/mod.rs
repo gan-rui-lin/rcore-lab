@@ -80,6 +80,8 @@ const SYSCALL_WRITEV: usize = 66;
 const SYSCALL_PREAD64: usize = 67;
 /// pwrite64 syscall
 const SYSCALL_PWRITE64: usize = 68;
+/// pwritev syscall
+const SYSCALL_PWRITEV: usize = 70;
 /// sendfile syscall
 const SYSCALL_SENDFILE: usize = 71;
 /// splice syscall
@@ -124,6 +126,8 @@ const SYSCALL_GETITIMER: usize = 102;
 const SYSCALL_SETITIMER: usize = 103;
 /// clock_nanosleep syscall
 const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
+/// ptrace syscall
+const SYSCALL_PTRACE: usize = 117;
 /// sched_setscheduler syscall
 const SYSCALL_SCHED_SETSCHEDULER: usize = 119;
 /// sched_getscheduler syscall
@@ -178,6 +182,8 @@ const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
 const SYSCALL_SIGRETURN: usize = 139;
 /// setpriority syscall
 const SYSCALL_SET_PRIORITY: usize = 140;
+/// getpriority syscall
+const SYSCALL_GET_PRIORITY: usize = 141;
 /// setregid syscall
 const SYSCALL_SETREGID: usize = 143;
 /// setgid syscall
@@ -194,6 +200,10 @@ const SYSCALL_GETRESUID: usize = 148;
 const SYSCALL_SETRESGID: usize = 149;
 /// getresgid syscall
 const SYSCALL_GETRESGID: usize = 150;
+/// setfsuid syscall
+const SYSCALL_SETFSUID: usize = 151;
+/// setfsgid syscall
+const SYSCALL_SETFSGID: usize = 152;
 /// times syscall
 const SYSCALL_TIMES: usize = 153;
 /// setpgid syscall
@@ -269,6 +279,8 @@ const SYSCALL_FORK: usize = 220;
 const SYSCALL_EXEC: usize = 221;
 /// mmap syscall
 const SYSCALL_MMAP: usize = 222;
+/// fadvise64 syscall
+const SYSCALL_FADVISE64: usize = 223;
 /// mprotect syscall
 const SYSCALL_MPROTECT: usize = 226;
 /// msync syscall
@@ -722,8 +734,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SYNC => 0,
         SYSCALL_READV => sys_readv(args[0], args[1] as *const usize, args[2]),
         SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const usize, args[2]),
-        SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *const u8, args[2], args[3]),
-        SYSCALL_PWRITE64 => sys_pwrite64(args[0], args[1] as *const u8, args[2], args[3]),
+        SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *const u8, args[2], args[3] as isize),
+        SYSCALL_PWRITE64 => sys_pwrite64(args[0], args[1] as *const u8, args[2], args[3] as isize),
+        SYSCALL_PWRITEV => sys_pwritev(args[0], args[1] as *const usize, args[2], args[3] as isize),
+        SYSCALL_FADVISE64 => {
+            sys_posix_fadvise(args[0], args[1] as isize, args[2] as isize, args[3] as i32)
+        }
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut isize, args[3]),
         SYSCALL_SPLICE => sys_splice(
             args[0],
@@ -856,6 +872,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETRESUID => process::sys_getresuid(args[0] as *mut u32, args[1] as *mut u32, args[2] as *mut u32),
         SYSCALL_SETRESGID => process::sys_setresgid(args[0] as u32, args[1] as u32, args[2] as u32),
         SYSCALL_GETRESGID => process::sys_getresgid(args[0] as *mut u32, args[1] as *mut u32, args[2] as *mut u32),
+        SYSCALL_SETFSUID => process::sys_setfsuid(args[0] as u32),
+        SYSCALL_SETFSGID => process::sys_setfsgid(args[0] as u32),
         SYSCALL_SETPGID => sys_setpgid(args[0] as isize, args[1] as isize),
         SYSCALL_GETPGID => sys_getpgid(args[0] as isize),
         SYSCALL_GETSID => sys_getsid(args[0] as isize),
@@ -925,6 +943,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0], args[1] as *mut TimeSpec),
         SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_GET_TIME => sys_get_time(args[0] as *mut TimeVal, args[1]),
+        SYSCALL_PTRACE => sys_ptrace(args[0], args[1] as isize, args[2], args[3]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
@@ -932,7 +951,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MADVISE => 0, // stub: madvise hints are advisory only
         SYSCALL_SBRK => sys_sbrk(args[0] as isize),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
-        SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
+        SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize, args[1] as isize, args[2] as isize),
+        SYSCALL_GET_PRIORITY => sys_get_priority(args[0] as isize, args[1] as isize),
         SYSCALL_POLL => sys_ppoll(args[0] as *mut PollFd, args[1], args[2] as *const TimeSpec),
         SYSCALL_SHUTDOWN => sys_shutdown(),
         // ---- Network syscalls ----
