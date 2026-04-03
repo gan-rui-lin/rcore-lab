@@ -75,16 +75,23 @@ struct SockAddrIn {
 
 /// Convert user-space sockaddr to smoltcp IpEndpoint.
 fn read_sockaddr(addr_ptr: *const u8, addr_len: usize, token: usize) -> Option<IpEndpoint> {
-    if addr_ptr.is_null() || addr_len < core::mem::size_of::<SockAddrIn>() {
+    let size = core::mem::size_of::<SockAddrIn>();
+    if addr_ptr.is_null() || addr_len < size {
         return None;
     }
-    let bufs = translated_byte_buffer(token, addr_ptr, core::mem::size_of::<SockAddrIn>());
+    let bufs = translated_byte_buffer_checked(token, addr_ptr, size, false)?;
     let mut raw = [0u8; 16];
     let mut offset = 0;
     for buf in bufs.iter() {
         let n = buf.len().min(16 - offset);
         raw[offset..offset + n].copy_from_slice(&buf[..n]);
         offset += n;
+        if offset >= 16 {
+            break;
+        }
+    }
+    if offset < 16 {
+        return None;
     }
     let family = u16::from_ne_bytes([raw[0], raw[1]]);
     // Linux compat: some tests pass sin_family = 0 (AF_UNSPEC) for IPv4 bind.
@@ -436,13 +443,19 @@ fn read_sockaddr_family(addr_ptr: *const u8, addr_len: usize, token: usize) -> O
     if addr_ptr.is_null() || addr_len < 2 {
         return None;
     }
-    let bufs = translated_byte_buffer(token, addr_ptr, 2);
+    let bufs = translated_byte_buffer_checked(token, addr_ptr, 2, false)?;
     let mut raw = [0u8; 2];
     let mut offset = 0;
     for buf in bufs.iter() {
         let n = buf.len().min(2 - offset);
         raw[offset..offset + n].copy_from_slice(&buf[..n]);
         offset += n;
+        if offset >= 2 {
+            break;
+        }
+    }
+    if offset < 2 {
+        return None;
     }
     Some(u16::from_ne_bytes(raw))
 }
@@ -455,13 +468,19 @@ fn read_unix_sockaddr(addr_ptr: *const u8, addr_len: usize, token: usize) -> Opt
     }
     // sockaddr_un: { sa_family: u16, sun_path: [u8; 108] }
     let max_len = addr_len.min(110);
-    let bufs = translated_byte_buffer(token, addr_ptr, max_len);
+    let bufs = translated_byte_buffer_checked(token, addr_ptr, max_len, false)?;
     let mut raw = vec![0u8; max_len];
     let mut offset = 0;
     for buf in bufs.iter() {
         let n = buf.len().min(max_len - offset);
         raw[offset..offset + n].copy_from_slice(&buf[..n]);
         offset += n;
+        if offset >= max_len {
+            break;
+        }
+    }
+    if offset < max_len {
+        return None;
     }
     // raw[0..2] = family, raw[2..] = sun_path
     let path_bytes = &raw[2..];
@@ -1109,7 +1128,9 @@ pub fn sys_sendto(
     }
 
     // Read user data into kernel buffer
-    let user_bufs = translated_byte_buffer(token, buf, len);
+    let Some(user_bufs) = translated_byte_buffer_checked(token, buf, len, false) else {
+        return EFAULT;
+    };
     let mut data = vec![0u8; len];
     let mut offset = 0;
     for ubuf in user_bufs.iter() {
@@ -1572,6 +1593,10 @@ pub fn sys_socketpair(domain: usize, _type: usize, _protocol: usize, sv: *mut i3
     if sv.is_null() {
         return EFAULT;
     }
+    let token = current_user_token();
+    if translated_byte_buffer_checked(token, sv as *const u8, 8, true).is_none() {
+        return EFAULT;
+    }
     // Create two pipes: pipe_a (sv[0] reads, sv[1] writes) and pipe_b (sv[1] reads, sv[0] writes)
     let (read_a, write_a) = crate::fs::make_pipe(0);
     let (read_b, write_b) = crate::fs::make_pipe(0);
@@ -1607,7 +1632,6 @@ pub fn sys_socketpair(domain: usize, _type: usize, _protocol: usize, sv: *mut i3
 
     drop(inner);
 
-    let token = current_user_token();
     let data = [
         (fd0 as i32).to_le_bytes(),
         (fd1 as i32).to_le_bytes(),
@@ -1615,13 +1639,8 @@ pub fn sys_socketpair(domain: usize, _type: usize, _protocol: usize, sv: *mut i3
     let mut buf = [0u8; 8];
     buf[..4].copy_from_slice(&data[0]);
     buf[4..].copy_from_slice(&data[1]);
-
-    let bufs = translated_byte_buffer(token, sv as *const u8, 8);
-    let mut offset = 0;
-    for slice in bufs {
-        let len = slice.len();
-        slice.copy_from_slice(&buf[offset..offset + len]);
-        offset += len;
+    if copy_to_user(token, sv as *mut u8, &buf).is_err() {
+        return EFAULT;
     }
     info!("[net] socketpair: created pipe pair fd{}(read) fd{}(write)", fd0, fd1);
     0

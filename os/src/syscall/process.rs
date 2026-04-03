@@ -3638,7 +3638,10 @@ pub fn sys_prlimit64(
         }
     }
     if !new_limit.is_null() {
-        let new_val = read_from_user::<RLimit>(token, new_limit).unwrap();
+        let new_val = match read_from_user::<RLimit>(token, new_limit) {
+            Ok(v) => v,
+            Err(_) => return errno(EFAULT),
+        };
         if new_val.rlim_cur > new_val.rlim_max {
             return errno(EINVAL);
         }
@@ -3791,14 +3794,20 @@ pub fn sys_rt_sigtimedwait(
 
     // Read the signal set from user space
     let token = current_user_token();
-    let sigset = *translated_ref(token, set);
+    let sigset = match read_from_user::<usize>(token, set) {
+        Ok(v) => v,
+        Err(_) => return errno(EFAULT),
+    };
     if sigset == 0 {
         return errno(EINVAL);
     }
 
     // Read timeout if provided
     let timeout_us = if !timeout.is_null() {
-        let ts = read_from_user::<TimeSpec>(token, timeout).unwrap();
+        let ts = match read_from_user::<TimeSpec>(token, timeout) {
+            Ok(v) => v,
+            Err(_) => return errno(EFAULT),
+        };
         if ts.tv_nsec >= 1_000_000_000 {
             return errno(EINVAL);
         }
