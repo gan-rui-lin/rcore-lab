@@ -3631,6 +3631,10 @@ pub fn sys_umask(mask: usize) -> isize {
     old as isize
 }
 
+pub fn get_current_umask() -> usize {
+    *UMASK_STATE.exclusive_access()
+}
+
 pub fn sys_getrlimit(resource: usize, rlim: *mut RLimit) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
