@@ -1873,32 +1873,119 @@ pub fn sys_linkat(
         return errno(EFAULT);
     };
     if old_raw.is_empty() || new_raw.is_empty() {
-        return errno(EINVAL);
+        return errno(ENOENT);
+    }
+    if old_raw.len() >= PATH_MAX
+        || new_raw.len() >= PATH_MAX
+        || old_raw
+            .split('/')
+            .any(|component| !component.is_empty() && component.len() > NAME_MAX)
+        || new_raw
+            .split('/')
+            .any(|component| !component.is_empty() && component.len() > NAME_MAX)
+    {
+        return errno(ENAMETOOLONG);
     }
     let old_path = if old_raw.starts_with('/') {
-        normalize_path(&old_raw)
+        resolve_user_path("/", &old_raw)
     } else {
         let base = match dirfd_base(old_dirfd) {
             Ok(base) => base,
             Err(err) => return err,
         };
-        resolve_path(&base, &old_raw)
+        resolve_user_path(&base, &old_raw)
     };
     let new_path = if new_raw.starts_with('/') {
-        normalize_path(&new_raw)
+        resolve_user_path("/", &new_raw)
     } else {
         let base = match dirfd_base(new_dirfd) {
             Ok(base) => base,
             Err(err) => return err,
         };
-        resolve_path(&base, &new_raw)
+        resolve_user_path(&base, &new_raw)
     };
-    if open_file(old_path.as_str(), OpenFlags::from_bits_truncate(0)).is_none() {
+    // Emulate Linux's "too many symlinks while walking" behavior for deep paths.
+    let old_comp_cnt = old_path.split('/').filter(|c| !c.is_empty()).count();
+    if old_comp_cnt > 40 {
+        let mut partial = String::from("/");
+        let mut saw_symlink = false;
+        for comp in old_path.split('/').filter(|c| !c.is_empty()) {
+            partial = if partial == "/" {
+                format!("/{}", comp)
+            } else {
+                format!("{}/{}", partial, comp)
+            };
+            if symlink_target_get(&partial).is_some() {
+                saw_symlink = true;
+                break;
+            }
+        }
+        if saw_symlink {
+            return errno(ELOOP);
+        }
+    }
+    let old_path = match resolve_access_path(&old_path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if !path_exists_for_access(&old_path) {
         return errno(ENOENT);
     }
-    if open_file(new_path.as_str(), OpenFlags::from_bits_truncate(0)).is_some() {
+    if path_is_dir(&old_path) {
+        return errno(EPERM);
+    }
+
+    let (new_parent_raw, new_name_only) = match new_path.rsplit_once('/') {
+        Some((parent, name)) => {
+            let parent = if parent.is_empty() { "/" } else { parent };
+            (parent, name)
+        }
+        None => return errno(ENOENT),
+    };
+    if new_name_only.is_empty() {
+        return errno(ENOENT);
+    }
+    let new_parent = match resolve_access_path(new_parent_raw) {
+        Ok(path) => path,
+        Err(err) => {
+            // Linux link() commonly reports ENOENT when the newpath prefix is invalid.
+            if err == errno(ENOTDIR) {
+                return errno(ENOENT);
+            }
+            return err;
+        }
+    };
+    if !path_exists_for_access(&new_parent) || !path_is_dir(&new_parent) {
+        return errno(ENOENT);
+    }
+    let new_path = if new_parent == "/" {
+        format!("/{}", new_name_only)
+    } else {
+        format!("{}/{}", new_parent, new_name_only)
+    };
+    if path_exists_for_access(&new_path) {
         return errno(EEXIST);
     }
+
+    let old_ro = readonly_mount_contains(&old_path);
+    let new_ro = readonly_mount_contains(&new_path);
+    if old_ro != new_ro {
+        return errno(EXDEV);
+    }
+    if new_ro {
+        return errno(EROFS);
+    }
+
+    let euid = current_process().inner_exclusive_access().effective_uid;
+    if euid != 0 {
+        if let Err(err) = access_allowed(&old_path, 0, euid) {
+            return err;
+        }
+        if let Err(err) = access_allowed(&new_parent, 0o3, euid) {
+            return err;
+        }
+    }
+
     #[cfg(feature = "ext4")]
     {
         let old_c = match CString::new(old_path.clone()) {
@@ -1912,9 +1999,20 @@ pub fn sys_linkat(
         let rc = unsafe { ext4_flink(old_c.as_ptr(), new_c.as_ptr()) };
         if rc == 0 {
             path_link_add(old_path.as_str(), new_path.as_str());
+            if let Some(mode) = path_mode_get(&old_path) {
+                path_mode_set(&new_path, mode);
+            }
+            if let Some((uid, gid)) = path_owner_get(&old_path) {
+                path_owner_set(&new_path, uid, gid);
+            }
             0
         } else {
-            errno(EIO)
+            let err_code = if rc < 0 { (-rc) as isize } else { rc as isize };
+            if err_code > 0 {
+                errno(err_code)
+            } else {
+                errno(EIO)
+            }
         }
     }
     #[cfg(not(feature = "ext4"))]
@@ -3909,21 +4007,45 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, count: usize, offset: isize) -> i
     };
     let file = file.clone();
     drop(inner);
+    if offset < 0 {
+        return errno(EINVAL);
+    }
     if !file.writable() {
         return errno(EBADF);
     }
     let Some(inode) = file.inode() else {
         return errno(ESPIPE);
     };
-    if offset < 0 {
-        return errno(EINVAL);
+    let mut off = offset as usize;
+    if (file.status_flags() & OpenFlags::APPEND.bits()) != 0 {
+        // Linux keeps O_APPEND semantics for pwrite(): write at EOF.
+        off = inode.size();
+    }
+    if count > 0 && (file.status_flags() & OpenFlags::DIRECT.bits()) != 0 {
+        if (buf as usize) % DIRECT_IO_ALIGN != 0
+            || count % DIRECT_IO_ALIGN != 0
+            || off % DIRECT_IO_ALIGN != 0
+        {
+            return errno(EINVAL);
+        }
     }
     let Some(slices) = translated_byte_buffer_checked(token, buf, count, false) else {
         return errno(EFAULT);
     };
     let mut total = 0usize;
-    let mut off = offset as usize;
     for slice in slices {
+        if off > inode.size() {
+            let mut cur = inode.size();
+            let zeros = [0u8; 512];
+            while cur < off {
+                let step = (off - cur).min(zeros.len());
+                let n = inode.write_at(cur, &zeros[..step]);
+                if n == 0 {
+                    return if total > 0 { total as isize } else { errno(EIO) };
+                }
+                cur += n;
+            }
+        }
         let n = inode.write_at(off, slice);
         if n == 0 {
             break;
@@ -3938,6 +4060,231 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, count: usize, offset: isize) -> i
         }
     }
     total as isize
+}
+
+/// sys_pwritev (syscall 70) - vectored write at offset without changing file position
+pub fn sys_pwritev(fd: usize, iov: *const usize, iovcnt: usize, offset: isize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!(
+            "kernel:pid[{}] sys_pwritev fd={} iovcnt={} offset={}",
+            pid,
+            fd,
+            iovcnt,
+            offset
+        );
+    }
+    if iov.is_null() {
+        return errno(EFAULT);
+    }
+    if offset < 0 {
+        return errno(EINVAL);
+    }
+    if iovcnt == 0 {
+        return 0;
+    }
+    const UIO_MAXIOV: usize = 1024;
+    if iovcnt > UIO_MAXIOV {
+        return errno(EINVAL);
+    }
+
+    let token = current_user_token();
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+    let file = file.clone();
+    drop(inner);
+    if !file.writable() {
+        return errno(EBADF);
+    }
+    let Some(inode) = file.inode() else {
+        return errno(ESPIPE);
+    };
+
+    let mut off = offset as usize;
+    if (file.status_flags() & OpenFlags::APPEND.bits()) != 0 {
+        off = inode.size();
+    }
+
+    let mut total_written = 0usize;
+    for i in 0..iovcnt {
+        let iov_ptr = unsafe { (iov as *const u8).add(i * 16) };
+        let Some(iov_buffers) = translated_byte_buffer_checked(token, iov_ptr, 16, false) else {
+            return if total_written > 0 {
+                total_written as isize
+            } else {
+                errno(EFAULT)
+            };
+        };
+
+        let mut iov_data = [0u8; 16];
+        let mut copied = 0usize;
+        for slice in iov_buffers {
+            let n = slice.len().min(16 - copied);
+            iov_data[copied..copied + n].copy_from_slice(&slice[..n]);
+            copied += n;
+            if copied >= 16 {
+                break;
+            }
+        }
+        if copied < 16 {
+            return if total_written > 0 {
+                total_written as isize
+            } else {
+                errno(EFAULT)
+            };
+        }
+
+        let base = usize::from_le_bytes([
+            iov_data[0],
+            iov_data[1],
+            iov_data[2],
+            iov_data[3],
+            iov_data[4],
+            iov_data[5],
+            iov_data[6],
+            iov_data[7],
+        ]);
+        let len = usize::from_le_bytes([
+            iov_data[8],
+            iov_data[9],
+            iov_data[10],
+            iov_data[11],
+            iov_data[12],
+            iov_data[13],
+            iov_data[14],
+            iov_data[15],
+        ]);
+
+        if len == 0 {
+            continue;
+        }
+        if len > isize::MAX as usize {
+            return if total_written > 0 {
+                total_written as isize
+            } else {
+                errno(EINVAL)
+            };
+        }
+        if base == 0 {
+            return if total_written > 0 {
+                total_written as isize
+            } else {
+                errno(EFAULT)
+            };
+        }
+        if (file.status_flags() & OpenFlags::DIRECT.bits()) != 0 {
+            if base % DIRECT_IO_ALIGN != 0 || len % DIRECT_IO_ALIGN != 0 || off % DIRECT_IO_ALIGN != 0 {
+                return if total_written > 0 {
+                    total_written as isize
+                } else {
+                    errno(EINVAL)
+                };
+            }
+        }
+
+        let Some(buffers) = translated_byte_buffer_checked(token, base as *const u8, len, false)
+        else {
+            return if total_written > 0 {
+                total_written as isize
+            } else {
+                errno(EFAULT)
+            };
+        };
+
+        let mut iov_written = 0usize;
+        for slice in buffers {
+            if off > inode.size() {
+                let mut cur = inode.size();
+                let zeros = [0u8; 512];
+                while cur < off {
+                    let step = (off - cur).min(zeros.len());
+                    let n = inode.write_at(cur, &zeros[..step]);
+                    if n == 0 {
+                        return if total_written > 0 {
+                            total_written as isize
+                        } else {
+                            errno(EIO)
+                        };
+                    }
+                    cur += n;
+                }
+            }
+            let n = inode.write_at(off, slice);
+            if n == 0 {
+                break;
+            }
+            let Some(next_off) = off.checked_add(n) else {
+                return if total_written > 0 {
+                    total_written as isize
+                } else {
+                    errno(EINVAL)
+                };
+            };
+            let Some(next_total) = total_written.checked_add(n) else {
+                return if total_written > 0 {
+                    total_written as isize
+                } else {
+                    errno(EINVAL)
+                };
+            };
+            off = next_off;
+            total_written = next_total;
+            iov_written += n;
+            if n < slice.len() {
+                break;
+            }
+        }
+        if iov_written < len {
+            break;
+        }
+    }
+
+    total_written as isize
+}
+
+/// sys_posix_fadvise/fadvise64 (syscall 223)
+pub fn sys_posix_fadvise(fd: usize, offset: isize, len: isize, advice: i32) -> isize {
+    if offset < 0 || len < 0 {
+        return errno(EINVAL);
+    }
+
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+    let file = file.clone();
+    drop(inner);
+
+    if file.inode().is_none() {
+        return errno(ESPIPE);
+    }
+
+    const POSIX_FADV_NORMAL: i32 = 0;
+    const POSIX_FADV_RANDOM: i32 = 1;
+    const POSIX_FADV_SEQUENTIAL: i32 = 2;
+    const POSIX_FADV_WILLNEED: i32 = 3;
+    const POSIX_FADV_DONTNEED: i32 = 4;
+    const POSIX_FADV_NOREUSE: i32 = 5;
+
+    match advice {
+        POSIX_FADV_NORMAL
+        | POSIX_FADV_RANDOM
+        | POSIX_FADV_SEQUENTIAL
+        | POSIX_FADV_WILLNEED
+        | POSIX_FADV_DONTNEED
+        | POSIX_FADV_NOREUSE => 0,
+        _ => errno(EINVAL),
+    }
 }
 
 /// sys_set_robust_list (syscall 99) - stub
