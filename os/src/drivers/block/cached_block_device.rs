@@ -285,7 +285,10 @@ impl CacheManager {
                 continue;
             };
 
-            if Arc::strong_count(&candidate) > 1 {
+            // `candidate` is a local Arc clone of the map entry, so:
+            // - strong_count == 2 means "only cache map + this local variable"
+            // - strong_count > 2 means there are external holders, skip eviction.
+            if Arc::strong_count(&candidate) > 2 {
                 self.queue.push_front(candidate_id);
                 continue;
             }
