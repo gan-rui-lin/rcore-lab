@@ -26,6 +26,7 @@ const AF_INET: usize = 2;
 // Socket types
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
+const SOCK_RAW: usize = 3;
 const SOCK_SEQPACKET: usize = 5;
 const SOCK_NONBLOCK: usize = 0o4000;
 const SOCK_CLOEXEC: usize = 0o2000000;
@@ -34,6 +35,7 @@ const SOCK_CLOEXEC: usize = 0o2000000;
 const SOL_SOCKET: usize = 1;
 const SOL_IP: usize = 0;
 const IPPROTO_TCP: usize = 6;
+const IPPROTO_UDP: usize = 17;
 const SO_REUSEADDR: usize = 2;
 const SO_ERROR: usize = 4;
 const SO_KEEPALIVE: usize = 9;
@@ -62,6 +64,7 @@ const ENOTDIR: isize = -20;
 const EMFILE: isize = -24;
 const EMSGSIZE: isize = -90;
 const EOPNOTSUPP: isize = -95;
+const EPROTONOSUPPORT: isize = -93;
 
 /// Linux sockaddr_in structure (16 bytes).
 #[repr(C)]
@@ -1580,40 +1583,74 @@ pub fn sys_shutdown_socket(fd: usize, how: i32) -> isize {
 }
 
 /// sys_socketpair(domain, type, protocol, sv)
-/// Emulate AF_UNIX socketpair using two pipes (bidirectional).
-/// sv[0] can read pipe_a / write pipe_b, sv[1] can read pipe_b / write pipe_a.
-/// For simplicity we use unidirectional pipes — sufficient for hackbench which
-/// uses each end in one direction only (parent writes, child reads or vice versa).
-pub fn sys_socketpair(domain: usize, _type: usize, _protocol: usize, sv: *mut i32) -> isize {
-    const AF_UNIX: usize = 1;
+pub fn sys_socketpair(domain: usize, sock_type: usize, protocol: usize, sv: *mut i32) -> isize {
+    let base_type = sock_type & 0xFF;
+    let nonblock = (sock_type & SOCK_NONBLOCK) != 0;
+    let cloexec = (sock_type & SOCK_CLOEXEC) != 0;
+
+    // LTP expects errno distinctions for AF_INET socketpair attempts.
+    if domain == AF_INET {
+        return match base_type {
+            SOCK_STREAM => {
+                if protocol == 0 || protocol == IPPROTO_TCP {
+                    EOPNOTSUPP
+                } else {
+                    EPROTONOSUPPORT
+                }
+            }
+            SOCK_DGRAM => {
+                if protocol == 0 || protocol == IPPROTO_UDP {
+                    EOPNOTSUPP
+                } else {
+                    EPROTONOSUPPORT
+                }
+            }
+            SOCK_RAW => EPROTONOSUPPORT,
+            _ => EINVAL,
+        };
+    }
+
     if domain != AF_UNIX {
-        warn!("[net] socketpair: only AF_UNIX supported, got {}", domain);
         return EAFNOSUPPORT;
+    }
+    if !matches!(base_type, SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET) {
+        return EINVAL;
+    }
+    if protocol != 0 {
+        return EPROTONOSUPPORT;
     }
     if sv.is_null() {
         return EFAULT;
     }
+
     let token = current_user_token();
-    if translated_byte_buffer_checked(token, sv as *const u8, 8, true).is_none() {
+    if translated_byte_buffer_checked(token, sv as *const u8, core::mem::size_of::<i32>(), false)
+        .is_none()
+        || translated_byte_buffer_checked(
+            token,
+            unsafe { sv.add(1) } as *const u8,
+            core::mem::size_of::<i32>(),
+            false,
+        )
+        .is_none()
+    {
         return EFAULT;
     }
-    // Create two pipes: pipe_a (sv[0] reads, sv[1] writes) and pipe_b (sv[1] reads, sv[0] writes)
-    let (read_a, write_a) = crate::fs::make_pipe(0);
-    let (read_b, write_b) = crate::fs::make_pipe(0);
+
+    let left = UnixSocketFile::new(base_type as u8, nonblock, cloexec);
+    let right = UnixSocketFile::new(base_type as u8, nonblock, cloexec);
+    let left_file: Arc<dyn crate::fs::File> = left.clone();
+    let right_file: Arc<dyn crate::fs::File> = right.clone();
+    left_file.unix_set_peer_dyn(Arc::downgrade(&right_file));
+    right_file.unix_set_peer_dyn(Arc::downgrade(&left_file));
 
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-
-    // sv[0]: reads from pipe_a, writes to pipe_b
-    // We need two fds per socket... but Linux socketpair returns 2 fds, each bidirectional.
-    // Simplification: sv[0]=read_a, sv[1]=write_a (like pipe2), which is what hackbench actually needs.
-    // hackbench creates socketpairs then forks; parent writes to sv[0], child reads from sv[1] or vice versa.
-    // Actually hackbench uses both directions. Let's just give it pipe fds for now.
     let fd0 = match inner.alloc_fd() {
         Some(fd) => fd,
         None => return EMFILE,
     };
-    inner.fd_table[fd0] = Some(read_a);
+    inner.fd_table[fd0] = Some(left_file);
     let fd1 = match inner.alloc_fd() {
         Some(fd) => fd,
         None => {
@@ -1621,28 +1658,11 @@ pub fn sys_socketpair(domain: usize, _type: usize, _protocol: usize, sv: *mut i3
             return EMFILE;
         }
     };
-    inner.fd_table[fd1] = Some(write_a);
-
-    // Also install the reverse direction pipe fds
-    // Actually, for a proper socketpair we need each fd to be bidirectional.
-    // Since our pipes are unidirectional, let's just use one pipe for now.
-    // hackbench: sender writes to fd, receiver reads from fd — one direction per pair is fine.
-    drop(read_b);
-    drop(write_b);
-
+    inner.fd_table[fd1] = Some(right_file);
     drop(inner);
 
-    let data = [
-        (fd0 as i32).to_le_bytes(),
-        (fd1 as i32).to_le_bytes(),
-    ];
-    let mut buf = [0u8; 8];
-    buf[..4].copy_from_slice(&data[0]);
-    buf[4..].copy_from_slice(&data[1]);
-    if copy_to_user(token, sv as *mut u8, &buf).is_err() {
-        return EFAULT;
-    }
-    info!("[net] socketpair: created pipe pair fd{}(read) fd{}(write)", fd0, fd1);
+    *translated_refmut(token, sv) = fd0 as i32;
+    *translated_refmut(token, unsafe { sv.add(1) }) = fd1 as i32;
     0
 }
 
