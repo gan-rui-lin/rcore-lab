@@ -3479,12 +3479,10 @@ fn read_user_bytes(token: usize, src: *const u8, len: usize) -> Result<Vec<u8>, 
 }
 
 #[inline]
-fn fdset_len_bytes(nfds: usize) -> usize {
+fn fdset_len_bytes(nfds: usize) -> Option<usize> {
     let bits_per_word = core::mem::size_of::<usize>() * 8;
-    nfds
-        .saturating_add(bits_per_word - 1)
-        / bits_per_word
-        * core::mem::size_of::<usize>()
+    let words = nfds.checked_add(bits_per_word - 1)? / bits_per_word;
+    words.checked_mul(core::mem::size_of::<usize>())
 }
 
 #[inline]
@@ -3528,8 +3526,19 @@ pub fn sys_pselect6(
     timeout: *const TimeSpec,
     _sigmask: usize,
 ) -> isize {
+    let nofile_limit = {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        inner.rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize
+    };
+    if nfds > nofile_limit {
+        return errno(EINVAL);
+    }
+
     let token = current_user_token();
-    let fdset_len = fdset_len_bytes(nfds);
+    let Some(fdset_len) = fdset_len_bytes(nfds) else {
+        return errno(EINVAL);
+    };
 
     let in_read = if readfds.is_null() {
         None
@@ -3680,7 +3689,15 @@ pub fn sys_pselect6(
 }
 
 pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: *const TimeSpec) -> isize {
-    if fds.is_null() {
+    let nofile_limit = {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        inner.rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize
+    };
+    if nfds > nofile_limit {
+        return errno(EINVAL);
+    }
+    if nfds != 0 && fds.is_null() {
         return errno(EFAULT);
     }
 
