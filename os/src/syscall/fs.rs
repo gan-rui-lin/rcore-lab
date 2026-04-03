@@ -635,8 +635,13 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
     if dst.is_null() {
         return Err(errno(EFAULT));
     }
+    if data.is_empty() {
+        return Ok(());
+    }
     let mut offset = 0usize;
-    let slices = translated_byte_buffer(token, dst, data.len());
+    let Some(slices) = translated_byte_buffer_checked(token, dst, data.len(), true) else {
+        return Err(errno(EFAULT));
+    };
     for slice in slices {
         let len = slice.len().min(data.len() - offset);
         slice[..len].copy_from_slice(&data[offset..offset + len]);
@@ -2571,6 +2576,10 @@ pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
     if iovcnt == 0 {
         return 0;
     }
+    const UIO_MAXIOV: usize = 1024;
+    if iovcnt > UIO_MAXIOV {
+        return errno(EINVAL);
+    }
 
     let token = current_user_token();
     let process = current_process();
@@ -2594,8 +2603,10 @@ pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
     let mut total_read = 0isize;
 
     for i in 0..iovcnt {
-        let iov_ptr = unsafe { iov.add(i * 2) };
-        let iov_buffers = translated_byte_buffer(token, iov_ptr as *const u8, 16);
+        let iov_ptr = unsafe { (iov as *const u8).add(i * 16) };
+        let Some(iov_buffers) = translated_byte_buffer_checked(token, iov_ptr, 16, false) else {
+            return if total_read > 0 { total_read } else { errno(EFAULT) };
+        };
 
         let mut iov_data = [0u8; 16];
         let mut offset = 0;
@@ -2606,6 +2617,9 @@ pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
             if offset >= 16 {
                 break;
             }
+        }
+        if offset < 16 {
+            return if total_read > 0 { total_read } else { errno(EFAULT) };
         }
 
         let base = usize::from_le_bytes([
@@ -2629,11 +2643,20 @@ pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
             iov_data[15],
         ]);
 
-        if base == 0 || len == 0 {
+        if len == 0 {
             continue;
         }
+        if len > isize::MAX as usize {
+            return errno(EINVAL);
+        }
+        if base == 0 {
+            return if total_read > 0 { total_read } else { errno(EFAULT) };
+        }
 
-        let buffers = translated_byte_buffer(token, base as *const u8, len);
+        let Some(buffers) = translated_byte_buffer_checked(token, base as *const u8, len, true)
+        else {
+            return if total_read > 0 { total_read } else { errno(EFAULT) };
+        };
         let read = file.read(UserBuffer::new(buffers));
         if read == usize::MAX {
             return if total_read > 0 { total_read } else { errno(EINTR) };
@@ -2670,6 +2693,10 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
     if iovcnt == 0 {
         return 0;
     }
+    const UIO_MAXIOV: usize = 1024;
+    if iovcnt > UIO_MAXIOV {
+        return errno(EINVAL);
+    }
 
     let token = current_user_token();
     let process = current_process();
@@ -2694,8 +2721,10 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 
     // Read iovec structures from user space
     for i in 0..iovcnt {
-        let iov_ptr = unsafe { iov.add(i * 2) };
-        let iov_buffers = translated_byte_buffer(token, iov_ptr as *const u8, 16);
+        let iov_ptr = unsafe { (iov as *const u8).add(i * 16) };
+        let Some(iov_buffers) = translated_byte_buffer_checked(token, iov_ptr, 16, false) else {
+            return if total_written > 0 { total_written } else { errno(EFAULT) };
+        };
 
         let mut iov_data = [0u8; 16];
         let mut offset = 0;
@@ -2706,6 +2735,9 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
             if offset >= 16 {
                 break;
             }
+        }
+        if offset < 16 {
+            return if total_written > 0 { total_written } else { errno(EFAULT) };
         }
 
         let base = usize::from_le_bytes([
@@ -2729,11 +2761,20 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
             iov_data[15],
         ]);
 
-        if base == 0 || len == 0 {
+        if len == 0 {
             continue;
         }
+        if len > isize::MAX as usize {
+            return errno(EINVAL);
+        }
+        if base == 0 {
+            return if total_written > 0 { total_written } else { errno(EFAULT) };
+        }
 
-        let buffers = translated_byte_buffer(token, base as *const u8, len);
+        let Some(buffers) = translated_byte_buffer_checked(token, base as *const u8, len, false)
+        else {
+            return if total_written > 0 { total_written } else { errno(EFAULT) };
+        };
         let written = match file.write_user_buffer(UserBuffer::new(buffers)) {
             Ok(written) => {
                 if written == usize::MAX {
@@ -3335,15 +3376,21 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut isize, count: usiz
         return errno(ESPIPE);
     }
 
+    let token = current_user_token();
     let mut src_off = if offset.is_null() {
         in_file.get_offset().unwrap_or(0)
     } else {
-        let token = current_user_token();
-        let offset_ref = translated_refmut(token, offset);
-        if *offset_ref < 0 {
+        let raw = match read_user_bytes(token, offset as *const u8, core::mem::size_of::<isize>()) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let mut off_raw = [0u8; core::mem::size_of::<isize>()];
+        off_raw.copy_from_slice(raw.as_slice());
+        let off = isize::from_ne_bytes(off_raw);
+        if off < 0 {
             return errno(EINVAL);
         }
-        *offset_ref as usize
+        off as usize
     };
 
     let mut out_off = out_file.get_offset().unwrap_or(0);
@@ -3397,9 +3444,10 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut isize, count: usiz
     }
 
     if !offset.is_null() {
-        let token = current_user_token();
-        let offset_ref = translated_refmut(token, offset);
-        *offset_ref = src_off as isize;
+        let bytes = (src_off as isize).to_ne_bytes();
+        if let Err(e) = copy_to_user(token, offset as *mut u8, &bytes) {
+            return e;
+        }
     } else if in_inode.is_some() {
         in_file.set_offset(src_off);
     }
@@ -3463,7 +3511,9 @@ fn read_user_bytes(token: usize, src: *const u8, len: usize) -> Result<Vec<u8>, 
     }
     let mut out = vec![0u8; len];
     let mut offset = 0usize;
-    let slices = translated_byte_buffer(token, src, len);
+    let Some(slices) = translated_byte_buffer_checked(token, src, len, false) else {
+        return Err(errno(EFAULT));
+    };
     for slice in slices {
         let n = slice.len().min(len - offset);
         out[offset..offset + n].copy_from_slice(&slice[..n]);
