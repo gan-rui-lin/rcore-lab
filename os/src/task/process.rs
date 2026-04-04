@@ -41,6 +41,12 @@ pub struct IntervalTimerState {
     pub remaining_us: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildWaitEvent {
+    Stopped(i32),
+    Continued(i32),
+}
+
 fn default_rlimits() -> [RLimit; RLIMIT_NLIMITS] {
     let mut limits = [RLimit {
         rlim_cur: RLIM_INFINITY,
@@ -138,6 +144,10 @@ pub struct ProcessControlBlockInner {
     pub ptrace_traceme: bool,
     /// Pending ptrace stop signal to be reported by waitpid.
     pub ptrace_stop_signal: Option<i32>,
+    /// Pending non-exit child event to be reported by waitid(WSTOPPED/WCONTINUED).
+    pub child_wait_event: Option<ChildWaitEvent>,
+    /// True when the process is currently in a job-control stopped state.
+    pub group_stopped: bool,
     /// ITIMER_REAL: absolute expire time in ms, 0 = inactive.
     pub itimer_real_expire_ms: usize,
     /// ITIMER_REAL: interval for repeating timer in ms, 0 = one-shot.
@@ -319,6 +329,8 @@ impl ProcessControlBlock {
                     pgid: 0,
                     ptrace_traceme: false,
                     ptrace_stop_signal: None,
+                    child_wait_event: None,
+                    group_stopped: false,
                     itimer_real_expire_ms: 0,
                     itimer_real_interval_ms: 0,
                     vfork_vm_parent: None,
@@ -786,6 +798,8 @@ impl ProcessControlBlock {
                     pgid: parent.pgid,
                     ptrace_traceme: false,
                     ptrace_stop_signal: None,
+                    child_wait_event: None,
+                    group_stopped: false,
                     itimer_real_expire_ms: 0,
                     itimer_real_interval_ms: 0,
                     vfork_vm_parent: None,

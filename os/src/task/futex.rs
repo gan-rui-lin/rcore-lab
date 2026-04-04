@@ -45,6 +45,14 @@ pub fn futex_wait(futex_key: FutexKey) -> isize {
 
 pub fn futex_wait_bitset(futex_key: FutexKey, bitset: i32) -> isize {
     let task = current_task().unwrap();
+    {
+        // Clear stale interruption state before sleeping. A previous signal
+        // (e.g. SIGCONT used to resume SIGSTOP) may have set this flag while
+        // the task was not in a futex wait. If we keep it, a normal FUTEX_WAKE
+        // on this wait can be misreported as EINTR.
+        let mut task_inner = task.inner_exclusive_access();
+        task_inner.interrupted_by_signal = false;
+    }
     let mut futex_q = FUTEX_Q.lock();
     let queue = futex_q
         .entry(futex_key.clone())
