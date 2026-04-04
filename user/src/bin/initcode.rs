@@ -9,8 +9,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::vec::Vec;
 use user_lib::{
-    chdir, close, dup, execve, exit, fork, kill, link, open, shutdown, unlink, write,
-    OpenFlags, SIGKILL,
+    chdir, close, dup, execve, exit, fork, link, open, shutdown, unlink, write, OpenFlags,
 };
 
 const ENABLE_ALL_TESTS: bool = true;
@@ -628,14 +627,22 @@ fn run_suite(root: &str, suite: &str) -> i32 {
     }
     if suite == "ltp" {
         let ret = run_ltp_suite(root);
-        reap_orphans();
+        let reaped = reap_orphans();
+        println!(
+            "[initcode] cleanup after {}/{} done (status=0x{:x}, reaped={})",
+            root, suite, ret, reaped
+        );
         return ret;
     }
     let script = format!("{}/{}_testcode.sh", root, suite);
     let ret = run_testcode(script.as_str(), root);
     // Kill orphan daemons (e.g. iperf3 -s -D, netserver -D) so they don't
     // hold ports when the next libc variant runs the same suite.
-    reap_orphans();
+    let reaped = reap_orphans();
+    println!(
+        "[initcode] cleanup after {}/{} done (status=0x{:x}, reaped={})",
+        root, suite, ret, reaped
+    );
     ret
 }
 
@@ -643,7 +650,7 @@ fn run_ltp_suite(root: &str) -> i32 {
     let script_path = "/tmp/ltp_testcode_filtered.sh";
     let start_from_default = LTP_START_FROM.unwrap_or("");
     let start_from_line = format!(
-        "start_from=\"{}\"\nstarted=1\nif [ -n \"$start_from\" ]; then\n  started=0\nfi\n",
+        "start_from=\"{}\"\nif [ -z \"$start_from\" ]; then\n  start_from=\"${{LTP_START_FROM:-}}\"\nfi\nstarted=1\nif [ -n \"$start_from\" ]; then\n  started=0\n  echo \"LTP start marker enabled: $start_from\"\nfi\n",
         start_from_default
     );
     // Run standalone LTP cases while skipping obvious helper/library entries
@@ -758,6 +765,14 @@ run_case_with_timeout() {
 for file in \"$target_dir\"/*; do
         [ -f \"$file\" ] || continue
         case_name=$(basename \"$file\")
+        if [ \"$started\" -eq 0 ]; then
+            if [ \"$case_name\" = \"$start_from\" ]; then
+                started=1
+                echo \"LTP start marker matched: $case_name\"
+            else
+                continue
+            fi
+        fi
         if is_skip_case \"$case_name\"; then
                 continue
         fi
@@ -784,29 +799,27 @@ echo \"#### OS COMP TEST GROUP END ltp-musl ####\"
     run_testcode(script_path, root)
 }
 
-/// Kill orphan daemon processes and reap zombies.
-fn reap_orphans() {
-    let my_pid = user_lib::getpid();
-    for p in 2..512usize {
-        if p as isize != my_pid {
-            let _ = kill(p, SIGKILL);
-        }
-    }
-    // Reap with WNOHANG until ECHILD — give killed processes time to exit.
+/// Reap exited child processes without force-killing arbitrary PIDs.
+///
+/// Aggressively killing a wide PID range can destabilize long LTP runs and
+/// may trigger kernel-side task-management panics. A safer cleanup strategy
+/// is to only reap children that have already exited.
+fn reap_orphans() -> usize {
+    // Reap with WNOHANG until ECHILD.
     let mut status: i32 = 0;
-    let mut yields_without_reap = 0usize;
+    let mut reaped = 0usize;
+    let mut idle_rounds = 0usize;
     loop {
         let ret = user_lib::waitpid_nohang(-1i32 as usize, &mut status);
         if ret > 0 {
-            // Reaped one zombie, reset counter and keep going
-            yields_without_reap = 0;
+            reaped += 1;
+            idle_rounds = 0;
             continue;
         }
         if ret == 0 {
-            // Children exist but none exited yet — yield and retry
-            yields_without_reap += 1;
-            if yields_without_reap > 500 {
-                // Safety valve: give up after many yields
+            // Children exist but none exited yet; bounded wait.
+            idle_rounds += 1;
+            if idle_rounds > 32 {
                 break;
             }
             user_lib::sys_yield();
@@ -814,6 +827,7 @@ fn reap_orphans() {
         }
         break; // ECHILD or error — no more children
     }
+    reaped
 }
 
 fn run_all_suites() {
