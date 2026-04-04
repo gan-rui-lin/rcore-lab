@@ -642,14 +642,21 @@ fn run_suite(root: &str, suite: &str) -> i32 {
 fn run_ltp_suite(root: &str) -> i32 {
     let script_path = "/tmp/ltp_testcode_filtered.sh";
     let start_from_default = LTP_START_FROM.unwrap_or("");
+    let suite_tag = if root == "/glibc" {
+        "ltp-glibc"
+    } else {
+        "ltp-musl"
+    };
     // Run standalone LTP cases while skipping obvious helper/library entries
     // that are not meant to be launched directly (e.g. cgroup_fj_proc).
     let script_template = "\
 #!/bin/sh
-echo \"#### OS COMP TEST GROUP START ltp-musl ####\"
+echo \"#### OS COMP TEST GROUP START __LTP_SUITE_TAG__ ####\"
 target_dir=\"ltp/testcases/bin\"
 export PATH=\"$PATH:./ltp/testcases/bin:./ltp/testcases/lib:./ltp/testcases/network/busy_poll:./ltp/testcases/kernel/controllers/cgroup_fj\"
 case_timeout=\"${LTP_CASE_TIMEOUT:-8}\"
+case_limit=\"${LTP_CASE_LIMIT:-10000}\"
+case_count=0
 start_from=\"__LTP_START_FROM_DEFAULT__\"
 if [ -z \"$start_from\" ]; then
   start_from=\"${LTP_START_FROM:-}\"
@@ -706,15 +713,22 @@ for file in \"$target_dir\"/*; do
   if is_skip_case \"$case_name\"; then
     continue
   fi
+  if [ \"$case_count\" -ge \"$case_limit\" ]; then
+    echo \"LTP case limit reached: $case_limit\"
+    break
+  fi
   echo \"RUN LTP CASE $case_name\"
+  case_count=$((case_count + 1))
   run_case_with_timeout \"$file\"
   ret=$?
   echo \"FAIL LTP CASE $case_name : $ret\"
 done
 
-echo \"#### OS COMP TEST GROUP END ltp ####\"
+echo \"#### OS COMP TEST GROUP END __LTP_SUITE_TAG__ ####\"
 ";
-    let script = script_template.replace("__LTP_START_FROM_DEFAULT__", start_from_default);
+    let script = script_template
+        .replace("__LTP_START_FROM_DEFAULT__", start_from_default)
+        .replace("__LTP_SUITE_TAG__", suite_tag);
     let _ = write_embedded_elf(script_path, script.as_bytes());
     run_testcode(script_path, root)
 }
