@@ -642,34 +642,25 @@ fn run_suite(root: &str, suite: &str) -> i32 {
 fn run_ltp_suite(root: &str) -> i32 {
     let script_path = "/tmp/ltp_testcode_filtered.sh";
     let start_from_default = LTP_START_FROM.unwrap_or("");
-    let suite_tag = if root == "/glibc" {
-        "ltp-glibc"
-    } else {
-        "ltp-musl"
-    };
+    let start_from_line = format!(
+        "start_from=\"{}\"\nstarted=1\nif [ -n \"$start_from\" ]; then\n  started=0\nfi\n",
+        start_from_default
+    );
     // Run standalone LTP cases while skipping obvious helper/library entries
     // that are not meant to be launched directly (e.g. cgroup_fj_proc).
-    let script_template = "\
+    let script = if root == "/glibc" {
+        "\
 #!/bin/sh
-echo \"#### OS COMP TEST GROUP START __LTP_SUITE_TAG__ ####\"
+echo \"#### OS COMP TEST GROUP START ltp-glibc ####\"
 target_dir=\"ltp/testcases/bin\"
 export PATH=\"$PATH:./ltp/testcases/bin:./ltp/testcases/lib:./ltp/testcases/network/busy_poll:./ltp/testcases/kernel/controllers/cgroup_fj\"
 case_timeout=\"${LTP_CASE_TIMEOUT:-8}\"
 case_limit=\"${LTP_CASE_LIMIT:-10000}\"
 case_count=0
-start_from=\"__LTP_START_FROM_DEFAULT__\"
-if [ -z \"$start_from\" ]; then
-  start_from=\"${LTP_START_FROM:-}\"
-fi
-started=1
-if [ -n \"$start_from\" ]; then
-  started=0
-  echo \"LTP start marker enabled: $start_from\"
-fi
 
 is_skip_case() {
   case \"$1\" in
-    *.sh|*_helper|*_helper.sh|*_child|busy_poll_lib.sh|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|cpuctl_fj_*|cpuhotplug_do_*|cpuhotplug_report_*|crash*|dio_read|dio_sparse|epoll*|eventfd*|event_generator|execveat*|fanotify*|fanout*|f00f|faccessat201|faccessat202|fallocate02|fallocate04|fallocate05|fallocate06|fchmod02|fchmod05|fchown01_16|fchown02_16|fchown03_16|fchown04|fchown04_16|fchown05_16|fchownat02|fcntl01|fcntl01_64|fcntl07|fcntl07_64|fcntl09|fcntl09_64|fcntl10|fcntl10_64|fcntl11|fcntl11_64|fcntl12|fcntl12_64|fcntl14|fcntl14_64|fcntl15|fcntl15_64|fcntl16|fcntl16_64|fcntl17|fcntl17_64|fcntl19|fcntl19_64|fcntl20|fcntl20_64|fcntl21|fcntl21_64|fcntl2[2-7]*|fcntl30|fcntl30_64|fcntl31|fcntl31_64|fcntl32|fcntl32_64|fcntl33|fcntl33_64|fcntl34|fcntl34_64|fcntl35|fcntl35_64|fcntl36|fcntl36_64|fcntl37|fcntl37_64|fcntl38|fcntl38_64|fcntl39|fcntl39_64|fdatasync02|fdatasync03|fgetxattr*|flistxattr*|find_portbundle|finit_module*|float_*|flock01|flock02|flock03|flock04|fork05|fork07|fork09|fork13|fork14|fork_exec_loop|fptest*|frag|fremovexattr*|fs_di|fs_fill|fs_inod|fs_perms|fsconfig*|fsetxattr*|fsmount*|fsopen*|fspick*|fsstress|fstatfs01|fstatfs01_64|fsx-linux|fsync*|ftest01|ftest02|ftest03|ftest04|ftest06|ftest07|ftest08|ftruncate01|ftruncate01_64|ftruncate04|ftruncate04_64|futex_cmp_requeue*|futex_wait03|futex_wait05|futex_wait_bitset*|futex_waitv*|futex_wake02|futex_wake04|futimesat01|fw_load|gen*|\
+    *.sh|*_helper|*_helper.sh|*_child|busy_poll_lib.sh|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|cpuctl_fj_*|cpuhotplug_do_*|cpuhotplug_report_*|cpuset*|crash*|dio_read|dio_sparse|epoll*|eventfd*|event_generator|execveat*|fanotify*|fanout*|f00f|faccessat201|faccessat202|fallocate02|fallocate04|fallocate05|fallocate06|fchmod02|fchmod05|fchown01_16|fchown02_16|fchown03_16|fchown04|fchown04_16|fchown05_16|fchownat02|fcntl01|fcntl01_64|fcntl07|fcntl07_64|fcntl09|fcntl09_64|fcntl10|fcntl10_64|fcntl11|fcntl11_64|fcntl12|fcntl12_64|fcntl14|fcntl14_64|fcntl15|fcntl15_64|fcntl16|fcntl16_64|fcntl17|fcntl17_64|fcntl19|fcntl19_64|fcntl20|fcntl20_64|fcntl21|fcntl21_64|fcntl2[2-7]*|fcntl30|fcntl30_64|fcntl31|fcntl31_64|fcntl32|fcntl32_64|fcntl33|fcntl33_64|fcntl34|fcntl34_64|fcntl35|fcntl35_64|fcntl36|fcntl36_64|fcntl37|fcntl37_64|fcntl38|fcntl38_64|fcntl39|fcntl39_64|fdatasync02|fdatasync03|fgetxattr*|flistxattr*|find_portbundle|finit_module*|float_*|flock01|flock02|flock03|flock04|fork05|fork07|fork09|fork13|fork14|fork_exec_loop|fptest*|frag|fremovexattr*|fs_di|fs_fill|fs_inod|fs_perms|fsconfig*|fsetxattr*|fsmount*|fsopen*|fspick*|fsstress|fstatfs01|fstatfs01_64|fsx-linux|fsync*|ftest01|ftest02|ftest03|ftest04|ftest06|ftest07|ftest08|ftruncate01|ftruncate01_64|ftruncate04|ftruncate04_64|futex_cmp_requeue*|futex_wait03|futex_wait05|futex_wait_bitset*|futex_waitv*|futex_wake02|futex_wake04|futimesat01|fw_load|gen*|\
     creat04|creat05|creat07|creat08|creat09|copy_file_range*|crypto_user*|cve-*|delete_module*|diotest2|dio_append|dio_truncate|dirtyc0w*|dirtypipe|dma_thread_diotest|dup05|ebizzy|eject_check_tray|endian_switch01|exec_with_inh|exec_without_inh|execve02|execve04|execve05|getxattr0[2-4]|hackbench|inode02|kill08|kill10|kill11|leapsec01|lftest|mallocstress|memcg*|mmap1|mmap3|mmapstress*|mmstress|mremap*|mtest*|nanosleep04|pause*|pids_task*|pipe13|ppoll*|prot_hsymlinks|pselect02*|pthcli|pthserv|select04*|sendfile07*|setfsgid03*|shm_test*|signal01*|starvation*|tgkill*|timed_forkbomb*|waitpid08*|chdir01|clock_nanosleep*|close_range01)
       return 0
       ;;
@@ -687,8 +678,6 @@ run_case_with_timeout() {
   while kill -0 \"$case_pid\" 2>/dev/null; do
     if [ \"$elapsed\" -ge \"$case_timeout\" ]; then
       kill -9 \"$case_pid\" 2>/dev/null
-      # Some buggy/hung tests may enter an uninterruptible state; waiting here
-      # can block the whole LTP run forever. Return timeout directly instead.
       echo \"TIMEOUT LTP CASE $(basename \"$case_file\")\"
       return 124
     fi
@@ -700,8 +689,8 @@ run_case_with_timeout() {
 }
 
 for file in \"$target_dir\"/*; do
-  [ -f \"$file\" ] || continue
-  case_name=$(basename \"$file\")
+    [ -f \"$file\" ] || continue
+    case_name=$(basename \"$file\")
   if [ \"$started\" -eq 0 ]; then
     if [ \"$case_name\" = \"$start_from\" ]; then
       started=1
@@ -710,25 +699,87 @@ for file in \"$target_dir\"/*; do
       continue
     fi
   fi
-  if is_skip_case \"$case_name\"; then
-    continue
-  fi
-  if [ \"$case_count\" -ge \"$case_limit\" ]; then
-    echo \"LTP case limit reached: $case_limit\"
-    break
-  fi
-  echo \"RUN LTP CASE $case_name\"
-  case_count=$((case_count + 1))
-  run_case_with_timeout \"$file\"
-  ret=$?
-  echo \"FAIL LTP CASE $case_name : $ret\"
+    if is_skip_case \"$case_name\"; then
+        continue
+    fi
+    if [ \"$case_count\" -ge \"$case_limit\" ]; then
+        echo \"LTP case limit reached: $case_limit\"
+        break
+    fi
+    echo \"RUN LTP CASE $case_name\"
+    case_count=$((case_count + 1))
+    run_case_with_timeout \"$file\"
+    ret=$?
+    echo \"FAIL LTP CASE $case_name : $ret\"
 done
 
-echo \"#### OS COMP TEST GROUP END __LTP_SUITE_TAG__ ####\"
-";
-    let script = script_template
-        .replace("__LTP_START_FROM_DEFAULT__", start_from_default)
-        .replace("__LTP_SUITE_TAG__", suite_tag);
+echo \"#### OS COMP TEST GROUP END ltp-glibc ####\"
+"
+    } else {
+        "\
+#!/bin/sh
+echo \"#### OS COMP TEST GROUP START ltp-musl ####\"
+target_dir=\"ltp/testcases/bin\"
+export PATH=\"$PATH:./ltp/testcases/bin:./ltp/testcases/lib:./ltp/testcases/network/busy_poll:./ltp/testcases/kernel/controllers/cgroup_fj\"
+case_timeout=\"${LTP_CASE_TIMEOUT:-8}\"
+case_limit=\"${LTP_CASE_LIMIT:-10000}\"
+case_count=0
+
+is_skip_case() {
+    case \"$1\" in
+        *.sh|*_helper|*_helper.sh|*_child|busy_poll_lib.sh|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|cpuctl_fj_*|cpuhotplug_do_*|cpuhotplug_report_*|cpuset*|crash*|dio_read|dio_sparse|epoll*|eventfd*|event_generator|execveat*|fanotify*|fanout*|f00f|faccessat201|faccessat202|fallocate02|fallocate04|fallocate05|fallocate06|fchmod02|fchmod05|fchown01_16|fchown02_16|fchown03_16|fchown04|fchown04_16|fchown05_16|fchownat02|fcntl01|fcntl01_64|fcntl07|fcntl07_64|fcntl09|fcntl09_64|fcntl10|fcntl10_64|fcntl11|fcntl11_64|fcntl12|fcntl12_64|fcntl14|fcntl14_64|fcntl15|fcntl15_64|fcntl16|fcntl16_64|fcntl17|fcntl17_64|fcntl19|fcntl19_64|fcntl20|fcntl20_64|fcntl21|fcntl21_64|fcntl2[2-7]*|fcntl30|fcntl30_64|fcntl31|fcntl31_64|fcntl32|fcntl32_64|fcntl33|fcntl33_64|fcntl34|fcntl34_64|fcntl35|fcntl35_64|fcntl36|fcntl36_64|fcntl37|fcntl37_64|fcntl38|fcntl38_64|fcntl39|fcntl39_64|fdatasync02|fdatasync03|fgetxattr*|flistxattr*|find_portbundle|finit_module*|float_*|flock01|flock02|flock03|flock04|fork05|fork07|fork09|fork13|fork14|fork_exec_loop|fptest*|frag|fremovexattr*|fs_di|fs_fill|fs_inod|fs_perms|fsconfig*|fsetxattr*|fsmount*|fsopen*|fspick*|fsstress|fstatfs01|fstatfs01_64|fsx-linux|fsync*|ftest01|ftest02|ftest03|ftest04|ftest06|ftest07|ftest08|ftruncate01|ftruncate01_64|ftruncate04|ftruncate04_64|futex_cmp_requeue*|futex_wait03|futex_wait05|futex_wait_bitset*|futex_waitv*|futex_wake02|futex_wake04|futimesat01|fw_load|gen*|\
+        creat04|creat05|creat07|creat08|creat09|copy_file_range*|crypto_user*|cve-*|delete_module*|diotest2|dio_append|dio_truncate|dirtyc0w*|dirtypipe|dma_thread_diotest|dup05|ebizzy|eject_check_tray|endian_switch01|exec_with_inh|exec_without_inh|execve02|execve04|execve05|getxattr0[2-4]|hackbench|inode02|kill08|kill10|kill11|leapsec01|lftest|mallocstress|memcg*|mmap1|mmap3|mmapstress*|mmstress|mremap*|mtest*|nanosleep04|pause*|pids_task*|pipe13|ppoll*|prot_hsymlinks|pselect02*|pthcli|pthserv|select04*|sendfile07*|setfsgid03*|shm_test*|signal01*|starvation*|tgkill*|timed_forkbomb*|waitpid08*|chdir01|clock_nanosleep*|close_range01)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+run_case_with_timeout() {
+    case_file=\"$1\"
+    \"$case_file\" &
+    case_pid=$!
+    elapsed=0
+    while kill -0 \"$case_pid\" 2>/dev/null; do
+        if [ \"$elapsed\" -ge \"$case_timeout\" ]; then
+            kill -9 \"$case_pid\" 2>/dev/null
+            wait \"$case_pid\" 2>/dev/null
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait \"$case_pid\"
+    return $?
+}
+
+for file in \"$target_dir\"/*; do
+        [ -f \"$file\" ] || continue
+        case_name=$(basename \"$file\")
+        if is_skip_case \"$case_name\"; then
+                continue
+        fi
+        if [ \"$case_count\" -ge \"$case_limit\" ]; then
+                echo \"LTP case limit reached: $case_limit\"
+                break
+        fi
+        echo \"RUN LTP CASE $case_name\"
+        case_count=$((case_count + 1))
+        run_case_with_timeout \"$file\"
+        ret=$?
+        echo \"FAIL LTP CASE $case_name : $ret\"
+done
+
+echo \"#### OS COMP TEST GROUP END ltp-musl ####\"
+"
+    };
+    let script = script.replacen(
+        "case_count=0\n",
+        format!("case_count=0\n{}", start_from_line).as_str(),
+        1,
+    );
     let _ = write_embedded_elf(script_path, script.as_bytes());
     run_testcode(script_path, root)
 }
