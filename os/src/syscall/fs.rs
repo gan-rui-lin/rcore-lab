@@ -1,6 +1,7 @@
 //! File and filesystem-related syscalls
 use super::errno::*;
 use super::process::{get_current_umask, TimeSpec};
+use crate::config::PAGE_SIZE;
 use crate::fs::{
     create_dir, make_pipe, open_file, path_exists, path_is_dir, remove_path, DevNull, DevUrandom,
     DevZero, OpenFlags, PollEvents, Stat, StatMode,
@@ -646,7 +647,7 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
         return Ok(());
     }
     let mut offset = 0usize;
-    let Some(slices) = translated_byte_buffer_checked(token, dst, data.len(), true) else {
+    let Some(slices) = translated_user_write_buffer(token, dst as *const u8, data.len()) else {
         return Err(errno(EFAULT));
     };
     for slice in slices {
@@ -664,6 +665,36 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
     }
 }
 
+fn try_resolve_user_cow_writable(token: usize, ptr: *const u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let start = ptr as usize;
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    let page_table = crate::mm::PageTable::from_token(token);
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let mut va = start;
+    while va < end {
+        let vpn = crate::mm::VirtAddr::from(va).floor();
+        let Some(pte) = page_table.translate(vpn) else {
+            return false;
+        };
+        let flags = pte.flags();
+        if !pte.is_valid() || !flags.contains(crate::mm::PTEFlags::U) {
+            return false;
+        }
+        if !flags.contains(crate::mm::PTEFlags::W) && !inner.memory_set.handle_cow_fault(va) {
+            return false;
+        }
+        let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
+        va = next_page.max(va + 1);
+    }
+    true
+}
+
 fn translated_user_write_buffer(
     token: usize,
     ptr: *const u8,
@@ -672,8 +703,13 @@ fn translated_user_write_buffer(
     if let Some(buffers) = translated_byte_buffer_checked(token, ptr, len, true) {
         return Some(buffers);
     }
-    // COW fallback is currently enabled only for fork-* tests to avoid
-    // regressing non-fork direct-IO permission checks.
+    if try_resolve_user_cow_writable(token, ptr, len) {
+        if let Some(buffers) = translated_byte_buffer_checked(token, ptr, len, true) {
+            return Some(buffers);
+        }
+    }
+    // Legacy fallback for a few fork-* tests that still rely on permissive
+    // kernel writes even when PTE.W is temporarily absent.
     let process = current_process();
     let proc_name = process.inner_exclusive_access().name.clone();
     if !proc_name.starts_with("fork") {

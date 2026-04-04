@@ -4,7 +4,7 @@
 pub use arch::{CLOCK_FREQ, MEMORY_END, MMIO};
 
 /// user app's stack size
-pub const USER_STACK_SIZE: usize = 4096 * 128; // 512KB, needed for deep recursion (regex) and glibc
+pub const USER_STACK_SIZE: usize = 4096 * 512; // 2MB, gives enough headroom for deep LTP stacks
 /// fixed user stack top for all architectures
 pub const USER_STACK_TOP: usize = 0x8_0000_0000;
 /// fixed mmap base top for all architectures

@@ -51,7 +51,8 @@ pub use manager::{
     remove_task, wakeup_task,
 };
 pub use process::{
-    IntervalTimerState, RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY,
+    ChildWaitEvent, IntervalTimerState, RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK,
+    RLIM_INFINITY,
 };
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
@@ -604,6 +605,8 @@ pub fn handle_signals() {
 
     // 9. 处理内核信号（SIGSTOP、SIGKILL）
     if signum == signal::SIGSTOP {
+        process_inner.child_wait_event = Some(ChildWaitEvent::Stopped(signal::SIGSTOP as i32));
+        process_inner.group_stopped = true;
         drop(task_inner);
         drop(process_inner);
         block_current_and_run_next();
@@ -698,11 +701,15 @@ pub fn handle_signals() {
             }
             // SIGCONT: 恢复被停止的进程（目前简单忽略）
             signal::SIGCONT => {
+                process_inner.child_wait_event = Some(ChildWaitEvent::Continued(signal::SIGCONT as i32));
+                process_inner.group_stopped = false;
                 debug!("[signal] pid={} SIGCONT default=continue", pid);
                 return;
             }
             // 默认停止的信号
             signal::SIGTSTP | signal::SIGTTIN | signal::SIGTTOU => {
+                process_inner.child_wait_event = Some(ChildWaitEvent::Stopped(signum as i32));
+                process_inner.group_stopped = true;
                 debug!("[signal] pid={} signum={} default=stop", pid, signum);
                 drop(task_inner);
                 drop(process_inner);

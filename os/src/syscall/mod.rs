@@ -110,6 +110,8 @@ const SYSCALL_GETRANDOM: usize = 278;
 const SYSCALL_EXIT: usize = 93;
 /// exit_group syscall
 const SYSCALL_EXIT_GROUP: usize = 94;
+/// waitid syscall
+const SYSCALL_WAITID: usize = 95;
 /// set_tid_address syscall
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
 /// futex syscall
@@ -788,6 +790,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             log::warn!("[exit_group] pid={} name={} code={}", pid, name, args[0] as i32);
             sys_exit_group(args[0] as i32)
         }
+        SYSCALL_WAITID => sys_waitid(
+            args[0],
+            args[1],
+            args[2] as *mut u8,
+            args[3] as i32,
+            args[4] as *mut u8,
+        ),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
         SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => {

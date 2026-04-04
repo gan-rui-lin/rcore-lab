@@ -19,7 +19,7 @@ pub use console::{flush, STDIN, STDOUT};
 pub use errno::*;
 pub use syscall::*;
 
-const USER_HEAP_SIZE: usize = 16384;
+const USER_HEAP_SIZE: usize = 65536;
 
 static mut HEAP_SPACE: [u8; USER_HEAP_SIZE] = [0; USER_HEAP_SIZE];
 
