@@ -837,8 +837,6 @@ fn run_all_suites() {
 
     for root in TEST_LIBC_ROOTS {
         println!("\n########## Running {} suites ##########", root);
-        #[cfg(target_arch = "loongarch64")]
-        shutdown();
         for suite in TEST_SUITES {
             // println!("\n[{}] Running {} / {}", total, root, suite);
             // println!("------------------------------------------");

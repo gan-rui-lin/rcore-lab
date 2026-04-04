@@ -4,7 +4,8 @@
 BUILD_TYPE="la"
 KERNEL_FILE="kernel-la"
 IMAGE_FILE="sdcard-la.img"
-DATA_DISK="disk-la.img"
+# Keep data disk optional by default. For la/rv parity we only require sdcard-la.img.
+DATA_DISK="${DATA_DISK-}"
 MEMORY="1G"
 SMP="1"
 GDB_DEBUG="0"
@@ -16,7 +17,8 @@ usage() {
     echo "Options:"
     echo "  -t, --type TYPE      build type (all/debug), default: $BUILD_TYPE"
     echo "  -f, --file FILE      root fs image, default: $IMAGE_FILE"
-    echo "  --data-disk FILE     extra data disk image, default: $DATA_DISK"
+    echo "  --data-disk FILE     extra data disk image (optional)"
+    echo "  --no-data-disk       disable extra data disk"
     echo "  -m, --mem SIZE       memory size, default: $MEMORY"
     echo "  -s, --smp N          smp cores, default: $SMP"
     echo "  -d                   enable GDB (-s -S)"
@@ -42,6 +44,10 @@ while [[ $# -gt 0 ]]; do
         --data-disk)
             DATA_DISK="$2"
             shift 2
+            ;;
+        --no-data-disk)
+            DATA_DISK=""
+            shift
             ;;
         -m|--mem)
             MEMORY="$2"
@@ -155,6 +161,18 @@ fi
 
 if [[ -n "$GDB_FLAGS" ]]; then
     QEMU_CMD+=( $GDB_FLAGS )
+fi
+
+if ! command -v "${QEMU_CMD[0]}" >/dev/null 2>&1; then
+    if [[ -x "$HOME/.local/bin/qemu-system-loongarch64" ]]; then
+        QEMU_CMD[0]="$HOME/.local/bin/qemu-system-loongarch64"
+    elif [[ -x "$HOME/.local/qemu-9.2.1/bin/qemu-system-loongarch64" ]]; then
+        QEMU_CMD[0]="$HOME/.local/qemu-9.2.1/bin/qemu-system-loongarch64"
+    else
+        echo "Error: qemu-system-loongarch64 not found in PATH."
+        echo "Hint: export PATH=\"\$HOME/.local/bin:\$PATH\""
+        exit 1
+    fi
 fi
 
 echo "Starting QEMU..."
