@@ -496,6 +496,13 @@ fn proc_sys_kernel() -> Arc<dyn VfsInode> {
         String::from("sched_rt_period_us"),
         ProcFileInode::new(|| String::from("1000000\n")),
     );
+    // waitid10 reads /proc/sys/kernel/core_pattern during setup.
+    // Return a plain filename pattern (not a pipe handler) so tests
+    // expecting non-dumped CLD_KILLED behavior can proceed.
+    entries.insert(
+        String::from("core_pattern"),
+        ProcFileInode::new(|| String::from("core\n")),
+    );
     ProcStaticDirInode::new(entries)
 }
 
