@@ -614,8 +614,10 @@ fn run_testcode(script_path: &str, root: &str) -> i32 {
         exit(-1);
     } else {
         let mut status: i32 = 0;
-        // Use waitpid(pid) instead of wait(-1) to avoid reaping
-        // orphan grandchildren (e.g. iperf3 daemon forks).
+        // Wait for the suite runner itself, but opportunistically reap any
+        // other exited children while we are polling. This prevents long LTP
+        // runs from accumulating many zombies and exhausting kernel resources.
+        let mut suite_done = false;
         loop {
             let ret = user_lib::waitpid(pid as usize, &mut status);
             if ret == pid {
@@ -625,7 +627,30 @@ fn run_testcode(script_path: &str, root: &str) -> i32 {
                 // error other than EAGAIN
                 break;
             }
-            // ret == -2 (EAGAIN) or reaped wrong child, keep waiting
+
+            // Reap any exited orphan children of initproc in a bounded loop.
+            let mut reap_rounds = 0usize;
+            loop {
+                if reap_rounds >= 64 {
+                    break;
+                }
+                let mut orphan_status: i32 = 0;
+                let orphan = user_lib::waitpid_nohang(-1i32 as usize, &mut orphan_status);
+                if orphan > 0 {
+                    if orphan == pid {
+                        status = orphan_status;
+                        suite_done = true;
+                        break;
+                    }
+                    reap_rounds += 1;
+                    continue;
+                }
+                break;
+            }
+            if suite_done {
+                break;
+            }
+            user_lib::sys_yield();
         }
         println!("=== {} completed (status=0x{:x}) ===\n", script_path, status);
         status
