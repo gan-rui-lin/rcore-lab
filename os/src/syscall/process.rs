@@ -2972,6 +2972,12 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
         Some(process) => process,
         None => return errno(ESRCH),
     };
+    // Keep initproc alive as test harness root process.
+    // Linux pid 1 has special signal semantics; for our lab runtime we
+    // conservatively reject external kill to pid 1.
+    if process.getpid() == 1 && pid_now != 1 {
+        return errno(EPERM);
+    }
     let mut inner = process.inner_exclusive_access();
     let mut yielded_after_continue = false;
     if flag == SignalFlags::SIGCONT && inner.group_stopped {
@@ -3085,6 +3091,9 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
     // Fallback: try as a global PID (for cross-process tkill)
     if let Some(process) = pid2process(tid) {
         let process_pid = process.getpid();
+        if process_pid == 1 && pid_now != 1 {
+            return errno(EPERM);
+        }
         let inner = process.inner_exclusive_access();
         let ret = send_signal_to_task_from_list(tid, process_pid, &inner.tasks, flag);
         drop(inner);
