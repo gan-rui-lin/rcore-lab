@@ -254,6 +254,7 @@ impl ProcessControlBlock {
         Some(tcb_addr)
     }
 
+    #[track_caller]
     pub fn inner_exclusive_access(&self) -> UPIntrRefMut<'_, ProcessControlBlockInner> {
         self.inner.exclusive_access()
     }

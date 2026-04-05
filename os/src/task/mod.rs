@@ -256,9 +256,20 @@ pub fn exit_current_and_run_next(exit_code: i32) {
                 copied
             );
         }
-        {
+        if Arc::ptr_eq(&process, &INITPROC) {
+            warn!("[exit] initproc is exiting; skip reparent-to-initproc");
+            for child in process_inner.children.iter() {
+                if Arc::ptr_eq(child, &process) {
+                    continue;
+                }
+                child.inner_exclusive_access().parent = None;
+            }
+        } else {
             let mut initproc_inner = INITPROC.inner_exclusive_access();
             for child in process_inner.children.iter() {
+                if Arc::ptr_eq(child, &INITPROC) {
+                    continue;
+                }
                 child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
                 initproc_inner.children.push(child.clone());
             }
