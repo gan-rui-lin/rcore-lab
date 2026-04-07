@@ -8,7 +8,7 @@ mod vfs;
 use crate::mm::UserBuffer;
 #[cfg(feature = "ext4")]
 use alloc::ffi::CString;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 #[cfg(feature = "ext4")]
 use lwext4_rust::bindings::ext4_flink;
@@ -24,13 +24,17 @@ pub trait File: Send + Sync {
     fn read(&self, buf: UserBuffer) -> usize;
     /// write to the file from buf, return the number of bytes written
     fn write(&self, buf: UserBuffer) -> usize;
+    /// write to the file from buf, returning either bytes written or errno
+    fn write_user_buffer(&self, buf: UserBuffer) -> Result<usize, isize> {
+        Ok(self.write(buf))
+    }
     /// read entire file content into a buffer
     fn read_all(&self) -> Vec<u8> {
         Vec::new()
     }
     /// poll the file for events, return the events bitflags
     /// default implementation returns POLLIN | POLLOUT, which means always readable and writable.
-    /// ! for files that are not always ready, e.g. pipes, this should be overridden to return the actual events. 
+    /// ! for files that are not always ready, e.g. pipes, this should be overridden to return the actual events.
     fn poll(&self, _events: PollEvents) -> PollEvents {
         PollEvents::POLLIN | PollEvents::POLLOUT
     }
@@ -82,6 +86,40 @@ pub trait File: Send + Sync {
     fn set_connected_remote(&self, _addr: smoltcp::wire::IpEndpoint) {}
     /// Optional: get the connected remote endpoint for UDP sockets (used by getpeername()).
     fn get_connected_remote(&self) -> Option<smoltcp::wire::IpEndpoint> { None }
+    /// Returns true if this file is an AF_UNIX domain socket.
+    fn is_unix_socket(&self) -> bool { false }
+    /// For AF_UNIX sockets: get address family (always 1) and socket type.
+    fn unix_socket_type(&self) -> u8 { 0 }
+    /// For AF_UNIX sockets: bind to a path.
+    /// `path`: the sun_path bytes (null-terminated or abstract if first byte is \0).
+    /// Returns 0 on success, negative errno on failure.
+    fn unix_do_bind(&self, _path: alloc::string::String, _is_abstract: bool) -> isize { -88 }
+    /// For AF_UNIX sockets: get the bound path (None if unbound).
+    fn unix_bound_path(&self) -> Option<alloc::string::String> { None }
+    /// For AF_UNIX sockets: mark as listening with given backlog.
+    fn unix_do_listen(&self, _backlog: usize) -> isize { -95 } // EOPNOTSUPP
+    /// For AF_UNIX sockets: accept a pending connection. Returns new socket file or None.
+    fn unix_do_accept(&self) -> Option<alloc::sync::Arc<dyn File>> { None }
+    /// For AF_UNIX sockets: connect to a listening socket.
+    fn unix_do_connect(&self, _path: alloc::string::String, _is_abstract: bool) -> isize { -111 } // ECONNREFUSED
+    /// For AF_UNIX sockets: read data, returns bytes read.
+    fn unix_read(&self, _buf: &mut [u8]) -> isize { 0 }
+    /// For AF_UNIX sockets: write data, returns bytes written.
+    fn unix_write(&self, _buf: &[u8]) -> isize { -32 } // EPIPE
+    /// For AF_UNIX sockets: peek/check if readable.
+    fn unix_readable(&self) -> bool { false }
+    /// For AF_UNIX sockets: poll events.
+    fn unix_poll(&self, _events: PollEvents) -> PollEvents { PollEvents::empty() }
+    /// For AF_UNIX sockets: push bytes into receive queue (internal use).
+    fn unix_push_rx_bytes(&self, _data: &[u8]) -> usize { 0 }
+    /// For AF_UNIX sockets: push an accepted socket into listen backlog (internal use).
+    fn unix_push_backlog(&self, _sock: Arc<dyn File>) {}
+    /// For AF_UNIX sockets: set peer socket by dynamic weak pointer (internal use).
+    fn unix_set_peer_dyn(&self, _peer: Weak<dyn File>) {}
+    /// For AF_UNIX sockets: mark peer as closed (internal use).
+    fn unix_mark_peer_closed(&self) {}
+    /// For AF_UNIX sockets: get current internal state code.
+    fn unix_get_state_u8(&self) -> u8 { 0 }
 }
 
 /// Linux-compatible stat layout (riscv64, matches musl struct stat).
@@ -142,10 +180,14 @@ bitflags! {
         const TRUNC = 1 << 9;
         /// append
         const APPEND = 1 << 10;
+        /// direct I/O
+        const DIRECT = 1 << 14;
         /// must be a directory
         const DIRECTORY = 1 << 16;
         /// close-on-exec
         const CLOEXEC = 1 << 19;
+        /// path-only descriptor (Linux O_PATH on riscv64)
+        const PATH = 1 << 21;
     }
 }
 
@@ -160,7 +202,6 @@ impl OpenFlags {
         }
     }
 }
-
 
 bitflags::bitflags! {
     /// Poll events for file polling.
@@ -180,6 +221,7 @@ bitflags::bitflags! {
     }
 }
 
+pub use pipe::make_pipe;
 #[cfg(feature = "ext4")]
 /// Mount ext4 as root with explicit device size.
 pub use vfs::mount_ext4;
@@ -191,7 +233,6 @@ pub use vfs::{
     path_exists, path_is_dir, remove_path,
 };
 pub use memfd::MemFdFile;
-pub use pipe::make_pipe;
 pub use stdio::{DevNull, DevUrandom, DevZero, Stdin, Stdout};
 
 /// Create minimal /etc and /dev files used by BusyBox tests.
@@ -204,18 +245,29 @@ pub fn ensure_basic_paths() {
     create_dir("/usr");
     create_dir("/usr/bin");
     create_dir("/tmp");
+    create_dir("/root");
 
-    write_file_if_missing(
-        "/etc/passwd",
-        "root:x:0:0:root:/root:/bin/sh\n",
-    );
+    write_file_if_missing("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n");
     write_file_if_missing("/etc/group", "root:x:0:\n");
+    append_line_if_missing("/etc/passwd", "nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n");
+    append_line_if_missing("/etc/group", "nogroup:x:65534:\n");
     write_file_if_missing("/etc/localtime", "");
     write_file_if_missing("/etc/adjtime", "");
-    // netperf needs /etc/protocols for getprotobyname()
-    write_file_if_missing(
+    // Keep /etc/protocols deterministic for getprotobyname()-based tests.
+    write_file_overwrite(
         "/etc/protocols",
-        "ip\t0\tIP\nicmp\t1\tICMP\ntcp\t6\tTCP\nudp\t17\tUDP\n",
+        "hopopt\t0\tHOPOPT\tip\tIP\n\
+icmp\t1\tICMP\n\
+tcp\t6\tTCP\n\
+udp\t17\tUDP\n\
+ipv6\t41\tIPv6\n\
+ipv6-route\t43\tIPv6-Route\n\
+ipv6-frag\t44\tIPv6-Frag\n\
+esp\t50\tIPSEC-ESP\n\
+ah\t51\tIPSEC-AH\n\
+ipv6-icmp\t58\tIPv6-ICMP\n\
+ipv6-nonxt\t59\tIPv6-NoNxt\n\
+ipv6-opts\t60\tIPv6-Opts\n",
     );
 
     write_file_if_missing("/dev/null", "");
@@ -233,14 +285,48 @@ fn write_file_if_missing(path: &str, content: &str) {
     if path_exists(path) {
         return;
     }
-    let Some(file) = open_file(path, OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY)
-    else {
+    let Some(file) = open_file(
+        path,
+        OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY,
+    ) else {
         return;
     };
     let Some(inode) = file.inode() else {
         return;
     };
     let _ = inode.write_at(0, content.as_bytes());
+}
+
+fn write_file_overwrite(path: &str, content: &str) {
+    let Some(file) = open_file(
+        path,
+        OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY,
+    ) else {
+        return;
+    };
+    let Some(inode) = file.inode() else {
+        return;
+    };
+    let _ = inode.write_at(0, content.as_bytes());
+}
+
+fn append_line_if_missing(path: &str, line: &str) {
+    let Some(file) = open_file(path, OpenFlags::RDWR) else {
+        return;
+    };
+    let Some(inode) = file.inode() else {
+        return;
+    };
+    let existing = file.read_all();
+    if existing.windows(line.len()).any(|window| window == line.as_bytes()) {
+        return;
+    }
+    let mut data = existing;
+    if !data.is_empty() && !data.ends_with(b"\n") {
+        data.push(b'\n');
+    }
+    let offset = data.len();
+    let _ = inode.write_at(offset, line.as_bytes());
 }
 
 #[cfg(feature = "ext4")]
@@ -266,7 +352,10 @@ fn ensure_hardlink(linkpath: &str, target: &str) {
     if rc == 0 {
         info!("ext4: created hardlink {} -> {}", linkpath, target);
     } else {
-        warn!("ext4: hardlink create failed {} -> {} rc={}", linkpath, target, rc);
+        warn!(
+            "ext4: hardlink create failed {} -> {} rc={}",
+            linkpath, target, rc
+        );
     }
 }
 
@@ -283,8 +372,7 @@ pub fn ensure_busybox_links() {
 
     debug!(
         "[ext4] ensure busybox links strict mode: musl={} glibc={}",
-        has_musl_busybox,
-        has_glibc_busybox
+        has_musl_busybox, has_glibc_busybox
     );
 
     create_dir("/bin");
@@ -345,7 +433,7 @@ pub fn ensure_busybox_links() {
     }
 
     if open_file("/bin/sh", OpenFlags::empty()).is_none() {
-        if has_musl_busybox && !has_glibc_busybox {
+        if has_musl_busybox {
             ensure_hardlink("/bin/sh", "/musl/busybox");
             ensure_hardlink("/bin/basename", "/musl/busybox");
             ensure_hardlink("/bin/ls", "/musl/busybox");
@@ -353,7 +441,7 @@ pub fn ensure_busybox_links() {
             ensure_hardlink("/usr/bin/basename", "/musl/busybox");
             ensure_hardlink("/usr/bin/ls", "/musl/busybox");
             ensure_hardlink("/usr/bin/sleep", "/musl/busybox");
-        } else if has_glibc_busybox && !has_musl_busybox {
+        } else if has_glibc_busybox {
             ensure_hardlink("/bin/sh", "/glibc/busybox");
             ensure_hardlink("/bin/basename", "/glibc/busybox");
             ensure_hardlink("/bin/ls", "/glibc/busybox");
@@ -361,8 +449,6 @@ pub fn ensure_busybox_links() {
             ensure_hardlink("/usr/bin/basename", "/glibc/busybox");
             ensure_hardlink("/usr/bin/ls", "/glibc/busybox");
             ensure_hardlink("/usr/bin/sleep", "/glibc/busybox");
-        } else {
-            warn!("[ext4] both /musl/busybox and /glibc/busybox exist, skip creating /bin/sh in strict mode");
         }
     }
 

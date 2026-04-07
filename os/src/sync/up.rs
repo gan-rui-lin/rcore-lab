@@ -1,8 +1,9 @@
 //! Uniprocessor interior mutability primitives
+use arch::{disable_interrupts, enable_interrupts, interrupts_enabled};
+use core::any::type_name;
 use core::cell::{RefCell, RefMut, UnsafeCell};
 use core::ops::{Deref, DerefMut};
 use lazy_static::lazy_static;
-use arch::{disable_interrupts, enable_interrupts, interrupts_enabled};
 
 /// Wrap a static data structure inside it so that we are
 /// able to access it without any `unsafe`.
@@ -61,6 +62,12 @@ struct IntrMaskingInfo {
     sie_before_masking: bool,
 }
 
+#[derive(Copy, Clone)]
+struct BorrowSite {
+    file: &'static str,
+    line: u32,
+}
+
 lazy_static! {
     static ref INTR_MASKING_INFO: UPSafeCellRaw<IntrMaskingInfo> =
         unsafe { UPSafeCellRaw::new(IntrMaskingInfo::new()) };
@@ -94,33 +101,97 @@ impl IntrMaskingInfo {
 /// Interior-mutable cell that masks S-mode interrupts on access.
 pub struct UPIntrFreeCell<T> {
     inner: RefCell<T>,
+    last_borrow_site: UnsafeCell<Option<BorrowSite>>,
 }
 
 unsafe impl<T> Sync for UPIntrFreeCell<T> {}
 unsafe impl<T> Send for UPIntrFreeCell<T> {}
 
 /// RAII guard that automatically unmasks interrupts when dropped.
-pub struct UPIntrRefMut<'a, T>(Option<RefMut<'a, T>>);
+pub struct UPIntrRefMut<'a, T> {
+    inner: Option<RefMut<'a, T>>,
+    borrow_site: *mut Option<BorrowSite>,
+}
 
 impl<T> UPIntrFreeCell<T> {
     /// Create a new interrupt-masking cell.
     pub unsafe fn new(value: T) -> Self {
         Self {
             inner: RefCell::new(value),
+            last_borrow_site: UnsafeCell::new(None),
         }
     }
 
     /// Borrow the inner value while masking interrupts.
+    #[track_caller]
     pub fn exclusive_access(&self) -> UPIntrRefMut<'_, T> {
+        let caller = core::panic::Location::caller();
         INTR_MASKING_INFO.get_mut().enter();
-        UPIntrRefMut(Some(self.inner.borrow_mut()))
+        match self.inner.try_borrow_mut() {
+            Ok(inner) => {
+                unsafe {
+                    *self.last_borrow_site.get() = Some(BorrowSite {
+                        file: caller.file(),
+                        line: caller.line(),
+                    });
+                }
+                UPIntrRefMut {
+                    inner: Some(inner),
+                    borrow_site: self.last_borrow_site.get(),
+                }
+            }
+            Err(_) => {
+                let info = INTR_MASKING_INFO.get_mut();
+                let nested_level = info.nested_level;
+                let sie_before_masking = info.sie_before_masking;
+                let holder = unsafe { *self.last_borrow_site.get() };
+                let (holder_file, holder_line) = match holder {
+                    Some(site) => (site.file, site.line),
+                    None => ("unknown", 0),
+                };
+                // Keep interrupt nesting state balanced before panic diagnostics.
+                info.exit();
+                error!(
+                    "[upcell] exclusive_access conflict type={} cell={:p} caller={}:{} holder={}:{} nested_level={} sie_before_masking={}",
+                    type_name::<T>(),
+                    self as *const Self,
+                    caller.file(),
+                    caller.line(),
+                    holder_file,
+                    holder_line,
+                    nested_level,
+                    sie_before_masking
+                );
+                panic!(
+                    "UPIntrFreeCell borrow conflict: type={} caller={}:{} holder={}:{}",
+                    type_name::<T>(),
+                    caller.file(),
+                    caller.line(),
+                    holder_file,
+                    holder_line
+                );
+            }
+        }
     }
 
     /// Try to borrow the inner value while masking interrupts; returns None if already borrowed.
+    #[track_caller]
     pub fn try_exclusive_access(&self) -> Option<UPIntrRefMut<'_, T>> {
+        let caller = core::panic::Location::caller();
         INTR_MASKING_INFO.get_mut().enter();
         match self.inner.try_borrow_mut() {
-            Ok(refmut) => Some(UPIntrRefMut(Some(refmut))),
+            Ok(refmut) => {
+                unsafe {
+                    *self.last_borrow_site.get() = Some(BorrowSite {
+                        file: caller.file(),
+                        line: caller.line(),
+                    });
+                }
+                Some(UPIntrRefMut {
+                    inner: Some(refmut),
+                    borrow_site: self.last_borrow_site.get(),
+                })
+            }
             Err(_) => {
                 INTR_MASKING_INFO.get_mut().exit();
                 None
@@ -140,7 +211,10 @@ impl<T> UPIntrFreeCell<T> {
 
 impl<'a, T> Drop for UPIntrRefMut<'a, T> {
     fn drop(&mut self) {
-        self.0 = None;
+        self.inner = None;
+        unsafe {
+            *self.borrow_site = None;
+        }
         INTR_MASKING_INFO.get_mut().exit();
     }
 }
@@ -148,12 +222,12 @@ impl<'a, T> Drop for UPIntrRefMut<'a, T> {
 impl<'a, T> Deref for UPIntrRefMut<'a, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().unwrap().deref()
+        self.inner.as_ref().unwrap().deref()
     }
 }
 
 impl<'a, T> DerefMut for UPIntrRefMut<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut().unwrap().deref_mut()
+        self.inner.as_mut().unwrap().deref_mut()
     }
 }

@@ -1,19 +1,24 @@
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
-use super::{PidHandle, SignalAction, SignalActions, SignalFlags, TaskControlBlock, TlsArea, add_task, pid_alloc};
+use super::{
+    add_task, pid_alloc, PidHandle, SignalAction, SignalActions, SignalFlags, TaskControlBlock,
+    TlsArea,
+};
 use crate::config::{USER_MMAP_TOP, USER_STACK_SIZE};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{MemorySet, translated_byte_buffer, translated_ref, translated_refmut, translated_str};
+use crate::mm::{
+    translated_byte_buffer, translated_ref, translated_refmut, translated_str, MemorySet,
+};
+use crate::sync::UPIntrRefMut;
 use crate::sync::{Condvar, Mutex, Semaphore, UPIntrFreeCell};
-use arch::{TrapContext, TrapFrameArgs};
-use xmas_elf::ElfFile;
-use xmas_elf::sections::{SectionData, ShType};
-use xmas_elf::symbol_table::Entry;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use crate::sync::UPIntrRefMut;
+use arch::{TrapContext, TrapFrameArgs};
+use xmas_elf::sections::{SectionData, ShType};
+use xmas_elf::symbol_table::Entry;
+use xmas_elf::ElfFile;
 
 #[cfg(target_arch = "loongarch64")]
 const LOONGARCH_MIN_TCB_ADDR: usize = 0x7000_1000;
@@ -30,14 +35,23 @@ pub struct RLimit {
     pub rlim_max: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IntervalTimerState {
+    pub interval_us: usize,
+    pub remaining_us: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildWaitEvent {
+    Stopped(i32),
+    Continued(i32),
+}
+
 fn default_rlimits() -> [RLimit; RLIMIT_NLIMITS] {
-    let mut limits = [
-        RLimit {
-            rlim_cur: RLIM_INFINITY,
-            rlim_max: RLIM_INFINITY,
-        };
-        RLIMIT_NLIMITS
-    ];
+    let mut limits = [RLimit {
+        rlim_cur: RLIM_INFINITY,
+        rlim_max: RLIM_INFINITY,
+    }; RLIMIT_NLIMITS];
     let stack = USER_STACK_SIZE as u64;
     limits[RLIMIT_STACK] = RLimit {
         rlim_cur: stack,
@@ -102,17 +116,44 @@ pub struct ProcessControlBlockInner {
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
     pub name: String,
     pub cwd: String,
+    pub root_dir: String,
+    pub real_uid: u32,
+    pub effective_uid: u32,
+    pub saved_uid: u32,
+    pub fs_uid: u32,
+    pub real_gid: u32,
+    pub effective_gid: u32,
+    pub saved_gid: u32,
+    pub fs_gid: u32,
+    /// Nice value in Linux range [-20, 19], default 0.
+    pub nice: i32,
+    /// Capability sets (bit mask, Linux kernel format)
+    pub cap_permitted: u64,
+    pub cap_effective: u64,
+    pub cap_inheritable: u64,
+    pub cap_bounding: u64,
     pub heap_bottom: usize,
     pub program_brk: usize,
     pub mmap_base: usize,
     pub tls_area: Option<TlsArea>,
     pub rlimits: [RLimit; RLIMIT_NLIMITS],
+    pub itimers: [IntervalTimerState; 3],
     pub session_id: usize,
     pub pgid: usize,
+    /// Set by ptrace(PTRACE_TRACEME).
+    pub ptrace_traceme: bool,
+    /// Pending ptrace stop signal to be reported by waitpid.
+    pub ptrace_stop_signal: Option<i32>,
+    /// Pending non-exit child event to be reported by waitid(WSTOPPED/WCONTINUED).
+    pub child_wait_event: Option<ChildWaitEvent>,
+    /// True when the process is currently in a job-control stopped state.
+    pub group_stopped: bool,
     /// ITIMER_REAL: absolute expire time in ms, 0 = inactive.
     pub itimer_real_expire_ms: usize,
     /// ITIMER_REAL: interval for repeating timer in ms, 0 = one-shot.
     pub itimer_real_interval_ms: usize,
+    /// Parent process waiting on clone(CLONE_VM|CLONE_VFORK) synchronization.
+    pub vfork_vm_parent: Option<Weak<ProcessControlBlock>>,
 }
 
 impl ProcessControlBlockInner {
@@ -173,7 +214,10 @@ impl ProcessControlBlock {
     }
 
     #[cfg(target_arch = "loongarch64")]
-    fn alloc_minimal_tcb_if_needed(memory_set: &mut MemorySet, tls_area: &Option<TlsArea>) -> Option<usize> {
+    fn alloc_minimal_tcb_if_needed(
+        memory_set: &mut MemorySet,
+        tls_area: &Option<TlsArea>,
+    ) -> Option<usize> {
         if tls_area.is_none() {
             Some(Self::alloc_minimal_tcb(memory_set))
         } else {
@@ -182,7 +226,10 @@ impl ProcessControlBlock {
     }
 
     #[cfg(not(target_arch = "loongarch64"))]
-    fn alloc_minimal_tcb_if_needed(_memory_set: &mut MemorySet, _tls_area: &Option<TlsArea>) -> Option<usize> {
+    fn alloc_minimal_tcb_if_needed(
+        _memory_set: &mut MemorySet,
+        _tls_area: &Option<TlsArea>,
+    ) -> Option<usize> {
         None
     }
 
@@ -196,13 +243,18 @@ impl ProcessControlBlock {
     }
 
     #[cfg(not(target_arch = "loongarch64"))]
-    fn fallback_tcb_addr_if_no_tls(token: usize, ustack_top: usize, _minimal_tcb: Option<usize>) -> Option<usize> {
+    fn fallback_tcb_addr_if_no_tls(
+        token: usize,
+        ustack_top: usize,
+        _minimal_tcb: Option<usize>,
+    ) -> Option<usize> {
         let tcb_addr = ustack_top - 16;
         *translated_refmut(token, tcb_addr as *mut usize) = 0;
         *translated_refmut(token, (tcb_addr + 8) as *mut usize) = tcb_addr;
         Some(tcb_addr)
     }
 
+    #[track_caller]
     pub fn inner_exclusive_access(&self) -> UPIntrRefMut<'_, ProcessControlBlockInner> {
         self.inner.exclusive_access()
     }
@@ -221,12 +273,12 @@ impl ProcessControlBlock {
         } else {
             0
         };
-        let gp = find_global_pointer(elf_data).map(|v| v + load_base).unwrap_or(0);
+        let gp = find_global_pointer(elf_data)
+            .map(|v| v + load_base)
+            .unwrap_or(0);
 
         // Initialize TLS if PT_TLS segment exists
-        let tls_area = tls_info.map(|info| {
-            TlsArea::new(&info, &mut memory_set, elf_data)
-        });
+        let tls_area = tls_info.map(|info| TlsArea::new(&info, &mut memory_set, elf_data));
         let minimal_tcb = Self::alloc_minimal_tcb_if_needed(&mut memory_set, &tls_area);
 
         let pid_handle = pid_alloc();
@@ -254,15 +306,35 @@ impl ProcessControlBlock {
                     condvar_list: Vec::new(),
                     name: String::from("initproc"),
                     cwd: String::from("/"),
+                    root_dir: String::from("/"),
+                    real_uid: 0,
+                    effective_uid: 0,
+                    saved_uid: 0,
+                    fs_uid: 0,
+                    real_gid: 0,
+                    effective_gid: 0,
+                    saved_gid: 0,
+                    fs_gid: 0,
+                    nice: 0,
+                    cap_permitted: u64::MAX,
+                    cap_effective: u64::MAX,
+                    cap_inheritable: 0,
+                    cap_bounding: u64::MAX,
                     heap_bottom,
                     program_brk: heap_bottom,
                     mmap_base: USER_MMAP_TOP,
                     tls_area: tls_area.clone(),
                     rlimits: default_rlimits(),
+                    itimers: [IntervalTimerState::default(); 3],
                     session_id: 0,
                     pgid: 0,
+                    ptrace_traceme: false,
+                    ptrace_stop_signal: None,
+                    child_wait_event: None,
+                    group_stopped: false,
                     itimer_real_expire_ms: 0,
                     itimer_real_interval_ms: 0,
+                    vfork_vm_parent: None,
                 })
             },
         });
@@ -277,10 +349,7 @@ impl ProcessControlBlock {
         let trap_cx = task_inner.get_trap_cx();
         let ustack_top = user_stack_top;
         drop(task_inner);
-        let mut trap_cx_value = TrapContext::app_init_context(
-            entry_point,
-            ustack_top,
-        );
+        let mut trap_cx_value = TrapContext::app_init_context(entry_point, ustack_top);
 
         if gp != 0 {
             trap_cx_value.set_gp(gp);
@@ -291,7 +360,8 @@ impl ProcessControlBlock {
             info!("[kernel] TLS initialized: tp = {:#x}", tls.tp_value);
         } else {
             let token = process.inner_exclusive_access().memory_set.token();
-            let tcb_addr = Self::fallback_tcb_addr_if_no_tls(token, ustack_top, minimal_tcb).unwrap_or(0);
+            let tcb_addr =
+                Self::fallback_tcb_addr_if_no_tls(token, ustack_top, minimal_tcb).unwrap_or(0);
             trap_cx_value[TrapFrameArgs::TLS] = tcb_addr;
             info!(
                 "[kernel] Minimal TCB initialized (no PT_TLS): tp = {:#x}",
@@ -321,17 +391,55 @@ impl ProcessControlBlock {
     ) {
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
         let exec_name = self.inner_exclusive_access().name.clone();
-        debug!("[kernel] exec: process name={} argc={}", exec_name, args.len());
-        let (mut memory_set, heap_bottom, user_stack_top, main_entry, tls_info, auxv_info, interp_base, interp_entry) =
-            if let Some(interp_data) = interp_data {
-                let (memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info, interp_base, interp_entry) =
-                    MemorySet::from_elf_with_interp(elf_data, interp_data);
-                (memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info, Some(interp_base), Some(interp_entry))
-            } else {
-                let (memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info) =
-                    MemorySet::from_elf(elf_data);
-                (memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info, None, None)
-            };
+        debug!(
+            "[kernel] exec: process name={} argc={}",
+            exec_name,
+            args.len()
+        );
+        let (
+            mut memory_set,
+            heap_bottom,
+            user_stack_top,
+            main_entry,
+            tls_info,
+            auxv_info,
+            interp_base,
+            interp_entry,
+        ) = if let Some(interp_data) = interp_data {
+            let (
+                memory_set,
+                heap_bottom,
+                user_stack_top,
+                entry_point,
+                tls_info,
+                auxv_info,
+                interp_base,
+                interp_entry,
+            ) = MemorySet::from_elf_with_interp(elf_data, interp_data);
+            (
+                memory_set,
+                heap_bottom,
+                user_stack_top,
+                entry_point,
+                tls_info,
+                auxv_info,
+                Some(interp_base),
+                Some(interp_entry),
+            )
+        } else {
+            let (memory_set, heap_bottom, user_stack_top, entry_point, tls_info, auxv_info) =
+                MemorySet::from_elf(elf_data);
+            (
+                memory_set,
+                heap_bottom,
+                user_stack_top,
+                entry_point,
+                tls_info,
+                auxv_info,
+                None,
+                None,
+            )
+        };
         let entry_point = interp_entry.unwrap_or(main_entry);
         let load_base = if let Ok(elf) = ElfFile::new(elf_data) {
             main_entry.saturating_sub(elf.header.pt2.entry_point() as usize)
@@ -348,7 +456,9 @@ impl ProcessControlBlock {
                 0
             }
         } else {
-            find_global_pointer(elf_data).map(|v| v + load_base).unwrap_or(0)
+            find_global_pointer(elf_data)
+                .map(|v| v + load_base)
+                .unwrap_or(0)
         };
         debug!(
             "[kernel] exec: entry={:#x} heap_bottom={:#x} user_stack_top={:#x} auxv_phdr={:#x} auxv_entry={:#x}",
@@ -360,9 +470,7 @@ impl ProcessControlBlock {
         );
 
         // Initialize TLS if PT_TLS segment exists
-        let tls_area = tls_info.map(|info| {
-            TlsArea::new(&info, &mut memory_set, elf_data)
-        });
+        let tls_area = tls_info.map(|info| TlsArea::new(&info, &mut memory_set, elf_data));
 
         let minimal_tcb = Self::alloc_minimal_tcb_if_needed(&mut memory_set, &tls_area);
 
@@ -401,6 +509,7 @@ impl ProcessControlBlock {
             }
             inner.mmap_base = USER_MMAP_TOP;
             inner.tls_area = tls_area.clone();
+            inner.itimers = [IntervalTimerState::default(); 3];
         }
         let task = self.inner_exclusive_access().get_task(0);
         let mut task_inner = task.inner_exclusive_access();
@@ -483,7 +592,10 @@ impl ProcessControlBlock {
         };
         if let Some(base) = interp_base {
             let at_base = crate::task::auxv::auxv_type::AT_BASE;
-            if let Some(pos) = auxv_entries.iter().position(|(k, _)| *k == crate::task::auxv::auxv_type::AT_NULL) {
+            if let Some(pos) = auxv_entries
+                .iter()
+                .position(|(k, _)| *k == crate::task::auxv::auxv_type::AT_NULL)
+            {
                 auxv_entries.insert(pos, (at_base, base));
             } else {
                 auxv_entries.push((at_base, base));
@@ -519,7 +631,7 @@ impl ProcessControlBlock {
             *translated_refmut(new_token, current_sp as *mut usize) = *addr;
             current_sp += word_size;
         }
-        *translated_refmut(new_token, current_sp as *mut usize) = 0;  // argv NULL terminator
+        *translated_refmut(new_token, current_sp as *mut usize) = 0; // argv NULL terminator
         current_sp += word_size;
 
         // Write envp pointers
@@ -528,14 +640,18 @@ impl ProcessControlBlock {
             *translated_refmut(new_token, current_sp as *mut usize) = *addr;
             current_sp += word_size;
         }
-        *translated_refmut(new_token, current_sp as *mut usize) = 0;  // envp NULL terminator
+        *translated_refmut(new_token, current_sp as *mut usize) = 0; // envp NULL terminator
         current_sp += word_size;
 
         // Write auxv entries immediately after envp NULL terminator.
         let auxv_base = current_sp;
         for (i, (aux_type, aux_val)) in auxv_entries.iter().enumerate() {
-            *translated_refmut(new_token, (auxv_base + i * 2 * word_size) as *mut usize) = *aux_type;
-            *translated_refmut(new_token, (auxv_base + i * 2 * word_size + word_size) as *mut usize) = *aux_val;
+            *translated_refmut(new_token, (auxv_base + i * 2 * word_size) as *mut usize) =
+                *aux_type;
+            *translated_refmut(
+                new_token,
+                (auxv_base + i * 2 * word_size + word_size) as *mut usize,
+            ) = *aux_val;
         }
 
         let argc_mem = *translated_ref(new_token, user_sp as *const usize);
@@ -551,32 +667,31 @@ impl ProcessControlBlock {
             };
             debug!(
                 "[kernel] exec: argv0_str={} argv1_str={} argc={}",
-                argv0_str,
-                argv1_str,
-                argc
+                argv0_str, argv1_str, argc
             );
         }
         info!(
             "[kernel] exec: sp={:#x}, argc={}, argv_base={:#x}, envp_base={:#x}",
-            user_sp,
-            argc,
-            argv_base,
-            envp_base
+            user_sp, argc, argv_base, envp_base
         );
-        info!("[kernel] exec: auxv_base={:#x}, auxv_entries={}", auxv_base, auxv_entries.len());
+        info!(
+            "[kernel] exec: auxv_base={:#x}, auxv_entries={}",
+            auxv_base,
+            auxv_entries.len()
+        );
         info!(
             "[kernel] exec: argc@sp={} argv0@argv_base={:#x} envp0@envp_base={:#x}",
-            argc_mem,
-            argv0_mem,
-            envp0_mem
+            argc_mem, argv0_mem, envp0_mem
         );
-        info!("[kernel] exec: argv[0]={:#x}, argv[1]={:#x}",
+        info!(
+            "[kernel] exec: argv[0]={:#x}, argv[1]={:#x}",
             if argc > 0 { arg_addrs[0] } else { 0 },
-            if argc > 1 { arg_addrs[1] } else { 0 });
+            if argc > 1 { arg_addrs[1] } else { 0 }
+        );
 
         let mut trap_cx = TrapContext::app_init_context(
             entry_point,
-            user_sp,  // sp should point to argc
+            user_sp, // sp should point to argc
         );
         trap_cx[TrapFrameArgs::ARG0] = argc;
         trap_cx[TrapFrameArgs::ARG1] = argv_base;
@@ -603,7 +718,13 @@ impl ProcessControlBlock {
 
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         let mut parent = self.inner_exclusive_access();
-        assert_eq!(parent.thread_count(), 1);
+        if parent.thread_count() != 1 {
+            warn!(
+                "[fork-stage] pid={} fork from multi-thread process (thread_count={}), continuing with single-thread child",
+                self.pid.0,
+                parent.thread_count()
+            );
+        }
         // info!(
         //     "[fork-stage] pid={} start: children={} tasks={} fd_table_len={}",
         //     self.pid.0,
@@ -654,15 +775,35 @@ impl ProcessControlBlock {
                     condvar_list: Vec::new(),
                     name: parent.name.clone(),
                     cwd: parent.cwd.clone(),
+                    root_dir: parent.root_dir.clone(),
+                    real_uid: parent.real_uid,
+                    effective_uid: parent.effective_uid,
+                    saved_uid: parent.saved_uid,
+                    fs_uid: parent.fs_uid,
+                    real_gid: parent.real_gid,
+                    effective_gid: parent.effective_gid,
+                    saved_gid: parent.saved_gid,
+                    fs_gid: parent.fs_gid,
+                    nice: parent.nice,
+                    cap_permitted: parent.cap_permitted,
+                    cap_effective: parent.cap_effective,
+                    cap_inheritable: parent.cap_inheritable,
+                    cap_bounding: parent.cap_bounding,
                     heap_bottom: parent.heap_bottom,
                     program_brk: parent.program_brk,
                     mmap_base: parent.mmap_base,
                     tls_area,
                     rlimits: parent.rlimits,
+                    itimers: [IntervalTimerState::default(); 3],
                     session_id: parent.session_id,
                     pgid: parent.pgid,
+                    ptrace_traceme: false,
+                    ptrace_stop_signal: None,
+                    child_wait_event: None,
+                    group_stopped: false,
                     itimer_real_expire_ms: 0,
                     itimer_real_interval_ms: 0,
+                    vfork_vm_parent: None,
                 })
             },
         });
@@ -677,9 +818,7 @@ impl ProcessControlBlock {
             .unwrap()
             .ustack_base;
         // 获取父线程的 signal_mask，用于子进程继承
-        let parent_signal_mask = parent.get_task(0)
-            .inner_exclusive_access()
-            .signal_mask;
+        let parent_signal_mask = parent.get_task(0).inner_exclusive_access().signal_mask;
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&child),
             ustack_base,

@@ -38,7 +38,16 @@ pub(super) fn handle_user_page_fault(addr: usize) {
         trap_cx[TrapFrameArgs::SP],
         trap_cx[TrapFrameArgs::TLS]
     );
-    current_add_signal(SignalFlags::SIGSEGV);
+    if let Some(task) = current_task() {
+        // Synchronous faults should be delivered to the faulting thread.
+        // If SIGSEGV stays masked, user mode can loop on the same fault forever.
+        let mut task_inner = task.inner_exclusive_access();
+        task_inner.signal_mask.remove(SignalFlags::SIGSEGV);
+        task_inner.signal_pending.insert(SignalFlags::SIGSEGV);
+        task_inner.interrupted_by_signal = true;
+    } else {
+        current_add_signal(SignalFlags::SIGSEGV);
+    }
 }
 
 pub(super) fn handle_user_illegal_instruction(addr: usize) {

@@ -16,8 +16,8 @@ use crate::{
     task::{current_process, current_user_token},
 };
 use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use spin::Mutex;
 
 /// IPC key type (used to identify IPC objects)
@@ -30,32 +30,32 @@ pub type IpcId = i32;
 pub const IPC_PRIVATE: IpcKey = 0;
 
 /// IPC flags
-pub const IPC_CREAT: i32 = 0o1000;  // Create if key doesn't exist
-pub const IPC_EXCL: i32 = 0o2000;   // Fail if key exists
+pub const IPC_CREAT: i32 = 0o1000; // Create if key doesn't exist
+pub const IPC_EXCL: i32 = 0o2000; // Fail if key exists
 pub const IPC_NOWAIT: i32 = 0o4000; // Return immediately if would block
 
 /// IPC control commands
-pub const IPC_RMID: i32 = 0;  // Remove identifier
-pub const IPC_SET: i32 = 1;   // Set options
-pub const IPC_STAT: i32 = 2;  // Get options
-pub const IPC_INFO: i32 = 3;  // Get info
+pub const IPC_RMID: i32 = 0; // Remove identifier
+pub const IPC_SET: i32 = 1; // Set options
+pub const IPC_STAT: i32 = 2; // Get options
+pub const IPC_INFO: i32 = 3; // Get info
 
 /// Message queue limits
-const MSGMAX: usize = 8192;      // Max message size
-const MSGMNB: usize = 16384;     // Max queue size in bytes
-const MSGMNI: usize = 128;       // Max number of message queues
+const MSGMAX: usize = 8192; // Max message size
+const MSGMNB: usize = 16384; // Max queue size in bytes
+const MSGMNI: usize = 128; // Max number of message queues
 
 /// Shared memory limits
-const SHMMAX: usize = 32 * 1024 * 1024;  // Max segment size (32MB)
-const SHMMIN: usize = 1;                  // Min segment size
-const SHMMNI: usize = 128;                // Max number of segments
-const SHMSEG: usize = 128;                // Max segments per process
+const SHMMAX: usize = 32 * 1024 * 1024; // Max segment size (32MB)
+const SHMMIN: usize = 1; // Min segment size
+const SHMMNI: usize = 128; // Max number of segments
+const SHMSEG: usize = 128; // Max segments per process
 
 /// Message structure for message queues
 #[derive(Clone)]
 pub struct Message {
-    pub mtype: isize,      // Message type (must be > 0)
-    pub mtext: Vec<u8>,    // Message data
+    pub mtype: isize,   // Message type (must be > 0)
+    pub mtext: Vec<u8>, // Message data
 }
 
 /// Message queue structure
@@ -332,10 +332,13 @@ pub fn sys_msgget(key: IpcKey, msgflg: i32) -> isize {
 /// - Success: 0
 /// - Failure: -errno
 pub fn sys_msgsnd(msqid: i32, msgp: usize, msgsz: usize, _msgflg: i32) -> isize {
-    use crate::mm::translated_byte_buffer;
+    use crate::mm::translated_byte_buffer_checked;
 
     if msgsz > MSGMAX {
         return errno(EINVAL);
+    }
+    if msgp == 0 {
+        return errno(EFAULT);
     }
 
     let manager = IPC_MANAGER.lock();
@@ -352,13 +355,20 @@ pub fn sys_msgsnd(msqid: i32, msgp: usize, msgsz: usize, _msgflg: i32) -> isize 
 
     // Read mtype (first sizeof(isize) bytes)
     let mtype_size = core::mem::size_of::<isize>();
-    let mtype_buffers = translated_byte_buffer(token, msgp as *const u8, mtype_size);
+    let Some(mtype_buffers) =
+        translated_byte_buffer_checked(token, msgp as *const u8, mtype_size, false)
+    else {
+        return errno(EFAULT);
+    };
     let mut mtype_bytes = [0u8; 8];
     let mut offset = 0;
     for buf in mtype_buffers {
         let len = buf.len().min(mtype_size - offset);
         mtype_bytes[offset..offset + len].copy_from_slice(&buf[..len]);
         offset += len;
+    }
+    if offset < mtype_size {
+        return errno(EFAULT);
     }
     let mtype = isize::from_ne_bytes(mtype_bytes);
 
@@ -367,10 +377,19 @@ pub fn sys_msgsnd(msqid: i32, msgp: usize, msgsz: usize, _msgflg: i32) -> isize 
     }
 
     // Read mtext
-    let mtext_buffers = translated_byte_buffer(token, (msgp + mtype_size) as *const u8, msgsz);
+    let Some(mtext_buffers) =
+        translated_byte_buffer_checked(token, (msgp + mtype_size) as *const u8, msgsz, false)
+    else {
+        return errno(EFAULT);
+    };
     let mut mtext = Vec::with_capacity(msgsz);
+    let mut copied = 0usize;
     for buf in mtext_buffers {
         mtext.extend_from_slice(buf);
+        copied += buf.len();
+    }
+    if copied < msgsz {
+        return errno(EFAULT);
     }
 
     let msg = Message { mtype, mtext };
@@ -395,7 +414,11 @@ pub fn sys_msgsnd(msqid: i32, msgp: usize, msgsz: usize, _msgflg: i32) -> isize 
 /// - Success: number of bytes in message text
 /// - Failure: -errno
 pub fn sys_msgrcv(msqid: i32, msgp: usize, msgsz: usize, msgtyp: isize, msgflg: i32) -> isize {
-    use crate::mm::translated_byte_buffer;
+    use crate::mm::translated_byte_buffer_checked;
+
+    if msgp == 0 {
+        return errno(EFAULT);
+    }
 
     let manager = IPC_MANAGER.lock();
     let msgq = match manager.get_msgq(msqid) {
@@ -413,7 +436,8 @@ pub fn sys_msgrcv(msqid: i32, msgp: usize, msgsz: usize, msgtyp: isize, msgflg: 
 
     let msg_size = msg.mtext.len();
     if msg_size > msgsz {
-        if msgflg & 0o10000 == 0 {  // MSG_NOERROR not set
+        if msgflg & 0o10000 == 0 {
+            // MSG_NOERROR not set
             return errno(E2BIG);
         }
         // Truncate message
@@ -427,7 +451,11 @@ pub fn sys_msgrcv(msqid: i32, msgp: usize, msgsz: usize, msgtyp: isize, msgflg: 
     // Write mtype
     let mtype_size = core::mem::size_of::<isize>();
     let mtype_bytes = msg.mtype.to_ne_bytes();
-    let mtype_buffers = translated_byte_buffer(token, msgp as *const u8, mtype_size);
+    let Some(mtype_buffers) =
+        translated_byte_buffer_checked(token, msgp as *const u8, mtype_size, true)
+    else {
+        return errno(EFAULT);
+    };
     let mut offset = 0;
     for buf in mtype_buffers {
         let len = buf.len().min(mtype_size - offset);
@@ -440,9 +468,16 @@ pub fn sys_msgrcv(msqid: i32, msgp: usize, msgsz: usize, msgtyp: isize, msgflg: 
         }
         offset += len;
     }
+    if offset < mtype_size {
+        return errno(EFAULT);
+    }
 
     // Write mtext
-    let mtext_buffers = translated_byte_buffer(token, (msgp + mtype_size) as *const u8, actual_size);
+    let Some(mtext_buffers) =
+        translated_byte_buffer_checked(token, (msgp + mtype_size) as *const u8, actual_size, true)
+    else {
+        return errno(EFAULT);
+    };
     offset = 0;
     for buf in mtext_buffers {
         let len = buf.len().min(actual_size - offset);
@@ -454,6 +489,9 @@ pub fn sys_msgrcv(msqid: i32, msgp: usize, msgsz: usize, msgtyp: isize, msgflg: 
             );
         }
         offset += len;
+    }
+    if offset < actual_size {
+        return errno(EFAULT);
     }
 
     actual_size as isize
@@ -663,7 +701,7 @@ pub fn sys_shmat(shmid: i32, shmaddr: usize, _shmflg: i32) -> isize {
         );
         return errno(EINVAL);
     }
-    if !inner.memory_set.insert_shared_framed_area(
+    if !inner.memory_set.insert_shm_area(
         VirtAddr(attach_addr),
         VirtAddr(attach_end),
         map_perm,

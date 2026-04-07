@@ -3,6 +3,7 @@
 mod action;
 mod auxv;
 mod context;
+mod futex;
 mod id;
 mod manager;
 mod process;
@@ -11,52 +12,60 @@ mod signal;
 #[allow(clippy::module_inception)]
 #[allow(rustdoc::private_intra_doc_links)]
 mod task;
-mod futex;
 mod tls;
-#[cfg_attr(all(debug_assertions, target_arch = "riscv64"), path = "initproc_embed_riscv64_debug.rs")]
-#[cfg_attr(all(not(debug_assertions), target_arch = "riscv64"), path = "initproc_embed_riscv64_release.rs")]
+use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
+#[cfg_attr(
+    all(debug_assertions, target_arch = "riscv64"),
+    path = "initproc_embed_riscv64_debug.rs"
+)]
+#[cfg_attr(
+    all(not(debug_assertions), target_arch = "riscv64"),
+    path = "initproc_embed_riscv64_release.rs"
+)]
 #[cfg_attr(target_arch = "loongarch64", path = "initproc_embed_loongarch64.rs")]
 mod initproc_embed;
 #[allow(unused_imports)]
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, PageTable, VirtAddr};
-use arch::{shutdown, TrapContext, TrapFrameArgs};
-use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
 use crate::timer::remove_timer;
 use alloc::sync::Arc;
-use lazy_static::*;
 #[allow(unused_imports)]
 use alloc::vec::Vec;
+use arch::{shutdown, TrapContext, TrapFrameArgs};
 use core::sync::atomic::{AtomicU64, Ordering};
+use lazy_static::*;
 use manager::fetch_task;
 use process::ProcessControlBlock;
 
 pub use action::{SignalAction, SignalActions, SA_RESTART, SA_SIGINFO, SA_RESETHAND};
 pub use auxv::AuxvInfo;
 pub use context::TaskContext;
-pub use id::{IDLE_PID, KernelStack, PidHandle, kstack_alloc, pid_alloc};
+pub use futex::{
+    futex_remove_waiter, futex_remove_waiter_any, futex_requeue, futex_wait, futex_wait_bitset,
+    futex_wake, futex_wake_bitset, FutexKey,
+};
+pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
 pub use manager::{
-    add_task, pid2process, pid2process_snapshot, ready_queue_snapshot, remove_from_pid2process,
-    remove_task, wakeup_task, pid2process_len, ready_queue_len, pid2process_aggregate,
-    pid2process_fdtable_summary,
+    add_task, pid2process, pid2process_aggregate, pid2process_fdtable_summary, pid2process_len,
+    pid2process_snapshot, ready_queue_len, ready_queue_snapshot, remove_from_pid2process,
+    remove_task, wakeup_task,
+};
+pub use process::{
+    ChildWaitEvent, IntervalTimerState, RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK,
+    RLIM_INFINITY,
 };
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
     current_user_token, has_pending_unmasked_signal, run_tasks, schedule, take_current_task,
 };
-pub use process::{RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY};
 pub use signal::{
-    SignalFlags, SigNumber, MAX_SIG, flags_to_user_mask, user_mask_to_flags,
-    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE,
-    SIGKILL, SIGUSR1, SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM,
-    SIGSTKFLT, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU,
-    SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGWINCH, SIGIO,
-    SIGPWR, SIGSYS,
+    flags_to_user_mask, user_mask_to_flags, SigNumber, SignalFlags, MAX_SIG, SIGABRT, SIGALRM,
+    SIGBUS, SIGCHLD, SIGCONT, SIGFPE, SIGHUP, SIGILL, SIGINT, SIGIO, SIGKILL, SIGPIPE, SIGPROF,
+    SIGPWR, SIGQUIT, SIGSEGV, SIGSTKFLT, SIGSTOP, SIGSYS, SIGTERM, SIGTRAP, SIGTSTP, SIGTTIN,
+    SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGVTALRM, SIGWINCH, SIGXCPU, SIGXFSZ,
 };
-pub use task::{TaskControlBlock, TaskControlBlockInner, TaskStatus, live_task_count, live_task_pid_summary};
-pub use futex::{
-    FutexKey, futex_requeue, futex_remove_waiter, futex_remove_waiter_any, futex_wait,
-    futex_wait_bitset, futex_wake, futex_wake_bitset,
+pub use task::{
+    live_task_count, live_task_pid_summary, TaskControlBlock, TaskControlBlockInner, TaskStatus,
 };
 pub use tls::{TlsArea, TlsInfo};
 
@@ -93,7 +102,8 @@ pub struct StackT {
 
 const USER_UCONTEXT_SIZE: usize = core::mem::size_of::<UserContext>();
 // musl cancel_handler reads/writes uc_mcontext.gregs[0]/pc at ucontext+176.
-const _USER_UCONTEXT_LAYOUT_CHECK: [(); core::mem::offset_of!(UserContext, uc_mcontext)] = [(); 176];
+const _USER_UCONTEXT_LAYOUT_CHECK: [(); core::mem::offset_of!(UserContext, uc_mcontext)] =
+    [(); 176];
 
 impl Default for LinuxSigInfo {
     fn default() -> Self {
@@ -121,7 +131,11 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), ()> {
             break;
         }
     }
-    Ok(())
+    if offset == data.len() {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 pub fn suspend_current_and_run_next() {
@@ -160,10 +174,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     let name = process.inner_exclusive_access().name.clone();
     info!(
         "[exit] pid={} tid={} name={} code={}",
-        pid,
-        tid,
-        name,
-        exit_code
+        pid, tid, name, exit_code
     );
     let clear_child_tid = task_inner.clear_child_tid;
     // Linux processes clear_child_tid for ALL threads, including the main thread (tid=0).
@@ -171,9 +182,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     if clear_child_tid != 0 {
         info!(
             "[exit] pid={} tid={} clear_child_tid={:#x}",
-            pid,
-            tid,
-            clear_child_tid
+            pid, tid, clear_child_tid
         );
         let token = process.inner_exclusive_access().memory_set.token();
         let page_table = PageTable::from_token(token);
@@ -201,9 +210,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         } else {
             warn!(
                 "[exit] pid={} tid={} clear_child_tid addr={:#x} not mapped",
-                pid,
-                tid,
-                clear_child_tid
+                pid, tid, clear_child_tid
             );
         }
     }
@@ -237,9 +244,32 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             parent_inner.signal_pending |= SignalFlags::SIGCHLD;
         }
         let process_inner = process.inner_exclusive_access();
-        {
+        if let Some(vfork_parent) = process_inner.vfork_vm_parent.as_ref().and_then(|p| p.upgrade()) {
+            let mut parent_inner = vfork_parent.inner_exclusive_access();
+            let copied = parent_inner
+                .memory_set
+                .sync_user_writable_from(&process_inner.memory_set);
+            trace!(
+                "[vfork] sync child pid={} -> parent pid={} copied_pages={}",
+                pid,
+                vfork_parent.pid.0,
+                copied
+            );
+        }
+        if Arc::ptr_eq(&process, &INITPROC) {
+            warn!("[exit] initproc is exiting; skip reparent-to-initproc");
+            for child in process_inner.children.iter() {
+                if Arc::ptr_eq(child, &process) {
+                    continue;
+                }
+                child.inner_exclusive_access().parent = None;
+            }
+        } else {
             let mut initproc_inner = INITPROC.inner_exclusive_access();
             for child in process_inner.children.iter() {
+                if Arc::ptr_eq(child, &INITPROC) {
+                    continue;
+                }
                 child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
                 initproc_inner.children.push(child.clone());
             }
@@ -288,6 +318,85 @@ pub fn current_add_signal(signal: SignalFlags) {
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
     process_inner.signal_pending |= signal;
+}
+
+fn wake_process_for_signal(process: &Arc<ProcessControlBlock>) {
+    let inner = process.inner_exclusive_access();
+    for task in inner.tasks.iter().filter_map(|t| t.as_ref()) {
+        let mut task_inner = task.inner_exclusive_access();
+        if task_inner.task_status == TaskStatus::Blocked {
+            futex_remove_waiter_any(task);
+            task_inner.interrupted_by_signal = true;
+            task_inner.task_status = TaskStatus::Ready;
+            drop(task_inner);
+            add_task(task.clone());
+        }
+    }
+}
+
+fn itimer_signal(which: usize) -> SignalFlags {
+    match which {
+        0 => SignalFlags::SIGALRM,
+        1 => SignalFlags::SIGVTALRM,
+        2 => SignalFlags::SIGPROF,
+        _ => SignalFlags::empty(),
+    }
+}
+
+fn tick_timer_state(state: &mut IntervalTimerState, delta_us: usize) -> bool {
+    if state.remaining_us == 0 {
+        return false;
+    }
+    if state.remaining_us > delta_us {
+        state.remaining_us -= delta_us;
+        return false;
+    }
+    if state.interval_us > 0 {
+        state.remaining_us = state.interval_us;
+    } else {
+        state.remaining_us = 0;
+    }
+    true
+}
+
+pub fn process_interval_timers(on_user_tick: bool) {
+    const TIMER_TICK_US: usize = 10_000;
+
+    for (_pid, process) in pid2process_snapshot() {
+        let should_signal = {
+            let mut inner = process.inner_exclusive_access();
+            tick_timer_state(&mut inner.itimers[0], TIMER_TICK_US)
+        };
+        if should_signal {
+            let mut inner = process.inner_exclusive_access();
+            inner.signal_pending |= SignalFlags::SIGALRM;
+            drop(inner);
+            wake_process_for_signal(&process);
+        }
+    }
+
+    if !on_user_tick {
+        return;
+    }
+
+    let Some(process) = current_task().and_then(|task| task.process.upgrade()) else {
+        return;
+    };
+    let mut pending = SignalFlags::empty();
+    {
+        let mut inner = process.inner_exclusive_access();
+        for which in [1usize, 2usize] {
+            if tick_timer_state(&mut inner.itimers[which], TIMER_TICK_US) {
+                pending |= itimer_signal(which);
+            }
+        }
+        if !pending.is_empty() {
+            inner.signal_pending |= pending;
+        }
+    }
+    if !pending.is_empty() {
+        wake_process_for_signal(&process);
+    }
 }
 
 /// 查找第一个待处理的信号
@@ -447,7 +556,6 @@ pub fn handle_signals() {
             process_pending
         );
     }
-
     // 5. 如果任务被阻塞，唤醒它
     if task_inner.task_status == TaskStatus::Blocked {
         if signum == 32 || signum == 33 {
@@ -496,8 +604,20 @@ pub fn handle_signals() {
         task_inner.signal_pending.remove(flag);
     }
 
+    // For ptrace(PTRACE_TRACEME), signal delivery stops the tracee and
+    // reports WIFSTOPPED to parent waitpid(), except for SIGKILL.
+    if process_inner.ptrace_traceme && signum != signal::SIGKILL {
+        process_inner.ptrace_stop_signal = Some(signum as i32);
+        drop(task_inner);
+        drop(process_inner);
+        block_current_and_run_next();
+        return;
+    }
+
     // 9. 处理内核信号（SIGSTOP、SIGKILL）
     if signum == signal::SIGSTOP {
+        process_inner.child_wait_event = Some(ChildWaitEvent::Stopped(signal::SIGSTOP as i32));
+        process_inner.group_stopped = true;
         drop(task_inner);
         drop(process_inner);
         block_current_and_run_next();
@@ -505,7 +625,10 @@ pub fn handle_signals() {
     }
 
     if signum == signal::SIGKILL {
-        warn!("[signal] pid={} name={} killed by SIGKILL", pid, process_inner.name);
+        warn!(
+            "[signal] pid={} name={} killed by SIGKILL",
+            pid, process_inner.name
+        );
         // SIGKILL 必须终止进程内所有线程，不仅仅是当前线程
         // 向其他线程也注入 SIGKILL，确保它们在下次调度时退出
         for other_task in process_inner.tasks.iter().filter_map(|t| t.as_ref()) {
@@ -539,8 +662,7 @@ pub fn handle_signals() {
         if invalid {
             warn!(
                 "[signal] pid={} sigchld invalid handler={:#x}, resetting to default",
-                pid,
-                action.handler
+                pid, action.handler
             );
             action = SignalAction::default();
             process_inner.signal_actions.table[signum] = action;
@@ -553,9 +675,7 @@ pub fn handle_signals() {
     if action.handler >= USER_ADDR_MAX && action.handler > 1 {
         error!(
             "[signal] pid={} signum={} invalid handler={:#x}, falling back to SIG_DFL",
-            pid,
-            signum,
-            action.handler
+            pid, signum, action.handler
         );
         action.handler = 0;
     }
@@ -587,23 +707,21 @@ pub fn handle_signals() {
         match signum {
             // 默认忽略的信号
             signal::SIGCHLD | signal::SIGURG | signal::SIGWINCH => {
-                debug!(
-                    "[signal] pid={} signum={} default=ignore",
-                    pid, signum
-                );
+                debug!("[signal] pid={} signum={} default=ignore", pid, signum);
                 return;
             }
             // SIGCONT: 恢复被停止的进程（目前简单忽略）
             signal::SIGCONT => {
+                process_inner.child_wait_event = Some(ChildWaitEvent::Continued(signal::SIGCONT as i32));
+                process_inner.group_stopped = false;
                 debug!("[signal] pid={} SIGCONT default=continue", pid);
                 return;
             }
             // 默认停止的信号
             signal::SIGTSTP | signal::SIGTTIN | signal::SIGTTOU => {
-                debug!(
-                    "[signal] pid={} signum={} default=stop",
-                    pid, signum
-                );
+                process_inner.child_wait_event = Some(ChildWaitEvent::Stopped(signum as i32));
+                process_inner.group_stopped = true;
+                debug!("[signal] pid={} signum={} default=stop", pid, signum);
                 drop(task_inner);
                 drop(process_inner);
                 block_current_and_run_next();
@@ -615,6 +733,23 @@ pub fn handle_signals() {
                     "[signal] pid={} name={} default handler for signal {} -> terminate",
                     pid, process_inner.name, signum
                 );
+                // Fatal default signals should terminate the whole thread group.
+                // Otherwise one thread can die while siblings keep waiting (e.g. futex join),
+                // and the process hangs instead of exiting by signal.
+                for other_task in process_inner.tasks.iter().filter_map(|t| t.as_ref()) {
+                    if !Arc::ptr_eq(other_task, &task) {
+                        let mut other_inner = other_task.inner_exclusive_access();
+                        other_inner.signal_pending.insert(flag);
+                        other_inner.signal_mask.remove(flag);
+                        if other_inner.task_status == TaskStatus::Blocked {
+                            futex_remove_waiter_any(other_task);
+                            other_inner.interrupted_by_signal = true;
+                            other_inner.task_status = TaskStatus::Ready;
+                            drop(other_inner);
+                            add_task(other_task.clone());
+                        }
+                    }
+                }
                 drop(task_inner);
                 drop(process_inner);
                 exit_current_and_run_next(-(signum as i32));
@@ -663,9 +798,9 @@ pub fn handle_signals() {
     // Our kernel trampoline does the same thing (calls rt_sigreturn).
     #[cfg(not(target_arch = "loongarch64"))]
     {
-        // Heuristic: a valid restorer should be above the PIE load base (0x40000000)
-        // or in the mmap region (0x600000000+). Values below 0x10000 are clearly
-        // unrelocated offsets from shared libraries.
+        // Heuristic: a valid restorer should be above 0x10000 (PIE load base or
+        // mmap region). Values below 0x10000 are clearly unrelocated offsets from
+        // glibc shared libraries (e.g., raw offset 0x200 instead of libc_base + 0x200).
         let use_restorer = action.restorer != 0
             && action.restorer < USER_ADDR_MAX
             && action.restorer >= 0x10000;
@@ -729,7 +864,11 @@ pub fn debug_dump_tasks() {
     }
     let processes = pid2process_snapshot();
     let ready = ready_queue_snapshot();
-    info!("[debug] process count={} ready_queue={}", processes.len(), ready.len());
+    info!(
+        "[debug] process count={} ready_queue={}",
+        processes.len(),
+        ready.len()
+    );
     for (idx, task) in ready.iter().enumerate() {
         let pid = task.process.upgrade().map(|p| p.getpid()).unwrap_or(0);
         if let Some(task_inner) = task.try_inner_exclusive_access() {
@@ -805,5 +944,4 @@ pub fn block_and_yield() {
     process_inner.signal_pending.remove(SignalFlags::SIGCONT);
     drop(process_inner);
     block_current_and_run_next();
-
 }

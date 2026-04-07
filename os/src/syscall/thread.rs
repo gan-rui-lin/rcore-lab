@@ -1,9 +1,9 @@
-use arch::{TrapContext, TrapFrameArgs};
 use crate::{
     syscall::errno::{errno, EAGAIN, ECHILD},
-    task::{TaskControlBlock, add_task, current_task},
+    task::{add_task, current_process, current_task, TaskControlBlock},
 };
 use alloc::sync::Arc;
+use arch::{TrapContext, TrapFrameArgs};
 
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     let task = current_task().unwrap();
@@ -29,10 +29,7 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     }
     tasks[new_task_tid] = Some(Arc::clone(&new_task));
     let new_task_trap_cx = new_task_inner.get_trap_cx();
-    *new_task_trap_cx = TrapContext::app_init_context(
-        entry,
-        new_task_res.ustack_top(),
-    );
+    *new_task_trap_cx = TrapContext::app_init_context(entry, new_task_res.ustack_top());
     new_task_trap_cx[TrapFrameArgs::ARG0] = arg;
     // Queue the thread after its initial trap context is ready.
     add_task(Arc::clone(&new_task));
@@ -45,10 +42,14 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
 /// We return internal_tid + 1 to guarantee > 0 and avoid collision.
 pub fn sys_gettid() -> isize {
     let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    let tid = inner.res.as_ref().unwrap().tid;
-    drop(inner);
-    (tid + 1) as isize
+    let process = current_process();
+    let process_pid = process.pid.0 as isize;
+    let tid = task.inner_exclusive_access().res.as_ref().unwrap().tid as isize;
+    if tid == 0 {
+        process_pid
+    } else {
+        tid
+    }
 }
 
 /// Save clear_child_tid pointer and return the caller's TID.
@@ -57,19 +58,21 @@ pub fn sys_gettid() -> isize {
 /// We return internal_tid + 1 to guarantee > 0 and avoid collision.
 pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
     let task = current_task().unwrap();
+    let process = current_process();
     let mut task_inner = task.inner_exclusive_access();
-    let tid = task_inner.res.as_ref().unwrap().tid;
+    let raw_tid = task_inner.res.as_ref().unwrap().tid as i32;
+    let tid = if raw_tid == 0 {
+        process.pid.0 as i32
+    } else {
+        raw_tid
+    };
     task_inner.clear_child_tid = tidptr as usize;
     drop(task_inner);
-    // Linux set_tid_address: only saves the pointer for clear_child_tid on exit,
-    // and returns the caller's TID. It does NOT write to *tidptr.
-    let system_tid = tid + 1;
     info!(
-        "[sys_set_tid_address] pid={} tid={}→{} tidptr={:#x}",
-        current_task().unwrap().process.upgrade().unwrap().pid.0,
-        tid, system_tid, tidptr as usize
+        "[sys_set_tid_address] pid={} tid={} tidptr={:#x}",
+        process.pid.0, tid, tidptr as usize
     );
-    system_tid as isize
+    tid as isize
 }
 
 /// thread does not exist, return -ECHILD

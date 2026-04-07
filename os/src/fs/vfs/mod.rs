@@ -1,11 +1,11 @@
 mod core;
 mod easyfs;
-mod file;
-mod mount;
-mod procfs;
 #[cfg(feature = "ext4")]
 mod ext4;
 mod fat32;
+mod file;
+mod mount;
+mod procfs;
 
 pub use core::{VfsInode, VfsNodeKind};
 pub use file::{create_dir, list_apps, open_file, path_exists, path_is_dir, remove_path};

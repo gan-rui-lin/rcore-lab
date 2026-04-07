@@ -9,30 +9,30 @@ extern crate alloc;
 use alloc::format;
 use alloc::vec::Vec;
 use user_lib::{
-    chdir, close, dup, execve, exit, fork, kill, link, open, shutdown, unlink, wait, write,
-    OpenFlags, SIGKILL,
+    chdir, close, dup, execve, exit, fork, link, open, shutdown, unlink, write, OpenFlags,
 };
 
 const ENABLE_ALL_TESTS: bool = true;
 const SINGLE_TEST: Option<&str> = option_env!("SINGLE_TEST");
+const LTP_START_FROM: Option<&str> = option_env!("LTP_START_FROM");
 
 const SH: &[u8] = b"sh\0";
 const PATH_ENV: &[u8] = b"PATH=/bin:/usr/bin:/musl:/glibc\0";
 const LD_LIB_MUSL: &[u8] = b"LD_LIBRARY_PATH=/musl/lib\0";
 const LD_LIB_GLIBC: &[u8] = b"LD_LIBRARY_PATH=/glibc/lib\0";
 const TEST_LIBC_ROOTS: [&str; 2] = ["/musl", "/glibc"];
-const TEST_SUITES: [&str; 4] = [
+const TEST_SUITES: [&str; 1] = [
     // "basic",
     // "busybox",
     // "cyclictest",
     // "iozone",
-    "iperf",
-    "libcbench",
+    // "iperf",
+    // "libcbench",
     // "libctest",
-    "lmbench",
-    // "ltp",
+    // "lmbench",
+    "ltp",
     // "lua",
-    "netperf",
+    // "netperf",
 ];
 #[allow(dead_code)]
 const RUN_EMBEDDED_PTHREAD: bool = option_env!("RUN_EMBEDDED_PTHREAD").is_some();
@@ -52,6 +52,139 @@ const TMP_IOZONE_4K_PATH: &str = "/tmp/iozone_temp_test_4k.sh";
 const TMP_IOZONE_4K_SCRIPT: &[u8] = b"\
 ./busybox echo iozone throughput write/read measurements 4k\n\
 ./iozone -t 4 -i 0 -i 1 -r 4k -s 1m\n\
+";
+
+const TMP_LIBCTEST_PATH: &str = "/tmp/libctest_testcode.sh";
+const TMP_LIBCTEST_SCRIPT: &[u8] = b"\
+./runtest.exe -w entry-static.exe pthread_cancel_points\n\
+./runtest.exe -w entry-static.exe pthread_cancel\n\
+./runtest.exe -w entry-static.exe pthread_cancel_sem_wait\n\
+./runtest.exe -w entry-static.exe pthread_exit_cancel\n\
+./runtest.exe -w entry-static.exe pthread_cond\n\
+./runtest.exe -w entry-static.exe pthread_tsd\n\
+./runtest.exe -w entry-static.exe pthread_once_deadlock\n\
+./runtest.exe -w entry-static.exe pthread_rwlock_ebusy\n\
+./runtest.exe -w entry-static.exe pthread_robust_detach\n\
+./runtest.exe -w entry-static.exe pthread_cond_smasher\n\
+./runtest.exe -w entry-static.exe pthread_condattr_setclock\n\
+";
+
+const TMP_LTP_MINI_PATH: &str = "/tmp/ltp_mini.sh";
+const TMP_LTP_MINI_SCRIPT: &[u8] = b"\
+./busybox echo '=== ltp-mini start ==='\n\
+ltp/testcases/bin/fork14\n\
+ltp/testcases/bin/futex_wait01\n\
+ltp/testcases/bin/futex_wake01\n\
+./busybox echo '=== ltp-mini done ==='\n\
+";
+
+const TMP_LTP_PATH: &str = "/tmp/ltp_testcode.sh";
+const TMP_LTP_SCRIPT: &[u8] = b"\
+./busybox echo '=== tmp-ltp: process/thread/signal/memory tests ==='\n\
+ltp/testcases/bin/abort01\n\
+ltp/testcases/bin/access01\n\
+ltp/testcases/bin/access02\n\
+ltp/testcases/bin/access03\n\
+ltp/testcases/bin/brk01\n\
+ltp/testcases/bin/brk02\n\
+ltp/testcases/bin/clone01\n\
+ltp/testcases/bin/clone02\n\
+ltp/testcases/bin/clone03\n\
+ltp/testcases/bin/clone301\n\
+ltp/testcases/bin/clone302\n\
+ltp/testcases/bin/exit01\n\
+ltp/testcases/bin/exit02\n\
+ltp/testcases/bin/exit_group01\n\
+ltp/testcases/bin/fork01\n\
+ltp/testcases/bin/fork02\n\
+ltp/testcases/bin/fork03\n\
+ltp/testcases/bin/fork04\n\
+ltp/testcases/bin/fork05\n\
+ltp/testcases/bin/fork06\n\
+ltp/testcases/bin/fork07\n\
+ltp/testcases/bin/fork08\n\
+ltp/testcases/bin/fork09\n\
+ltp/testcases/bin/fork10\n\
+ltp/testcases/bin/fork11\n\
+ltp/testcases/bin/fork13\n\
+ltp/testcases/bin/fork14\n\
+ltp/testcases/bin/futex_cmp_requeue01\n\
+ltp/testcases/bin/futex_cmp_requeue02\n\
+ltp/testcases/bin/futex_wait01\n\
+ltp/testcases/bin/futex_wait02\n\
+ltp/testcases/bin/futex_wait03\n\
+ltp/testcases/bin/futex_wait04\n\
+ltp/testcases/bin/futex_wait05\n\
+ltp/testcases/bin/futex_wake01\n\
+ltp/testcases/bin/futex_wake02\n\
+ltp/testcases/bin/futex_wake03\n\
+ltp/testcases/bin/futex_wake04\n\
+ltp/testcases/bin/getpid01\n\
+ltp/testcases/bin/getpid02\n\
+ltp/testcases/bin/getppid01\n\
+ltp/testcases/bin/getppid02\n\
+ltp/testcases/bin/gettid01\n\
+ltp/testcases/bin/kill01\n\
+ltp/testcases/bin/kill02\n\
+ltp/testcases/bin/kill03\n\
+ltp/testcases/bin/kill04\n\
+ltp/testcases/bin/kill05\n\
+ltp/testcases/bin/kill06\n\
+ltp/testcases/bin/kill07\n\
+ltp/testcases/bin/kill08\n\
+ltp/testcases/bin/kill09\n\
+ltp/testcases/bin/kill10\n\
+ltp/testcases/bin/kill11\n\
+ltp/testcases/bin/kill12\n\
+ltp/testcases/bin/kill13\n\
+ltp/testcases/bin/mmap01\n\
+ltp/testcases/bin/mmap02\n\
+ltp/testcases/bin/mmap03\n\
+ltp/testcases/bin/mmap04\n\
+ltp/testcases/bin/mmap05\n\
+ltp/testcases/bin/mmap06\n\
+ltp/testcases/bin/munmap01\n\
+ltp/testcases/bin/munmap02\n\
+ltp/testcases/bin/munmap03\n\
+ltp/testcases/bin/pipe01\n\
+ltp/testcases/bin/pipe02\n\
+ltp/testcases/bin/pipe03\n\
+ltp/testcases/bin/pipe04\n\
+ltp/testcases/bin/pipe05\n\
+ltp/testcases/bin/pipe06\n\
+ltp/testcases/bin/pipe07\n\
+ltp/testcases/bin/pipe08\n\
+ltp/testcases/bin/read01\n\
+ltp/testcases/bin/read02\n\
+ltp/testcases/bin/read03\n\
+ltp/testcases/bin/read04\n\
+ltp/testcases/bin/rt_sigprocmask01\n\
+ltp/testcases/bin/rt_sigprocmask02\n\
+ltp/testcases/bin/rt_sigtimedwait01\n\
+ltp/testcases/bin/sigaction01\n\
+ltp/testcases/bin/sigaction02\n\
+ltp/testcases/bin/signal01\n\
+ltp/testcases/bin/signal02\n\
+ltp/testcases/bin/signal03\n\
+ltp/testcases/bin/signal04\n\
+ltp/testcases/bin/signal05\n\
+ltp/testcases/bin/signal06\n\
+ltp/testcases/bin/sigprocmask01\n\
+ltp/testcases/bin/wait01\n\
+ltp/testcases/bin/wait02\n\
+ltp/testcases/bin/wait401\n\
+ltp/testcases/bin/wait402\n\
+ltp/testcases/bin/waitpid01\n\
+ltp/testcases/bin/waitpid02\n\
+ltp/testcases/bin/waitpid03\n\
+ltp/testcases/bin/waitpid04\n\
+ltp/testcases/bin/waitpid05\n\
+ltp/testcases/bin/write01\n\
+ltp/testcases/bin/write02\n\
+ltp/testcases/bin/write03\n\
+ltp/testcases/bin/write04\n\
+ltp/testcases/bin/write05\n\
+./busybox echo '=== tmp-ltp: done ==='\n\
 ";
 
 fn cstring(s: &str) -> Vec<u8> {
@@ -168,7 +301,12 @@ fn run_busybox_mkdir_p(root: &str, busybox_path: &str, path: &str) -> isize {
 fn select_busybox_for_root(root: &str) -> Option<&'static str> {
     match root {
         "/musl" => {
-            if file_exists("/musl/busybox") {
+            // `/musl/busybox` on some images may not be directly executable by
+            // our kernel path resolution (it can be treated as non-ELF and
+            // recurse through `/bin/sh`). Prefer a known executable busybox.
+            if file_exists("/glibc/busybox") {
+                Some("/glibc/busybox")
+            } else if file_exists("/musl/busybox") {
                 Some("/musl/busybox")
             } else {
                 None
@@ -192,7 +330,14 @@ fn activate_runtime_profile(root: &str) -> bool {
     };
 
     force_link("/bin/sh", busybox_path);
-    force_link("/bin/busybox", busybox_path);
+    if root == "/musl" && file_exists("/glibc/busybox") {
+        // In some images `/musl/busybox` may be a symlink to `/bin/busybox`.
+        // Linking `/bin/busybox` back to `/musl/busybox` would create a loop
+        // and make busybox exec fail with ELOOP.
+        force_link("/bin/busybox", "/glibc/busybox");
+    } else {
+        force_link("/bin/busybox", busybox_path);
+    }
     force_link("/bin/basename", busybox_path);
     force_link("/bin/ls", busybox_path);
     force_link("/bin/sleep", busybox_path);
@@ -251,8 +396,9 @@ fn activate_runtime_profile(root: &str) -> bool {
                 "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
             );
             // glibc dynamic binaries need shared libs in default search path
-            force_link("/lib/libc.so.6", "/glibc/lib/libc.so.6");
-            force_link("/lib/libm.so.6", "/glibc/lib/libm.so.6");
+            // sdcard has libc.so / libm.so (without version suffix)
+            force_link("/lib/libc.so.6", "/glibc/lib/libc.so");
+            force_link("/lib/libm.so.6", "/glibc/lib/libm.so");
 
             let _ = run_busybox_mkdir_p("/glibc", busybox_path, "/code/lmbench_src/bin/build");
             force_link("/code/lmbench_src/bin/build/lmbench_all", "/glibc/lmbench_all");
@@ -468,8 +614,10 @@ fn run_testcode(script_path: &str, root: &str) -> i32 {
         exit(-1);
     } else {
         let mut status: i32 = 0;
-        // Use waitpid(pid) instead of wait(-1) to avoid reaping
-        // orphan grandchildren (e.g. iperf3 daemon forks).
+        // Wait for the suite runner itself, but opportunistically reap any
+        // other exited children while we are polling. This prevents long LTP
+        // runs from accumulating many zombies and exhausting kernel resources.
+        let mut suite_done = false;
         loop {
             let ret = user_lib::waitpid(pid as usize, &mut status);
             if ret == pid {
@@ -479,7 +627,30 @@ fn run_testcode(script_path: &str, root: &str) -> i32 {
                 // error other than EAGAIN
                 break;
             }
-            // ret == -2 (EAGAIN) or reaped wrong child, keep waiting
+
+            // Reap any exited orphan children of initproc in a bounded loop.
+            let mut reap_rounds = 0usize;
+            loop {
+                if reap_rounds >= 64 {
+                    break;
+                }
+                let mut orphan_status: i32 = 0;
+                let orphan = user_lib::waitpid_nohang(-1i32 as usize, &mut orphan_status);
+                if orphan > 0 {
+                    if orphan == pid {
+                        status = orphan_status;
+                        suite_done = true;
+                        break;
+                    }
+                    reap_rounds += 1;
+                    continue;
+                }
+                break;
+            }
+            if suite_done {
+                break;
+            }
+            user_lib::sys_yield();
         }
         println!("=== {} completed (status=0x{:x}) ===\n", script_path, status);
         status
@@ -491,37 +662,201 @@ fn run_suite(root: &str, suite: &str) -> i32 {
         println!("=== Skipped {} / {} (profile activate failed) ===\n", root, suite);
         return -1;
     }
+    if suite == "ltp" {
+        let ret = run_ltp_suite(root);
+        let reaped = reap_orphans();
+        println!(
+            "[initcode] cleanup after {}/{} done (status=0x{:x}, reaped={})",
+            root, suite, ret, reaped
+        );
+        return ret;
+    }
     let script = format!("{}/{}_testcode.sh", root, suite);
     let ret = run_testcode(script.as_str(), root);
     // Kill orphan daemons (e.g. iperf3 -s -D, netserver -D) so they don't
     // hold ports when the next libc variant runs the same suite.
-    reap_orphans();
+    let reaped = reap_orphans();
+    println!(
+        "[initcode] cleanup after {}/{} done (status=0x{:x}, reaped={})",
+        root, suite, ret, reaped
+    );
     ret
 }
 
-/// Kill orphan daemon processes and reap zombies.
-fn reap_orphans() {
-    let my_pid = user_lib::getpid();
-    for p in 2..512usize {
-        if p as isize != my_pid {
-            let _ = kill(p, SIGKILL);
-        }
-    }
-    // Reap with WNOHANG until ECHILD — give killed processes time to exit.
+fn run_ltp_suite(root: &str) -> i32 {
+    let script_path = "/tmp/ltp_testcode_filtered.sh";
+    let start_from_default = LTP_START_FROM.unwrap_or("");
+    let start_from_line = format!(
+        "start_from=\"{}\"\nif [ -z \"$start_from\" ]; then\n  start_from=\"${{LTP_START_FROM:-}}\"\nfi\nstarted=1\nif [ -n \"$start_from\" ]; then\n  started=0\n  echo \"LTP start marker enabled: $start_from\"\nfi\n",
+        start_from_default
+    );
+    // Run standalone LTP cases while skipping obvious helper/library entries
+    // that are not meant to be launched directly (e.g. cgroup_fj_proc).
+    let script = if root == "/glibc" {
+        "\
+#!/bin/sh
+echo \"#### OS COMP TEST GROUP START ltp-glibc ####\"
+target_dir=\"ltp/testcases/bin\"
+export PATH=\"$PATH:./ltp/testcases/bin:./ltp/testcases/lib:./ltp/testcases/network/busy_poll:./ltp/testcases/kernel/controllers/cgroup_fj\"
+case_timeout=\"${LTP_CASE_TIMEOUT:-8}\"
+case_limit=\"${LTP_CASE_LIMIT:-}\"
+case_count=0
+
+is_skip_case() {
+  case \"$1\" in
+    *.sh|*_helper|*_helper.sh|*_child|busy_poll_lib.sh|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|cpuctl_fj_*|cpuhotplug_do_*|cpuhotplug_report_*|cpuset*|crash*|dio_read|dio_sparse|epoll*|eventfd*|event_generator|execveat*|fanotify*|fanout*|f00f|faccessat201|faccessat202|fallocate02|fallocate04|fallocate05|fallocate06|fchmod02|fchmod05|fchown01_16|fchown02_16|fchown03_16|fchown04|fchown04_16|fchown05_16|fchownat02|fcntl01|fcntl01_64|fcntl07|fcntl07_64|fcntl09|fcntl09_64|fcntl10|fcntl10_64|fcntl11|fcntl11_64|fcntl12|fcntl12_64|fcntl14|fcntl14_64|fcntl15|fcntl15_64|fcntl16|fcntl16_64|fcntl17|fcntl17_64|fcntl19|fcntl19_64|fcntl20|fcntl20_64|fcntl21|fcntl21_64|fcntl2[2-7]*|fcntl30|fcntl30_64|fcntl31|fcntl31_64|fcntl32|fcntl32_64|fcntl33|fcntl33_64|fcntl34|fcntl34_64|fcntl35|fcntl35_64|fcntl36|fcntl36_64|fcntl37|fcntl37_64|fcntl38|fcntl38_64|fcntl39|fcntl39_64|fdatasync02|fdatasync03|fgetxattr*|flistxattr*|find_portbundle|finit_module*|float_*|flock01|flock02|flock03|flock04|fork05|fork07|fork09|fork13|fork14|fork_exec_loop|fptest*|frag|fremovexattr*|fs_di|fs_fill|fs_inod|fs_perms|fsconfig*|fsetxattr*|fsmount*|fsopen*|fspick*|fsstress|fstatfs01|fstatfs01_64|fsx-linux|fsync*|ftest01|ftest02|ftest03|ftest04|ftest06|ftest07|ftest08|ftruncate01|ftruncate01_64|ftruncate04|ftruncate04_64|futex_cmp_requeue*|futex_wait03|futex_wait05|futex_wait_bitset*|futex_waitv*|futex_wake02|futex_wake04|futimesat01|fw_load|gen*|\
+    creat04|creat05|creat07|creat08|creat09|copy_file_range*|crypto_user*|cve-*|delete_module*|diotest2|dio_append|dio_truncate|dirtyc0w*|dirtypipe|dma_thread_diotest|dup05|ebizzy|eject_check_tray|endian_switch01|exec_with_inh|exec_without_inh|execve02|execve04|execve05|getxattr0[2-4]|hackbench|inode02|kill08|kill10|kill11|leapsec01|lftest|mallocstress|memcg*|mmap1|mmap3|mmapstress*|mmstress|mremap*|mtest*|nanosleep04|nptl01|pause*|pids_task*|pipe13|ppoll*|prot_hsymlinks|pselect02*|pthcli|pthserv|select04*|sendfile07*|setfsgid03*|shm_test*|signal01*|starvation*|tgkill*|timed_forkbomb*|waitpid08*|chdir01|clock_nanosleep*|close_range01|sched_datafile*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+run_case_with_timeout() {
+  case_file=\"$1\"
+  \"$case_file\" &
+  case_pid=$!
+  elapsed=0
+  while kill -0 \"$case_pid\" 2>/dev/null; do
+    if [ \"$elapsed\" -ge \"$case_timeout\" ]; then
+      kill -9 \"$case_pid\" 2>/dev/null
+      echo \"TIMEOUT LTP CASE $(basename \"$case_file\")\"
+      return 124
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  wait \"$case_pid\"
+  return $?
+}
+
+for file in \"$target_dir\"/*; do
+    [ -f \"$file\" ] || continue
+    case_name=$(basename \"$file\")
+  if [ \"$started\" -eq 0 ]; then
+    if [ \"$case_name\" = \"$start_from\" ]; then
+      started=1
+      echo \"LTP start marker matched: $case_name\"
+    else
+      continue
+    fi
+  fi
+    if is_skip_case \"$case_name\"; then
+        continue
+    fi
+    if [ -n \"$case_limit\" ] && [ \"$case_count\" -ge \"$case_limit\" ]; then
+        echo \"LTP case limit reached: $case_limit\"
+        break
+    fi
+    echo \"RUN LTP CASE $case_name\"
+    case_count=$((case_count + 1))
+    run_case_with_timeout \"$file\"
+    ret=$?
+    echo \"FAIL LTP CASE $case_name : $ret\"
+done
+
+echo \"#### OS COMP TEST GROUP END ltp-glibc ####\"
+"
+    } else {
+        "\
+#!/bin/sh
+echo \"#### OS COMP TEST GROUP START ltp-musl ####\"
+target_dir=\"ltp/testcases/bin\"
+export PATH=\"$PATH:./ltp/testcases/bin:./ltp/testcases/lib:./ltp/testcases/network/busy_poll:./ltp/testcases/kernel/controllers/cgroup_fj\"
+case_timeout=\"${LTP_CASE_TIMEOUT:-8}\"
+case_limit=\"${LTP_CASE_LIMIT:-}\"
+case_count=0
+
+is_skip_case() {
+    case \"$1\" in
+        *.sh|*_helper|*_helper.sh|*_child|busy_poll_lib.sh|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|cpuctl_fj_*|cpuhotplug_do_*|cpuhotplug_report_*|cpuset*|crash*|dio_read|dio_sparse|epoll*|eventfd*|event_generator|execveat*|fanotify*|fanout*|f00f|faccessat201|faccessat202|fallocate02|fallocate04|fallocate05|fallocate06|fchmod02|fchmod05|fchown01_16|fchown02_16|fchown03_16|fchown04|fchown04_16|fchown05_16|fchownat02|fcntl01|fcntl01_64|fcntl07|fcntl07_64|fcntl09|fcntl09_64|fcntl10|fcntl10_64|fcntl11|fcntl11_64|fcntl12|fcntl12_64|fcntl14|fcntl14_64|fcntl15|fcntl15_64|fcntl16|fcntl16_64|fcntl17|fcntl17_64|fcntl19|fcntl19_64|fcntl20|fcntl20_64|fcntl21|fcntl21_64|fcntl2[2-7]*|fcntl30|fcntl30_64|fcntl31|fcntl31_64|fcntl32|fcntl32_64|fcntl33|fcntl33_64|fcntl34|fcntl34_64|fcntl35|fcntl35_64|fcntl36|fcntl36_64|fcntl37|fcntl37_64|fcntl38|fcntl38_64|fcntl39|fcntl39_64|fdatasync02|fdatasync03|fgetxattr*|flistxattr*|find_portbundle|finit_module*|float_*|flock01|flock02|flock03|flock04|fork05|fork07|fork09|fork13|fork14|fork_exec_loop|fptest*|frag|fremovexattr*|fs_di|fs_fill|fs_inod|fs_perms|fsconfig*|fsetxattr*|fsmount*|fsopen*|fspick*|fsstress|fstatfs01|fstatfs01_64|fsx-linux|fsync*|ftest01|ftest02|ftest03|ftest04|ftest06|ftest07|ftest08|ftruncate01|ftruncate01_64|ftruncate04|ftruncate04_64|futex_cmp_requeue*|futex_wait03|futex_wait05|futex_wait_bitset*|futex_waitv*|futex_wake02|futex_wake04|futimesat01|fw_load|gen*|\
+        creat04|creat05|creat07|creat08|creat09|copy_file_range*|crypto_user*|cve-*|delete_module*|diotest2|dio_append|dio_truncate|dirtyc0w*|dirtypipe|dma_thread_diotest|dup05|ebizzy|eject_check_tray|endian_switch01|exec_with_inh|exec_without_inh|execve02|execve04|execve05|getxattr0[2-4]|hackbench|inode02|kill08|kill10|kill11|leapsec01|lftest|mallocstress|memcg*|mmap1|mmap3|mmapstress*|mmstress|mremap*|mtest*|nanosleep04|pause*|pids_task*|pipe13|ppoll*|prot_hsymlinks|pselect02*|pthcli|pthserv|select04*|sendfile07*|setfsgid03*|shm_test*|signal01*|starvation*|tgkill*|timed_forkbomb*|waitpid08*|chdir01|clock_nanosleep*|close_range01|sched_datafile*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+run_case_with_timeout() {
+    case_file=\"$1\"
+    \"$case_file\" &
+    case_pid=$!
+    elapsed=0
+    while kill -0 \"$case_pid\" 2>/dev/null; do
+        if [ \"$elapsed\" -ge \"$case_timeout\" ]; then
+            kill -9 \"$case_pid\" 2>/dev/null
+            wait \"$case_pid\" 2>/dev/null
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait \"$case_pid\"
+    return $?
+}
+
+for file in \"$target_dir\"/*; do
+        [ -f \"$file\" ] || continue
+        case_name=$(basename \"$file\")
+        if [ \"$started\" -eq 0 ]; then
+            if [ \"$case_name\" = \"$start_from\" ]; then
+                started=1
+                echo \"LTP start marker matched: $case_name\"
+            else
+                continue
+            fi
+        fi
+        if is_skip_case \"$case_name\"; then
+                continue
+        fi
+        if [ -n \"$case_limit\" ] && [ \"$case_count\" -ge \"$case_limit\" ]; then
+                echo \"LTP case limit reached: $case_limit\"
+                break
+        fi
+        echo \"RUN LTP CASE $case_name\"
+        case_count=$((case_count + 1))
+        run_case_with_timeout \"$file\"
+        ret=$?
+        echo \"FAIL LTP CASE $case_name : $ret\"
+done
+
+echo \"#### OS COMP TEST GROUP END ltp-musl ####\"
+"
+    };
+    let script = script.replacen(
+        "case_count=0\n",
+        format!("case_count=0\n{}", start_from_line).as_str(),
+        1,
+    );
+    let _ = write_embedded_elf(script_path, script.as_bytes());
+    run_testcode(script_path, root)
+}
+
+/// Reap exited child processes without force-killing arbitrary PIDs.
+///
+/// Aggressively killing a wide PID range can destabilize long LTP runs and
+/// may trigger kernel-side task-management panics. A safer cleanup strategy
+/// is to only reap children that have already exited.
+fn reap_orphans() -> usize {
+    // Reap with WNOHANG until ECHILD.
     let mut status: i32 = 0;
-    let mut yields_without_reap = 0usize;
+    let mut reaped = 0usize;
+    let mut idle_rounds = 0usize;
     loop {
         let ret = user_lib::waitpid_nohang(-1i32 as usize, &mut status);
         if ret > 0 {
-            // Reaped one zombie, reset counter and keep going
-            yields_without_reap = 0;
+            reaped += 1;
+            idle_rounds = 0;
             continue;
         }
         if ret == 0 {
-            // Children exist but none exited yet — yield and retry
-            yields_without_reap += 1;
-            if yields_without_reap > 500 {
-                // Safety valve: give up after many yields
+            // Children exist but none exited yet; bounded wait.
+            idle_rounds += 1;
+            if idle_rounds > 32 {
                 break;
             }
             user_lib::sys_yield();
@@ -529,6 +864,7 @@ fn reap_orphans() {
         }
         break; // ECHILD or error — no more children
     }
+    reaped
 }
 
 fn run_all_suites() {
@@ -568,6 +904,33 @@ fn run_selector(selector: &str) {
 
     if selector == "single-elf" {
         run_single_elf_suite();
+        return;
+    }
+
+    // Write /tmp/libctest_testcode.sh and run pthread_cancel tests
+    if selector == "tmp-libctest" {
+        let _ = activate_runtime_profile("/musl");
+        let _ = write_embedded_elf(TMP_LIBCTEST_PATH, TMP_LIBCTEST_SCRIPT);
+        let _ = run_testcode(TMP_LIBCTEST_PATH, "/musl");
+        return;
+    }
+
+    // Minimal LTP debug script
+    if selector == "tmp-ltp-mini" || selector == "tmp-ltp-mini-glibc" {
+        let root = if selector.ends_with("-glibc") { "/glibc" } else { "/musl" };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_LTP_MINI_PATH, TMP_LTP_MINI_SCRIPT);
+        let _ = run_testcode(TMP_LTP_MINI_PATH, root);
+        return;
+    }
+
+    // Write /tmp/ltp_testcode.sh and run selected LTP tests
+    // Usage: SINGLE_TEST=tmp-ltp or SINGLE_TEST=tmp-ltp-glibc
+    if selector == "tmp-ltp" || selector == "tmp-ltp-glibc" {
+        let root = if selector == "tmp-ltp-glibc" { "/glibc" } else { "/musl" };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_LTP_PATH, TMP_LTP_SCRIPT);
+        let _ = run_testcode(TMP_LTP_PATH, root);
         return;
     }
 

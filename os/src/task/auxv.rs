@@ -7,34 +7,34 @@ use alloc::vec::Vec;
 
 /// Auxiliary vector entry type constants (AT_* from Linux)
 pub mod auxv_type {
-    pub const AT_NULL: usize = 0;       // End of vector
+    pub const AT_NULL: usize = 0; // End of vector
     #[allow(dead_code)]
-    pub const AT_IGNORE: usize = 1;     // Entry should be ignored
+    pub const AT_IGNORE: usize = 1; // Entry should be ignored
     #[allow(dead_code)]
-    pub const AT_EXECFD: usize = 2;     // File descriptor of program
-    pub const AT_PHDR: usize = 3;       // Program headers for program
-    pub const AT_PHENT: usize = 4;      // Size of program header entry
-    pub const AT_PHNUM: usize = 5;      // Number of program headers
-    pub const AT_PAGESZ: usize = 6;     // System page size
+    pub const AT_EXECFD: usize = 2; // File descriptor of program
+    pub const AT_PHDR: usize = 3; // Program headers for program
+    pub const AT_PHENT: usize = 4; // Size of program header entry
+    pub const AT_PHNUM: usize = 5; // Number of program headers
+    pub const AT_PAGESZ: usize = 6; // System page size
     #[allow(dead_code)]
-    pub const AT_BASE: usize = 7;       // Base address of interpreter
+    pub const AT_BASE: usize = 7; // Base address of interpreter
     #[allow(dead_code)]
-    pub const AT_FLAGS: usize = 8;      // Flags
-    pub const AT_ENTRY: usize = 9;      // Entry point of program
+    pub const AT_FLAGS: usize = 8; // Flags
+    pub const AT_ENTRY: usize = 9; // Entry point of program
     #[allow(dead_code)]
-    pub const AT_NOTELF: usize = 10;    // Program is not ELF
-    pub const AT_UID: usize = 11;       // Real uid
-    pub const AT_EUID: usize = 12;      // Effective uid
-    pub const AT_GID: usize = 13;       // Real gid
-    pub const AT_EGID: usize = 14;      // Effective gid
+    pub const AT_NOTELF: usize = 10; // Program is not ELF
+    pub const AT_UID: usize = 11; // Real uid
+    pub const AT_EUID: usize = 12; // Effective uid
+    pub const AT_GID: usize = 13; // Real gid
+    pub const AT_EGID: usize = 14; // Effective gid
     #[allow(dead_code)]
-    pub const AT_PLATFORM: usize = 15;  // String identifying platform
+    pub const AT_PLATFORM: usize = 15; // String identifying platform
     #[allow(dead_code)]
-    pub const AT_HWCAP: usize = 16;     // Machine dependent hints about processor capabilities
+    pub const AT_HWCAP: usize = 16; // Machine dependent hints about processor capabilities
     #[allow(dead_code)]
-    pub const AT_CLKTCK: usize = 17;    // Frequency of times()
-    pub const AT_SECURE: usize = 23;    // Secure mode boolean
-    pub const AT_RANDOM: usize = 25;    // Address of 16 random bytes
+    pub const AT_CLKTCK: usize = 17; // Frequency of times()
+    pub const AT_SECURE: usize = 23; // Secure mode boolean
+    pub const AT_RANDOM: usize = 25; // Address of 16 random bytes
 }
 
 /// Information needed for auxiliary vectors
@@ -61,13 +61,13 @@ impl AuxvInfo {
             (AT_PHNUM, self.phnum),
             (AT_PAGESZ, page_size),
             (AT_ENTRY, self.entry),
-            (AT_UID, 0),        // Root user
-            (AT_EUID, 0),       // Root user
-            (AT_GID, 0),        // Root group
-            (AT_EGID, 0),       // Root group
-            (AT_SECURE, 0),     // Not secure mode
-            (AT_RANDOM, 0),     // TODO: Implement random bytes
-            (AT_NULL, 0),       // Terminator
+            (AT_UID, 0),    // Root user
+            (AT_EUID, 0),   // Root user
+            (AT_GID, 0),    // Root group
+            (AT_EGID, 0),   // Root group
+            (AT_SECURE, 0), // Not secure mode
+            (AT_RANDOM, 0), // TODO: Implement random bytes
+            (AT_NULL, 0),   // Terminator
         ]
     }
 }

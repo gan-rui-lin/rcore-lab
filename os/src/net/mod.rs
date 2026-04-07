@@ -2,6 +2,7 @@
 
 pub mod socket_file;
 pub mod syscall;
+pub mod unix_socket;
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, Ordering};

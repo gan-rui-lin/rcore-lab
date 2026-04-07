@@ -2,12 +2,13 @@
 use super::{File, PollEvents};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
-use crate::task::{has_pending_unmasked_signal, suspend_current_and_run_next};
+use crate::task::{current_task, has_pending_unmasked_signal, suspend_current_and_run_next, SignalFlags};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
 const DEFAULT_PIPE_CAPACITY: usize = 4096;
+const EPIPE_ERRNO: isize = -32;
 
 struct Pipe {
     buf: Vec<u8>,
@@ -38,9 +39,7 @@ impl Pipe {
         let mut read = 0;
         while read < out.len() && self.len > 0 {
             let cap = self.capacity();
-            let chunk = (cap - self.head)
-                .min(self.len)
-                .min(out.len() - read);
+            let chunk = (cap - self.head).min(self.len).min(out.len() - read);
             out[read..read + chunk].copy_from_slice(&self.buf[self.head..self.head + chunk]);
             self.head = (self.head + chunk) % cap;
             self.len -= chunk;
@@ -54,11 +53,8 @@ impl Pipe {
         while written < data.len() && self.len < self.capacity() {
             let cap = self.capacity();
             let space = cap - self.len;
-            let chunk = (cap - self.tail)
-                .min(space)
-                .min(data.len() - written);
-            self.buf[self.tail..self.tail + chunk]
-                .copy_from_slice(&data[written..written + chunk]);
+            let chunk = (cap - self.tail).min(space).min(data.len() - written);
+            self.buf[self.tail..self.tail + chunk].copy_from_slice(&data[written..written + chunk]);
             self.tail = (self.tail + chunk) % cap;
             self.len += chunk;
             written += chunk;
@@ -161,13 +157,54 @@ impl File for PipeEnd {
         total
     }
 
+    fn write_user_buffer(&self, user_buf: UserBuffer) -> Result<usize, isize> {
+        let mut total = 0usize;
+        for slice in user_buf.buffers.iter() {
+            let mut offset = 0usize;
+            while offset < slice.len() {
+                let mut pipe = self.pipe.exclusive_access();
+                if !pipe.read_open {
+                    if total == 0 {
+                        if let Some(task) = current_task() {
+                            let mut task_inner = task.inner_exclusive_access();
+                            task_inner.signal_pending |= SignalFlags::SIGPIPE;
+                        }
+                        return Err(EPIPE_ERRNO);
+                    }
+                    return Ok(total);
+                }
+                if pipe.len < pipe.capacity() {
+                    let n = pipe.write_from(&slice[offset..]);
+                    total += n;
+                    offset += n;
+                    if n == 0 {
+                        break;
+                    }
+                } else {
+                    if total > 0 {
+                        return Ok(total);
+                    }
+                    drop(pipe);
+                    suspend_current_and_run_next();
+                }
+            }
+        }
+        Ok(total)
+    }
+
     fn poll(&self, events: PollEvents) -> PollEvents {
         let pipe = self.pipe.exclusive_access();
         let mut revents = PollEvents::empty();
-        if events.contains(PollEvents::POLLIN) && self.readable && (pipe.len > 0 || !pipe.write_open) {
+        if events.contains(PollEvents::POLLIN)
+            && self.readable
+            && (pipe.len > 0 || !pipe.write_open)
+        {
             revents |= PollEvents::POLLIN;
         }
-        if events.contains(PollEvents::POLLOUT) && self.writable && (pipe.len < pipe.capacity() || !pipe.read_open) {
+        if events.contains(PollEvents::POLLOUT)
+            && self.writable
+            && (pipe.len < pipe.capacity() || !pipe.read_open)
+        {
             revents |= PollEvents::POLLOUT;
         }
         revents
@@ -176,7 +213,8 @@ impl File for PipeEnd {
 
 /// Create a pipe and return (read_end, write_end).
 pub fn make_pipe(capacity: usize) -> (Arc<dyn File + Send + Sync>, Arc<dyn File + Send + Sync>) {
-    let pipe = Arc::new(unsafe { UPIntrFreeCell::new(Pipe::new(capacity.max(DEFAULT_PIPE_CAPACITY))) });
+    let pipe =
+        Arc::new(unsafe { UPIntrFreeCell::new(Pipe::new(capacity.max(DEFAULT_PIPE_CAPACITY))) });
     let read_end = Arc::new(PipeEnd::new(pipe.clone(), true, false));
     let write_end = Arc::new(PipeEnd::new(pipe, false, true));
     (read_end, write_end)

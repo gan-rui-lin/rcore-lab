@@ -2,22 +2,22 @@
 //!
 //! User-mode traps are handled in `user_trap_loop()` (arch-specific).
 //! Kernel-mode traps are dispatched
-//! through `ArchInterface::kernel_interrupt` → `kernel_interrupt_dispatch`.
+//! through `ArchInterface::kernel_interrupt` -> `kernel_interrupt_dispatch`.
 
 #![allow(missing_docs)]
 #![allow(unused_imports)]
 
+use crate::config::PAGE_SIZE;
+use crate::mm::{PageTable, VirtAddr};
 use crate::syscall::syscall;
 use crate::task::{
-    current_add_signal, current_process, current_task, current_trap_cx,
-    current_user_token, handle_signals, suspend_current_and_run_next, SignalFlags,
+    current_add_signal, current_process, current_task, current_trap_cx, current_user_token,
+    handle_signals, process_interval_timers, suspend_current_and_run_next, SignalFlags,
 };
-use crate::mm::{PageTable, VirtAddr};
-use crate::config::PAGE_SIZE;
 use crate::timer::{check_timer, set_next_trigger};
+use alloc::string::String;
 use arch::TrapFrameArgs;
 use core::sync::atomic::{AtomicU64, Ordering};
-use alloc::string::String;
 
 const TIMER_SAMPLE_INTERVAL: u64 = 200;
 static TIMER_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -25,6 +25,8 @@ static TIMER_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg_attr(target_arch = "riscv64", path = "user_trap_riscv64.rs")]
 #[cfg_attr(target_arch = "loongarch64", path = "user_trap_loongarch64.rs")]
 mod user_trap_arch;
+
+pub use user_trap_loop as user_trap_entry;
 
 fn handle_user_syscall() {
     let trap_cx = current_trap_cx();
@@ -36,20 +38,11 @@ fn handle_user_syscall() {
 fn handle_user_time_interrupt() {
     set_next_trigger();
     check_timer();
-    crate::syscall::process::check_itimer_real();
+    process_interval_timers(true);
     handle_signals();
     suspend_current_and_run_next();
 }
 
-// ---------------------------------------------------------------------------
-// Kernel-mode trap dispatch (called from ArchInterface::kernel_interrupt)
-// ---------------------------------------------------------------------------
-
-/// Dispatch a kernel-mode trap / interrupt.
-///
-/// Called from `arch::api::ArchInterface::kernel_interrupt` which is
-/// invoked by the architecture's kernel-mode trap handler after it has
-/// classified the hardware event into a [`arch::TrapType`].
 pub fn kernel_interrupt_dispatch(trap_type: arch::TrapType) {
     match trap_type {
         arch::TrapType::SupervisorExternal => {
@@ -58,6 +51,7 @@ pub fn kernel_interrupt_dispatch(trap_type: arch::TrapType) {
         arch::TrapType::Time => {
             set_next_trigger();
             check_timer();
+            process_interval_timers(false);
 
             let count = TIMER_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
             if count % TIMER_SAMPLE_INTERVAL == 0 {
@@ -87,15 +81,6 @@ pub fn kernel_interrupt_dispatch(trap_type: arch::TrapType) {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// User-mode trap entry loop (LoongArch64)
-//
-// On LoongArch64 the kernel enters user mode via a loop: restore user
-// registers -> ertn -> (user runs) -> trap -> user_vec returns here.
-// This avoids the old trampoline-style return path and keeps the kernel
-// control flow in a direct loop.
-// ---------------------------------------------------------------------------
 
 pub fn user_trap_loop() -> ! {
     loop {
@@ -133,8 +118,6 @@ pub fn user_trap_loop() -> ! {
     }
 }
 
-/// Debug helper for GDB: translate a user virtual address to physical address.
-/// Returns 0 if unmapped.
 #[cfg(target_arch = "riscv64")]
 #[no_mangle]
 #[link_section = ".text.keep"]

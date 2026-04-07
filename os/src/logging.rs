@@ -65,7 +65,7 @@ pub fn init() {
         Some("OFF") | Some("NONE") => (LevelFilter::Off, 0),
         Some("ERROR") => (LevelFilter::Error, 10),
         Some("WARN") => (LevelFilter::Warn, 20),
-        Some("SYSCALL") => (LevelFilter::Info, SYSCALL_LEVEL),  // 新增 SYSCALL 级别
+        Some("SYSCALL") => (LevelFilter::Info, SYSCALL_LEVEL), // 新增 SYSCALL 级别
         Some("INFO") => (LevelFilter::Info, 30),
         Some("DEBUG") => (LevelFilter::Debug, 40),
         Some("TRACE") => (LevelFilter::Trace, 50),

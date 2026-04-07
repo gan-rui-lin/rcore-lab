@@ -1,11 +1,14 @@
 #![allow(missing_docs)]
 
-use super::{ProcessControlBlock, TaskContext, TaskControlBlock, TaskStatus, fetch_task, ready_queue_snapshot};
+use super::{
+    fetch_task, ready_queue_snapshot, ProcessControlBlock, TaskContext, TaskControlBlock,
+    TaskStatus,
+};
 use crate::sync::UPIntrFreeCell;
-use arch::TrapContext;
 use alloc::sync::Arc;
-use lazy_static::*;
+use arch::TrapContext;
 use core::sync::atomic::{AtomicU64, Ordering};
+use lazy_static::*;
 
 pub struct Processor {
     current: Option<Arc<TaskControlBlock>>,
@@ -31,7 +34,8 @@ impl Processor {
 }
 
 lazy_static! {
-    pub static ref PROCESSOR: UPIntrFreeCell<Processor> = unsafe { UPIntrFreeCell::new(Processor::new()) };
+    pub static ref PROCESSOR: UPIntrFreeCell<Processor> =
+        unsafe { UPIntrFreeCell::new(Processor::new()) };
 }
 
 const RUN_TASKS_EMPTY_INTERVAL: u64 = 2000;

@@ -212,8 +212,12 @@ fi
 
 # 运行QEMU
 echo "启动QEMU模拟器..."
+KERNEL_IMAGE="kernel-rv.bin"
+if [[ ! -f "$KERNEL_IMAGE" ]]; then
+    KERNEL_IMAGE="kernel-rv"
+fi
 qemu-system-riscv64 -machine virt \
-    -kernel kernel-rv \
+    -kernel "$KERNEL_IMAGE" \
   -m 1024M \
   -nographic \
   -smp 1 \

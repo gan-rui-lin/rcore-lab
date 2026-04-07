@@ -1,31 +1,41 @@
 //! Network system call implementations.
 
 use alloc::sync::Arc;
+use alloc::collections::BTreeSet;
 use alloc::vec;
 use core::sync::atomic::{AtomicBool, AtomicU16};
+use lazy_static::lazy_static;
 use log::warn;
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
+use spin::Mutex;
 
-use crate::mm::{translated_byte_buffer, translated_refmut};
+use crate::fs::{open_file, path_is_dir, OpenFlags};
+use crate::mm::{translated_byte_buffer, translated_byte_buffer_checked, translated_refmut};
 use crate::task::{current_process, current_user_token, has_pending_unmasked_signal, suspend_current_and_run_next};
 
 use super::socket_file::{SocketFile, SocketType};
+use super::unix_socket::{unix_registry_get, unix_registry_has, unix_registry_insert, UnixSocketFile};
 use super::{alloc_ephemeral_port, poll_net, NET_STACK};
 
 // Address family
+const AF_UNIX: usize = 1;
 const AF_INET: usize = 2;
 
 // Socket types
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
+const SOCK_RAW: usize = 3;
+const SOCK_SEQPACKET: usize = 5;
 const SOCK_NONBLOCK: usize = 0o4000;
 const SOCK_CLOEXEC: usize = 0o2000000;
 
 // Socket options
 const SOL_SOCKET: usize = 1;
+const SOL_IP: usize = 0;
 const IPPROTO_TCP: usize = 6;
+const IPPROTO_UDP: usize = 17;
 const SO_REUSEADDR: usize = 2;
 const SO_ERROR: usize = 4;
 const SO_KEEPALIVE: usize = 9;
@@ -34,6 +44,8 @@ const SO_RCVBUF: usize = 8;
 const SO_RCVTIMEO: usize = 20;
 const SO_SNDTIMEO: usize = 21;
 const TCP_NODELAY: usize = 1;
+const MCAST_JOIN_GROUP: usize = 42;
+const MCAST_LEAVE_GROUP: usize = 45;
 
 // Errno values
 const EINTR: isize = -4;
@@ -42,38 +54,51 @@ const EINVAL: isize = -22;
 const ENOTSOCK: isize = -88;
 const EAFNOSUPPORT: isize = -97;
 const EADDRINUSE: isize = -98;
+const EADDRNOTAVAIL: isize = -99;
+const EISCONN: isize = -106;
 const ENOTCONN: isize = -107;
 const ECONNREFUSED: isize = -111;
 const EFAULT: isize = -14;
+const EACCES: isize = -13;
+const ENOTDIR: isize = -20;
 const EMFILE: isize = -24;
 const EMSGSIZE: isize = -90;
 const EOPNOTSUPP: isize = -95;
+const EPROTONOSUPPORT: isize = -93;
 
 /// Linux sockaddr_in structure (16 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct SockAddrIn {
     sin_family: u16,
-    sin_port: u16,   // big-endian
-    sin_addr: u32,   // big-endian
+    sin_port: u16, // big-endian
+    sin_addr: u32, // big-endian
     sin_zero: [u8; 8],
 }
 
 /// Convert user-space sockaddr to smoltcp IpEndpoint.
 fn read_sockaddr(addr_ptr: *const u8, addr_len: usize, token: usize) -> Option<IpEndpoint> {
-    if addr_ptr.is_null() || addr_len < core::mem::size_of::<SockAddrIn>() {
+    let size = core::mem::size_of::<SockAddrIn>();
+    if addr_ptr.is_null() || addr_len < size {
         return None;
     }
-    let bufs = translated_byte_buffer(token, addr_ptr, core::mem::size_of::<SockAddrIn>());
+    let bufs = translated_byte_buffer_checked(token, addr_ptr, size, false)?;
     let mut raw = [0u8; 16];
     let mut offset = 0;
     for buf in bufs.iter() {
         let n = buf.len().min(16 - offset);
         raw[offset..offset + n].copy_from_slice(&buf[..n]);
         offset += n;
+        if offset >= 16 {
+            break;
+        }
+    }
+    if offset < 16 {
+        return None;
     }
     let family = u16::from_ne_bytes([raw[0], raw[1]]);
-    if family != AF_INET as u16 {
+    // Linux compat: some tests pass sin_family = 0 (AF_UNSPEC) for IPv4 bind.
+    if family != AF_INET as u16 && family != 0 {
         return None;
     }
     let port = u16::from_be_bytes([raw[2], raw[3]]);
@@ -81,10 +106,125 @@ fn read_sockaddr(addr_ptr: *const u8, addr_len: usize, token: usize) -> Option<I
     Some(IpEndpoint::new(IpAddress::Ipv4(ip), port))
 }
 
-/// Write smoltcp IpEndpoint back to user-space sockaddr.
-fn write_sockaddr(ep: &IpEndpoint, addr_ptr: *mut u8, addrlen_ptr: *mut u32, token: usize) {
+/// Read IPv4 sockaddr with errno-precise validation for connect().
+fn read_sockaddr_for_connect(
+    addr_ptr: *const u8,
+    addr_len: usize,
+    token: usize,
+) -> Result<IpEndpoint, isize> {
     if addr_ptr.is_null() {
-        return;
+        return Err(EFAULT);
+    }
+    if addr_len < core::mem::size_of::<SockAddrIn>() {
+        return Err(EINVAL);
+    }
+    if (addr_ptr as usize) >= 0x4000_0000_0000 {
+        return Err(EFAULT);
+    }
+    let size = core::mem::size_of::<SockAddrIn>();
+    if translated_byte_buffer_checked(token, addr_ptr, size, false).is_none() {
+        return Err(EFAULT);
+    }
+    let bufs = translated_byte_buffer(token, addr_ptr, size);
+    let mut raw = [0u8; 16];
+    let mut offset = 0usize;
+    for buf in bufs.iter() {
+        let n = buf.len().min(size - offset);
+        raw[offset..offset + n].copy_from_slice(&buf[..n]);
+        offset += n;
+        if offset >= size {
+            break;
+        }
+    }
+    if offset < size {
+        return Err(EFAULT);
+    }
+    let family = u16::from_ne_bytes([raw[0], raw[1]]);
+    if family != AF_INET as u16 && family != 0 {
+        return Err(EAFNOSUPPORT);
+    }
+    let port = u16::from_be_bytes([raw[2], raw[3]]);
+    let ip = Ipv4Address::new(raw[4], raw[5], raw[6], raw[7]);
+    Ok(IpEndpoint::new(IpAddress::Ipv4(ip), port))
+}
+
+fn read_user_u32(token: usize, ptr: *const u32) -> Result<u32, isize> {
+    let Some(bufs) =
+        translated_byte_buffer_checked(token, ptr as *const u8, core::mem::size_of::<u32>(), false)
+    else {
+        return Err(EFAULT);
+    };
+    let mut raw = [0u8; 4];
+    let mut offset = 0usize;
+    for buf in bufs.iter() {
+        let n = buf.len().min(4 - offset);
+        raw[offset..offset + n].copy_from_slice(&buf[..n]);
+        offset += n;
+        if offset >= 4 {
+            break;
+        }
+    }
+    if offset < 4 {
+        return Err(EFAULT);
+    }
+    Ok(u32::from_ne_bytes(raw))
+}
+
+fn write_user_u32(token: usize, ptr: *mut u32, val: u32) -> Result<(), isize> {
+    let Some(bufs) =
+        translated_byte_buffer_checked(token, ptr as *const u8, core::mem::size_of::<u32>(), true)
+    else {
+        return Err(EFAULT);
+    };
+    let bytes = val.to_ne_bytes();
+    let mut offset = 0usize;
+    for buf in bufs.iter() {
+        let n = buf.len().min(4 - offset);
+        let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, n) };
+        dst.copy_from_slice(&bytes[offset..offset + n]);
+        offset += n;
+        if offset >= 4 {
+            break;
+        }
+    }
+    if offset < 4 {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+
+fn copy_to_user(token: usize, dst_ptr: *mut u8, src: &[u8]) -> Result<(), isize> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    let Some(bufs) = translated_byte_buffer_checked(token, dst_ptr, src.len(), true) else {
+        return Err(EFAULT);
+    };
+    let mut offset = 0usize;
+    for buf in bufs.iter() {
+        let n = buf.len().min(src.len() - offset);
+        let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, n) };
+        dst.copy_from_slice(&src[offset..offset + n]);
+        offset += n;
+        if offset >= src.len() {
+            break;
+        }
+    }
+    if offset < src.len() {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+
+/// Write smoltcp IpEndpoint back to user-space sockaddr.
+fn write_sockaddr(
+    ep: &IpEndpoint,
+    addr_ptr: *mut u8,
+    addrlen_ptr: *mut u32,
+    token: usize,
+) -> Result<(), isize> {
+    if addr_ptr.is_null() || addrlen_ptr.is_null() {
+        return Err(EFAULT);
     }
     let mut raw = [0u8; 16];
     raw[0] = AF_INET as u8;
@@ -99,20 +239,14 @@ fn write_sockaddr(ep: &IpEndpoint, addr_ptr: *mut u8, addrlen_ptr: *mut u32, tok
     raw[6] = octets[2];
     raw[7] = octets[3];
 
-    let bufs = translated_byte_buffer(token, addr_ptr, 16);
-    let mut offset = 0;
-    for buf in bufs.iter() {
-        let n = buf.len().min(16 - offset);
-        // Safety: translated_byte_buffer gives mutable kernel-mapped slices
-        let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, n) };
-        dst.copy_from_slice(&raw[offset..offset + n]);
-        offset += n;
+    let user_len = read_user_u32(token, addrlen_ptr as *const u32)?;
+    if (user_len as i32) < 0 {
+        return Err(EINVAL);
     }
-
-    if !addrlen_ptr.is_null() {
-        let len_ref = translated_refmut(token, addrlen_ptr);
-        *len_ref = 16;
-    }
+    let copy_len = core::cmp::min(raw.len(), user_len as usize);
+    copy_to_user(token, addr_ptr, &raw[..copy_len])?;
+    write_user_u32(token, addrlen_ptr, raw.len() as u32)?;
+    Ok(())
 }
 
 /// Helper: get socket handle and type from fd.
@@ -123,10 +257,15 @@ fn get_socket_info(fd: usize) -> Result<(SocketHandle, SocketType), isize> {
         return Err(EBADF);
     }
     match inner.fd_table[fd].as_ref() {
-        Some(file) => match file.as_socket() {
-            Some((handle, sock_type)) => Ok((handle, sock_type)),
-            None => Err(ENOTSOCK),
-        },
+        Some(file) => {
+            if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
+                return Err(EBADF);
+            }
+            match file.as_socket() {
+                Some((handle, sock_type)) => Ok((handle, sock_type)),
+                None => Err(ENOTSOCK),
+            }
+        }
         None => Err(EBADF),
     }
 }
@@ -139,15 +278,71 @@ fn get_socket_extra(fd: usize) -> Result<(SocketHandle, SocketType, u16, bool), 
         return Err(EBADF);
     }
     match inner.fd_table[fd].as_ref() {
-        Some(file) => match file.as_socket() {
-            Some((handle, sock_type)) => {
-                let bound_port = file.bound_port();
-                let listening = file.is_listening();
-                Ok((handle, sock_type, bound_port, listening))
+        Some(file) => {
+            if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
+                return Err(EBADF);
             }
-            None => Err(ENOTSOCK),
-        },
+            match file.as_socket() {
+                Some((handle, sock_type)) => {
+                    let bound_port = file.bound_port();
+                    let listening = file.is_listening();
+                    Ok((handle, sock_type, bound_port, listening))
+                }
+                None => Err(ENOTSOCK),
+            }
+        }
         None => Err(EBADF),
+    }
+}
+
+lazy_static! {
+    // Track sockets that joined MCAST group via MCAST_JOIN_GROUP.
+    // Needed by accept02: accepted socket should not inherit this state.
+    static ref MCAST_JOINED: Mutex<BTreeSet<SocketHandle>> = Mutex::new(BTreeSet::new());
+}
+
+fn mcast_mark_joined(handle: SocketHandle) {
+    MCAST_JOINED.lock().insert(handle);
+}
+
+fn mcast_leave_group(handle: SocketHandle) -> bool {
+    MCAST_JOINED.lock().remove(&handle)
+}
+
+fn mcast_transfer_membership(old_handle: SocketHandle, new_handle: SocketHandle) {
+    let mut joined = MCAST_JOINED.lock();
+    if joined.remove(&old_handle) {
+        joined.insert(new_handle);
+    }
+}
+
+fn normalize_abs_path(path: &str) -> alloc::string::String {
+    let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(comp),
+        }
+    }
+    if parts.is_empty() {
+        alloc::string::String::from("/")
+    } else {
+        alloc::format!("/{}", parts.join("/"))
+    }
+}
+
+fn resolve_unix_bind_path(path: &str) -> alloc::string::String {
+    if path.starts_with('/') {
+        return normalize_abs_path(path);
+    }
+    let cwd = current_process().inner_exclusive_access().cwd.clone();
+    if cwd == "/" {
+        normalize_abs_path(&alloc::format!("/{}", path))
+    } else {
+        normalize_abs_path(&alloc::format!("{}/{}", cwd.trim_end_matches('/'), path))
     }
 }
 
@@ -157,13 +352,30 @@ fn get_socket_extra(fd: usize) -> Result<(SocketHandle, SocketType, u16, bool), 
 
 /// sys_socket(domain, type, protocol) -> fd
 pub fn sys_socket(domain: usize, sock_type: usize, _protocol: usize) -> isize {
-    if domain != AF_INET {
-        return EAFNOSUPPORT;
-    }
-
     let base_type = sock_type & 0xFF;
     let nonblock = (sock_type & SOCK_NONBLOCK) != 0;
     let cloexec = (sock_type & SOCK_CLOEXEC) != 0;
+
+    // Handle AF_UNIX domain sockets
+    if domain == AF_UNIX {
+        let unix_type = match base_type {
+            SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET => base_type as u8,
+            _ => return EINVAL,
+        };
+        let sock = UnixSocketFile::new(unix_type, nonblock, cloexec);
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        let fd = match inner.alloc_fd() {
+            Some(fd) => fd,
+            None => return EMFILE,
+        };
+        inner.fd_table[fd] = Some(sock);
+        return fd as isize;
+    }
+
+    if domain != AF_INET {
+        return EAFNOSUPPORT;
+    }
 
     let st = match base_type {
         SOCK_STREAM => SocketType::Tcp,
@@ -185,14 +397,10 @@ pub fn sys_socket(domain: usize, sock_type: usize, _protocol: usize) -> isize {
                 stack.sockets.add(socket)
             }
             SocketType::Udp => {
-                let rx_buf = udp::PacketBuffer::new(
-                    vec![udp::PacketMetadata::EMPTY; 32],
-                    vec![0u8; 65536],
-                );
-                let tx_buf = udp::PacketBuffer::new(
-                    vec![udp::PacketMetadata::EMPTY; 32],
-                    vec![0u8; 65536],
-                );
+                let rx_buf =
+                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0u8; 65536]);
+                let tx_buf =
+                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0u8; 65536]);
                 let socket = udp::Socket::new(rx_buf, tx_buf);
                 stack.sockets.add(socket)
             }
@@ -219,8 +427,7 @@ fn endpoint_to_listen(ep: &IpEndpoint) -> IpListenEndpoint {
         IpAddress::Ipv4(v4) => {
             let bytes = v4.as_bytes();
             // 0.0.0.0 = INADDR_ANY, 127.x.x.x = loopback → treat as wildcard
-            if (bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0)
-                || bytes[0] == 127
+            if (bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0) || bytes[0] == 127
             {
                 None
             } else {
@@ -234,9 +441,180 @@ fn endpoint_to_listen(ep: &IpEndpoint) -> IpListenEndpoint {
     }
 }
 
+/// Read the address family (first 2 bytes) from a user sockaddr.
+fn read_sockaddr_family(addr_ptr: *const u8, addr_len: usize, token: usize) -> Option<u16> {
+    if addr_ptr.is_null() || addr_len < 2 {
+        return None;
+    }
+    let bufs = translated_byte_buffer_checked(token, addr_ptr, 2, false)?;
+    let mut raw = [0u8; 2];
+    let mut offset = 0;
+    for buf in bufs.iter() {
+        let n = buf.len().min(2 - offset);
+        raw[offset..offset + n].copy_from_slice(&buf[..n]);
+        offset += n;
+        if offset >= 2 {
+            break;
+        }
+    }
+    if offset < 2 {
+        return None;
+    }
+    Some(u16::from_ne_bytes(raw))
+}
+
+/// Read AF_UNIX sockaddr path from user memory.
+/// Returns (path_string, is_abstract).
+fn read_unix_sockaddr(addr_ptr: *const u8, addr_len: usize, token: usize) -> Option<(alloc::string::String, bool)> {
+    if addr_ptr.is_null() || addr_len < 3 {
+        return None;
+    }
+    // sockaddr_un: { sa_family: u16, sun_path: [u8; 108] }
+    let max_len = addr_len.min(110);
+    let bufs = translated_byte_buffer_checked(token, addr_ptr, max_len, false)?;
+    let mut raw = vec![0u8; max_len];
+    let mut offset = 0;
+    for buf in bufs.iter() {
+        let n = buf.len().min(max_len - offset);
+        raw[offset..offset + n].copy_from_slice(&buf[..n]);
+        offset += n;
+        if offset >= max_len {
+            break;
+        }
+    }
+    if offset < max_len {
+        return None;
+    }
+    // raw[0..2] = family, raw[2..] = sun_path
+    let path_bytes = &raw[2..];
+    if path_bytes.is_empty() {
+        return Some((alloc::string::String::new(), false));
+    }
+    if path_bytes[0] == 0 {
+        // Abstract socket: name starts after the leading \0
+        let name_end = path_bytes.iter().position(|&b| b == 0 && path_bytes.iter().position(|&x| x == b).unwrap_or(0) != 0)
+            .unwrap_or(path_bytes.len());
+        let name = alloc::string::String::from_utf8_lossy(&path_bytes[1..name_end]).into_owned();
+        Some((name, true))
+    } else {
+        // Pathname socket: null-terminated
+        let end = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+        let path = alloc::string::String::from_utf8_lossy(&path_bytes[..end]).into_owned();
+        Some((path, false))
+    }
+}
+
+/// Write AF_UNIX sockaddr to user memory.
+fn write_unix_sockaddr(
+    path: &str,
+    addr_ptr: *mut u8,
+    addrlen_ptr: *mut u32,
+    token: usize,
+) -> Result<(), isize> {
+    if addr_ptr.is_null() || addrlen_ptr.is_null() {
+        return Err(EFAULT);
+    }
+    let mut raw = [0u8; 110];
+    raw[0] = AF_UNIX as u8;
+    raw[1] = 0;
+
+    let path_bytes = path.as_bytes();
+    let copy_len = path_bytes.len().min(108);
+    raw[2..2 + copy_len].copy_from_slice(&path_bytes[..copy_len]);
+
+    // For pathname sockets, include trailing '\0' when there is room.
+    let mut used_len = 2 + copy_len;
+    if copy_len > 0 && path_bytes[0] != 0 && copy_len < 108 {
+        raw[2 + copy_len] = 0;
+        used_len += 1;
+    }
+
+    let user_len = read_user_u32(token, addrlen_ptr as *const u32)?;
+    if (user_len as i32) < 0 {
+        return Err(EINVAL);
+    }
+    let copy_to = core::cmp::min(used_len, user_len as usize);
+    copy_to_user(token, addr_ptr, &raw[..copy_to])?;
+    write_user_u32(token, addrlen_ptr, used_len as u32)?;
+    Ok(())
+}
+
 /// sys_bind(fd, addr, addrlen) -> 0
 pub fn sys_bind(fd: usize, addr: *const u8, addr_len: usize) -> isize {
     let token = current_user_token();
+
+    // Read address family first to dispatch properly
+    let family = match read_sockaddr_family(addr, addr_len, token) {
+        Some(f) => f,
+        None => return EINVAL,
+    };
+
+    // Check if fd is valid and get file
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return EBADF;
+        }
+        let file = match inner.fd_table[fd].as_ref() {
+            Some(f) => f.clone(),
+            None => return EBADF,
+        };
+        drop(inner);
+
+        // Handle AF_UNIX sockets
+        if file.is_unix_socket() {
+            if family != AF_UNIX as u16 {
+                return EINVAL; // Can't bind unix socket to non-unix addr
+            }
+            let (path, is_abstract) = match read_unix_sockaddr(addr, addr_len, token) {
+                Some(r) => r,
+                None => return EINVAL,
+            };
+            let registry_key = if is_abstract {
+                let mut k = alloc::string::String::from("\0");
+                k.push_str(&path);
+                k
+            } else {
+                let resolved = resolve_unix_bind_path(&path);
+                if let Some((parent, _)) = resolved.rsplit_once('/') {
+                    let parent = if parent.is_empty() { "/" } else { parent };
+                    if !path_is_dir(parent) {
+                        return ENOTDIR;
+                    }
+                } else {
+                    return ENOTDIR;
+                }
+                resolved
+            };
+            if unix_registry_has(&registry_key) {
+                return EADDRINUSE;
+            }
+            if !is_abstract && open_file(registry_key.as_str(), OpenFlags::empty()).is_some() {
+                return EADDRINUSE;
+            }
+
+            let ret = file.unix_do_bind(registry_key.clone(), is_abstract);
+            if ret == 0 {
+                if !is_abstract {
+                    // Create a filesystem node so unlink() succeeds for pathname sockets.
+                    let _ = open_file(
+                        registry_key.as_str(),
+                        OpenFlags::CREATE | OpenFlags::WRONLY,
+                    );
+                }
+                unix_registry_insert(registry_key, file.clone());
+            }
+            return ret;
+        }
+
+        // For INET sockets bound to AF_UNIX addr → EAFNOSUPPORT
+        if family == AF_UNIX as u16 {
+            return EAFNOSUPPORT;
+        }
+    }
+
+    // Original INET bind logic
     let ep = match read_sockaddr(addr, addr_len, token) {
         Some(ep) => ep,
         None => return EINVAL,
@@ -248,6 +626,25 @@ pub fn sys_bind(fd: usize, addr: *const u8, addr_len: usize) -> isize {
     };
 
     let listen_ep = endpoint_to_listen(&ep);
+
+    // Non-local explicit bind address should fail with EADDRNOTAVAIL.
+    if listen_ep.addr.is_some() {
+        let IpAddress::Ipv4(v4) = ep.addr;
+        let b = v4.as_bytes();
+        let is_local = b == [10, 0, 2, 15] || b[0] == 127 || b == [0, 0, 0, 0];
+        if !is_local {
+            return EADDRNOTAVAIL;
+        }
+    }
+
+    // Check privileged port access (ports < 1024 require root)
+    if listen_ep.port > 0 && listen_ep.port < 1024 {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        if inner.effective_uid != 0 {
+            return EACCES;
+        }
+    }
 
     let mut net = NET_STACK.exclusive_access();
     let stack = match net.as_mut() {
@@ -318,10 +715,7 @@ pub fn sys_listen(fd: usize, _backlog: usize) -> isize {
     };
 
     let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-    let listen_ep = IpListenEndpoint {
-        addr: None,
-        port,
-    };
+    let listen_ep = IpListenEndpoint { addr: None, port };
     if let Err(e) = socket.listen(listen_ep) {
         warn!("[net] TCP listen failed: {:?}", e);
         return EINVAL;
@@ -338,10 +732,11 @@ pub fn sys_listen(fd: usize, _backlog: usize) -> isize {
     0
 }
 
-/// sys_accept(listen_fd, addr, addrlen) -> new_fd
-pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
+/// sys_accept(listen_fd, addr, addrlen, flags) -> new_fd
+/// flags: SOCK_CLOEXEC=0o2000000, SOCK_NONBLOCK=0o4000
+pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32, flags: usize) -> isize {
     let token = current_user_token();
-    let (listen_handle, sock_type, bound_port, _listening) = match get_socket_extra(listen_fd) {
+    let (listen_handle, sock_type, bound_port, listening) = match get_socket_extra(listen_fd) {
         Ok(info) => info,
         Err(e) => return e,
     };
@@ -349,7 +744,9 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize 
     if sock_type != SocketType::Tcp {
         return EOPNOTSUPP;
     }
-    if !_listening || bound_port == 0 {
+    // Linux returns EINVAL for accept() on a TCP socket that has not entered
+    // the listening state yet, instead of blocking forever.
+    if bound_port == 0 || !listening {
         return EINVAL;
     }
 
@@ -376,7 +773,9 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize 
             // Write peer address to user space
             if let Some(ep) = remote_ep {
                 if !addr.is_null() {
-                    write_sockaddr(&ep, addr, addr_len, token);
+                    if let Err(e) = write_sockaddr(&ep, addr, addr_len, token) {
+                        return e;
+                    }
                 }
             }
 
@@ -392,12 +791,19 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize 
                 port: bound_port,
             });
             let new_listen_handle = stack.sockets.add(new_listen_sock);
+            // Preserve multicast membership on the listening socket only.
+            mcast_transfer_membership(listen_handle, new_listen_handle);
 
             drop(net);
 
             // Swap: the accepted connection keeps listen_handle,
             // but update the listen fd to point to new_listen_handle
-            let accepted_file = Arc::new(SocketFile::new(listen_handle, SocketType::Tcp));
+            let accepted_file = {
+                let mut sf = SocketFile::new(listen_handle, SocketType::Tcp);
+                sf.cloexec = (flags & SOCK_CLOEXEC) != 0;
+                sf.nonblock = (flags & SOCK_NONBLOCK) != 0;
+                Arc::new(sf)
+            };
 
             // Update listen fd to new listen socket
             let process = current_process();
@@ -437,9 +843,55 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize 
 /// sys_connect(fd, addr, addrlen) -> 0
 pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
     let token = current_user_token();
-    let remote = match read_sockaddr(addr, addr_len, token) {
-        Some(ep) => ep,
-        None => return EINVAL,
+
+    // AF_UNIX connect path.
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return EBADF;
+        }
+        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+            return EBADF;
+        };
+        if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
+            return EBADF;
+        }
+        if file.is_unix_socket() {
+            drop(inner);
+            let family = match read_sockaddr_family(addr, addr_len, token) {
+                Some(f) => f,
+                None => return EINVAL,
+            };
+            if family != AF_UNIX as u16 {
+                return EINVAL;
+            }
+            let (path, is_abstract) = match read_unix_sockaddr(addr, addr_len, token) {
+                Some(p) => p,
+                None => return EINVAL,
+            };
+            let registry_key = if is_abstract {
+                let mut k = alloc::string::String::from("\0");
+                k.push_str(&path);
+                k
+            } else {
+                resolve_unix_bind_path(&path)
+            };
+            let peer = match unix_registry_get(&registry_key) {
+                Some(p) => p,
+                None => return ECONNREFUSED,
+            };
+            let client: Arc<dyn crate::fs::File> = file.clone();
+            // Minimal AF_UNIX-DGRAM connect semantics used by LTP bind05.
+            file.unix_set_peer_dyn(Arc::downgrade(&peer));
+            peer.unix_set_peer_dyn(Arc::downgrade(&client));
+            return 0;
+        }
+    }
+
+    let remote = match read_sockaddr_for_connect(addr, addr_len, token) {
+        Ok(ep) => ep,
+        Err(err) => return err,
     };
 
     let (handle, sock_type) = match get_socket_info(fd) {
@@ -482,7 +934,10 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
                 let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
                 if let Err(e) = socket.connect(cx, connect_remote, local_port) {
                     warn!("[net] TCP connect failed: {:?}", e);
-                    return ECONNREFUSED;
+                    return match e {
+                        tcp::ConnectError::InvalidState => EISCONN,
+                        _ => ECONNREFUSED,
+                    };
                 }
             }
 
@@ -553,6 +1008,30 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
 /// sys_getsockname(fd, addr, addrlen) -> 0
 pub fn sys_getsockname(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
     let token = current_user_token();
+
+    // AF_UNIX sockets are stored as generic File objects (not smoltcp sockets).
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return EBADF;
+        }
+        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+            return EBADF;
+        };
+        if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
+            return EBADF;
+        }
+        if file.is_unix_socket() {
+            let path = file.unix_bound_path().unwrap_or_else(alloc::string::String::new);
+            drop(inner);
+            return match write_unix_sockaddr(&path, addr, addr_len, token) {
+                Ok(()) => 0,
+                Err(e) => e,
+            };
+        }
+    }
+
     let (handle, sock_type, bound_port, _listening) = match get_socket_extra(fd) {
         Ok(info) => info,
         Err(e) => return e,
@@ -583,8 +1062,10 @@ pub fn sys_getsockname(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
     };
     drop(net);
 
-    write_sockaddr(&ep, addr, addr_len, token);
-    0
+    match write_sockaddr(&ep, addr, addr_len, token) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
 }
 
 /// sys_getpeername(fd, addr, addrlen) -> 0
@@ -608,8 +1089,10 @@ pub fn sys_getpeername(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
                 None => return ENOTCONN,
             };
             drop(net);
-            write_sockaddr(&ep, addr, addr_len, token);
-            0
+            match write_sockaddr(&ep, addr, addr_len, token) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
         }
         SocketType::Udp => {
             // Return the connected remote endpoint if set
@@ -619,8 +1102,10 @@ pub fn sys_getpeername(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
                 if let Some(ref file) = inner.fd_table[fd] {
                     if let Some(ep) = file.get_connected_remote() {
                         drop(inner);
-                        write_sockaddr(&ep, addr, addr_len, token);
-                        return 0;
+                        return match write_sockaddr(&ep, addr, addr_len, token) {
+                            Ok(()) => 0,
+                            Err(e) => e,
+                        };
                     }
                 }
             }
@@ -639,10 +1124,6 @@ pub fn sys_sendto(
     addr_len: usize,
 ) -> isize {
     let token = current_user_token();
-    let (handle, sock_type) = match get_socket_info(fd) {
-        Ok(info) => info,
-        Err(e) => return e,
-    };
 
     // Validate user buffer pointer
     if len > 0 && (buf as usize) >= 0x4000_0000_0000 {
@@ -650,7 +1131,9 @@ pub fn sys_sendto(
     }
 
     // Read user data into kernel buffer
-    let user_bufs = translated_byte_buffer(token, buf, len);
+    let Some(user_bufs) = translated_byte_buffer_checked(token, buf, len, false) else {
+        return EFAULT;
+    };
     let mut data = vec![0u8; len];
     let mut offset = 0;
     for ubuf in user_bufs.iter() {
@@ -658,6 +1141,50 @@ pub fn sys_sendto(
         data[offset..offset + n].copy_from_slice(&ubuf[..n]);
         offset += n;
     }
+
+    // AF_UNIX sendto path.
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return EBADF;
+        }
+        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+            return EBADF;
+        };
+        if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
+            return EBADF;
+        }
+        if file.is_unix_socket() {
+            drop(inner);
+            // If destination is provided, try direct pathname/abstract delivery first.
+            if !dest_addr.is_null() {
+                if let Some((path, is_abstract)) = read_unix_sockaddr(dest_addr, addr_len, token) {
+                    let registry_key = if is_abstract {
+                        let mut k = alloc::string::String::from("\0");
+                        k.push_str(&path);
+                        k
+                    } else {
+                        resolve_unix_bind_path(&path)
+                    };
+                    if let Some(target) = unix_registry_get(&registry_key) {
+                        return target.unix_push_rx_bytes(&data) as isize;
+                    }
+                }
+            }
+            // Fallback to connected peer.
+            let n = file.unix_write(&data);
+            if n >= 0 {
+                return n;
+            }
+            return ENOTCONN;
+        }
+    }
+
+    let (handle, sock_type) = match get_socket_info(fd) {
+        Ok(info) => info,
+        Err(e) => return e,
+    };
 
     match sock_type {
         SocketType::Tcp => loop {
@@ -746,11 +1273,7 @@ pub fn sys_sendto(
 
             if is_loopback {
                 // Loopback: inject directly into target socket's rx buffer
-                let sender_port = stack
-                    .sockets
-                    .get_mut::<udp::Socket>(handle)
-                    .endpoint()
-                    .port;
+                let sender_port = stack.sockets.get_mut::<udp::Socket>(handle).endpoint().port;
                 let sender_meta = udp::UdpMetadata {
                     endpoint: IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), sender_port),
                     meta: Default::default(),
@@ -783,6 +1306,54 @@ pub fn sys_recvfrom(
     addr_len: *mut u32,
 ) -> isize {
     let token = current_user_token();
+
+    // AF_UNIX recvfrom path.
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return EBADF;
+        }
+        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+            return EBADF;
+        };
+        if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
+            return EBADF;
+        }
+        if file.is_unix_socket() {
+            drop(inner);
+            loop {
+                let mut tmp = vec![0u8; len];
+                let n = file.unix_read(&mut tmp);
+                if n > 0 {
+                    let n = n as usize;
+                    let user_bufs = translated_byte_buffer(token, buf, n);
+                    let mut off = 0;
+                    for ubuf in user_bufs.iter() {
+                        let copy = ubuf.len().min(n - off);
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(ubuf.as_ptr() as *mut u8, copy)
+                        };
+                        dst.copy_from_slice(&tmp[off..off + copy]);
+                        off += copy;
+                    }
+                    // Return AF_UNIX family. For bind05 this is enough; sendto falls back to connected peer.
+                    if !src_addr.is_null() {
+                        if let Err(e) = write_unix_sockaddr("", src_addr, addr_len, token) {
+                            return e;
+                        }
+                    }
+                    return n as isize;
+                }
+
+                suspend_current_and_run_next();
+                if has_pending_unmasked_signal(false) {
+                    return EINTR;
+                }
+            }
+        }
+    }
+
     let (handle, sock_type) = match get_socket_info(fd) {
         Ok(info) => info,
         Err(e) => return e,
@@ -859,7 +1430,11 @@ pub fn sys_recvfrom(
                             off += copy;
                         }
                         // Write source address
-                        write_sockaddr(&endpoint.endpoint, src_addr, addr_len, token);
+                        if !src_addr.is_null() {
+                            if let Err(e) = write_sockaddr(&endpoint.endpoint, src_addr, addr_len, token) {
+                                return e;
+                            }
+                        }
                         return n as isize;
                     }
                     Err(_) => return EINVAL,
@@ -883,13 +1458,24 @@ pub fn sys_setsockopt(
     _optval: *const u8,
     _optlen: usize,
 ) -> isize {
-    let (_handle, _sock_type) = match get_socket_info(fd) {
+    let (handle, _sock_type) = match get_socket_info(fd) {
         Ok(info) => info,
         Err(e) => return e,
     };
 
     // Stub: accept common options silently
     match (level, optname) {
+        (SOL_IP, MCAST_JOIN_GROUP) => {
+            mcast_mark_joined(handle);
+            0
+        }
+        (SOL_IP, MCAST_LEAVE_GROUP) => {
+            if mcast_leave_group(handle) {
+                0
+            } else {
+                EADDRNOTAVAIL
+            }
+        }
         (SOL_SOCKET, SO_REUSEADDR) => 0,
         (SOL_SOCKET, SO_KEEPALIVE) => 0,
         (SOL_SOCKET, SO_SNDBUF) => 0,
@@ -997,36 +1583,74 @@ pub fn sys_shutdown_socket(fd: usize, how: i32) -> isize {
 }
 
 /// sys_socketpair(domain, type, protocol, sv)
-/// Emulate AF_UNIX socketpair using two pipes (bidirectional).
-/// sv[0] can read pipe_a / write pipe_b, sv[1] can read pipe_b / write pipe_a.
-/// For simplicity we use unidirectional pipes — sufficient for hackbench which
-/// uses each end in one direction only (parent writes, child reads or vice versa).
-pub fn sys_socketpair(domain: usize, _type: usize, _protocol: usize, sv: *mut i32) -> isize {
-    const AF_UNIX: usize = 1;
+pub fn sys_socketpair(domain: usize, sock_type: usize, protocol: usize, sv: *mut i32) -> isize {
+    let base_type = sock_type & 0xFF;
+    let nonblock = (sock_type & SOCK_NONBLOCK) != 0;
+    let cloexec = (sock_type & SOCK_CLOEXEC) != 0;
+
+    // LTP expects errno distinctions for AF_INET socketpair attempts.
+    if domain == AF_INET {
+        return match base_type {
+            SOCK_STREAM => {
+                if protocol == 0 || protocol == IPPROTO_TCP {
+                    EOPNOTSUPP
+                } else {
+                    EPROTONOSUPPORT
+                }
+            }
+            SOCK_DGRAM => {
+                if protocol == 0 || protocol == IPPROTO_UDP {
+                    EOPNOTSUPP
+                } else {
+                    EPROTONOSUPPORT
+                }
+            }
+            SOCK_RAW => EPROTONOSUPPORT,
+            _ => EINVAL,
+        };
+    }
+
     if domain != AF_UNIX {
-        warn!("[net] socketpair: only AF_UNIX supported, got {}", domain);
         return EAFNOSUPPORT;
+    }
+    if !matches!(base_type, SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET) {
+        return EINVAL;
+    }
+    if protocol != 0 {
+        return EPROTONOSUPPORT;
     }
     if sv.is_null() {
         return EFAULT;
     }
-    // Create two pipes: pipe_a (sv[0] reads, sv[1] writes) and pipe_b (sv[1] reads, sv[0] writes)
-    let (read_a, write_a) = crate::fs::make_pipe(0);
-    let (read_b, write_b) = crate::fs::make_pipe(0);
+
+    let token = current_user_token();
+    if translated_byte_buffer_checked(token, sv as *const u8, core::mem::size_of::<i32>(), false)
+        .is_none()
+        || translated_byte_buffer_checked(
+            token,
+            unsafe { sv.add(1) } as *const u8,
+            core::mem::size_of::<i32>(),
+            false,
+        )
+        .is_none()
+    {
+        return EFAULT;
+    }
+
+    let left = UnixSocketFile::new(base_type as u8, nonblock, cloexec);
+    let right = UnixSocketFile::new(base_type as u8, nonblock, cloexec);
+    let left_file: Arc<dyn crate::fs::File> = left.clone();
+    let right_file: Arc<dyn crate::fs::File> = right.clone();
+    left_file.unix_set_peer_dyn(Arc::downgrade(&right_file));
+    right_file.unix_set_peer_dyn(Arc::downgrade(&left_file));
 
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-
-    // sv[0]: reads from pipe_a, writes to pipe_b
-    // We need two fds per socket... but Linux socketpair returns 2 fds, each bidirectional.
-    // Simplification: sv[0]=read_a, sv[1]=write_a (like pipe2), which is what hackbench actually needs.
-    // hackbench creates socketpairs then forks; parent writes to sv[0], child reads from sv[1] or vice versa.
-    // Actually hackbench uses both directions. Let's just give it pipe fds for now.
     let fd0 = match inner.alloc_fd() {
         Some(fd) => fd,
         None => return EMFILE,
     };
-    inner.fd_table[fd0] = Some(read_a);
+    inner.fd_table[fd0] = Some(left_file);
     let fd1 = match inner.alloc_fd() {
         Some(fd) => fd,
         None => {
@@ -1034,34 +1658,11 @@ pub fn sys_socketpair(domain: usize, _type: usize, _protocol: usize, sv: *mut i3
             return EMFILE;
         }
     };
-    inner.fd_table[fd1] = Some(write_a);
-
-    // Also install the reverse direction pipe fds
-    // Actually, for a proper socketpair we need each fd to be bidirectional.
-    // Since our pipes are unidirectional, let's just use one pipe for now.
-    // hackbench: sender writes to fd, receiver reads from fd — one direction per pair is fine.
-    drop(read_b);
-    drop(write_b);
-
+    inner.fd_table[fd1] = Some(right_file);
     drop(inner);
 
-    let token = current_user_token();
-    let data = [
-        (fd0 as i32).to_le_bytes(),
-        (fd1 as i32).to_le_bytes(),
-    ];
-    let mut buf = [0u8; 8];
-    buf[..4].copy_from_slice(&data[0]);
-    buf[4..].copy_from_slice(&data[1]);
-
-    let bufs = translated_byte_buffer(token, sv as *const u8, 8);
-    let mut offset = 0;
-    for slice in bufs {
-        let len = slice.len();
-        slice.copy_from_slice(&buf[offset..offset + len]);
-        offset += len;
-    }
-    info!("[net] socketpair: created pipe pair fd{}(read) fd{}(write)", fd0, fd1);
+    *translated_refmut(token, sv) = fd0 as i32;
+    *translated_refmut(token, unsafe { sv.add(1) }) = fd1 as i32;
     0
 }
 

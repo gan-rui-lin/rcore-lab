@@ -95,7 +95,8 @@ impl Fat32Disk {
             self.device
                 .read_block(self.base_lba + self.block_id, &mut data);
             data[start..start + count].copy_from_slice(&buf[..count]);
-            self.device.write_block(self.base_lba + self.block_id, &data);
+            self.device
+                .write_block(self.base_lba + self.block_id, &data);
             self.offset += count;
             if self.offset >= BLOCK_SIZE {
                 self.block_id += 1;

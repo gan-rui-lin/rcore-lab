@@ -1,7 +1,8 @@
 //!Stdin & Stdout
-use super::PollEvents;
 use super::File;
+use super::PollEvents;
 use crate::mm::UserBuffer;
+use core::sync::atomic::{AtomicU64, Ordering};
 /// Read a character from the SBI console, returning the raw usize value.
 /// 0 means no character available.
 fn console_getchar() -> usize {
@@ -12,14 +13,61 @@ fn console_getchar() -> usize {
 }
 use crate::task::{has_pending_unmasked_signal, suspend_current_and_run_next};
 
+static URANDOM_SEED: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+
 /// /dev/null device: reads return 0 (EOF), writes succeed silently
-pub struct DevNull;
+pub struct DevNull {
+    readable: bool,
+    writable: bool,
+    path: &'static str,
+}
 
 /// /dev/zero device: reads return zero bytes, writes succeed silently
-pub struct DevZero;
+pub struct DevZero {
+    readable: bool,
+    writable: bool,
+    path: &'static str,
+}
 
-/// /dev/urandom device: reads return pseudo-random bytes, writes succeed silently
-pub struct DevUrandom;
+/// /dev/urandom and /dev/random device: reads return pseudorandom bytes
+pub struct DevUrandom {
+    readable: bool,
+    writable: bool,
+    path: &'static str,
+}
+
+impl DevNull {
+    /// Create a `/dev/null` handle with the requested access mode.
+    pub fn new(readable: bool, writable: bool, path: &'static str) -> Self {
+        Self {
+            readable,
+            writable,
+            path,
+        }
+    }
+}
+
+impl DevZero {
+    /// Create a `/dev/zero` handle with the requested access mode.
+    pub fn new(readable: bool, writable: bool, path: &'static str) -> Self {
+        Self {
+            readable,
+            writable,
+            path,
+        }
+    }
+}
+
+impl DevUrandom {
+    /// Create a `/dev/urandom` handle with the requested access mode.
+    pub fn new(readable: bool, writable: bool, path: &'static str) -> Self {
+        Self {
+            readable,
+            writable,
+            path,
+        }
+    }
+}
 
 /// stdin file for getting chars from console
 pub struct Stdin;
@@ -68,8 +116,7 @@ impl File for Stdin {
             if console_getchar() == usize::MAX {
                 // no char available, suspend and run next task
                 suspend_current_and_run_next();
-            }
-            else {
+            } else {
                 // char available, put it back to console buffer and return POLLIN
                 // since we have no way to put back the char to console buffer, we just return POLLIN and let the caller read it again.
                 break;
@@ -91,7 +138,8 @@ impl File for Stdout {
     }
     fn write(&self, user_buf: UserBuffer) -> usize {
         for buffer in user_buf.buffers.iter() {
-            print!("{}", core::str::from_utf8(*buffer).unwrap());
+            let text = alloc::string::String::from_utf8_lossy(*buffer);
+            print!("{}", text);
         }
         user_buf.len()
     }
@@ -105,16 +153,26 @@ impl File for Stdout {
 }
 
 impl File for DevNull {
-    fn readable(&self) -> bool { true }
-    fn writable(&self) -> bool { true }
+    fn readable(&self) -> bool {
+        self.readable
+    }
+    fn writable(&self) -> bool {
+        self.writable
+    }
     fn read(&self, _user_buf: UserBuffer) -> usize { 0 }
     fn write(&self, user_buf: UserBuffer) -> usize { user_buf.len() }
-    fn path(&self) -> Option<&str> { Some("/dev/null") }
+    fn path(&self) -> Option<&str> {
+        Some(self.path)
+    }
 }
 
 impl File for DevZero {
-    fn readable(&self) -> bool { true }
-    fn writable(&self) -> bool { true }
+    fn readable(&self) -> bool {
+        self.readable
+    }
+    fn writable(&self) -> bool {
+        self.writable
+    }
     fn read(&self, mut user_buf: UserBuffer) -> usize {
         let mut total = 0;
         for buffer in user_buf.buffers.iter_mut() {
@@ -124,30 +182,38 @@ impl File for DevZero {
         total
     }
     fn write(&self, user_buf: UserBuffer) -> usize { user_buf.len() }
-    fn path(&self) -> Option<&str> { Some("/dev/zero") }
+    fn path(&self) -> Option<&str> {
+        Some(self.path)
+    }
 }
 
 impl File for DevUrandom {
-    fn readable(&self) -> bool { true }
-    fn writable(&self) -> bool { true }
+    fn readable(&self) -> bool {
+        self.readable
+    }
+    fn writable(&self) -> bool {
+        self.writable
+    }
     fn read(&self, mut user_buf: UserBuffer) -> usize {
-        use core::sync::atomic::{AtomicU64, Ordering};
-        static STATE: AtomicU64 = AtomicU64::new(0xdead_beef_cafe_babe);
-        let mut s = STATE.load(Ordering::Relaxed)
-            .wrapping_add(crate::timer::get_time_us() as u64);
-        let mut total = 0;
+        let mut total = 0usize;
+        let mut seed = URANDOM_SEED.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
+            ^ (crate::timer::get_time_us() as u64);
         for buffer in user_buf.buffers.iter_mut() {
             for byte in buffer.iter_mut() {
-                s ^= s >> 12;
-                s ^= s << 25;
-                s ^= s >> 27;
-                *byte = s.wrapping_mul(0x2545_F491_4F6C_DD1D) as u8;
-                total += 1;
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *byte = (seed >> 56) as u8;
             }
+            total += buffer.len();
         }
-        STATE.store(s, Ordering::Relaxed);
+        URANDOM_SEED.store(seed, Ordering::Relaxed);
         total
     }
-    fn write(&self, user_buf: UserBuffer) -> usize { user_buf.len() }
-    fn path(&self) -> Option<&str> { Some("/dev/urandom") }
+    fn write(&self, user_buf: UserBuffer) -> usize {
+        user_buf.len()
+    }
+    fn path(&self) -> Option<&str> {
+        Some(self.path)
+    }
 }

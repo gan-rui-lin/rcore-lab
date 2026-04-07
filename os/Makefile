@@ -10,7 +10,8 @@ KERNEL_LA_ELF := target/$(TARGET_LA)/$(MODE)/os
 KERNEL_RV := kernel-rv
 KERNEL_LA := kernel-la
 DISASM_TMP := target/$(TARGET_RV)/$(MODE)/asm
-FS_IMG := ../user/target/$(TARGET_RV)/$(MODE)/fs.img
+USER_TARGET_DIR := ../user/target-user
+FS_IMG := $(USER_TARGET_DIR)/$(TARGET_RV)/$(MODE)/fs.img
 APPS := ../user/src/bin/*
 OFFLINE :=
 
@@ -89,7 +90,7 @@ sbi-qemu:
 fs-img: $(APPS)
 	@make -C ../user build MODE=$(MODE) TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE) OFFLINE=$(OFFLINE)
 	@rm -f $(FS_IMG)
-	@cd ../easy-fs-fuse && cargo run --release $(CARGO_OFFLINE_ARG) -- -s ../user/build/app/ -t ../user/target/riscv64gc-unknown-none-elf/release/
+	@cd ../easy-fs-fuse && cargo run --release $(CARGO_OFFLINE_ARG) -- -s ../user/build-user/app/ -t $(USER_TARGET_DIR)/riscv64gc-unknown-none-elf/release/
 
 kernel:
 	@make -C ../user build MODE=$(MODE) TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE) OFFLINE=$(OFFLINE)

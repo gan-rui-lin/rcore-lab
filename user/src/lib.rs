@@ -19,7 +19,7 @@ pub use console::{flush, STDIN, STDOUT};
 pub use errno::*;
 pub use syscall::*;
 
-const USER_HEAP_SIZE: usize = 16384;
+const USER_HEAP_SIZE: usize = 65536;
 
 static mut HEAP_SPACE: [u8; USER_HEAP_SIZE] = [0; USER_HEAP_SIZE];
 
@@ -257,6 +257,12 @@ pub fn execve(path: &str, args: &[*const u8], envp: &[*const u8]) -> isize {
 
 pub fn chdir(path: &str) -> isize {
     sys_chdir(path)
+}
+
+pub fn mkdir(path: &str) -> isize {
+    use syscall::sys_mkdirat;
+    const AT_FDCWD: isize = -100;
+    sys_mkdirat(AT_FDCWD, path, 0o755)
 }
 
 pub fn set_priority(prio: isize) -> isize {

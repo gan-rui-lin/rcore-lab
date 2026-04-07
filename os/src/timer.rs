@@ -5,7 +5,7 @@
 pub use arch::{get_time, get_time_ms, get_time_us, set_next_trigger};
 
 use crate::sync::UPIntrFreeCell;
-use crate::task::{TaskControlBlock, wakeup_task};
+use crate::task::{wakeup_task, TaskControlBlock};
 use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
 use core::cmp::Ordering;
@@ -67,7 +67,11 @@ pub fn remove_timer(task: Arc<TaskControlBlock>) {
 pub fn check_timer() {
     let count = CHECK_TIMER_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
     if count % TIMER_DEBUG_INTERVAL == 0 {
-        info!("[timer] check_timer count={} time_ms={}", count, get_time_ms());
+        info!(
+            "[timer] check_timer count={} time_ms={}",
+            count,
+            get_time_ms()
+        );
     }
     let current_ms = get_time_ms();
     let mut timers = TIMERS.exclusive_access();

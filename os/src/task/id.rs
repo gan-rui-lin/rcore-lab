@@ -2,8 +2,8 @@
 
 use super::ProcessControlBlock;
 use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, USER_STACK_SIZE};
-use crate::mm::{MapPermission, PhysPageNum, VirtAddr};
 use crate::mm::{frame_alloc, FrameTracker};
+use crate::mm::{MapPermission, PhysPageNum, VirtAddr};
 use crate::sync::UPIntrFreeCell;
 use alloc::{
     sync::{Arc, Weak},
@@ -133,7 +133,11 @@ fn ustack_bottom_from_tid(ustack_base: usize, tid: usize) -> usize {
 }
 
 impl TaskUserRes {
-    pub fn new(process: Arc<ProcessControlBlock>, ustack_base: usize, alloc_user_res: bool) -> Self {
+    pub fn new(
+        process: Arc<ProcessControlBlock>,
+        ustack_base: usize,
+        alloc_user_res: bool,
+    ) -> Self {
         let tid = process.inner_exclusive_access().alloc_tid();
         let mut task_user_res = Self {
             tid,

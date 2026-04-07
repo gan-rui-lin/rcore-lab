@@ -99,6 +99,8 @@ impl Ext4File {
         let cstr = match flags {
             O_RDONLY => "rb",
             O_RDWR => "r+",
+            0x201 => "wb", // O_WRONLY | O_TRUNC
+            0x202 => "w+", // O_RDWR | O_TRUNC
             0x241 => "wb", // O_WRONLY | O_CREAT | O_TRUNC
             0x441 => "ab", // O_WRONLY | O_CREAT | O_APPEND
             0x242 => "w+", // O_RDWR | O_CREAT | O_TRUNC
@@ -176,14 +178,6 @@ impl Ext4File {
     }
 
     pub fn file_seek(&mut self, offset: i64, seek_type: u32) -> Result<usize, i32> {
-        let mut offset = offset;
-        let size = self.file_size() as i64;
-
-        if offset > size {
-            warn!("Seek beyond the end of the file");
-            offset = size;
-        }
-
         let r = unsafe { ext4_fseek(&mut self.file_desc, offset, seek_type) };
         if r != EOK as i32 {
             error!("ext4_fseek: rc = {}", r);

@@ -1,10 +1,10 @@
 use crate::sync::UPIntrFreeCell;
-use lazy_static::lazy_static;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
+use lazy_static::lazy_static;
 
 #[cfg(feature = "ext4")]
 use super::ext4::Ext4Fs;
@@ -216,7 +216,8 @@ impl Vfs {
 }
 
 lazy_static! {
-    pub(crate) static ref ROOT_VFS: UPIntrFreeCell<Vfs> = unsafe { UPIntrFreeCell::new(Vfs::new()) };
+    pub(crate) static ref ROOT_VFS: UPIntrFreeCell<Vfs> =
+        unsafe { UPIntrFreeCell::new(Vfs::new()) };
 }
 
 struct NullInode;
@@ -230,8 +231,8 @@ impl VfsInode for NullInode {
         0
     }
 
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
-        0
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        buf.len()
     }
 
     fn lookup(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {

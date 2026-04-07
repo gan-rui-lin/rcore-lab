@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
-use super::core::{normalize_path, VfsInode, VfsNodeKind, ROOT_VFS};
 use super::super::{File, OpenFlags};
+use super::core::{normalize_path, VfsInode, VfsNodeKind, ROOT_VFS};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
 use alloc::string::String;
@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 pub struct VfsFile {
     readable: bool,
     writable: bool,
+    status_flags: u32,
     path: String,
     ts_id: usize,
     inner: UPIntrFreeCell<VfsFileInner>,
@@ -25,18 +26,25 @@ struct VfsFileInner {
 }
 
 impl VfsFile {
+    #[allow(dead_code)]
     pub fn new(readable: bool, writable: bool, inode: Arc<dyn VfsInode>, path: String) -> Self {
+        Self::new_with_flags(readable, writable, 0, inode, path)
+    }
+
+    pub fn new_with_flags(
+        readable: bool,
+        writable: bool,
+        status_flags: u32,
+        inode: Arc<dyn VfsInode>,
+        path: String,
+    ) -> Self {
         Self {
             readable,
             writable,
+            status_flags,
             path,
             ts_id: NEXT_TS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-            inner: unsafe {
-                UPIntrFreeCell::new(VfsFileInner {
-                    offset: 0,
-                    inode,
-                })
-            },
+            inner: unsafe { UPIntrFreeCell::new(VfsFileInner { offset: 0, inode }) },
         }
     }
 
@@ -107,6 +115,10 @@ impl File for VfsFile {
 
     fn write(&self, buf: UserBuffer) -> usize {
         let mut inner = self.inner.exclusive_access();
+        if (self.status_flags & OpenFlags::APPEND.bits()) != 0 {
+            // O_APPEND: each write starts at current EOF.
+            inner.offset = inner.inode.size();
+        }
         let mut total = 0usize;
         for slice in buf.buffers.iter() {
             let n = inner.inode.write_at(inner.offset, *slice);
@@ -148,6 +160,10 @@ impl File for VfsFile {
     fn ts_id(&self) -> Option<usize> {
         Some(self.ts_id)
     }
+
+    fn status_flags(&self) -> u32 {
+        self.status_flags
+    }
 }
 
 pub fn list_apps() {
@@ -163,24 +179,53 @@ pub fn list_apps() {
 
 pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<dyn File>> {
     let path = normalize_path(path);
-    let (readable, writable) = flags.read_write();
+    let (mut readable, mut writable) = flags.read_write();
+    let status_flags =
+        flags.bits() & (OpenFlags::PATH | OpenFlags::APPEND | OpenFlags::DIRECT).bits();
+    if flags.contains(OpenFlags::PATH) {
+        readable = false;
+        writable = false;
+    }
     let vfs = ROOT_VFS.exclusive_access();
     if flags.contains(OpenFlags::CREATE) {
         if let Some(inode) = vfs.resolve_quiet(&path) {
             if flags.contains(OpenFlags::TRUNC) {
                 inode.truncate();
             }
-            return Some(Arc::new(VfsFile::new(readable, writable, inode, path)));
+            return Some(Arc::new(VfsFile::new_with_flags(
+                readable,
+                writable,
+                status_flags,
+                inode,
+                path,
+            )));
         }
         let (parent, name) = vfs.resolve_parent(&path)?;
         let inode = parent.create(&name)?;
-        Some(Arc::new(VfsFile::new(readable, writable, inode, path)))
+        // Keep O_CREAT|O_TRUNC semantics even if create() returns an
+        // existing inode (some backends may take that path).
+        if flags.contains(OpenFlags::TRUNC) {
+            inode.truncate();
+        }
+        Some(Arc::new(VfsFile::new_with_flags(
+            readable,
+            writable,
+            status_flags,
+            inode,
+            path,
+        )))
     } else {
         let inode = vfs.resolve_quiet(&path)?;
         if flags.contains(OpenFlags::TRUNC) {
             inode.truncate();
         }
-        Some(Arc::new(VfsFile::new(readable, writable, inode, path)))
+        Some(Arc::new(VfsFile::new_with_flags(
+            readable,
+            writable,
+            status_flags,
+            inode,
+            path,
+        )))
     }
 }
 

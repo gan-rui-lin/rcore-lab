@@ -8,6 +8,22 @@
 # 设置环境变量（必需）
 export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TESTENV_QEMU_BIN="$SCRIPT_DIR/tools/qemu-testenv-riscv64.sh"
+LOCAL_QEMU_BIN="$(command -v qemu-system-riscv64 2>/dev/null || true)"
+QEMU_BIN="${QEMU_BIN:-}"
+
+if [[ -z "$QEMU_BIN" ]]; then
+    if [[ -x "$TESTENV_QEMU_BIN" ]] && command -v docker >/dev/null 2>&1; then
+        QEMU_BIN="$TESTENV_QEMU_BIN"
+    elif [[ -n "$LOCAL_QEMU_BIN" ]]; then
+        QEMU_BIN="$LOCAL_QEMU_BIN"
+    else
+        echo "错误: 未找到可用的 qemu-system-riscv64" >&2
+        exit 1
+    fi
+fi
+
 # 默认配置
 BUILD_TYPE="debug"
 IMAGE_FILE="sdcard-final.img"
@@ -19,6 +35,7 @@ NET_DUMP_OBJ=""
 NET_MODE="user"
 TAP_IFNAME="tap0"
 BRIDGE_NAME="br0"
+SNAPSHOT_MODE="${QEMU_SNAPSHOT:-1}"
 
 # 显示用法信息
 usage() {
@@ -32,6 +49,7 @@ usage() {
     echo "  --netmode MODE     网络模式 (user/tap), 默认: $NET_MODE"
     echo "  --tap-ifname NAME  tap 模式网卡名, 默认: $TAP_IFNAME"
     echo "  --bridge NAME      bridge 模式桥接名(需预先创建), 默认: $BRIDGE_NAME"
+    echo "  --persist          关闭 QEMU snapshot，允许写回基础镜像"
     echo "  -h, --help         显示此帮助信息"
     echo ""
     echo "示例:"
@@ -69,6 +87,10 @@ while [[ $# -gt 0 ]]; do
         --bridge)
             BRIDGE_NAME="$2"
             shift 2
+            ;;
+        --persist)
+            SNAPSHOT_MODE="0"
+            shift
             ;;
         --netdump)
             NET_DUMP_FILE="$2"
@@ -113,7 +135,8 @@ echo "  rCore-Lab 修复版运行脚本"
 echo "===================================="
 echo "开始构建: make $BUILD_TYPE"
 echo "使用镜像: $IMAGE_FILE"
-echo "QEMU 版本: $(qemu-system-riscv64 --version | head -1)"
+echo "QEMU 命令: $QEMU_BIN"
+echo "QEMU 版本: $("$QEMU_BIN" --version | head -1)"
 
 if [[ "$GDB_DEBUG" == "1" ]]; then
     GDB_FLAGS="-s -S"
@@ -144,6 +167,14 @@ if [[ -n "$NET_DUMP_FILE" ]]; then
     echo "NET 抓包: ${NET_DUMP_FILE}"
 fi
 
+QEMU_SNAPSHOT_FLAG=""
+if [[ "$SNAPSHOT_MODE" == "1" ]]; then
+    QEMU_SNAPSHOT_FLAG="-snapshot"
+    echo "磁盘写回: 关闭 (QEMU snapshot)"
+else
+    echo "磁盘写回: 开启 (直接写回镜像)"
+fi
+
 # 执行构建
 echo "===================================="
 if [[ "$BUILD_TYPE" == "debug" ]]; then
@@ -168,7 +199,7 @@ else
 fi
 
 # 检查 QEMU 版本并设置兼容参数
-QEMU_VERSION=$(qemu-system-riscv64 --version | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+QEMU_VERSION=$("$QEMU_BIN" --version | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
 QEMU_MAJOR=$(echo $QEMU_VERSION | cut -d. -f1)
 
 VIRTIO_BLK_OPTS="virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0"
@@ -186,12 +217,13 @@ echo "启动QEMU模拟器..."
 echo "退出: Ctrl+A 然后 X"
 echo "===================================="
 
-qemu-system-riscv64 -machine virt \
+"$QEMU_BIN" -machine virt \
   -kernel kernel-qemu \
   -m 1024M \
   -nographic \
   -smp 1 \
   -bios default \
+  $QEMU_SNAPSHOT_FLAG \
   -drive file="$IMAGE_FILE",if=none,format=raw,id=x0 \
   -device $VIRTIO_BLK_OPTS \
   -device virtio-net-device,netdev=net,bus=virtio-mmio-bus.1 \
