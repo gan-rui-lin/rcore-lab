@@ -223,8 +223,14 @@ fn write_sockaddr(
     addrlen_ptr: *mut u32,
     token: usize,
 ) -> Result<(), isize> {
+    // Linux accept()/getsockname()/getpeername() semantics:
+    // - Both NULL is OK (caller doesn't want the address)
+    // - Only one NULL is EFAULT (inconsistent state)
+    if addr_ptr.is_null() && addrlen_ptr.is_null() {
+        return Ok(());  // Caller doesn't want address info
+    }
     if addr_ptr.is_null() || addrlen_ptr.is_null() {
-        return Err(EFAULT);
+        return Err(EFAULT);  // Only one NULL is an error
     }
     let mut raw = [0u8; 16];
     raw[0] = AF_INET as u8;

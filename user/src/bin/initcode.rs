@@ -21,7 +21,7 @@ const PATH_ENV: &[u8] = b"PATH=/bin:/usr/bin:/musl:/glibc\0";
 const LD_LIB_MUSL: &[u8] = b"LD_LIBRARY_PATH=/musl/lib\0";
 const LD_LIB_GLIBC: &[u8] = b"LD_LIBRARY_PATH=/glibc/lib\0";
 const TEST_LIBC_ROOTS: [&str; 2] = ["/musl", "/glibc"];
-const TEST_SUITES: [&str; 1] = [
+const TEST_SUITES: [&str; 2] = [
     // "basic",
     // "busybox",
     // "cyclictest",
@@ -31,6 +31,7 @@ const TEST_SUITES: [&str; 1] = [
     // "libctest",
     // "lmbench",
     "ltp",
+    // "basic",
     // "lua",
     // "netperf",
 ];
@@ -76,6 +77,75 @@ ltp/testcases/bin/fork14\n\
 ltp/testcases/bin/futex_wait01\n\
 ltp/testcases/bin/futex_wake01\n\
 ./busybox echo '=== ltp-mini done ==='\n\
+";
+
+// Debug script for LTP tests that get stuck (selected from skip list)
+// fork14 skipped - causes OOM with 1GB mmap (being fixed separately)
+// futex_cmp_requeue01 skipped - creates hundreds of processes, takes too long
+const TMP_LTP_STUCK_PATH: &str = "/tmp/ltp_stuck_debug.sh";
+const TMP_LTP_STUCK_SCRIPT: &[u8] = b"\
+./busybox echo '=== ltp-stuck debug start ==='\n\
+./busybox echo 'Testing futex tests...'\n\
+ltp/testcases/bin/futex_cmp_requeue02\n\
+ltp/testcases/bin/futex_wait03\n\
+ltp/testcases/bin/futex_wake02\n\
+ltp/testcases/bin/futex_wake04\n\
+./busybox echo 'Testing clock_nanosleep...'\n\
+ltp/testcases/bin/clock_nanosleep01\n\
+./busybox echo 'Testing chdir01...'\n\
+ltp/testcases/bin/chdir01\n\
+./busybox echo '=== ltp-stuck debug done ==='\n\
+";
+
+const TMP_LTP_CPUSET_PATH: &str = "/tmp/ltp_cpuset_debug.sh";
+const TMP_LTP_CPUSET_SCRIPT: &[u8] = b"\
+./busybox echo '=== ltp-cpuset debug start ==='\n\
+./busybox echo 'RUN LTP CASE cpuset01'\n\
+ltp/testcases/bin/cpuset01\n\
+ret=$?\n\
+./busybox echo \"FAIL LTP CASE cpuset01 : $ret\"\n\
+./busybox echo 'RUN LTP CASE cpuset_cpu_hog'\n\
+rm -f ./myfifo /tmp/cpuset_fifo.log /tmp/cpuset_cpu_hog.stderr\n\
+./busybox mknod ./myfifo p || true\n\
+(\n\
+  while true; do\n\
+    cat ./myfifo\n\
+  done\n\
+) > /tmp/cpuset_fifo.log &\n\
+fifo_reader=$!\n\
+ltp/testcases/bin/cpuset_cpu_hog &\n\
+hog_pid=$!\n\
+sleep 1\n\
+kill -USR1 \"$hog_pid\" 2>/dev/null\n\
+sleep 1\n\
+kill -USR1 \"$hog_pid\" 2>/dev/null\n\
+sleep 5\n\
+kill -USR2 \"$hog_pid\" 2>/dev/null\n\
+wait \"$hog_pid\"\n\
+ret=$?\n\
+kill \"$fifo_reader\" 2>/dev/null\n\
+rm -f ./myfifo\n\
+./busybox echo \"FAIL LTP CASE cpuset_cpu_hog : $ret\"\n\
+./busybox echo '=== ltp-cpuset debug done ==='\n\
+";
+
+// Quick test for recent fixes (clone07, accept4)
+const TMP_FIXES_PATH: &str = "/tmp/test_fixes.sh";
+const TMP_FIXES_SCRIPT: &[u8] = b"\
+./busybox echo '=== Testing recent fixes ==='\n\
+./busybox echo 'Test 1: clone07 (waitpid with pid=0)'\n\
+ltp/testcases/bin/clone07\n\
+./busybox echo 'Test 2: accept4_01 (NULL addr handling)'\n\
+ltp/testcases/bin/accept4_01\n\
+./busybox echo '=== Tests completed ==='\n\
+";
+
+// Test /proc/cpuinfo implementation
+const TMP_CPUINFO_PATH: &str = "/tmp/test_cpuinfo.sh";
+const TMP_CPUINFO_SCRIPT: &[u8] = b"\
+./busybox echo '=== Testing /proc/cpuinfo ==='\n\
+./busybox cat /proc/cpuinfo\n\
+./busybox echo '=== cpuinfo test done ==='\n\
 ";
 
 const TMP_LTP_PATH: &str = "/tmp/ltp_testcode.sh";
@@ -418,13 +488,13 @@ fn activate_runtime_profile(root: &str) -> bool {
                 "/lib64/ld-linux-loongarch-lp64d.so.1",
                 "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
             );
-
-            let _ = run_busybox_mkdir_p("/glibc", busybox_path, "/code/lmbench_src/bin/build");
+            // WORKAROUND: Skip mkdir due to fork+exec hang bug on LoongArch
+            // See docs/GRLDocs/LA-fork-exec-hang-bug-2026-04-03.md
             force_link("/code/lmbench_src/bin/build/lmbench_all", "/glibc/lmbench_all");
         } else {
             force_link("/lib64/ld-linux-loongarch-lp64d.so.1", "/musl/lib/libc.so");
             force_link("/lib64/ld-musl-loongarch-lp64d.so.1", "/musl/lib/libc.so");
-            let _ = run_busybox_mkdir_p("/musl", busybox_path, "/code/lmbench_src/bin/build");
+            // WORKAROUND: Skip mkdir due to fork+exec hang bug on LoongArch
             force_link("/code/lmbench_src/bin/build/lmbench_all", "/musl/lmbench_all");
         }
     }
@@ -921,6 +991,46 @@ fn run_selector(selector: &str) {
         let _ = activate_runtime_profile(root);
         let _ = write_embedded_elf(TMP_LTP_MINI_PATH, TMP_LTP_MINI_SCRIPT);
         let _ = run_testcode(TMP_LTP_MINI_PATH, root);
+        return;
+    }
+
+    // LTP stuck tests debug script - tests that may hang
+    // Usage: SINGLE_TEST=tmp-ltp-stuck or SINGLE_TEST=tmp-ltp-stuck-glibc
+    if selector == "tmp-ltp-stuck" || selector == "tmp-ltp-stuck-glibc" {
+        let root = if selector.ends_with("-glibc") { "/glibc" } else { "/musl" };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_LTP_STUCK_PATH, TMP_LTP_STUCK_SCRIPT);
+        let _ = run_testcode(TMP_LTP_STUCK_PATH, root);
+        return;
+    }
+
+    // Focused cpuset debug: cpuset01 and cpuset_cpu_hog only
+    // Usage: SINGLE_TEST=tmp-ltp-cpuset or SINGLE_TEST=tmp-ltp-cpuset-glibc
+    if selector == "tmp-ltp-cpuset" || selector == "tmp-ltp-cpuset-glibc" {
+        let root = if selector.ends_with("-glibc") { "/glibc" } else { "/musl" };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_LTP_CPUSET_PATH, TMP_LTP_CPUSET_SCRIPT);
+        let _ = run_testcode(TMP_LTP_CPUSET_PATH, root);
+        return;
+    }
+
+    // Recent fixes test - clone07, accept4
+    // Usage: SINGLE_TEST=tmp-fixes or SINGLE_TEST=tmp-fixes-glibc
+    if selector == "tmp-fixes" || selector == "tmp-fixes-glibc" {
+        let root = if selector.ends_with("-glibc") { "/glibc" } else { "/musl" };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_FIXES_PATH, TMP_FIXES_SCRIPT);
+        let _ = run_testcode(TMP_FIXES_PATH, root);
+        return;
+    }
+
+    // Test /proc/cpuinfo implementation
+    // Usage: SINGLE_TEST=tmp-cpuinfo
+    if selector == "tmp-cpuinfo" {
+        let root = "/musl";
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_CPUINFO_PATH, TMP_CPUINFO_SCRIPT);
+        let _ = run_testcode(TMP_CPUINFO_PATH, root);
         return;
     }
 

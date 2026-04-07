@@ -20,7 +20,7 @@ pub use arch::{PhysAddr, PhysPageNum, StepByOne, VPNRange, VirtAddr, VirtPageNum
 pub use frame_allocator::{frame_alloc, frame_alloc_more, frame_dealloc, FrameTracker};
 pub use memory_set::remap_test;
 pub use memory_set::{
-    kernel_token, MapPermission, MemorySet, MmapMeta, ProtectError, KERNEL_SPACE,
+    kernel_token, MapAreaType, MapPermission, MemorySet, MmapMeta, ProtectError, KERNEL_SPACE,
 };
 
 static KERNEL_PT_READY: AtomicBool = AtomicBool::new(false);

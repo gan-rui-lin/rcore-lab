@@ -13,8 +13,8 @@ use crate::{
     fs::{open_file, path_exists, path_is_dir, File, OpenFlags},
     mm::{
         translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
-        translated_str_checked, MapPermission, MmapMeta, PTEFlags, PageTable, ProtectError,
-        VirtAddr,
+        translated_str_checked, MapAreaType, MapPermission, MmapMeta, PTEFlags, PageTable,
+        ProtectError, VirtAddr,
     },
     task::{
         add_task, current_process, current_task, current_trap_cx, current_user_token,
@@ -193,6 +193,7 @@ bitflags! {
         const FUTEX_WAIT = 0;
         const FUTEX_WAKE = 1;
         const FUTEX_REQUEUE = 3;
+        const FUTEX_CMP_REQUEUE = 4;
         const FUTEX_WAIT_BITSET = 9;
         const FUTEX_WAKE_BITSET = 10;
     }
@@ -330,7 +331,15 @@ pub fn sys_futex(
     };
     let private = opt.contains(FutexOpt::FUTEX_PRIVATE_FLAG);
     let pid = if private { current_process().pid.0 } else { 0 };
-    let key = FutexKey::new(pa, pid);
+    // For private futexes, key by user virtual address within the process.
+    // Physical page can change due to COW after fork/threads, which would
+    // otherwise break wakeup matching for the same uaddr.
+    let key_addr = if private {
+        crate::mm::PhysAddr::from(uaddr1 as usize)
+    } else {
+        pa
+    };
+    let key = FutexKey::new(key_addr, pid);
     let name = current_process().inner_exclusive_access().name.clone();
     if matches!(cmd, FutexCmd::FUTEX_WAIT | FutexCmd::FUTEX_WAIT_BITSET)
         && name == "entry-static.exe"
@@ -467,7 +476,12 @@ pub fn sys_futex(
                 Some(pa) => pa,
                 None => return errno(EFAULT),
             };
-            let new_key = FutexKey::new(pa2, pid);
+            let new_key_addr = if private {
+                crate::mm::PhysAddr::from(uaddr2 as usize)
+            } else {
+                pa2
+            };
+            let new_key = FutexKey::new(new_key_addr, pid);
             let requeued = futex_requeue(key, val, new_key, val3) as isize;
             trace!(
                 "[sys_futex] pid={} requeue n={} uaddr2={:#x} pa2={:#x}",
@@ -475,6 +489,46 @@ pub fn sys_futex(
                 requeued,
                 uaddr2 as usize,
                 pa2.0
+            );
+            requeued
+        }
+        FutexCmd::FUTEX_CMP_REQUEUE => {
+            // val3 contains expected value for comparison
+            // val = max_wake, timeout (as usize) = max_requeue
+            if uaddr2.is_null() {
+                return errno(EINVAL);
+            }
+            let futex_word = translated_ref(token, uaddr1);
+            if *futex_word != val3 {
+                trace!(
+                    "[sys_futex] pid={} cmp_requeue mismatch word={} expected={}",
+                    pid_now,
+                    *futex_word,
+                    val3
+                );
+                return errno(EAGAIN);
+            }
+            let pa2 = match page_table.translate_va(VirtAddr::from(uaddr2 as usize)) {
+                Some(pa) => pa,
+                None => return errno(EFAULT),
+            };
+            let new_key_addr = if private {
+                crate::mm::PhysAddr::from(uaddr2 as usize)
+            } else {
+                pa2
+            };
+            let new_key = FutexKey::new(new_key_addr, pid);
+            // For CMP_REQUEUE: val = max_wake, timeout (cast to usize) = max_requeue
+            let max_requeue = timeout as usize as i32;
+            let requeued = futex_requeue(key, val, new_key, max_requeue) as isize;
+            trace!(
+                "[sys_futex] pid={} cmp_requeue n={} uaddr2={:#x} pa2={:#x} max_wake={} max_requeue={}",
+                pid_now,
+                requeued,
+                uaddr2 as usize,
+                pa2.0,
+                val,
+                max_requeue
             );
             requeued
         }
@@ -1712,41 +1766,37 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
     const WNOHANG: i32 = 1;
     let my_pid = current_process().getpid();
+    let my_pgid = current_process().inner_exclusive_access().pgid;
+    const SIG_DFL: usize = 0;
+    const SIG_IGN: usize = 1;
+    
+    // Helper: check if child matches the pid criteria
+    let matches_pid = |child_pid: usize, child_pgid: usize| -> bool {
+        match pid {
+            -1 => true,  // Any child
+            0 => child_pgid == my_pgid,  // Same process group
+            p if p > 0 => child_pid == p as usize,  // Specific PID
+            p => child_pgid == (-p) as usize,  // Specific process group (pid < -1)
+        }
+    };
+    
     loop {
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-        if !inner.children.iter().any(|p| pid == -1 || pid as usize == p.getpid()) {
+        
+        // Check if any child matches the criteria
+        let has_matching_child = inner.children.iter().any(|p| {
+            let child_inner = p.inner_exclusive_access();
+            matches_pid(p.getpid(), child_inner.pgid)
+        });
+        
+        if !has_matching_child {
             return errno(ECHILD);
         }
-        // ptrace-traced child reports stopped state via waitpid.
-        let stopped = inner.children.iter().find_map(|p| {
-            if pid != -1 && pid as usize != p.getpid() {
-                return None;
-            }
-            let mut child_inner = p.inner_exclusive_access();
-            child_inner
-                .ptrace_stop_signal
-                .take()
-                .map(|sig| (p.getpid(), sig))
-        });
-        if let Some((found_pid, stop_sig)) = stopped {
-            if !exit_code_ptr.is_null() {
-                let stop_sig = if (1..=(MAX_SIG as i32)).contains(&stop_sig) {
-                    stop_sig
-                } else {
-                    SIGSTOP as i32
-                };
-                let status = ((stop_sig & 0xff) << 8) | 0x7f;
-                *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
-            }
-            trace!(
-                "[sys_waitpid] pid={} observed traced-stop child pid={} sig={}",
-                my_pid, found_pid, stop_sig
-            );
-            return found_pid as isize;
-        }
+        
         let pair = inner.children.iter().enumerate().find(|(_, p)| {
-            p.inner_exclusive_access().is_zombie && (pid == -1 || pid as usize == p.getpid())
+            let child_inner = p.inner_exclusive_access();
+            child_inner.is_zombie && matches_pid(p.getpid(), child_inner.pgid)
         });
         if let Some((idx, _)) = pair {
             let child = inner.children.remove(idx);
@@ -1928,6 +1978,9 @@ pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
         Ok(v) => v,
         Err(e) => return e,
     };
+    if req.tv_nsec >= 1_000_000_000 {
+        return errno(EINVAL);
+    }
     let sleep_us = req
         .tv_sec
         .saturating_mul(1_000_000)
@@ -1986,7 +2039,9 @@ pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
                         core::mem::size_of::<TimeSpec>(),
                     )
                 };
-                let _ = copy_to_user(token, rem as *mut u8, bytes);
+                if let Err(err) = copy_to_user(token, rem as *mut u8, bytes) {
+                    return err;
+                }
             }
             return errno(EINTR);
         }
@@ -2143,8 +2198,8 @@ pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: *mut u8) -> is
 }
 
 pub fn sys_clock_nanosleep(
-    _clock_id: usize,
-    _flags: usize,
+    clock_id: usize,
+    flags: usize,
     req: *const TimeSpec,
     rem: *mut TimeSpec,
 ) -> isize {
@@ -2152,7 +2207,18 @@ pub fn sys_clock_nanosleep(
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_clock_nanosleep", pid);
     }
-    // libc pthread paths only need relative sleep behavior here.
+    // Support common clocks; reject thread CPU clock like Linux.
+    match clock_id {
+        0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 => {}
+        _ => return errno(EINVAL),
+    }
+    if clock_id == 3 {
+        return errno(ENOTSUP);
+    }
+    // Only relative sleep is supported for now.
+    if flags != 0 {
+        return errno(EINVAL);
+    }
     sys_nanosleep(req, rem)
 }
 
@@ -2491,11 +2557,12 @@ pub fn sys_mmap(
             .memory_set
             .overlap_count(VirtAddr(start), VirtAddr(start + len));
         trace!(
-            "[sys_mmap] pid={} name={} req={:#x} len={:#x} flags={:#x} -> start={:#x} overlap={} fixed={}",
+            "[sys_mmap] pid={} name={} req={:#x} len={:#x} prot={:#x} flags={:#x} -> start={:#x} overlap={} fixed={}",
             pid,
             inner.name,
             req_start,
             len,
+            prot,
             flags,
             start,
             overlap,
@@ -2551,6 +2618,11 @@ pub fn sys_mmap(
     }
 
     // 在进程的内存空间里插入一个新的映射区域，起始地址为 start，长度为 len，权限为 map_perm。
+    let area_type = if is_anon {
+        MapAreaType::MmapAnon
+    } else {
+        MapAreaType::MmapFile
+    };
     inner.memory_set.insert_mmap_area(
         VirtAddr(start),
         VirtAddr(start + len),
@@ -2563,6 +2635,7 @@ pub fn sys_mmap(
                 .map(|(_, writable)| *writable)
                 .unwrap_or(true),
         },
+        area_type,
     );
     drop(inner);
 
@@ -2686,13 +2759,13 @@ pub fn sys_sbrk(arg: isize) -> isize {
     let result = if delta == 0 {
         true
     } else if delta < 0 {
-        inner
-            .memory_set
-            .shrink_to(VirtAddr(heap_bottom), VirtAddr(new_brk))
+        // Shrink heap using type-based lookup
+        inner.memory_set.shrink_heap_to(VirtAddr(new_brk))
     } else {
+        // Expand heap using type-based lookup
         inner
             .memory_set
-            .append_to(VirtAddr(heap_bottom), VirtAddr(new_brk))
+            .append_heap_to(VirtAddr(new_brk), VirtAddr(heap_bottom))
     };
     if result {
         inner.program_brk = new_brk;

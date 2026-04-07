@@ -93,7 +93,7 @@ pub fn check_timer() {
 
 /// Check and fire ITIMER_REAL timers across all processes.
 fn check_itimers(current_ms: usize) {
-    use crate::task::{pid2process_snapshot, SignalFlags};
+    use crate::task::{pid2process_snapshot, wakeup_task, SignalFlags, TaskStatus};
     let procs = pid2process_snapshot();
     for (_pid, process) in procs {
         // Use try_inner_exclusive_access to avoid deadlocking if the timer
@@ -112,6 +112,20 @@ fn check_itimers(current_ms: usize) {
                 inner.itimer_real_expire_ms = current_ms + inner.itimer_real_interval_ms;
             } else {
                 inner.itimer_real_expire_ms = 0;
+            }
+            
+            // Wake up any blocked tasks in this process so they can handle the signal
+            for task_opt in inner.tasks.iter() {
+                if let Some(task) = task_opt {
+                    let mut task_inner = task.inner_exclusive_access();
+                    if task_inner.task_status == TaskStatus::Blocked {
+                        task_inner.interrupted_by_signal = true;
+                        task_inner.task_status = TaskStatus::Ready;
+                        drop(task_inner);
+                        wakeup_task(task.clone());
+                        log::info!("[itimer] pid={} woke blocked task", _pid);
+                    }
+                }
             }
         }
     }
