@@ -6,6 +6,7 @@ use super::{StepByOne, VPNRange};
 #[allow(unused_imports)]
 use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, USER_STACK_SIZE};
 use crate::config::USER_STACK_TOP;
+use crate::fs::File;
 use crate::sync::UPIntrFreeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -94,6 +95,75 @@ impl MemorySet {
         permission: MapPermission,
     ) {
         self.push(MapArea::new(start_va, end_va, permission), None);
+    }
+    /// Register an anonymous lazy VMA — no physical frames allocated until page fault.
+    pub fn insert_lazy_anon_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) {
+        self.areas.push(MapArea::new_lazy(start_va, end_va, permission));
+    }
+    /// Register a file-backed lazy VMA — pages populated from file on fault.
+    pub fn insert_lazy_file_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+        file: Arc<dyn File + Send + Sync>,
+        file_offset: u64,
+    ) {
+        self.areas.push(MapArea::new_lazy_file(
+            start_va, end_va, permission, file, file_offset,
+        ));
+    }
+    /// Handle a demand-paging fault at `addr`.
+    /// Returns `true` if the fault was resolved (lazy VMA found and page installed),
+    /// `false` if no lazy VMA covers this address (caller should SIGSEGV).
+    pub fn handle_demand_fault(&mut self, addr: usize) -> bool {
+        let fault_vpn = VirtAddr::from(addr).floor();
+
+        // Find index of lazy MapArea containing fault_vpn
+        let area_idx = match self.areas.iter().position(|a| {
+            a.lazy
+                && a.vpn_range.get_start() <= fault_vpn
+                && fault_vpn < a.vpn_range.get_end()
+        }) {
+            Some(idx) => idx,
+            None => return false,
+        };
+
+        // Defence: already mapped (shouldn't happen on UP, but be safe)
+        if self.page_table.translate(fault_vpn).map_or(false, |p| p.is_valid()) {
+            return true;
+        }
+
+        // Compute file info before taking &mut area (avoids mixed borrow)
+        let file_info = self.areas[area_idx]
+            .file_back
+            .as_ref()
+            .map(|(f, base_off)| {
+                let page_idx = fault_vpn.0 - self.areas[area_idx].vpn_range.get_start().0;
+                let file_off = *base_off + (page_idx * PAGE_SIZE) as u64;
+                (f.clone(), file_off)
+            });
+
+        // map_one uses &mut area and &mut page_table — split borrows on two fields
+        self.areas[area_idx].map_one(&mut self.page_table, fault_vpn);
+
+        // If file-backed, overwrite the zero page with file content
+        if let Some((file, file_off)) = file_info {
+            if let Some(pte) = self.page_table.translate(fault_vpn) {
+                if pte.is_valid() {
+                    let buf = pte.ppn().get_bytes_array();
+                    file.read_at_kernel(file_off as usize, buf);
+                }
+            }
+        }
+
+        trace!("[demand_fault] vpn={:#x} addr={:#x}", fault_vpn.0, addr);
+        true
     }
     /// Insert a shared framed area (for SysV SHM)
     /// Maps pre-allocated frames to a virtual address range
@@ -1060,6 +1130,11 @@ pub struct MapArea {
     data_frames: BTreeMap<VirtPageNum, Arc<FrameTracker>>,
     map_perm: MapPermission,
     kind: MapAreaKind,
+    /// true = VMA registered but no physical frames allocated yet;
+    /// page fault will call map_one on demand.
+    lazy: bool,
+    /// For file-backed lazy mappings: (file, file_offset_bytes of the start VPN).
+    file_back: Option<(Arc<dyn File + Send + Sync>, u64)>,
 }
 
 impl MapArea {
@@ -1084,7 +1159,25 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_perm,
             kind,
+            lazy: false,
+            file_back: None,
         }
+    }
+    pub fn new_lazy(start_va: VirtAddr, end_va: VirtAddr, map_perm: MapPermission) -> Self {
+        let mut a = Self::new(start_va, end_va, map_perm);
+        a.lazy = true;
+        a
+    }
+    pub fn new_lazy_file(
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        map_perm: MapPermission,
+        file: Arc<dyn File + Send + Sync>,
+        offset: u64,
+    ) -> Self {
+        let mut a = Self::new_lazy(start_va, end_va, map_perm);
+        a.file_back = Some((file, offset));
+        a
     }
     pub fn from_another(another: &Self) -> Self {
         Self {
@@ -1093,6 +1186,8 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_perm: another.map_perm,
             kind: another.kind,
+            lazy: another.lazy,
+            file_back: another.file_back.clone(),
         }
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
@@ -1130,7 +1225,10 @@ impl MapArea {
     }
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         self.data_frames.remove(&vpn);
-        page_table.unmap(vpn);
+        // Lazy VPNs that were never faulted in have no PTE; only unmap if valid.
+        if page_table.translate(vpn).map_or(false, |p| p.is_valid()) {
+            page_table.unmap(vpn);
+        }
     }
     pub fn map(&mut self, page_table: &mut PageTable) {
         for (_i, vpn) in self.vpn_range.into_iter().enumerate() {

@@ -148,6 +148,11 @@ impl File for VfsFile {
     fn ts_id(&self) -> Option<usize> {
         Some(self.ts_id)
     }
+
+    fn read_at_kernel(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let inner = self.inner.exclusive_access();
+        inner.inode.read_at(offset, buf)
+    }
 }
 
 pub fn list_apps() {

@@ -1895,44 +1895,32 @@ pub fn sys_mmap(start: usize, len: usize, prot: usize, flags: usize, fd: usize, 
         }
     }
 
-    inner
-        .memory_set
-        .insert_framed_area(VirtAddr(start), VirtAddr(start + len), map_perm);
-    drop(inner);
-
-    // 文件映射填充部分，在“不是匿名映射、而且有有效 fd”的情况下，把文件内容读进映射的页里。
-    // TODO: 懒分配/写时复制等优化
-    if (flags & MAP_ANON) == 0 && fd != usize::MAX {
-        // offset 参数必须是页大小的整数倍，否则返回 -EINVAL。
+    if (flags & MAP_ANON) != 0 || fd == usize::MAX {
+        // Anonymous lazy mapping: register VMA, allocate pages on fault
+        inner.memory_set.insert_lazy_anon_area(
+            VirtAddr(start), VirtAddr(start + len), map_perm,
+        );
+    } else {
+        // File-backed lazy mapping: offset must be page-aligned
         if offset % PAGE_SIZE != 0 {
             return errno(EINVAL);
         }
-        let inode = {
-            let inner = process.inner_exclusive_access();
-            if fd < inner.fd_table.len() {
-                inner.fd_table[fd]
-                    .as_ref()
-                    .and_then(|file| file.inode())
-            } else {
-                None
-            }
+        let file = if fd < inner.fd_table.len() {
+            inner.fd_table[fd].as_ref().map(|f| f.clone())
+        } else {
+            None
         };
-        if let Some(inode) = inode {
-            let token = current_user_token();
-            let slices = translated_byte_buffer(token, start as *const u8, len);
-            let mut file_off = offset;
-            let mut total_read = 0usize;
-            for slice in slices {
-                let n = inode.read_at(file_off, slice);
-                total_read += n;
-                file_off += n;
-                if n < slice.len() {
-                    break;
-                }
+        match file {
+            Some(file) => {
+                inner.memory_set.insert_lazy_file_area(
+                    VirtAddr(start), VirtAddr(start + len), map_perm,
+                    file, offset as u64,
+                );
             }
-            let _ = total_read;
+            None => return errno(EBADF),
         }
     }
+    drop(inner);
 
     start as isize
 }

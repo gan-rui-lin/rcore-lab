@@ -6,11 +6,14 @@ pub(super) fn handle_user_supervisor_external() {
 }
 
 pub(super) fn handle_user_page_fault(addr: usize) {
-    // Try COW first
+    // Try COW first, then demand paging (both under the process lock)
     {
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
         if inner.memory_set.handle_cow_fault(addr) {
+            return;
+        }
+        if inner.memory_set.handle_demand_fault(addr) {
             return;
         }
     }
