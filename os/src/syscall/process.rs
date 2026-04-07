@@ -1767,7 +1767,9 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
     const WNOHANG: i32 = 1;
     let my_pid = current_process().getpid();
     let my_pgid = current_process().inner_exclusive_access().pgid;
+    #[allow(dead_code)]
     const SIG_DFL: usize = 0;
+    #[allow(dead_code)]
     const SIG_IGN: usize = 1;
     
     // Helper: check if child matches the pid criteria

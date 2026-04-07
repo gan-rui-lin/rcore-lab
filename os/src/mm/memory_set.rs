@@ -1534,6 +1534,7 @@ impl MapArea {
         self
     }
     /// Get the area type
+    #[allow(dead_code)]
     pub fn area_type(&self) -> MapAreaType {
         self.area_type
     }
