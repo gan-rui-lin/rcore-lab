@@ -54,6 +54,17 @@ const TMP_IOZONE_4K_SCRIPT: &[u8] = b"\
 ./busybox echo iozone throughput write/read measurements 4k\n\
 ./iozone -t 4 -i 0 -i 1 -r 4k -s 1m\n\
 ";
+const TMP_IOZONE_QUICK_PATH: &str = "/tmp/iozone_temp_quick_debug.sh";
+const TMP_IOZONE_QUICK_SCRIPT: &[u8] = b"\
+./busybox echo '=== tmp-iozone-quick start ==='\n\
+set -x\n\
+./busybox echo 'RUN iozone: -t 4 -i 6 -r 1k -s 1m'\n\
+./iozone -t 4 -i 6 -r 1k -s 1m\n\
+ret=$?\n\
+./busybox echo \"tmp-iozone-quick exit code: $ret\"\n\
+./busybox echo '=== tmp-iozone-quick done ==='\n\
+exit $ret\n\
+";
 
 const TMP_LIBCTEST_PATH: &str = "/tmp/libctest_testcode.sh";
 const TMP_LIBCTEST_SCRIPT: &[u8] = b"\
@@ -1041,6 +1052,20 @@ fn run_selector(selector: &str) {
         let _ = activate_runtime_profile(root);
         let _ = write_embedded_elf(TMP_LTP_PATH, TMP_LTP_SCRIPT);
         let _ = run_testcode(TMP_LTP_PATH, root);
+        return;
+    }
+
+    // Fast iozone debug: only fwrite/fread modes with shell tracing enabled.
+    // Usage: SINGLE_TEST=tmp or SINGLE_TEST=tmp-glibc
+    if selector == "tmp" || selector == "tmp-glibc" {
+        let root = if selector.ends_with("-glibc") {
+            "/glibc"
+        } else {
+            "/musl"
+        };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_IOZONE_QUICK_PATH, TMP_IOZONE_QUICK_SCRIPT);
+        let _ = run_testcode(TMP_IOZONE_QUICK_PATH, root);
         return;
     }
 

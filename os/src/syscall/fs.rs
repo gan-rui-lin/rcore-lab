@@ -679,7 +679,14 @@ fn try_resolve_user_cow_writable(token: usize, ptr: *const u8, len: usize) -> bo
     let mut va = start;
     while va < end {
         let vpn = crate::mm::VirtAddr::from(va).floor();
-        let Some(pte) = page_table.translate(vpn) else {
+        // For lazy mmap areas, kernel writes can legitimately touch pages
+        // before user mode faults them in. Resolve demand fault first.
+        let mut pte = page_table.translate(vpn);
+        if pte.is_none() && !inner.memory_set.handle_demand_fault(va) {
+            return false;
+        }
+        pte = page_table.translate(vpn);
+        let Some(pte) = pte else {
             return false;
         };
         let flags = pte.flags();
@@ -687,6 +694,16 @@ fn try_resolve_user_cow_writable(token: usize, ptr: *const u8, len: usize) -> bo
             return false;
         }
         if !flags.contains(crate::mm::PTEFlags::W) && !inner.memory_set.handle_cow_fault(va) {
+            return false;
+        }
+        let Some(pte_after) = page_table.translate(vpn) else {
+            return false;
+        };
+        let flags_after = pte_after.flags();
+        if !pte_after.is_valid()
+            || !flags_after.contains(crate::mm::PTEFlags::U)
+            || !flags_after.contains(crate::mm::PTEFlags::W)
+        {
             return false;
         }
         let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
@@ -2819,7 +2836,7 @@ pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
             return if total_read > 0 { total_read } else { errno(EFAULT) };
         }
 
-        let Some(buffers) = translated_byte_buffer_checked(token, base as *const u8, len, true)
+        let Some(buffers) = translated_user_write_buffer(token, base as *const u8, len)
         else {
             return if total_read > 0 { total_read } else { errno(EFAULT) };
         };
@@ -4025,7 +4042,7 @@ pub fn sys_pread64(fd: usize, buf: *const u8, count: usize, offset: isize) -> is
     if offset < 0 {
         return errno(EINVAL);
     }
-    let Some(slices) = translated_byte_buffer_checked(token, buf, count, true) else {
+    let Some(slices) = translated_user_write_buffer(token, buf, count) else {
         return errno(EFAULT);
     };
     let mut total = 0usize;
