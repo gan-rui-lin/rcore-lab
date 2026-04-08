@@ -1765,6 +1765,7 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
 /// Returns child pid on success, 0 if WNOHANG and no zombie, -ECHILD if no matching child.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
     const WNOHANG: i32 = 1;
+    const WUNTRACED: i32 = 2;
     let my_pid = current_process().getpid();
     let my_pgid = current_process().inner_exclusive_access().pgid;
     #[allow(dead_code)]
@@ -1796,6 +1797,71 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
             return errno(ECHILD);
         }
         
+        // First, check for ptrace-stopped children (higher priority than zombies)
+        let ptrace_pair = inner.children.iter().enumerate().find(|(_, p)| {
+            let child_inner = p.inner_exclusive_access();
+            child_inner.ptrace_stop_signal.is_some() && matches_pid(p.getpid(), child_inner.pgid)
+        });
+        if let Some((idx, _)) = ptrace_pair {
+            let child = &inner.children[idx];
+            let found_pid = child.getpid();
+            let mut child_inner = child.inner_exclusive_access();
+            
+            if let Some(signum) = child_inner.ptrace_stop_signal.take() {
+                if !exit_code_ptr.is_null() {
+                    // WIFSTOPPED encoding: (signal << 8) | 0x7f
+                    let status = ((signum & 0xff) << 8) | 0x7f;
+                    *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
+                }
+                trace!(
+                    "[sys_waitpid] pid={} reports ptrace-stop of child pid={} signal={}",
+                    my_pid, found_pid, signum
+                );
+                return found_pid as isize;
+            }
+        }
+
+        // Then, if caller requests WUNTRACED, report group-stopped children.
+        if (options & WUNTRACED) != 0 {
+            let stopped_pair = inner.children.iter().enumerate().find_map(|(idx, p)| {
+                let mut child_inner = p.inner_exclusive_access();
+                if !matches_pid(p.getpid(), child_inner.pgid) {
+                    return None;
+                }
+                let stop_sig = match child_inner.child_wait_event.take() {
+                    Some(ChildWaitEvent::Stopped(sig)) => Some(sig),
+                    Some(other) => {
+                        // Keep non-stopped event for waitid()/other wait semantics.
+                        child_inner.child_wait_event = Some(other);
+                        None
+                    }
+                    None => None,
+                };
+                stop_sig.map(|sig| (idx, sig))
+            });
+            if let Some((idx, signum)) = stopped_pair {
+                let found_pid = inner.children[idx].getpid();
+                if !exit_code_ptr.is_null() {
+                    let stop_sig = if (1..=(MAX_SIG as i32)).contains(&signum) {
+                        signum
+                    } else {
+                        SIGSTOP as i32
+                    };
+                    // WIFSTOPPED encoding.
+                    let status = ((stop_sig & 0xff) << 8) | 0x7f;
+                    *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
+                }
+                trace!(
+                    "[sys_waitpid] pid={} reports group-stop of child pid={} signal={}",
+                    my_pid,
+                    found_pid,
+                    signum
+                );
+                return found_pid as isize;
+            }
+        }
+        
+        // Then check for zombie children
         let pair = inner.children.iter().enumerate().find(|(_, p)| {
             let child_inner = p.inner_exclusive_access();
             child_inner.is_zombie && matches_pid(p.getpid(), child_inner.pgid)
