@@ -92,7 +92,18 @@ pub fn pid_alloc() -> PidHandle {
 
 impl Drop for PidHandle {
     fn drop(&mut self) {
-        PID_ALLOCATOR.exclusive_access().dealloc(self.0);
+        // Keep PID monotonic and avoid immediate PID reuse.
+        //
+        // LTP fork13 checks that two consecutive fork() calls do not return the
+        // same PID; aggressively recycling PIDs on every wait()/drop can trigger
+        // that exact failure pattern (e.g. ... 4, 4 ...).
+        //
+        // We intentionally do not recycle process IDs here. TID recycling still
+        // uses RecycleAllocator via TaskUserRes and is unaffected.
+        //
+        // TODO(grl): implement delayed PID recycling (quarantine/generation based)
+        // so we can eventually reuse PID space without immediate reuse that breaks
+        // fork13-style monotonic-sequence expectations.
     }
 }
 
