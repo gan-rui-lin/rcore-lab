@@ -3094,10 +3094,6 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
             signum
         );
     }
-    let flag = match signal_flag_from_signum(signum) {
-        Ok(flag) => flag,
-        Err(err) => return err,
-    };
     let process = match pid2process(pid) {
         Some(process) => process,
         None => return errno(ESRCH),
@@ -3108,6 +3104,15 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
     if process.getpid() == 1 && pid_now != 1 {
         return errno(EPERM);
     }
+    // Linux semantics: kill(pid, 0) performs existence/permission checks only.
+    // It must not enqueue any pending signal.
+    if signum == 0 {
+        return 0;
+    }
+    let flag = match signal_flag_from_signum(signum) {
+        Ok(flag) => flag,
+        Err(err) => return err,
+    };
     let mut inner = process.inner_exclusive_access();
     let mut yielded_after_continue = false;
     if flag == SignalFlags::SIGCONT && inner.group_stopped {

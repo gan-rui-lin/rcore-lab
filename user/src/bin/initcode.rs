@@ -65,6 +65,39 @@ ret=$?\n\
 ./busybox echo '=== tmp-iozone-quick done ==='\n\
 exit $ret\n\
 ";
+const TMP_LMBENCH_SIG_PATH: &str = "/tmp/lmbench_sig_debug.sh";
+const TMP_LMBENCH_SIG_SCRIPT: &[u8] = b"\
+./busybox echo '=== lmbench-sig debug start ==='\n\
+./busybox echo 'RUN lat_sig -P 1 catch (Signal handler overhead)'\n\
+./busybox date\n\
+./lmbench_all lat_sig -P 1 catch\n\
+ret1=$?\n\
+./busybox echo \"lat_sig catch ret=$ret1\"\n\
+./busybox date\n\
+./busybox echo 'RUN lat_sig -P 1 prot lat_sig (next test)'\n\
+./lmbench_all lat_sig -P 1 prot lat_sig\n\
+ret2=$?\n\
+./busybox echo \"lat_sig prot ret=$ret2\"\n\
+./busybox date\n\
+./busybox echo 'RUN lat_pipe -P 1 (follow-up sanity)'\n\
+./lmbench_all lat_pipe -P 1\n\
+ret3=$?\n\
+./busybox echo \"lat_pipe ret=$ret3\"\n\
+./busybox echo '=== lmbench-sig debug done ==='\n\
+";
+const TMP_LMBENCH_AFTER_PROT_PATH: &str = "/tmp/lmbench_after_prot.sh";
+const TMP_LMBENCH_AFTER_PROT_SCRIPT: &[u8] = b"\
+./busybox echo '=== lmbench after-prot1 start ==='\n\
+./busybox echo 'Bandwidth measurements'\n\
+./lmbench_all bw_pipe -P 1\n\
+./lmbench_all bw_file_rd -P 1 512k io_only /var/tmp/XXX\n\
+./lmbench_all bw_file_rd -P 1 512k open2close /var/tmp/XXX\n\
+./lmbench_all bw_mmap_rd -P 1 512k mmap_only /var/tmp/XXX\n\
+./lmbench_all bw_mmap_rd -P 1 512k open2close /var/tmp/XXX\n\
+./busybox echo 'context switch overhead'\n\
+./lmbench_all lat_ctx -P 1 -s 32 2 4 8 16 24 32 64 96\n\
+./busybox echo '=== lmbench after-prot done ==='\n\
+";
 
 const TMP_LIBCTEST_PATH: &str = "/tmp/libctest_testcode.sh";
 const TMP_LIBCTEST_SCRIPT: &[u8] = b"\
@@ -1090,6 +1123,34 @@ fn run_selector(selector: &str) {
         let _ = activate_runtime_profile(root);
         let _ = write_embedded_elf(TMP_IOZONE_4K_PATH, TMP_IOZONE_4K_SCRIPT);
         let _ = run_testcode(TMP_IOZONE_4K_PATH, root);
+        return;
+    }
+
+    // Focused lmbench signal debug: catch + prot + one follow-up test.
+    // Usage: SINGLE_TEST=tmp-lmbench-sig or SINGLE_TEST=tmp-lmbench-sig-glibc
+    if selector == "tmp-lmbench-sig" || selector == "tmp-lmbench-sig-glibc" {
+        let root = if selector.ends_with("-glibc") {
+            "/glibc"
+        } else {
+            "/musl"
+        };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_LMBENCH_SIG_PATH, TMP_LMBENCH_SIG_SCRIPT);
+        let _ = run_testcode(TMP_LMBENCH_SIG_PATH, root);
+        return;
+    }
+
+    // Run lmbench from Protection fault onward.
+    // Usage: SINGLE_TEST=tmp-lmbench-after-prot or SINGLE_TEST=tmp-lmbench-after-prot-glibc
+    if selector == "tmp-lmbench-after-prot" || selector == "tmp-lmbench-after-prot-glibc" {
+        let root = if selector.ends_with("-glibc") {
+            "/glibc"
+        } else {
+            "/musl"
+        };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_LMBENCH_AFTER_PROT_PATH, TMP_LMBENCH_AFTER_PROT_SCRIPT);
+        let _ = run_testcode(TMP_LMBENCH_AFTER_PROT_PATH, root);
         return;
     }
 

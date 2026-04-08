@@ -223,9 +223,11 @@ impl MemorySet {
             None => return false,
         };
 
-        // Defence: already mapped (shouldn't happen on UP, but be safe)
+        // Already mapped means this is not a "missing page" fault.
+        // Typical case: write to a present read-only page (e.g. PROT_READ mmap).
+        // Let caller treat it as protection fault (COW path already tried first).
         if self.page_table.translate(fault_vpn).map_or(false, |p| p.is_valid()) {
-            return true;
+            return false;
         }
 
         // Compute file info before taking &mut area (avoids mixed borrow)
