@@ -6,7 +6,7 @@ use super::{
 };
 use crate::sync::UPIntrFreeCell;
 use alloc::sync::Arc;
-use arch::TrapContext;
+use arch::{TrapContext, TrapFrameArgs};
 use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::*;
 
@@ -111,6 +111,82 @@ pub fn current_trap_cx_user_va() -> usize {
 
 pub fn current_kstack_top() -> usize {
     current_task().unwrap().kstack.get_top()
+}
+
+/// Return lightweight current-task context for allocator tracing.
+/// (pid, tid, last_syscall, sampled)
+pub fn current_task_context_for_alloc_trace() -> (usize, usize, usize, bool) {
+    let Some(processor) = PROCESSOR.try_exclusive_access() else {
+        return (0, 0, 0, false);
+    };
+    let Some(task) = processor.current() else {
+        return (0, 0, 0, false);
+    };
+    drop(processor);
+
+    let pid = task.process.upgrade().map(|p| p.getpid()).unwrap_or(0);
+    let result = if let Some(task_inner) = task.try_inner_exclusive_access() {
+        let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+        (pid, tid, task_inner.last_syscall, true)
+    } else {
+        (pid, 0, 0, false)
+    };
+    result
+}
+
+/// Print current task/process context for alloc_error diagnostics.
+pub fn print_current_task_brief_for_alloc_error() {
+    let task = PROCESSOR.exclusive_access().current();
+    let Some(task) = task else {
+        println!("[kernel] alloc_error current: <no-current-task>");
+        return;
+    };
+    let Some(process) = task.process.upgrade() else {
+        println!("[kernel] alloc_error current: <task-without-process>");
+        return;
+    };
+    let pid = process.getpid();
+    if let Some(task_inner) = task.try_inner_exclusive_access() {
+        let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+        let trap_cx = task_inner.get_trap_cx();
+        if let Some(proc_inner) = process.try_inner_exclusive_access() {
+            println!(
+                "[kernel] alloc_error current: pid={} tid={} name={} zombie={} status={:?} last_syscall={} sepc={:#x} sp={:#x} ra={:#x} sampled=true",
+                pid,
+                tid,
+                proc_inner.name.as_str(),
+                proc_inner.is_zombie,
+                task_inner.task_status,
+                task_inner.last_syscall,
+                trap_cx.sepc,
+                trap_cx[TrapFrameArgs::SP],
+                trap_cx[TrapFrameArgs::RA]
+            );
+        } else {
+            println!(
+                "[kernel] alloc_error current: pid={} tid={} name=<proc_busy> status={:?} last_syscall={} sepc={:#x} sp={:#x} ra={:#x} sampled=false",
+                pid,
+                tid,
+                task_inner.task_status,
+                task_inner.last_syscall,
+                trap_cx.sepc,
+                trap_cx[TrapFrameArgs::SP],
+                trap_cx[TrapFrameArgs::RA]
+            );
+        }
+    } else if let Some(proc_inner) = process.try_inner_exclusive_access() {
+        println!(
+            "[kernel] alloc_error current: pid={} name={} zombie={} <task_busy> sampled=true",
+            pid,
+            proc_inner.name.as_str(),
+            proc_inner.is_zombie
+        );
+    } else {
+        println!(
+            "[kernel] alloc_error current: pid={} name=<proc_busy> <task_busy> sampled=false",
+            pid
+        );
+    };
 }
 
 /// Check if the current task has pending unmasked signals.

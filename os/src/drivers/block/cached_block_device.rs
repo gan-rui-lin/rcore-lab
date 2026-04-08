@@ -33,10 +33,11 @@ const fn parse_cache_size(value: &str) -> Option<usize> {
 const fn cache_size_blocks_from_env() -> usize {
     match option_env!("BLOCK_CACHE_SIZE") {
         Some(v) => match parse_cache_size(v) {
-            Some(0) | None => 49_152,
+            Some(0) | None => 16_384,
             Some(n) => n,
         },
-        None => 49_152,
+        // Default: 16384 blocks * 512B = 8MB (reduced from 24MB to ease heap pressure).
+        None => 16_384,
     }
 }
 
@@ -63,7 +64,7 @@ static CACHE_DIRTY_EVICT_CALLS: AtomicU64 = AtomicU64::new(0);
 static CACHE_BACKEND_READS: AtomicU64 = AtomicU64::new(0);
 static CACHE_BACKEND_WRITES: AtomicU64 = AtomicU64::new(0);
 static CACHE_LAST_LOG_STEP: AtomicU64 = AtomicU64::new(0);
-static CACHE_FORCED_EVICT_COUNT: AtomicU64 = AtomicU64::new(0);
+static CACHE_FULL_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn maybe_log_cache_stats() {
@@ -117,7 +118,7 @@ fn maybe_log_cache_stats() {
 
 #[inline]
 fn maybe_warn_cache_pressure() {
-    let forced = CACHE_FORCED_EVICT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let forced = CACHE_FULL_WARN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if forced <= CACHE_PRESSURE_WARN_BURST || forced % CACHE_PRESSURE_WARN_EVERY == 0 {
         warn!(
             "Cache full with all pages recently used/in use, forcing eviction (count={})",
@@ -281,17 +282,21 @@ impl CacheManager {
             let Some(candidate_id) = self.queue.pop_back() else {
                 break;
             };
-            let Some(candidate) = self.pages.get(&candidate_id).cloned() else {
-                continue;
-            };
-
-            // `candidate` is a local Arc clone of the map entry, so:
-            // - strong_count == 2 means "only cache map + this local variable"
-            // - strong_count > 2 means there are external holders, skip eviction.
-            if Arc::strong_count(&candidate) > 2 {
+            // Check strong_count BEFORE cloning to avoid counting our own reference.
+            // After pages.get() returns a reference (count = 1 if only in map),
+            // cloning would make it 2, causing "> 1" to always be true.
+            let externally_held = self
+                .pages
+                .get(&candidate_id)
+                .map(|arc| Arc::strong_count(arc) > 1)
+                .unwrap_or(false);
+            if externally_held {
                 self.queue.push_front(candidate_id);
                 continue;
             }
+            let Some(candidate) = self.pages.get(&candidate_id).cloned() else {
+                continue;
+            };
 
             let mut guard = candidate.lock();
             if guard.take_accessed() {

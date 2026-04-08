@@ -135,6 +135,17 @@ pub fn frame_dealloc(ppn: PhysPageNum) {
     FRAME_ALLOCATOR.exclusive_access().dealloc(ppn);
 }
 
+/// Return frame allocator state snapshot.
+/// (current, end, recycled_len, available_estimate)
+pub fn frame_allocator_stats() -> (usize, usize, usize, usize) {
+    let inner = FRAME_ALLOCATOR.exclusive_access();
+    let current = inner.current;
+    let end = inner.end;
+    let recycled_len = inner.recycled.len();
+    let available_estimate = end.saturating_sub(current).saturating_add(recycled_len);
+    (current, end, recycled_len, available_estimate)
+}
+
 #[allow(unused)]
 /// a simple test for frame allocator
 pub fn frame_allocator_test() {

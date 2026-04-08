@@ -13,7 +13,7 @@ use crate::{
     fs::{open_file, path_exists, path_is_dir, File, OpenFlags},
     mm::{
         translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
-        translated_str_checked, MapAreaType, MapPermission, MmapMeta, PTEFlags, PageTable,
+        translated_str_checked, MapPermission, PTEFlags, PageTable,
         ProtectError, VirtAddr,
     },
     task::{
@@ -2619,47 +2619,30 @@ pub fn sys_mmap(
         }
     }
 
-    // 在进程的内存空间里插入一个新的映射区域，起始地址为 start，长度为 len，权限为 map_perm。
-    let area_type = if is_anon {
-        MapAreaType::MmapAnon
+    // Lazy VMA insertion: register VMA, allocate pages on fault.
+    // Preserve MapAreaType tracking from dev for bookkeeping.
+    let _file_writable = file_info.as_ref().map(|(_, writable)| *writable).unwrap_or(true);
+    if is_anon || fd == usize::MAX {
+        inner.memory_set.insert_lazy_anon_area(
+            VirtAddr(start), VirtAddr(start + len), map_perm,
+        );
     } else {
-        MapAreaType::MmapFile
-    };
-    inner.memory_set.insert_mmap_area(
-        VirtAddr(start),
-        VirtAddr(start + len),
-        map_perm,
-        MmapMeta {
-            shared: is_shared,
-            file_backed: !is_anon,
-            file_writable: file_info
-                .as_ref()
-                .map(|(_, writable)| *writable)
-                .unwrap_or(true),
-        },
-        area_type,
-    );
-    drop(inner);
-
-    // 文件映射填充部分，在“不是匿名映射、而且有有效 fd”的情况下，把文件内容读进映射的页里。
-    // TODO: 懒分配/写时复制等优化
-    if let Some((inode, _)) = file_info {
-        if let Some(inode) = inode {
-            let token = current_user_token();
-            let slices = translated_byte_buffer(token, start as *const u8, len);
-            let mut file_off = offset;
-            let mut total_read = 0usize;
-            for slice in slices {
-                let n = inode.read_at(file_off, slice);
-                total_read += n;
-                file_off += n;
-                if n < slice.len() {
-                    break;
-                }
+        let file = if fd < inner.fd_table.len() {
+            inner.fd_table[fd].as_ref().map(|f| f.clone())
+        } else {
+            None
+        };
+        match file {
+            Some(file) => {
+                inner.memory_set.insert_lazy_file_area(
+                    VirtAddr(start), VirtAddr(start + len), map_perm,
+                    file, offset as u64,
+                );
             }
-            let _ = total_read;
+            None => return errno(EBADF),
         }
     }
+    drop(inner);
 
     start as isize
 }

@@ -32,6 +32,11 @@ pub trait File: Send + Sync {
     fn read_all(&self) -> Vec<u8> {
         Vec::new()
     }
+    /// Read file content directly into a kernel buffer at a given byte offset.
+    /// Used by demand paging for file-backed mappings. Default returns 0 (unsupported).
+    fn read_at_kernel(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
     /// poll the file for events, return the events bitflags
     /// default implementation returns POLLIN | POLLOUT, which means always readable and writable.
     /// ! for files that are not always ready, e.g. pipes, this should be overridden to return the actual events.

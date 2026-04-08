@@ -17,7 +17,9 @@ pub use arch::{
 };
 pub use arch::{PageTable, PageTableEntry, UserBuffer, UserBufferIterator};
 pub use arch::{PhysAddr, PhysPageNum, StepByOne, VPNRange, VirtAddr, VirtPageNum};
-pub use frame_allocator::{frame_alloc, frame_alloc_more, frame_dealloc, FrameTracker};
+pub use frame_allocator::{
+    frame_alloc, frame_alloc_more, frame_allocator_stats, frame_dealloc, FrameTracker,
+};
 pub use memory_set::remap_test;
 pub use memory_set::{
     kernel_token, MapAreaType, MapPermission, MemorySet, MmapMeta, ProtectError, KERNEL_SPACE,

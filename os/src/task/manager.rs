@@ -6,6 +6,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 #[allow(unused_imports)]
 use alloc::vec::Vec;
+use arch::TrapFrameArgs;
 use lazy_static::*;
 
 pub struct TaskManager {
@@ -177,4 +178,144 @@ pub fn pid2process_fdtable_summary() -> (usize, usize, usize) {
         }
     }
     (total_fd_slots, max_fd_slots, max_fd_pid)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TopFdEntry {
+    valid: bool,
+    pid: usize,
+    fd_slots: usize,
+    fd_used: usize,
+    tasks_alive: usize,
+    children: usize,
+    is_zombie: bool,
+}
+
+impl TopFdEntry {
+    const fn empty() -> Self {
+        Self {
+            valid: false,
+            pid: 0,
+            fd_slots: 0,
+            fd_used: 0,
+            tasks_alive: 0,
+            children: 0,
+            is_zombie: false,
+        }
+    }
+}
+
+/// Print top processes ordered by fd_table length.
+/// Intended for alloc_error diagnostics, so it avoids heap allocation.
+pub fn print_pid2process_top_by_fd(limit: usize) {
+    const MAX_TOP: usize = 8;
+    let limit = limit.min(MAX_TOP);
+    if limit == 0 {
+        return;
+    }
+    let mut top = [TopFdEntry::empty(); MAX_TOP];
+    let map = PID2PCB.exclusive_access();
+    for (pid, process) in map.iter() {
+        let Some(inner) = process.try_inner_exclusive_access() else {
+            continue;
+        };
+        let fd_slots = inner.fd_table.len();
+        let fd_used = inner.fd_table.iter().filter(|fd| fd.is_some()).count();
+        let tasks_alive = inner.tasks.iter().filter(|t| t.is_some()).count();
+        let children = inner.children.len();
+        let is_zombie = inner.is_zombie;
+        let candidate = TopFdEntry {
+            valid: true,
+            pid: *pid,
+            fd_slots,
+            fd_used,
+            tasks_alive,
+            children,
+            is_zombie,
+        };
+
+        // Insertion-sort into fixed-size descending array by fd_slots.
+        for idx in 0..limit {
+            if !top[idx].valid || candidate.fd_slots > top[idx].fd_slots {
+                for j in (idx + 1..limit).rev() {
+                    top[j] = top[j - 1];
+                }
+                top[idx] = candidate;
+                break;
+            }
+        }
+    }
+    drop(map);
+
+    for (idx, entry) in top.iter().take(limit).enumerate() {
+        if !entry.valid {
+            break;
+        }
+        if let Some(process) = pid2process(entry.pid) {
+            if let Some(inner) = process.try_inner_exclusive_access() {
+                println!(
+                    "[kernel] alloc_error top_fd[{}]: pid={} name={} zombie={} tasks_alive={} children={} fd_used={} fd_slots={} sampled=true",
+                    idx,
+                    entry.pid,
+                    inner.name.as_str(),
+                    entry.is_zombie,
+                    entry.tasks_alive,
+                    entry.children,
+                    entry.fd_used,
+                    entry.fd_slots
+                );
+            } else {
+                println!(
+                    "[kernel] alloc_error top_fd[{}]: pid={} name=<busy> zombie={} tasks_alive={} children={} fd_used={} fd_slots={} sampled=false",
+                    idx,
+                    entry.pid,
+                    entry.is_zombie,
+                    entry.tasks_alive,
+                    entry.children,
+                    entry.fd_used,
+                    entry.fd_slots
+                );
+            }
+        } else {
+            println!(
+                "[kernel] alloc_error top_fd[{}]: pid={} name=<gone> zombie={} tasks_alive={} children={} fd_used={} fd_slots={} sampled=false",
+                idx,
+                entry.pid,
+                entry.is_zombie,
+                entry.tasks_alive,
+                entry.children,
+                entry.fd_used,
+                entry.fd_slots
+            );
+        }
+    }
+}
+
+/// Print brief ready-queue context for alloc_error diagnostics.
+pub fn print_ready_queue_brief(limit: usize) {
+    let mgr = TASK_MANAGER.exclusive_access();
+    for (idx, task) in mgr.ready_queue.iter().take(limit).enumerate() {
+        let pid = task.process.upgrade().map(|p| p.getpid()).unwrap_or(0);
+        if let Some(task_inner) = task.try_inner_exclusive_access() {
+            let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+            let trap_cx = task_inner.get_trap_cx();
+            println!(
+                "[kernel] alloc_error ready[{}]: pid={} tid={} status={:?} last_syscall={} sepc={:#x} sp={:#x} ra={:#x}",
+                idx,
+                pid,
+                tid,
+                task_inner.task_status,
+                task_inner.last_syscall,
+                trap_cx.sepc,
+                trap_cx[TrapFrameArgs::SP],
+                trap_cx[TrapFrameArgs::RA]
+            );
+        } else {
+            println!(
+                "[kernel] alloc_error ready[{}]: pid={} <task_busy>",
+                idx,
+                pid
+            );
+        }
+    }
 }

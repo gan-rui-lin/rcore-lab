@@ -164,6 +164,11 @@ impl File for VfsFile {
     fn status_flags(&self) -> u32 {
         self.status_flags
     }
+
+    fn read_at_kernel(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let inner = self.inner.exclusive_access();
+        inner.inode.read_at(offset, buf)
+    }
 }
 
 pub fn list_apps() {
