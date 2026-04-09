@@ -13,7 +13,7 @@ use crate::{
     fs::{open_file, path_exists, path_is_dir, File, OpenFlags},
     mm::{
         translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
-        translated_str_checked, MapPermission, PTEFlags, PageTable,
+        translated_str_checked, MapPermission, MmapMeta, PTEFlags, PageTable,
         ProtectError, VirtAddr,
     },
     task::{
@@ -2708,10 +2708,20 @@ pub fn sys_mmap(
 
     // Lazy VMA insertion: register VMA, allocate pages on fault.
     // Preserve MapAreaType tracking from dev for bookkeeping.
-    let _file_writable = file_info.as_ref().map(|(_, writable)| *writable).unwrap_or(true);
+    let meta = MmapMeta {
+        shared: is_shared,
+        file_backed: !is_anon && fd != usize::MAX,
+        file_writable: file_info
+            .as_ref()
+            .map(|(_, writable)| *writable)
+            .unwrap_or(true),
+    };
     if is_anon || fd == usize::MAX {
         inner.memory_set.insert_lazy_anon_area(
-            VirtAddr(start), VirtAddr(start + len), map_perm,
+            VirtAddr(start),
+            VirtAddr(start + len),
+            map_perm,
+            meta,
         );
     } else {
         let file = if fd < inner.fd_table.len() {
@@ -2722,8 +2732,12 @@ pub fn sys_mmap(
         match file {
             Some(file) => {
                 inner.memory_set.insert_lazy_file_area(
-                    VirtAddr(start), VirtAddr(start + len), map_perm,
-                    file, offset as u64,
+                    VirtAddr(start),
+                    VirtAddr(start + len),
+                    map_perm,
+                    file,
+                    offset as u64,
+                    meta,
                 );
             }
             None => return errno(EBADF),

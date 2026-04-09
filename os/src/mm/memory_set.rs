@@ -191,8 +191,15 @@ impl MemorySet {
         start_va: VirtAddr,
         end_va: VirtAddr,
         permission: MapPermission,
+        meta: MmapMeta,
     ) {
-        self.areas.push(MapArea::new_lazy(start_va, end_va, permission));
+        let mut area = MapArea::new_lazy(start_va, end_va, permission)
+            .with_mmap_meta(meta)
+            .with_area_type(MapAreaType::MmapAnon);
+        if meta.shared {
+            area = area.with_kind(MapAreaKind::Shared).with_shared_frames();
+        }
+        self.areas.push(area);
     }
     /// Register a file-backed lazy VMA — pages populated from file on fault.
     pub fn insert_lazy_file_area(
@@ -202,10 +209,15 @@ impl MemorySet {
         permission: MapPermission,
         file: Arc<dyn File + Send + Sync>,
         file_offset: u64,
+        meta: MmapMeta,
     ) {
-        self.areas.push(MapArea::new_lazy_file(
-            start_va, end_va, permission, file, file_offset,
-        ));
+        let mut area = MapArea::new_lazy_file(start_va, end_va, permission, file, file_offset)
+            .with_mmap_meta(meta)
+            .with_area_type(MapAreaType::MmapFile);
+        if meta.shared {
+            area = area.with_kind(MapAreaKind::Shared).with_shared_frames();
+        }
+        self.areas.push(area);
     }
     /// Handle a demand-paging fault at `addr`.
     /// Returns `true` if the fault was resolved (lazy VMA found and page installed),
@@ -1201,7 +1213,11 @@ impl MemorySet {
             if area.map_perm.contains(MapPermission::X) {
                 perms[2] = 'x';
             }
-            perms[3] = if area.mmap_meta.is_some() { 's' } else { 'p' };
+            perms[3] = if area.mmap_meta.map(|m| m.shared).unwrap_or(false) {
+                's'
+            } else {
+                'p'
+            };
 
             let mut label = "";
             if heap_bottom >= start && heap_bottom < end && program_brk >= heap_bottom {
@@ -1680,6 +1696,10 @@ impl MapArea {
     }
     fn with_shared_frames(mut self) -> Self {
         self.shared_frames = true;
+        self
+    }
+    fn with_kind(mut self, kind: MapAreaKind) -> Self {
+        self.kind = kind;
         self
     }
     fn with_mmap_meta(mut self, meta: MmapMeta) -> Self {

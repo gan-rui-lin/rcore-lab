@@ -30,6 +30,7 @@ const TEST_SUITES: [&str; 3] = [
     // "libcbench",
     // "libctest",
     // "lmbench",
+    // "lmbench",
     "ltp",
     // "basic",
     // "lua",
@@ -121,6 +122,16 @@ ltp/testcases/bin/fork14\n\
 ltp/testcases/bin/futex_wait01\n\
 ltp/testcases/bin/futex_wake01\n\
 ./busybox echo '=== ltp-mini done ==='\n\
+";
+
+const TMP_LTP_ABORT_PATH: &str = "/tmp/ltp_abort_debug.sh";
+const TMP_LTP_ABORT_SCRIPT: &[u8] = b"\
+./busybox echo '=== ltp-abort debug start ==='\n\
+./busybox echo 'RUN LTP CASE abort01'\n\
+ltp/testcases/bin/abort01\n\
+ret=$?\n\
+./busybox echo \"FAIL LTP CASE abort01 : $ret\"\n\
+./busybox echo '=== ltp-abort debug done ==='\n\
 ";
 
 // Debug script for LTP tests that get stuck (selected from skip list)
@@ -1035,6 +1046,16 @@ fn run_selector(selector: &str) {
         let _ = activate_runtime_profile(root);
         let _ = write_embedded_elf(TMP_LTP_MINI_PATH, TMP_LTP_MINI_SCRIPT);
         let _ = run_testcode(TMP_LTP_MINI_PATH, root);
+        return;
+    }
+
+    // Minimal LTP abort debug script.
+    // Usage: SINGLE_TEST=tmp-ltp-abort or SINGLE_TEST=tmp-ltp-abort-glibc
+    if selector == "tmp-ltp-abort" || selector == "tmp-ltp-abort-glibc" {
+        let root = if selector.ends_with("-glibc") { "/glibc" } else { "/musl" };
+        let _ = activate_runtime_profile(root);
+        let _ = write_embedded_elf(TMP_LTP_ABORT_PATH, TMP_LTP_ABORT_SCRIPT);
+        let _ = run_testcode(TMP_LTP_ABORT_PATH, root);
         return;
     }
 
