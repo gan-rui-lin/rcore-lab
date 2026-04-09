@@ -18,68 +18,18 @@ pub(super) fn handle_user_page_fault(addr: usize) {
         }
     }
 
-    // Not COW-able: log and SIGSEGV
-    let token = current_user_token();
-    let page_table = PageTable::from_token(token);
-    let fault_va = VirtAddr::from(addr);
-    let fault_vpn = fault_va.floor();
-
+    // Not COW-able: deliver SIGSEGV to user.
     let trap_cx = current_trap_cx();
-    let (pid, tid, name) = if let Some(task) = current_task() {
-        let task_inner = task.inner_exclusive_access();
-        let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-        let name = task
-            .process
-            .upgrade()
-            .map(|p| p.inner_exclusive_access().name.clone())
-            .unwrap_or_else(|| String::from("<unknown>"));
-        (current_process().pid.0, tid, name)
-    } else {
-        (0, 0, String::from("<no-task>"))
-    };
-    let args = trap_cx.args();
-    error!(
-        "[kernel] trap_handler: page fault addr={:#x} pid={} tid={} name={} sepc={:#x}",
-        addr, pid, tid, name, trap_cx.sepc
-    );
-    error!(
-        "[kernel] trap_handler: ra={:#x} sp={:#x} tp={:#x} syscall={:#x} args={:x?}",
-        trap_cx[TrapFrameArgs::RA],
-        trap_cx[TrapFrameArgs::SP],
-        trap_cx[TrapFrameArgs::TLS],
-        trap_cx[TrapFrameArgs::SYSCALL],
-        args
-    );
-    if let Some(pte) = page_table.translate(fault_vpn) {
-        if pte.is_valid() {
-            let offset = fault_va.page_offset();
-            let end = core::cmp::min(offset + 8, PAGE_SIZE);
-            let bytes = &pte.ppn().get_bytes_array()[offset..end];
-            error!(
-                "[kernel] trap_handler: fault pte ppn={:#x} flags={:?} bytes={:02x?}",
-                pte.ppn().0, pte.flags(), bytes
-            );
-        } else {
-            error!("[kernel] trap_handler: fault pte invalid flags={:?}", pte.flags());
-        }
-    } else {
-        error!("[kernel] trap_handler: fault pte unmapped");
-    }
-    let sepc_va = VirtAddr::from(trap_cx.sepc);
-    if let Some(pte) = page_table.translate(sepc_va.floor()) {
-        if pte.is_valid() {
-            let offset = sepc_va.page_offset();
-            let end = core::cmp::min(offset + 8, PAGE_SIZE);
-            let bytes = &pte.ppn().get_bytes_array()[offset..end];
-            error!(
-                "[kernel] trap_handler: sepc pte ppn={:#x} flags={:?} bytes={:02x?}",
-                pte.ppn().0, pte.flags(), bytes
-            );
-        } else {
-            error!("[kernel] trap_handler: sepc pte invalid flags={:?}", pte.flags());
-        }
-    } else {
-        error!("[kernel] trap_handler: sepc pte unmapped");
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        debug!(
+            "[trap] page fault pid={} addr={:#x} sepc={:#x} ra={:#x} sp={:#x}",
+            pid,
+            addr,
+            trap_cx.sepc,
+            trap_cx[TrapFrameArgs::RA],
+            trap_cx[TrapFrameArgs::SP]
+        );
     }
     if let Some(task) = current_task() {
         // Synchronous faults should be delivered to the faulting thread.

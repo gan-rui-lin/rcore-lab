@@ -261,9 +261,19 @@ impl SocketFile {
             let socket = stack.sockets.get_mut::<udp::Socket>(self.handle);
 
             if socket.can_recv() {
-                // Collect into a contiguous buffer first
-                let mut tmp = alloc::vec![0u8; 65536];
-                match socket.recv_slice(&mut tmp) {
+                // Avoid large fixed stack allocation (64KB) on kernel stack.
+                // Size tmp by user receive capacity on heap.
+                let mut cap = user_buf
+                    .buffers
+                    .iter()
+                    .map(|slice| slice.len())
+                    .sum::<usize>();
+                if cap == 0 {
+                    return 0;
+                }
+                cap = cap.min(65536);
+                let mut tmp = alloc::vec![0u8; cap];
+                match socket.recv_slice(&mut tmp[..]) {
                     Ok((n, _endpoint)) => {
                         // Copy to user buffer
                         let mut offset = 0;

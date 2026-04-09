@@ -93,6 +93,10 @@ pub fn pid_alloc() -> PidHandle {
 impl Drop for PidHandle {
     fn drop(&mut self) {
         PID_ALLOCATOR.exclusive_access().dealloc(self.0);
+        // TODO(grl): implement delayed PID recycling (quarantine/generation based)
+        // ! 现在过不了 fork13 测试，原因是 fork13 期望 PID 分配是单调递增的（不允许 PID 重复），而当前实现会立即重用 PID 导致测试失败。我们需要实现一个延迟回收机制（比如隔离/基于代数的回收），
+        // so we can eventually reuse PID space without immediate reuse that breaks
+        // fork13-style monotonic-sequence expectations.
     }
 }
 

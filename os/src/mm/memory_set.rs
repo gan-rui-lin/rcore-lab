@@ -191,8 +191,15 @@ impl MemorySet {
         start_va: VirtAddr,
         end_va: VirtAddr,
         permission: MapPermission,
+        meta: MmapMeta,
     ) {
-        self.areas.push(MapArea::new_lazy(start_va, end_va, permission));
+        let mut area = MapArea::new_lazy(start_va, end_va, permission)
+            .with_mmap_meta(meta)
+            .with_area_type(MapAreaType::MmapAnon);
+        if meta.shared {
+            area = area.with_kind(MapAreaKind::Shared).with_shared_frames();
+        }
+        self.areas.push(area);
     }
     /// Register a file-backed lazy VMA — pages populated from file on fault.
     pub fn insert_lazy_file_area(
@@ -202,10 +209,15 @@ impl MemorySet {
         permission: MapPermission,
         file: Arc<dyn File + Send + Sync>,
         file_offset: u64,
+        meta: MmapMeta,
     ) {
-        self.areas.push(MapArea::new_lazy_file(
-            start_va, end_va, permission, file, file_offset,
-        ));
+        let mut area = MapArea::new_lazy_file(start_va, end_va, permission, file, file_offset)
+            .with_mmap_meta(meta)
+            .with_area_type(MapAreaType::MmapFile);
+        if meta.shared {
+            area = area.with_kind(MapAreaKind::Shared).with_shared_frames();
+        }
+        self.areas.push(area);
     }
     /// Handle a demand-paging fault at `addr`.
     /// Returns `true` if the fault was resolved (lazy VMA found and page installed),
@@ -223,9 +235,11 @@ impl MemorySet {
             None => return false,
         };
 
-        // Defence: already mapped (shouldn't happen on UP, but be safe)
+        // Already mapped means this is not a "missing page" fault.
+        // Typical case: write to a present read-only page (e.g. PROT_READ mmap).
+        // Let caller treat it as protection fault (COW path already tried first).
         if self.page_table.translate(fault_vpn).map_or(false, |p| p.is_valid()) {
-            return true;
+            return false;
         }
 
         // Compute file info before taking &mut area (avoids mixed borrow)
@@ -352,7 +366,9 @@ impl MemorySet {
                 while vpn < overlap_end {
                     if self.areas[idx].data_frames.contains_key(&vpn) {
                         self.areas[idx].unmap_one(&mut self.page_table, vpn);
-                    } else if self.page_table.translate(vpn).map_or(false, |pte| pte.is_valid()) {
+                    } else if !self.areas[idx].lazy
+                        && self.page_table.translate(vpn).map_or(false, |pte| pte.is_valid())
+                    {
                         self.page_table.unmap(vpn);
                     }
                     vpn.step();
@@ -380,7 +396,9 @@ impl MemorySet {
                             if self.page_table.translate(tail_vpn).map_or(false, |pte| pte.is_valid()) {
                                 self.page_table.unmap(tail_vpn);
                             }
-                        } else if self.page_table.translate(tail_vpn).map_or(false, |pte| pte.is_valid()) {
+                        } else if !self.areas[idx].lazy
+                            && self.page_table.translate(tail_vpn).map_or(false, |pte| pte.is_valid())
+                        {
                             self.page_table.unmap(tail_vpn);
                         }
                         tail_vpn.step();
@@ -905,76 +923,131 @@ impl MemorySet {
         let mut child = Self::new_bare();
         child.map_trampoline();
         debug!("[kernel] COW clone areas len {}", parent_space.areas.len());
+        // For huge sparse VMAs (e.g. fork14's repeated 1GB lazy mmaps),
+        // scanning every VPN during fork is prohibitively expensive.
+        // Small areas keep the strict full-range scan; large areas clone only
+        // pages that are already materialized in `data_frames`.
+        // TODO(grl): make this threshold adaptive (area density / fork budget)
+        // instead of a fixed constant if future workloads show regressions.
+        const FULL_VPN_SCAN_LIMIT: usize = 4096;
         for (idx, area) in parent_space.areas.iter_mut().enumerate() {
             // Create a new MapArea with the same permissions and VPN range
             let mut new_area = MapArea::from_another(area);
             let is_shared = area.kind == MapAreaKind::Shared;
-            for vpn in area.vpn_range {
-                let src_pte = match parent_space.page_table.translate(vpn) {
-                    Some(pte) if pte.is_valid() => pte,
-                    _ => continue,
-                };
-                let src_ppn = src_pte.ppn();
-                let src_flags = src_pte.flags();
-                let is_writable = area.map_perm.contains(MapPermission::W) && !is_shared;
-                // Share the frame: clone the Arc
-                let shared_frame = if let Some(frame_arc) = area.data_frames.get(&vpn) {
-                    frame_arc.clone()
-                } else {
-                    // Page not tracked by data_frames (e.g. identity-mapped kernel area
-                    // should not appear here, but handle gracefully).
-                    // Allocate a fresh frame and copy.
-                    let frame = frame_alloc().unwrap();
-                    frame.ppn.get_bytes_array().copy_from_slice(src_ppn.get_bytes_array());
-                    let arc = Arc::new(frame);
-                    // For writable pages, also need to remove W from parent
-                    if is_writable {
+            let area_pages = area
+                .vpn_range
+                .get_end()
+                .0
+                .saturating_sub(area.vpn_range.get_start().0);
+
+            if area_pages <= FULL_VPN_SCAN_LIMIT {
+                for vpn in area.vpn_range {
+                    let src_pte = match parent_space.page_table.translate(vpn) {
+                        Some(pte) if pte.is_valid() => pte,
+                        _ => continue,
+                    };
+                    let src_ppn = src_pte.ppn();
+                    let src_flags = src_pte.flags();
+                    let is_writable = area.map_perm.contains(MapPermission::W) && !is_shared;
+                    // Share the frame: clone the Arc
+                    let shared_frame = if let Some(frame_arc) = area.data_frames.get(&vpn) {
+                        frame_arc.clone()
+                    } else {
+                        // Page not tracked by data_frames (e.g. identity-mapped kernel area
+                        // should not appear here, but handle gracefully).
+                        // Allocate a fresh frame and copy.
+                        let frame = frame_alloc().unwrap();
+                        frame.ppn.get_bytes_array().copy_from_slice(src_ppn.get_bytes_array());
+                        let arc = Arc::new(frame);
+                        // For writable pages, also need to remove W from parent
+                        if is_writable {
+                            let ro_flags = src_flags & !PTEFlags::W;
+                            parent_space.page_table.change_pte_flags(vpn, ro_flags);
+                        }
+                        // Map child with same flags as parent (possibly already RO)
+                        let child_flags = if is_writable {
+                            src_flags & !PTEFlags::W
+                        } else {
+                            src_flags
+                        };
+                        child.page_table.map(vpn, arc.ppn, child_flags);
+                        new_area.data_frames.insert(vpn, arc);
+                        continue;
+                    };
+
+                    if is_shared {
+                        // SysV SHM semantics: keep parent/child mappings writable-shared.
+                        let mut shared_flags = src_flags;
+                        if area.map_perm.contains(MapPermission::W) {
+                            shared_flags |= PTEFlags::W;
+                            if !src_flags.contains(PTEFlags::W) {
+                                parent_space
+                                    .page_table
+                                    .change_pte_flags(vpn, shared_flags);
+                            }
+                        } else {
+                            shared_flags &= !PTEFlags::W;
+                        }
+                        child.page_table.map(vpn, shared_frame.ppn, shared_flags);
+                        new_area.data_frames.insert(vpn, shared_frame);
+                        continue;
+                    }
+
+                    if is_writable && src_flags.contains(PTEFlags::W) {
+                        // Remove W from parent's PTE (defer copy to fault handler)
                         let ro_flags = src_flags & !PTEFlags::W;
                         parent_space.page_table.change_pte_flags(vpn, ro_flags);
                     }
-                    // Map child with same flags as parent (possibly already RO)
+
+                    // Map child page with read-only flags (if originally writable)
                     let child_flags = if is_writable {
                         src_flags & !PTEFlags::W
                     } else {
                         src_flags
                     };
-                    child.page_table.map(vpn, arc.ppn, child_flags);
-                    new_area.data_frames.insert(vpn, arc);
-                    continue;
-                };
-
-                if is_shared {
-                    // SysV SHM semantics: keep parent/child mappings writable-shared.
-                    let mut shared_flags = src_flags;
-                    if area.map_perm.contains(MapPermission::W) {
-                        shared_flags |= PTEFlags::W;
-                        if !src_flags.contains(PTEFlags::W) {
-                            parent_space
-                                .page_table
-                                .change_pte_flags(vpn, shared_flags);
-                        }
-                    } else {
-                        shared_flags &= !PTEFlags::W;
-                    }
-                    child.page_table.map(vpn, shared_frame.ppn, shared_flags);
+                    child.page_table.map(vpn, shared_frame.ppn, child_flags);
                     new_area.data_frames.insert(vpn, shared_frame);
-                    continue;
                 }
+            } else {
+                for (&vpn, frame_arc) in area.data_frames.iter() {
+                    let src_pte = match parent_space.page_table.translate(vpn) {
+                        Some(pte) if pte.is_valid() => pte,
+                        _ => continue,
+                    };
+                    let src_flags = src_pte.flags();
+                    let is_writable = area.map_perm.contains(MapPermission::W) && !is_shared;
+                    let shared_frame = frame_arc.clone();
 
-                if is_writable && src_flags.contains(PTEFlags::W) {
-                    // Remove W from parent's PTE (defer copy to fault handler)
-                    let ro_flags = src_flags & !PTEFlags::W;
-                    parent_space.page_table.change_pte_flags(vpn, ro_flags);
+                    if is_shared {
+                        // SysV SHM semantics: keep parent/child mappings writable-shared.
+                        let mut shared_flags = src_flags;
+                        if area.map_perm.contains(MapPermission::W) {
+                            shared_flags |= PTEFlags::W;
+                            if !src_flags.contains(PTEFlags::W) {
+                                parent_space
+                                    .page_table
+                                    .change_pte_flags(vpn, shared_flags);
+                            }
+                        } else {
+                            shared_flags &= !PTEFlags::W;
+                        }
+                        child.page_table.map(vpn, shared_frame.ppn, shared_flags);
+                        new_area.data_frames.insert(vpn, shared_frame);
+                        continue;
+                    }
+
+                    if is_writable && src_flags.contains(PTEFlags::W) {
+                        let ro_flags = src_flags & !PTEFlags::W;
+                        parent_space.page_table.change_pte_flags(vpn, ro_flags);
+                    }
+                    let child_flags = if is_writable {
+                        src_flags & !PTEFlags::W
+                    } else {
+                        src_flags
+                    };
+                    child.page_table.map(vpn, shared_frame.ppn, child_flags);
+                    new_area.data_frames.insert(vpn, shared_frame);
                 }
-
-                // Map child page with read-only flags (if originally writable)
-                let child_flags = if is_writable {
-                    src_flags & !PTEFlags::W
-                } else {
-                    src_flags
-                };
-                child.page_table.map(vpn, shared_frame.ppn, child_flags);
-                new_area.data_frames.insert(vpn, shared_frame);
             }
             child.areas.push(new_area);
             debug!("[kernel] COW clone area {} done", idx);
@@ -1140,7 +1213,11 @@ impl MemorySet {
             if area.map_perm.contains(MapPermission::X) {
                 perms[2] = 'x';
             }
-            perms[3] = if area.mmap_meta.is_some() { 's' } else { 'p' };
+            perms[3] = if area.mmap_meta.map(|m| m.shared).unwrap_or(false) {
+                's'
+            } else {
+                'p'
+            };
 
             let mut label = "";
             if heap_bottom >= start && heap_bottom < end && program_brk >= heap_bottom {
@@ -1621,6 +1698,10 @@ impl MapArea {
         self.shared_frames = true;
         self
     }
+    fn with_kind(mut self, kind: MapAreaKind) -> Self {
+        self.kind = kind;
+        self
+    }
     fn with_mmap_meta(mut self, meta: MmapMeta) -> Self {
         self.mmap_meta = Some(meta);
         self
@@ -1739,11 +1820,15 @@ impl MapArea {
         }
     }
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
-        if self.map_type == MapType::Framed {
-            self.data_frames.remove(&vpn);
-        }
-        // Lazy VPNs that were never faulted in have no PTE; only unmap if valid.
-        if page_table.translate(vpn).map_or(false, |p| p.is_valid()) {
+        let had_frame = if self.map_type == MapType::Framed {
+            self.data_frames.remove(&vpn).is_some()
+        } else {
+            false
+        };
+        // For lazy areas, only pages tracked in data_frames are owned by this VMA.
+        // Blindly unmapping by VPN can hit aliased PTEs on narrow-VA MMU modes
+        // (e.g. LoongArch 39-bit) when userspace maps very high virtual addresses.
+        if (had_frame || !self.lazy) && page_table.translate(vpn).map_or(false, |p| p.is_valid()) {
             page_table.unmap(vpn);
         }
     }

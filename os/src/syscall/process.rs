@@ -13,7 +13,7 @@ use crate::{
     fs::{open_file, path_exists, path_is_dir, File, OpenFlags},
     mm::{
         translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
-        translated_str_checked, MapPermission, PTEFlags, PageTable,
+        translated_str_checked, MapPermission, MmapMeta, PTEFlags, PageTable,
         ProtectError, VirtAddr,
     },
     task::{
@@ -2603,23 +2603,56 @@ pub fn sys_mmap(
         None
     };
 
-    // 获取 mmap 的起始地址，如果是固定映射且提供了非零的起始地址，则使用该地址；否则根据当前进程的 mmap_base 来分配一个合适的地址，并更新 mmap_base。
+    // 计算 mmap 起始地址：
+    // - MAP_FIXED: 使用调用方给定地址
+    // - 非 MAP_FIXED: 从 hint/mmap_base 出发，向上跳过所有重叠区间后再放置
     let mut inner = process.inner_exclusive_access();
     let req_start = start;
     let is_fixed = (flags & MAP_FIXED) != 0 && req_start != 0;
-    let start = if is_fixed {
+    let mut start = if is_fixed {
         req_start
     } else if req_start != 0 {
-        let base = (req_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        if base + len > inner.mmap_base {
-            inner.mmap_base = base + len;
-        }
-        base
+        (req_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
     } else {
-        let base = (inner.mmap_base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        inner.mmap_base = base + len;
-        base
+        (inner.mmap_base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
     };
+
+    if !is_fixed {
+        loop {
+            let end = match start.checked_add(len) {
+                Some(v) => v,
+                None => return errno(ENOMEM),
+            };
+            let overlaps = inner
+                .memory_set
+                .overlap_ranges(VirtAddr(start), VirtAddr(end));
+            if overlaps.is_empty() {
+                break;
+            }
+            let jump_to = overlaps
+                .iter()
+                .map(|(_, r_end)| r_end.0)
+                .max()
+                .unwrap_or(start);
+            let next = (jump_to + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            if next <= start {
+                return errno(ENOMEM);
+            }
+            start = next;
+        }
+        let end = match start.checked_add(len) {
+            Some(v) => v,
+            None => return errno(ENOMEM),
+        };
+        if end > inner.mmap_base {
+            inner.mmap_base = end;
+        }
+    }
+    // TODO(grl): harden mmap end-range validation in one place for both MAP_FIXED
+    // and non-fixed paths:
+    // 1) compute/check `end = start.checked_add(len)` once;
+    // 2) enforce `end <= USER_ADDR_MAX`;
+    // 3) stop using raw `start + len` in overlap/unmap/insert calls.
     if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
         let overlap = inner
             .memory_set
@@ -2668,29 +2701,27 @@ pub fn sys_mmap(
             // MAP_FIXED: unmap overlapping pages in the target range.
             inner.memory_set.unmap_range(VirtAddr(start), VirtAddr(start + len));
         } else {
-            if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
-                let ranges = inner
-                    .memory_set
-                    .overlap_ranges(VirtAddr(start), VirtAddr(start + len));
-                for (idx, (r_start, r_end)) in ranges.into_iter().enumerate() {
-                    trace!(
-                        "[sys_mmap] pid={} overlap[{}]=[{:#x},{:#x})",
-                        pid,
-                        idx,
-                        r_start.0,
-                        r_end.0
-                    );
-                }
-            }
+            // Non-MAP_FIXED mappings must not overlap existing VMAs.
+            return errno(ENOMEM);
         }
     }
 
     // Lazy VMA insertion: register VMA, allocate pages on fault.
     // Preserve MapAreaType tracking from dev for bookkeeping.
-    let _file_writable = file_info.as_ref().map(|(_, writable)| *writable).unwrap_or(true);
+    let meta = MmapMeta {
+        shared: is_shared,
+        file_backed: !is_anon && fd != usize::MAX,
+        file_writable: file_info
+            .as_ref()
+            .map(|(_, writable)| *writable)
+            .unwrap_or(true),
+    };
     if is_anon || fd == usize::MAX {
         inner.memory_set.insert_lazy_anon_area(
-            VirtAddr(start), VirtAddr(start + len), map_perm,
+            VirtAddr(start),
+            VirtAddr(start + len),
+            map_perm,
+            meta,
         );
     } else {
         let file = if fd < inner.fd_table.len() {
@@ -2701,8 +2732,12 @@ pub fn sys_mmap(
         match file {
             Some(file) => {
                 inner.memory_set.insert_lazy_file_area(
-                    VirtAddr(start), VirtAddr(start + len), map_perm,
-                    file, offset as u64,
+                    VirtAddr(start),
+                    VirtAddr(start + len),
+                    map_perm,
+                    file,
+                    offset as u64,
+                    meta,
                 );
             }
             None => return errno(EBADF),
@@ -3073,10 +3108,6 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
             signum
         );
     }
-    let flag = match signal_flag_from_signum(signum) {
-        Ok(flag) => flag,
-        Err(err) => return err,
-    };
     let process = match pid2process(pid) {
         Some(process) => process,
         None => return errno(ESRCH),
@@ -3087,6 +3118,15 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
     if process.getpid() == 1 && pid_now != 1 {
         return errno(EPERM);
     }
+    // Linux semantics: kill(pid, 0) performs existence/permission checks only.
+    // It must not enqueue any pending signal.
+    if signum == 0 {
+        return 0;
+    }
+    let flag = match signal_flag_from_signum(signum) {
+        Ok(flag) => flag,
+        Err(err) => return err,
+    };
     let mut inner = process.inner_exclusive_access();
     let mut yielded_after_continue = false;
     if flag == SignalFlags::SIGCONT && inner.group_stopped {
