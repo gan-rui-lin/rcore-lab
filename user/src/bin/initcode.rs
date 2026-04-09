@@ -754,9 +754,13 @@ fn run_suite(root: &str, suite: &str) -> i32 {
     }
     let script = format!("{}/{}_testcode.sh", root, suite);
     let ret = run_testcode(script.as_str(), root);
-    // Kill orphan daemons (e.g. iperf3 -s -D, netserver -D) so they don't
-    // hold ports when the next libc variant runs the same suite.
-    let reaped = reap_orphans();
+    // Network suites leave daemon processes (iperf3 -s -D, netserver -D)
+    // that hold ports. Must kill them before the next libc variant.
+    let reaped = if suite == "iperf" || suite == "netperf" {
+        kill_and_reap_orphans()
+    } else {
+        reap_orphans()
+    };
     println!(
         "[initcode] cleanup after {}/{} done (status=0x{:x}, reaped={})",
         root, suite, ret, reaped
@@ -946,6 +950,23 @@ fn reap_orphans() -> usize {
         break; // ECHILD or error — no more children
     }
     reaped
+}
+
+/// Kill all remaining child processes and reap them.
+/// Used after network test suites (iperf, netperf) whose daemon processes
+/// (iperf3 -s -D, netserver -D) hold ports across libc variants.
+fn kill_and_reap_orphans() -> usize {
+    // sys_kill only accepts a specific PID (no broadcast).
+    // Daemon PIDs are typically small; sweep a reasonable range.
+    // Skip pid 1 (initcode itself).
+    for pid in 2..128 {
+        let _ = user_lib::kill(pid, 9); // SIGKILL, ignore ESRCH
+    }
+    // Yield a few times to let killed processes become zombies.
+    for _ in 0..16 {
+        user_lib::sys_yield();
+    }
+    reap_orphans()
 }
 
 fn run_all_suites() {

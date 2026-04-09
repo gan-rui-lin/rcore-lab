@@ -262,7 +262,7 @@ impl SocketFile {
 
             if socket.can_recv() {
                 // Collect into a contiguous buffer first
-                let mut tmp = [0u8; 65536];
+                let mut tmp = alloc::vec![0u8; 65536];
                 match socket.recv_slice(&mut tmp) {
                     Ok((n, _endpoint)) => {
                         // Copy to user buffer
