@@ -48,7 +48,11 @@ pub fn sys_gettid() -> isize {
     if tid == 0 {
         process_pid
     } else {
-        tid
+        // Non-main threads: use process_pid + internal_tid to guarantee:
+        //   1. TID > 0 (required for musl __tl_lock)
+        //   2. TID != process_pid (Linux guarantee: thread TID != process PID)
+        //   3. Unique per thread within the process
+        process_pid + tid
     }
 }
 
@@ -64,7 +68,8 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
     let tid = if raw_tid == 0 {
         process.pid.0 as i32
     } else {
-        raw_tid
+        // Must match sys_gettid: non-main thread TID = process_pid + internal_tid
+        process.pid.0 as i32 + raw_tid
     };
     task_inner.clear_child_tid = tidptr as usize;
     drop(task_inner);

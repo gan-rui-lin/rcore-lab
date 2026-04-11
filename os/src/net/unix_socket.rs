@@ -44,6 +44,8 @@ pub struct UnixSocketFile {
     pub peer: Mutex<Option<Weak<dyn File>>>,
     /// Whether the peer has closed its end
     pub peer_closed: AtomicBool,
+    /// Peer credentials: (pid, uid, gid) of the connecting process (for SO_PEERCRED)
+    pub peer_cred: Mutex<(u32, u32, u32)>,
 }
 
 impl UnixSocketFile {
@@ -59,6 +61,7 @@ impl UnixSocketFile {
             backlog: Mutex::new(VecDeque::new()),
             peer: Mutex::new(None),
             peer_closed: AtomicBool::new(false),
+            peer_cred: Mutex::new((0, 0, 0)),
         })
     }
 
@@ -79,16 +82,18 @@ impl UnixSocketFile {
     }
 }
 
-// Global registry: path → bound/listening socket (Arc<dyn File>).
+// Global registry: path → bound/listening socket (Weak<dyn File>).
 // Key = path for pathname sockets, "\0name" for abstract sockets.
+// Using Weak so that when all fds to a socket are closed, the address becomes reusable.
 lazy_static! {
-    static ref UNIX_REGISTRY: Mutex<BTreeMap<String, Arc<dyn File>>> =
+    static ref UNIX_REGISTRY: Mutex<BTreeMap<String, Weak<dyn File>>> =
         Mutex::new(BTreeMap::new());
 }
 
 /// Register a unix socket in the global registry (for listen/connect).
+/// Takes a Weak reference so closing all fds automatically frees the address.
 pub fn unix_registry_insert(key: String, sock: Arc<dyn File>) {
-    UNIX_REGISTRY.lock().insert(key, sock);
+    UNIX_REGISTRY.lock().insert(key, Arc::downgrade(&sock));
 }
 
 /// Remove a unix socket from the registry.
@@ -96,14 +101,37 @@ pub fn unix_registry_remove(key: &str) {
     UNIX_REGISTRY.lock().remove(key);
 }
 
-/// Check if a path is in the unix registry (path is in use).
+/// Check if a path is in the unix registry (path is in use by a live socket).
 pub fn unix_registry_has(key: &str) -> bool {
-    UNIX_REGISTRY.lock().contains_key(key)
+    let mut map = UNIX_REGISTRY.lock();
+    match map.get(key) {
+        Some(weak) => {
+            if weak.upgrade().is_some() {
+                true
+            } else {
+                // Socket was closed; remove stale entry
+                map.remove(key);
+                false
+            }
+        }
+        None => false,
+    }
 }
 
-/// Look up a socket by path.
+/// Look up a socket by path. Returns None if the socket was closed (Weak expired).
 pub fn unix_registry_get(key: &str) -> Option<Arc<dyn File>> {
-    UNIX_REGISTRY.lock().get(key).cloned()
+    let mut map = UNIX_REGISTRY.lock();
+    match map.get(key) {
+        Some(weak) => match weak.upgrade() {
+            Some(arc) => Some(arc),
+            None => {
+                // Stale entry; remove it
+                map.remove(key);
+                None
+            }
+        },
+        None => None,
+    }
 }
 
 impl File for UnixSocketFile {
@@ -238,6 +266,14 @@ impl File for UnixSocketFile {
 
     fn unix_get_state_u8(&self) -> u8 {
         self.get_state() as u8
+    }
+
+    fn unix_set_peer_cred(&self, pid: u32, uid: u32, gid: u32) {
+        *self.peer_cred.lock() = (pid, uid, gid);
+    }
+
+    fn unix_get_peer_cred(&self) -> Option<(u32, u32, u32)> {
+        Some(*self.peer_cred.lock())
     }
 
     fn unix_do_bind(&self, path: alloc::string::String, _is_abstract: bool) -> isize {

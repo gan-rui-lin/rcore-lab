@@ -324,8 +324,20 @@ pub fn sys_futex(
     let cmd = FutexCmd::from_bits_truncate(futex_op & 0x7f);
     let opt = FutexOpt::from_bits_truncate(futex_op);
     let token = current_user_token();
+    let uaddr1_va = uaddr1 as usize;
+    // Handle lazy mmap pages: if VA isn't mapped yet, trigger demand page allocation.
+    {
+        let pt = PageTable::from_token(token);
+        if pt.translate_va(VirtAddr::from(uaddr1_va)).is_none() {
+            let process = current_process();
+            let mut inner = process.inner_exclusive_access();
+            if !inner.memory_set.handle_demand_fault(uaddr1_va) {
+                return errno(EFAULT);
+            }
+        }
+    }
     let page_table = PageTable::from_token(token);
-    let pa = match page_table.translate_va(VirtAddr::from(uaddr1 as usize)) {
+    let pa = match page_table.translate_va(VirtAddr::from(uaddr1_va)) {
         Some(pa) => pa,
         None => return errno(EFAULT),
     };
@@ -3758,16 +3770,20 @@ pub fn sys_setregid(rgid: u32, egid: u32) -> isize {
         }
     }
 
+    let old_real_gid = inner.real_gid;
     if rgid != neg1 {
         inner.real_gid = rgid;
     }
+    let new_egid = if egid != neg1 { egid } else { inner.effective_gid };
     if egid != neg1 {
-        inner.effective_gid = egid;
-        inner.fs_gid = egid;
+        inner.effective_gid = new_egid;
+        inner.fs_gid = new_egid;
     }
-    // Update saved_gid if effective changes
-    if rgid != neg1 {
-        inner.saved_gid = inner.effective_gid;
+    // Linux setregid: saved_gid is set to new effective GID if:
+    //   1. real GID was changed, OR
+    //   2. new effective GID != old real GID
+    if rgid != neg1 || new_egid != old_real_gid {
+        inner.saved_gid = new_egid;
     }
     0
 }
@@ -3788,15 +3804,20 @@ pub fn sys_setreuid(ruid: u32, euid: u32) -> isize {
         }
     }
 
+    let old_real_uid = inner.real_uid;
     if ruid != neg1 {
         inner.real_uid = ruid;
     }
+    let new_euid = if euid != neg1 { euid } else { inner.effective_uid };
     if euid != neg1 {
-        inner.effective_uid = euid;
-        inner.fs_uid = euid;
+        inner.effective_uid = new_euid;
+        inner.fs_uid = new_euid;
     }
-    if ruid != neg1 {
-        inner.saved_uid = inner.effective_uid;
+    // Linux setreuid: saved_uid is set to new effective UID if:
+    //   1. real UID was changed, OR
+    //   2. new effective UID != old real UID
+    if ruid != neg1 || new_euid != old_real_uid {
+        inner.saved_uid = new_euid;
     }
     0
 }

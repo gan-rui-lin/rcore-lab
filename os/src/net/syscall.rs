@@ -959,6 +959,12 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
                 let nonblock = (file.status_flags() & 0o4000u32) != 0;
                 let server_side = UnixSocketFile::new(sock_type, nonblock, false);
                 let server_side_arc: Arc<dyn crate::fs::File> = server_side;
+                // Record connecting process credentials (for SO_PEERCRED on accepted socket).
+                let (cred_pid, cred_uid, cred_gid) = {
+                    let inner2 = process.inner_exclusive_access();
+                    (process.pid.0 as u32, inner2.real_uid, inner2.real_gid)
+                };
+                server_side_arc.unix_set_peer_cred(cred_pid, cred_uid, cred_gid);
                 // Link peers: client ↔ server_side
                 file.unix_set_peer_dyn(Arc::downgrade(&server_side_arc));
                 server_side_arc.unix_set_peer_dyn(Arc::downgrade(&client));
@@ -1640,7 +1646,8 @@ pub fn sys_getsockopt(
         let process = current_process();
         let inner = process.inner_exclusive_access();
         if fd < inner.fd_table.len() {
-            if let Some(ref file) = inner.fd_table[fd] {
+            if let Some(file_cloned) = inner.fd_table[fd].as_ref().cloned() {
+                let file = &file_cloned;
                 if file.is_unix_socket() {
                     let unix_type = file.unix_socket_type() as u32;
                     drop(inner);
@@ -1665,6 +1672,7 @@ pub fn sys_getsockopt(
                         const SO_RCVBUF_OPT: usize = 8;
                         const SO_REUSEADDR_OPT: usize = 2;
                         const SO_KEEPALIVE_OPT: usize = 9;
+                        const SO_PEERCRED: usize = 17;
                         match optname {
                             SO_TYPE => { write_u32(unix_type); return 0; }
                             SO_DOMAIN => { write_u32(1); return 0; } // AF_UNIX = 1
@@ -1672,6 +1680,32 @@ pub fn sys_getsockopt(
                             SO_ERROR_OPT | SO_SNDBUF_OPT | SO_RCVBUF_OPT |
                             SO_REUSEADDR_OPT | SO_KEEPALIVE_OPT => {
                                 write_u32(0); return 0;
+                            }
+                            SO_PEERCRED => {
+                                // Write struct ucred { pid: u32, uid: u32, gid: u32 }
+                                if (optlen_val as usize) < 12 { return EINVAL; }
+                                let (p, u, g) = file.unix_get_peer_cred().unwrap_or((0, 0, 0));
+                                let ucred_bytes: [u8; 12] = {
+                                    let mut b = [0u8; 12];
+                                    b[0..4].copy_from_slice(&p.to_ne_bytes());
+                                    b[4..8].copy_from_slice(&u.to_ne_bytes());
+                                    b[8..12].copy_from_slice(&g.to_ne_bytes());
+                                    b
+                                };
+                                let bufs = translated_byte_buffer(token, optval, 12);
+                                let mut off = 0usize;
+                                for buf in bufs {
+                                    let dst = unsafe {
+                                        core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, buf.len())
+                                    };
+                                    let n = dst.len().min(12 - off);
+                                    dst[..n].copy_from_slice(&ucred_bytes[off..off + n]);
+                                    off += n;
+                                    if off >= 12 { break; }
+                                }
+                                let len_ref = translated_refmut(token, optlen);
+                                *len_ref = 12;
+                                return 0;
                             }
                             _ => return EOPNOTSUPP,
                         }

@@ -580,6 +580,7 @@ impl ProcPidStatusInode {
         drop(inner);
         format!(
             "Name:\t{name}\n\
+             Tgid:\t{pid}\n\
              Pid:\t{pid}\n\
              PPid:\t0\n\
              Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n\

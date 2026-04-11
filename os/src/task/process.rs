@@ -338,11 +338,11 @@ impl ProcessControlBlock {
                 })
             },
         });
-        // Init process is its own session leader and process group leader
+        // Init process: session_id=0, pgid=0 (matches Linux /proc/1/stat behavior)
         {
             let mut inner = process.inner_exclusive_access();
-            inner.session_id = process.pid.0;
-            inner.pgid = process.pid.0;
+            inner.session_id = 0;
+            inner.pgid = 0;
         }
         let task = Arc::new(TaskControlBlock::new(Arc::clone(&process), ustack_base, false));
         let task_inner = task.inner_exclusive_access();

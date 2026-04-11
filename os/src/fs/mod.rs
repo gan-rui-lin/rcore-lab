@@ -125,6 +125,10 @@ pub trait File: Send + Sync {
     fn unix_mark_peer_closed(&self) {}
     /// For AF_UNIX sockets: get current internal state code.
     fn unix_get_state_u8(&self) -> u8 { 0 }
+    /// For AF_UNIX sockets: set peer credentials (pid, uid, gid) on server-side socket.
+    fn unix_set_peer_cred(&self, _pid: u32, _uid: u32, _gid: u32) {}
+    /// For AF_UNIX sockets: get peer credentials (pid, uid, gid). None if not set.
+    fn unix_get_peer_cred(&self) -> Option<(u32, u32, u32)> { None }
 }
 
 /// Linux-compatible stat layout (riscv64, matches musl struct stat).
@@ -261,7 +265,8 @@ pub fn ensure_basic_paths() {
     // Keep /etc/protocols deterministic for getprotobyname()-based tests.
     write_file_overwrite(
         "/etc/protocols",
-        "hopopt\t0\tHOPOPT\tip\tIP\n\
+        "ip\t0\tIP\n\
+hopopt\t0\tHOPOPT\n\
 icmp\t1\tICMP\n\
 tcp\t6\tTCP\n\
 udp\t17\tUDP\n\
