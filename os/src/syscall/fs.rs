@@ -3923,7 +3923,10 @@ pub fn sys_pselect6(
             }
         }
         suspend_current_and_run_next();
-        if crate::task::has_pending_unmasked_signal(false) {
+        // Respect SA_RESTART: only return EINTR for signals whose handler
+        // does NOT have SA_RESTART set. This prevents netserver's select()
+        // from being spuriously interrupted by SIGCHLD/SIGALRM with SA_RESTART.
+        if super::process::has_unmasked_user_signal_without_restart() {
             return errno(EINTR);
         }
     }
@@ -4004,7 +4007,7 @@ pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: *const TimeSpec) -> isi
             }
         }
         suspend_current_and_run_next();
-        if crate::task::has_pending_unmasked_signal(false) {
+        if super::process::has_unmasked_user_signal_without_restart() {
             return errno(EINTR);
         }
     }

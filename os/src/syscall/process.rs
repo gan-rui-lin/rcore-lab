@@ -1593,7 +1593,7 @@ fn exit_code_to_waitid(exit_code: i32) -> (i32, i32) {
     (signum, code)
 }
 
-fn has_unmasked_user_signal_without_restart() -> bool {
+pub(crate) fn has_unmasked_user_signal_without_restart() -> bool {
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
     let task = current_task().unwrap();
