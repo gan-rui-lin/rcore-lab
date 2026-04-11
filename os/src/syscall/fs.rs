@@ -1177,7 +1177,10 @@ pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> isize {
     }
 
     let token = current_user_token();
-    let slices = translated_byte_buffer(token, buf, len);
+    // Use the checked version to detect invalid/kernel addresses and return EFAULT.
+    let Some(slices) = translated_byte_buffer_checked(token, buf, len, true) else {
+        return errno(EFAULT);
+    };
     let mut state = GETRANDOM_STATE
         .load(AtomicOrdering::Relaxed)
         .wrapping_add(get_time_us() as u64)
@@ -2319,14 +2322,16 @@ pub fn sys_getcwd(buf: *mut u8, len: usize) -> isize {
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_getcwd", pid);
     }
-    if buf.is_null() {
-        return errno(EFAULT);
-    }
+    // Get cwd first so we can check the size before validating buf.
+    // Linux checks ERANGE (buffer too small) before EFAULT (invalid buf pointer).
     let process = current_process();
     let cwd = process.inner_exclusive_access().cwd.clone();
     let bytes = cwd.as_bytes();
-    if len < bytes.len() + 1 {
+    if len == 0 || len < bytes.len() + 1 {
         return errno(ERANGE);
+    }
+    if buf.is_null() {
+        return errno(EFAULT);
     }
     let token = current_user_token();
     let mut out = Vec::with_capacity(bytes.len() + 1);
@@ -4375,8 +4380,50 @@ pub fn sys_set_robust_list(_head: usize, _len: usize) -> isize {
     0
 }
 
-/// sys_get_robust_list (syscall 100) - stub
-pub fn sys_get_robust_list(_pid: usize, _head: *mut u8, _len: *mut u8) -> isize {
+/// sys_get_robust_list (syscall 100)
+/// Returns the robust futex list head for a process.
+pub fn sys_get_robust_list(pid: usize, head: *mut u8, len: *mut u8) -> isize {
+    use crate::mm::translated_refmut;
+    // Validate pointers first
+    if head.is_null() || len.is_null() {
+        return errno(EFAULT);
+    }
+    let token = current_user_token();
+    // Determine which process to query
+    let target_process = if pid == 0 {
+        // pid=0 means the calling process
+        Some(current_process())
+    } else {
+        crate::task::pid2process(pid)
+    };
+    let Some(process) = target_process else {
+        return errno(ESRCH);
+    };
+    // Check permissions: non-root can only query their own process
+    {
+        let cur = current_process();
+        let inner = cur.inner_exclusive_access();
+        let effective_uid = inner.effective_uid;
+        drop(inner);
+        if pid != 0 && effective_uid != 0 {
+            // Check if this is our own thread group
+            let target_pid = process.pid.0;
+            let my_pid = current_process().pid.0;
+            if target_pid != my_pid {
+                return errno(EPERM);
+            }
+        }
+    }
+    // Write null head pointer (we don't actually use robust lists)
+    {
+        let head_ptr = translated_refmut(token, head as *mut usize);
+        *head_ptr = 0;
+    }
+    // Write sizeof(robust_list_head) = 24 (3 * 8 bytes on 64-bit)
+    {
+        let len_ptr = translated_refmut(token, len as *mut usize);
+        *len_ptr = 24;
+    }
     0
 }
 

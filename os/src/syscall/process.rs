@@ -13,7 +13,7 @@ use crate::{
     fs::{open_file, path_exists, path_is_dir, File, OpenFlags},
     mm::{
         translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
-        translated_str_checked, MapPermission, MmapMeta, PTEFlags, PageTable,
+        translated_str_checked, MapAreaType, MapPermission, MmapMeta, PTEFlags, PageTable,
         ProtectError, VirtAddr,
     },
     task::{
@@ -715,8 +715,18 @@ pub fn sys_getpgid(pid: isize) -> isize {
     if pid == 0 || pid as usize == process.pid.0 {
         let inner = process.inner_exclusive_access();
         inner.pgid as isize
+    } else if pid < 0 {
+        // Negative pid: no process can have a negative pid → ESRCH.
+        errno(ESRCH)
     } else {
-        0
+        // Look up target process; return ESRCH if it doesn't exist.
+        match pid2process(pid as usize) {
+            Some(target) => {
+                let inner = target.inner_exclusive_access();
+                inner.pgid as isize
+            }
+            None => errno(ESRCH),
+        }
     }
 }
 
@@ -725,8 +735,17 @@ pub fn sys_getsid(pid: isize) -> isize {
     if pid == 0 || pid as usize == process.pid.0 {
         let inner = process.inner_exclusive_access();
         inner.session_id as isize
+    } else if pid < 0 {
+        errno(EINVAL)
     } else {
-        0
+        // Look up target process; return ESRCH if it doesn't exist.
+        match pid2process(pid as usize) {
+            Some(target) => {
+                let inner = target.inner_exclusive_access();
+                inner.session_id as isize
+            }
+            None => errno(ESRCH),
+        }
     }
 }
 pub fn sys_fork() -> isize {
@@ -1906,6 +1925,11 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_get_time", pid);
     }
+    // Validate tz pointer: non-null tz must be a valid user address.
+    // Linux returns EFAULT for invalid (e.g., -1) tz even though timezone is deprecated.
+    if _tz != 0 && _tz >= crate::config::USER_STACK_TOP {
+        return errno(EFAULT);
+    }
     if _ts.is_null() {
         return errno(EFAULT);
     }
@@ -2717,12 +2741,25 @@ pub fn sys_mmap(
             .unwrap_or(true),
     };
     if is_anon || fd == usize::MAX {
-        inner.memory_set.insert_lazy_anon_area(
-            VirtAddr(start),
-            VirtAddr(start + len),
-            map_perm,
-            meta,
-        );
+        if is_shared {
+            // MAP_SHARED anonymous: eagerly allocate so that all forked processes
+            // share the same physical frames. Lazy allocation creates per-process
+            // pages on fault, breaking MAP_SHARED semantics (e.g. getpid02 test).
+            inner.memory_set.insert_mmap_area(
+                VirtAddr(start),
+                VirtAddr(start + len),
+                map_perm,
+                meta,
+                MapAreaType::MmapAnon,
+            );
+        } else {
+            inner.memory_set.insert_lazy_anon_area(
+                VirtAddr(start),
+                VirtAddr(start + len),
+                map_perm,
+                meta,
+            );
+        }
     } else {
         let file = if fd < inner.fd_table.len() {
             inner.fd_table[fd].as_ref().map(|f| f.clone())
@@ -3647,6 +3684,61 @@ pub fn sys_setgid(gid: u32) -> isize {
     errno(EPERM)
 }
 
+
+/// getgroups(size, list) - syscall 158
+/// Returns the supplementary group IDs of the calling process.
+/// Root (gid=0) has one supplementary group: gid 0.
+pub fn sys_getgroups(size: i32, list: *mut u32) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_getgroups size={} list={:p}", pid, size, list);
+    }
+    // size < 0 is invalid
+    if size < 0 {
+        return errno(EINVAL);
+    }
+    // Root has one supplementary group: gid 0.
+    const NSUPP: i32 = 1;
+    if size == 0 {
+        // Just return the count.
+        return NSUPP as isize;
+    }
+    // Validate list pointer when size > 0.
+    if (list as usize) == 0 {
+        return errno(EFAULT);
+    }
+    if size < NSUPP {
+        // Buffer too small to hold all groups.
+        return errno(EINVAL);
+    }
+    // Write gid 0 to the list.
+    let token = current_user_token();
+    {
+        let gid_ref = translated_refmut(token, list);
+        *gid_ref = 0u32;
+    }
+    NSUPP as isize
+}
+
+/// setgroups(size, list) - syscall 159
+/// Set supplementary group IDs. We always pretend to accept it (root-only kernel).
+pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!("kernel:pid[{}] sys_setgroups size={} list={:p}", pid, size, list);
+    }
+    const NGROUPS_MAX: usize = 65536;
+    if size > NGROUPS_MAX {
+        return errno(EINVAL);
+    }
+    // Validate pointer when size > 0
+    if size > 0 && (list as usize) == 0 {
+        return errno(EFAULT);
+    }
+    // We always run as root (uid=0), so accept the call.
+    // We don't actually store the groups since we have no user/group database.
+    0
+}
 
 /// setregid(rgid, egid) - syscall 143
 /// Set real and/or effective group ID.

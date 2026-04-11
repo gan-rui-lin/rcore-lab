@@ -65,6 +65,7 @@ const EMFILE: isize = -24;
 const EMSGSIZE: isize = -90;
 const EOPNOTSUPP: isize = -95;
 const EPROTONOSUPPORT: isize = -93;
+const ENOPROTOOPT: isize = -92;
 
 /// Linux sockaddr_in structure (16 bytes).
 #[repr(C)]
@@ -699,6 +700,20 @@ pub fn sys_bind(fd: usize, addr: *const u8, addr_len: usize) -> isize {
 
 /// sys_listen(fd, _backlog) -> 0
 pub fn sys_listen(fd: usize, _backlog: usize) -> isize {
+    // Handle AF_UNIX sockets first (not tracked via smoltcp).
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        if fd < inner.fd_table.len() {
+            if let Some(ref file) = inner.fd_table[fd] {
+                if file.is_unix_socket() {
+                    let ret = file.unix_do_listen(_backlog);
+                    return ret;
+                }
+            }
+        }
+    }
+
     let (handle, sock_type, bound_port, _listening) = match get_socket_extra(fd) {
         Ok(info) => info,
         Err(e) => return e,
@@ -742,6 +757,51 @@ pub fn sys_listen(fd: usize, _backlog: usize) -> isize {
 /// flags: SOCK_CLOEXEC=0o2000000, SOCK_NONBLOCK=0o4000
 pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32, flags: usize) -> isize {
     let token = current_user_token();
+
+    // Handle AF_UNIX sockets (not tracked via smoltcp).
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        if listen_fd < inner.fd_table.len() {
+            if let Some(ref file) = inner.fd_table[listen_fd] {
+                if file.is_unix_socket() {
+                    let listen_file = file.clone();
+                    let state = listen_file.unix_get_state_u8();
+                    drop(inner);
+                    if state != 2 {
+                        // Not in listening state
+                        return EINVAL;
+                    }
+                    // Block until a connection appears in the backlog.
+                    // sys_connect pushes a new socket into the backlog (for STREAM sockets)
+                    // or directly sets the peer (for DGRAM), so we poll the backlog.
+                    loop {
+                        if let Some(accepted_sock) = listen_file.unix_do_accept() {
+                            // Write the peer addr (empty for anonymous Unix sockets).
+                            if !addr.is_null() && !addr_len.is_null() {
+                                let _ = write_unix_sockaddr("", addr, addr_len, token);
+                            }
+                            // Allocate a new fd for the accepted socket.
+                            let proc = current_process();
+                            let mut inner2 = proc.inner_exclusive_access();
+                            let new_fd = match inner2.alloc_fd() {
+                                Some(fd) => fd,
+                                None => return EMFILE,
+                            };
+                            inner2.fd_table[new_fd] = Some(accepted_sock);
+                            return new_fd as isize;
+                        }
+                        crate::task::suspend_current_and_run_next();
+                        // Check if we should give up (e.g., pending signal).
+                        if crate::task::has_pending_unmasked_signal(false) {
+                            return EINTR;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let (listen_handle, sock_type, bound_port, listening) = match get_socket_extra(listen_fd) {
         Ok(info) => info,
         Err(e) => return e,
@@ -888,9 +948,27 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
                 None => return ECONNREFUSED,
             };
             let client: Arc<dyn crate::fs::File> = file.clone();
-            // Minimal AF_UNIX-DGRAM connect semantics used by LTP bind05.
-            file.unix_set_peer_dyn(Arc::downgrade(&peer));
-            peer.unix_set_peer_dyn(Arc::downgrade(&client));
+            let sock_type = file.unix_socket_type();
+            if sock_type == 1 || sock_type == 5 {
+                // SOCK_STREAM / SOCK_SEQPACKET: use backlog mechanism.
+                // Server must be in listening state.
+                if peer.unix_get_state_u8() != 2 {
+                    return ECONNREFUSED;
+                }
+                // Create a new server-side socket to represent this connection.
+                let nonblock = (file.status_flags() & 0o4000u32) != 0;
+                let server_side = UnixSocketFile::new(sock_type, nonblock, false);
+                let server_side_arc: Arc<dyn crate::fs::File> = server_side;
+                // Link peers: client ↔ server_side
+                file.unix_set_peer_dyn(Arc::downgrade(&server_side_arc));
+                server_side_arc.unix_set_peer_dyn(Arc::downgrade(&client));
+                // Push server_side into the server's backlog so accept() can dequeue it.
+                peer.unix_push_backlog(server_side_arc);
+            } else {
+                // SOCK_DGRAM: direct peer linking (no backlog).
+                file.unix_set_peer_dyn(Arc::downgrade(&peer));
+                peer.unix_set_peer_dyn(Arc::downgrade(&client));
+            }
             return 0;
         }
     }
@@ -1077,6 +1155,36 @@ pub fn sys_getsockname(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
 /// sys_getpeername(fd, addr, addrlen) -> 0
 pub fn sys_getpeername(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
     let token = current_user_token();
+
+    // Handle AF_UNIX sockets (not tracked via smoltcp).
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return EBADF;
+        }
+        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+            return EBADF;
+        };
+        if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
+            return EBADF;
+        }
+        if file.is_unix_socket() {
+            let state = file.unix_get_state_u8();
+            drop(inner);
+            if state != 3 {
+                // Not Connected
+                return ENOTCONN;
+            }
+            // Connected: return the peer's AF_UNIX address (may be empty for anonymous sockets).
+            let peer_path = alloc::string::String::new();
+            return match write_unix_sockaddr(&peer_path, addr, addr_len, token) {
+                Ok(()) => 0,
+                Err(e) => e,
+            };
+        }
+    }
+
     let (handle, sock_type) = match get_socket_info(fd) {
         Ok(info) => info,
         Err(e) => return e,
@@ -1507,46 +1615,134 @@ pub fn sys_getsockopt(
     optval: *mut u8,
     optlen: *mut u32,
 ) -> isize {
+    let token = current_user_token();
+
+    // optlen must be a valid non-null pointer.
+    if optlen.is_null() {
+        return EFAULT;
+    }
+    // optval must be non-null (we always write at least 4 bytes).
+    if optval.is_null() {
+        return EFAULT;
+    }
+    // Read *optlen to validate it. If the value is negative (high bit set), return EINVAL.
+    // Must happen before socket type check per Linux semantics.
+    let optlen_val = {
+        let r = translated_refmut(token, optlen);
+        *r
+    };
+    if (optlen_val as i32) < 0 {
+        return EINVAL;
+    }
+
+    // Handle AF_UNIX sockets: limited support for SOL_SOCKET options.
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        if fd < inner.fd_table.len() {
+            if let Some(ref file) = inner.fd_table[fd] {
+                if file.is_unix_socket() {
+                    let unix_type = file.unix_socket_type() as u32;
+                    drop(inner);
+                    let write_u32 = |val: u32| {
+                        let bufs = translated_byte_buffer(token, optval, 4);
+                        let bytes = val.to_ne_bytes();
+                        if let Some(buf) = bufs.first() {
+                            let dst = unsafe {
+                                core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, 4)
+                            };
+                            dst.copy_from_slice(&bytes);
+                        }
+                        let len_ref = translated_refmut(token, optlen);
+                        *len_ref = 4;
+                    };
+                    if level == SOL_SOCKET {
+                        const SO_TYPE: usize = 3;
+                        const SO_DOMAIN: usize = 39;
+                        const SO_PROTOCOL: usize = 38;
+                        const SO_ERROR_OPT: usize = 4;
+                        const SO_SNDBUF_OPT: usize = 7;
+                        const SO_RCVBUF_OPT: usize = 8;
+                        const SO_REUSEADDR_OPT: usize = 2;
+                        const SO_KEEPALIVE_OPT: usize = 9;
+                        match optname {
+                            SO_TYPE => { write_u32(unix_type); return 0; }
+                            SO_DOMAIN => { write_u32(1); return 0; } // AF_UNIX = 1
+                            SO_PROTOCOL => { write_u32(0); return 0; }
+                            SO_ERROR_OPT | SO_SNDBUF_OPT | SO_RCVBUF_OPT |
+                            SO_REUSEADDR_OPT | SO_KEEPALIVE_OPT => {
+                                write_u32(0); return 0;
+                            }
+                            _ => return EOPNOTSUPP,
+                        }
+                    }
+                    return EOPNOTSUPP;
+                }
+            }
+        }
+    }
+
     let (_handle, _sock_type) = match get_socket_info(fd) {
         Ok(info) => info,
         Err(e) => return e,
     };
 
-    let token = current_user_token();
-
     // Helper to write a u32 value to user optval/optlen
     let write_u32 = |val: u32| {
-        if !optval.is_null() && !optlen.is_null() {
-            let bufs = translated_byte_buffer(token, optval, 4);
-            let bytes = val.to_ne_bytes();
-            if let Some(buf) = bufs.first() {
-                let dst =
-                    unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, 4) };
-                dst.copy_from_slice(&bytes);
-            }
-            let len_ref = translated_refmut(token, optlen);
-            *len_ref = 4;
+        let bufs = translated_byte_buffer(token, optval, 4);
+        let bytes = val.to_ne_bytes();
+        if let Some(buf) = bufs.first() {
+            let dst =
+                unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, 4) };
+            dst.copy_from_slice(&bytes);
         }
+        let len_ref = translated_refmut(token, optlen);
+        *len_ref = 4;
     };
 
-    // Return default values for common options
-    match (level, optname) {
-        (SOL_SOCKET, SO_ERROR) => { write_u32(0); 0 }
-        (SOL_SOCKET, SO_SNDBUF) => { write_u32(65536); 0 }
-        (SOL_SOCKET, SO_RCVBUF) => { write_u32(65536); 0 }
-        (SOL_SOCKET, SO_REUSEADDR) => { write_u32(1); 0 }
-        (SOL_SOCKET, SO_KEEPALIVE) => { write_u32(0); 0 }
-        (IPPROTO_TCP, TCP_NODELAY) => { write_u32(0); 0 }
-        // TCP_MAXSEG (2): return default MSS for loopback
-        (IPPROTO_TCP, 2) => { write_u32(65495); 0 }
-        // TCP_INFO (11): not supported, return silently
-        (IPPROTO_TCP, 11) => { write_u32(0); 0 }
+    // Validate level and return appropriate errors for invalid/unsupported options.
+    // SOL_SOCKET=1, SOL_IP=IPPROTO_IP=0, IPPROTO_TCP=6, IPPROTO_UDP=17
+    match level {
+        SOL_SOCKET => {
+            // Return default values for common socket options
+            match optname {
+                SO_ERROR => { write_u32(0); 0 }
+                SO_SNDBUF => { write_u32(65536); 0 }
+                SO_RCVBUF => { write_u32(65536); 0 }
+                SO_REUSEADDR => { write_u32(1); 0 }
+                SO_KEEPALIVE => { write_u32(0); 0 }
+                _ => {
+                    warn!("[net] getsockopt SOL_SOCKET unsupported optname={}", optname);
+                    EOPNOTSUPP
+                }
+            }
+        }
+        SOL_IP => {
+            // IPPROTO_IP = SOL_IP = 0; unknown option names → ENOPROTOOPT
+            warn!("[net] getsockopt IPPROTO_IP unsupported optname={}", optname);
+            ENOPROTOOPT
+        }
+        IPPROTO_TCP => {
+            match optname {
+                TCP_NODELAY => { write_u32(0); 0 }
+                // TCP_MAXSEG (2): return default MSS
+                2 => { write_u32(65495); 0 }
+                // TCP_INFO (11): not supported, return 0
+                11 => { write_u32(0); 0 }
+                _ => {
+                    warn!("[net] getsockopt IPPROTO_TCP unsupported optname={}", optname);
+                    ENOPROTOOPT
+                }
+            }
+        }
+        IPPROTO_UDP => {
+            // UDP has very limited getsockopt support; most options return EOPNOTSUPP
+            warn!("[net] getsockopt IPPROTO_UDP unsupported optname={}", optname);
+            EOPNOTSUPP
+        }
         _ => {
-            warn!(
-                "[net] getsockopt: unsupported level={} optname={}",
-                level, optname
-            );
-            0
+            warn!("[net] getsockopt unsupported level={} optname={}", level, optname);
+            EOPNOTSUPP
         }
     }
 }

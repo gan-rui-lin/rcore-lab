@@ -218,6 +218,10 @@ const SYSCALL_GETPGID: usize = 155;
 const SYSCALL_GETSID: usize = 156;
 /// setsid syscall
 const SYSCALL_SETSID: usize = 157;
+/// getgroups syscall
+const SYSCALL_GETGROUPS: usize = 158;
+/// setgroups syscall
+const SYSCALL_SETGROUPS: usize = 159;
 /// adjtimex syscall
 const SYSCALL_ADJTIMEX: usize = 171;
 const SYSCALL_PRCTL: usize = 167;
@@ -889,6 +893,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETPGID => sys_getpgid(args[0] as isize),
         SYSCALL_GETSID => sys_getsid(args[0] as isize),
         SYSCALL_SETSID => sys_setsid(),
+        SYSCALL_GETGROUPS => process::sys_getgroups(args[0] as i32, args[1] as *mut u32),
+        SYSCALL_SETGROUPS => process::sys_setgroups(args[0], args[1] as *const u32),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut RLimit),
         SYSCALL_GETRUSAGE => sys_getrusage(args[0] as isize, args[1] as *mut RUsage),
         SYSCALL_UMASK => sys_umask(args[0]),
