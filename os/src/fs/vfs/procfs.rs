@@ -733,12 +733,143 @@ fn proc_sys_kernel() -> Arc<dyn VfsInode> {
         String::from("core_pattern"),
         ProcFileInode::new(|| String::from("core\n")),
     );
+    // tst_taint.c checks /proc/sys/kernel/tainted before many tests.
+    // Return 0 (untainted kernel).
+    entries.insert(
+        String::from("tainted"),
+        ProcFileInode::new(|| String::from("0\n")),
+    );
+    // Some tests read /proc/sys/kernel/hostname for gethostname behavior.
+    entries.insert(
+        String::from("hostname"),
+        ProcFileInode::new(|| String::from("rcore\n")),
+    );
+    // /proc/sys/kernel/ngroups_max — getgroups01 reads this.
+    entries.insert(
+        String::from("ngroups_max"),
+        ProcFileInode::new(|| String::from("65536\n")),
+    );
+    // /proc/sys/kernel/ostype and /proc/sys/kernel/osrelease.
+    entries.insert(
+        String::from("ostype"),
+        ProcFileInode::new(|| String::from("Linux\n")),
+    );
+    entries.insert(
+        String::from("osrelease"),
+        ProcFileInode::new(|| String::from("5.10.0\n")),
+    );
+    ProcStaticDirInode::new(entries)
+}
+
+/// Build /proc/sys/fs/ subtree with inotify limits and file-max.
+fn proc_sys_fs() -> Arc<dyn VfsInode> {
+    let mut inotify: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    inotify.insert(
+        String::from("max_queued_events"),
+        ProcFileInode::new(|| String::from("16384\n")),
+    );
+    inotify.insert(
+        String::from("max_user_instances"),
+        ProcFileInode::new(|| String::from("128\n")),
+    );
+    inotify.insert(
+        String::from("max_user_watches"),
+        ProcFileInode::new(|| String::from("8192\n")),
+    );
+    let inotify_dir = ProcStaticDirInode::new(inotify);
+
+    let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    entries.insert(String::from("inotify"), inotify_dir);
+    entries.insert(
+        String::from("file-max"),
+        ProcFileInode::new(|| String::from("65536\n")),
+    );
+    entries.insert(
+        String::from("nr_open"),
+        ProcFileInode::new(|| String::from("1048576\n")),
+    );
+    entries.insert(
+        String::from("overcommit_memory"),
+        ProcFileInode::new(|| String::from("0\n")),
+    );
+    ProcStaticDirInode::new(entries)
+}
+
+/// Build /proc/sys/vm/ subtree with common memory tunables.
+fn proc_sys_vm() -> Arc<dyn VfsInode> {
+    let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    entries.insert(
+        String::from("overcommit_memory"),
+        ProcFileInode::new(|| String::from("0\n")),
+    );
+    entries.insert(
+        String::from("overcommit_ratio"),
+        ProcFileInode::new(|| String::from("50\n")),
+    );
+    entries.insert(
+        String::from("dirty_ratio"),
+        ProcFileInode::new(|| String::from("20\n")),
+    );
+    entries.insert(
+        String::from("dirty_background_ratio"),
+        ProcFileInode::new(|| String::from("10\n")),
+    );
+    entries.insert(
+        String::from("max_map_count"),
+        ProcFileInode::new(|| String::from("65536\n")),
+    );
+    entries.insert(
+        String::from("mmap_min_addr"),
+        ProcFileInode::new(|| String::from("65536\n")),
+    );
+    entries.insert(
+        String::from("swappiness"),
+        ProcFileInode::new(|| String::from("60\n")),
+    );
+    ProcStaticDirInode::new(entries)
+}
+
+/// Build /proc/sys/net/ subtree with minimal ipv4 conf entries.
+fn proc_sys_net() -> Arc<dyn VfsInode> {
+    // /proc/sys/net/ipv4/conf/lo/tag — clone09 reads this
+    let mut lo: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    lo.insert(
+        String::from("tag"),
+        ProcFileInode::new(|| String::from("0\n")),
+    );
+    lo.insert(
+        String::from("rp_filter"),
+        ProcFileInode::new(|| String::from("1\n")),
+    );
+    let lo_dir = ProcStaticDirInode::new(lo);
+
+    let mut conf: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    conf.insert(String::from("lo"), lo_dir);
+    let conf_dir = ProcStaticDirInode::new(conf);
+
+    let mut ipv4: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    ipv4.insert(String::from("conf"), conf_dir);
+    ipv4.insert(
+        String::from("tcp_syncookies"),
+        ProcFileInode::new(|| String::from("1\n")),
+    );
+    let ipv4_dir = ProcStaticDirInode::new(ipv4);
+
+    let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    entries.insert(String::from("ipv4"), ipv4_dir);
+    entries.insert(
+        String::from("core"),
+        ProcStaticDirInode::new(BTreeMap::new()),
+    );
     ProcStaticDirInode::new(entries)
 }
 
 fn proc_sys() -> Arc<dyn VfsInode> {
     let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
     entries.insert(String::from("kernel"), proc_sys_kernel());
+    entries.insert(String::from("fs"), proc_sys_fs());
+    entries.insert(String::from("vm"), proc_sys_vm());
+    entries.insert(String::from("net"), proc_sys_net());
     ProcStaticDirInode::new(entries)
 }
 
@@ -750,6 +881,11 @@ pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
     entries.insert(String::from("stat"), ProcFileInode::new(proc_stat));
     entries.insert(String::from("uptime"), ProcFileInode::new(proc_uptime));
     entries.insert(String::from("cpuinfo"), ProcFileInode::new(proc_cpuinfo));
+    // /proc/cmdline — tst_kconfig.c tries to open this
+    entries.insert(
+        String::from("cmdline"),
+        ProcFileInode::new(|| String::from("\n")),
+    );
     // /proc/cgroups - needed by cgroup tests (empty = no cgroup controllers)
     entries.insert(
         String::from("cgroups"),

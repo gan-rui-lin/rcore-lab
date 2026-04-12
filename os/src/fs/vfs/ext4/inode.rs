@@ -8,6 +8,7 @@ use lwext4_rust::bindings::{O_CREAT, O_RDONLY, O_RDWR, O_TRUNC};
 use lwext4_rust::{Ext4File, InodeTypes};
 
 const SEEK_SET: u32 = 0;
+const SEEK_END: u32 = 2;
 
 pub struct Ext4Inode {
     path: String,
@@ -162,21 +163,37 @@ impl VfsInode for Ext4Inode {
         }
         self.with_data_file(true, |file| {
             if file.file_seek(offset as i64, SEEK_SET).is_err() {
-                // Some lwext4 backends reject SEEK_SET beyond EOF with EINVAL.
-                // Extend the file first, then seek again to emulate sparse growth.
+                // lwext4 rejects SEEK_SET beyond EOF with EINVAL.
+                // To extend: seek to end, write zeros from EOF to the target position,
+                // then write the actual data (or return early if buf is all zeros).
                 let size = file.file_size() as usize;
-                if offset <= size {
+                if offset < size {
+                    // offset is within file but seek failed — reopen
                     return None;
                 }
                 let new_size = offset.checked_add(buf.len())?;
-                if file.file_truncate(new_size as u64).is_err() {
+                let pad_len = new_size - size;
+                // Seek to end of file (SEEK_END with offset=0 always succeeds)
+                if file.file_seek(0, SEEK_END).is_err() {
                     return None;
                 }
-                // For sparse-zero extension (e.g. fallocate emulation), truncate
-                // already guarantees visible zeros without requiring a large seek+write.
+                // Write zeros to extend the file; use a 512-byte stack buffer
+                let zeros = [0u8; 512];
+                let mut remaining = pad_len;
+                while remaining > 0 {
+                    let chunk = remaining.min(zeros.len());
+                    let written = file.file_write(&zeros[..chunk]).unwrap_or(0) as usize;
+                    if written == 0 {
+                        return None;
+                    }
+                    remaining -= written;
+                }
+                // If buf is all zeros (e.g. fallocate emulation), we're done —
+                // the file has been extended with zeros already.
                 if buf.iter().all(|&b| b == 0) {
                     return Some(buf.len());
                 }
+                // Seek back to offset to write the actual data
                 if file.file_seek(offset as i64, SEEK_SET).is_err() {
                     return None;
                 }
@@ -268,6 +285,33 @@ impl VfsInode for Ext4Inode {
         let _ = file.file_close();
     }
 
+    fn truncate_to(&self, size: usize) {
+        if self.kind != VfsNodeKind::File {
+            return;
+        }
+        let current = self.size();
+        if size == current {
+            return;
+        }
+        if size == 0 {
+            self.truncate();
+            return;
+        }
+        if size > current {
+            // Extend: write a single zero byte at offset size-1.
+            // Our write_at fills the gap with zeros via SEEK_END approach.
+            self.write_at(size - 1, &[0u8; 1]);
+        } else {
+            // Shrink: use ext4's ftruncate (works correctly for shrinking).
+            self.with_data_file(true, |file| {
+                file.file_truncate(size as u64).ok().map(|_| ())
+            });
+            // ext4_ftruncate does NOT update file->fsize in the cached ext4_file
+            // struct, so close the cached file to force a fresh open on next access.
+            self.close_cached_file();
+        }
+    }
+
     fn list(&self) -> Vec<String> {
         if self.kind != VfsNodeKind::Dir {
             return Vec::new();
@@ -290,10 +334,20 @@ impl VfsInode for Ext4Inode {
         if self.kind != VfsNodeKind::File {
             return 0;
         }
-        self.with_data_file(false, |file| Some(file.file_size() as usize))
-            .unwrap_or_else(|| {
-                error!("ext4: open failed path={} (size)", self.path);
-                0
-            })
+        // Always open a fresh handle to read the authoritative inode size.
+        // Using the cached handle would return a stale f->fsize if another
+        // file descriptor (or path-based truncate) changed the file size.
+        if let Some(mut fresh) = ext4_open_file(
+            self.path.as_str(),
+            InodeTypes::EXT4_DE_REG_FILE,
+            O_RDONLY,
+        ) {
+            let sz = fresh.file_size() as usize;
+            let _ = fresh.file_close();
+            sz
+        } else {
+            trace!("ext4: open failed path={} (size, file may be deleted)", self.path);
+            0
+        }
     }
 }

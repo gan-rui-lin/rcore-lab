@@ -3,6 +3,7 @@
 mod memfd;
 mod pipe;
 mod stdio;
+pub mod timerfd;
 mod vfs;
 
 use crate::mm::UserBuffer;
@@ -129,6 +130,16 @@ pub trait File: Send + Sync {
     fn unix_set_peer_cred(&self, _pid: u32, _uid: u32, _gid: u32) {}
     /// For AF_UNIX sockets: get peer credentials (pid, uid, gid). None if not set.
     fn unix_get_peer_cred(&self) -> Option<(u32, u32, u32)> { None }
+    /// Returns true if this is a timerfd file descriptor.
+    fn is_timerfd(&self) -> bool { false }
+    /// For timerfd: arm the timer (expiry_us = absolute monotonic µs, interval_us = 0 for one-shot).
+    fn timerfd_arm(&self, _expiry_us: u64, _interval_us: u64) {}
+    /// For timerfd: disarm the timer. Returns remaining µs.
+    fn timerfd_disarm(&self) -> u64 { 0 }
+    /// For timerfd: get (remaining_us, interval_us). Returns None if not a timerfd.
+    fn timerfd_gettime(&self) -> Option<(u64, u64)> { None }
+    /// For timerfd: clockid (0=REALTIME, 1=MONOTONIC).
+    fn timerfd_clockid(&self) -> i32 { -1 }
 }
 
 /// Linux-compatible stat layout (riscv64, matches musl struct stat).
@@ -243,6 +254,7 @@ pub use vfs::{
 };
 pub use memfd::MemFdFile;
 pub use stdio::{DevNull, DevUrandom, DevZero, Stdin, Stdout};
+pub use timerfd::{TimerFdFile, TIMERFD_EAGAIN};
 
 /// Create minimal /etc and /dev files used by BusyBox tests.
 pub fn ensure_basic_paths() {
@@ -256,17 +268,88 @@ pub fn ensure_basic_paths() {
     create_dir("/tmp");
     create_dir("/root");
 
-    write_file_if_missing("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n");
-    write_file_if_missing("/etc/group", "root:x:0:\n");
+    // Always overwrite passwd/group to ensure all required entries are present
+    // across multiple test runs on the same sdcard image.
+    write_file_overwrite(
+        "/etc/passwd",
+        "root:x:0:0:root:/root:/bin/sh\n\
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n\
+bin:x:2:2:bin:/bin:/usr/sbin/nologin\n\
+sys:x:3:3:sys:/dev:/usr/sbin/nologin\n\
+nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n",
+    );
+    write_file_overwrite(
+        "/etc/group",
+        "root:x:0:\n\
+daemon:x:1:\n\
+bin:x:2:\n\
+sys:x:3:\n\
+adm:x:4:\n\
+tty:x:5:\n\
+disk:x:6:\n\
+lp:x:7:\n\
+mail:x:8:\n\
+news:x:9:\n\
+uucp:x:10:\n\
+man:x:12:\n\
+proxy:x:13:\n\
+kmem:x:15:\n\
+dialout:x:20:\n\
+fax:x:21:\n\
+voice:x:22:\n\
+cdrom:x:24:\n\
+floppy:x:25:\n\
+tape:x:26:\n\
+sudo:x:27:\n\
+audio:x:29:\n\
+dip:x:30:\n\
+www-data:x:33:\n\
+backup:x:34:\n\
+operator:x:37:\n\
+list:x:38:\n\
+irc:x:39:\n\
+src:x:40:\n\
+gnats:x:41:\n\
+shadow:x:42:\n\
+utmp:x:43:\n\
+video:x:44:\n\
+sasl:x:45:\n\
+plugdev:x:46:\n\
+staff:x:50:\n\
+games:x:60:\n\
+users:x:100:\n\
+",
+    );
     append_line_if_missing("/etc/passwd", "nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n");
     append_line_if_missing("/etc/group", "nogroup:x:65534:\n");
     write_file_if_missing("/etc/localtime", "");
     write_file_if_missing("/etc/adjtime", "");
+    // NSS configuration: ensure glibc uses "files" for all relevant databases.
+    write_file_if_missing(
+        "/etc/nsswitch.conf",
+        "passwd:     files\n\
+group:      files\n\
+shadow:     files\n\
+hosts:      files\n\
+networks:   files\n\
+protocols:  files\n\
+services:   files\n\
+ethers:     files\n\
+rpc:        files\n\
+netgroup:   files\n",
+    );
+    // Minimal /etc/hosts for hostname resolution.
+    write_file_if_missing(
+        "/etc/hosts",
+        "127.0.0.1\tlocalhost\n\
+::1\t\tlocalhost\n",
+    );
     // Keep /etc/protocols deterministic for getprotobyname()-based tests.
+    // hopopt comes BEFORE ip to ensure getprotobyname("hopopt") finds it first.
     write_file_overwrite(
         "/etc/protocols",
-        "ip\t0\tIP\n\
-hopopt\t0\tHOPOPT\n\
+        "hopopt\t0\tHOPOPT\n\
+ip\t0\tIP\n\
 icmp\t1\tICMP\n\
 tcp\t6\tTCP\n\
 udp\t17\tUDP\n\

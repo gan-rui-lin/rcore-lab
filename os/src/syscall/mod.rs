@@ -38,6 +38,8 @@ const SYSCALL_LINKAT: usize = 37;
 const SYSCALL_UMOUNT2: usize = 39;
 /// mount syscall
 const SYSCALL_MOUNT: usize = 40;
+/// truncate syscall (by path)
+const SYSCALL_TRUNCATE: usize = 45;
 /// ftruncate syscall
 const SYSCALL_FTRUNCATE: usize = 46;
 /// fallocate syscall
@@ -98,6 +100,16 @@ const SYSCALL_FSTATAT: usize = 79;
 const SYSCALL_FSTAT: usize = 80;
 /// sync syscall
 const SYSCALL_SYNC: usize = 81;
+/// fsync syscall
+const SYSCALL_FSYNC: usize = 82;
+/// fdatasync syscall
+const SYSCALL_FDATASYNC: usize = 83;
+/// timerfd_create syscall
+const SYSCALL_TIMERFD_CREATE: usize = 85;
+/// timerfd_settime syscall
+const SYSCALL_TIMERFD_SETTIME: usize = 86;
+/// timerfd_gettime syscall
+const SYSCALL_TIMERFD_GETTIME: usize = 87;
 /// utimensat syscall
 const SYSCALL_UTIMENSAT: usize = 88;
 /// statx syscall
@@ -445,6 +457,8 @@ const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (83, "fdatasync"),
     (84, "sync_file_range"),
     (85, "timerfd_create"),
+    (86, "timerfd_settime"),
+    (87, "timerfd_gettime"),
     (88, "symlink/utimensat"),
     (89, "acct"),
     (93, "exit"),
@@ -667,12 +681,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1] as i32, args[2]),
         SYSCALL_FLOCK => sys_flock(args[0], args[1] as i32),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
+        SYSCALL_TRUNCATE => sys_truncate(args[0] as *const u8, args[1] as isize),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as isize),
         SYSCALL_FALLOCATE => {
             sys_fallocate(args[0], args[1] as u32, args[2] as isize, args[3] as isize)
         }
-        // fsync/fdatasync: no page cache to flush, return success
-        82 | 83 => 0,
         SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut StatFs),
         SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut StatFs),
         SYSCALL_FACCESSAT => sys_faccessat(
@@ -740,6 +753,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_SYNC => 0,
+        SYSCALL_FSYNC => sys_fsync(args[0]),
+        SYSCALL_FDATASYNC => sys_fdatasync(args[0]),
+        SYSCALL_TIMERFD_CREATE => sys_timerfd_create(args[0] as i32, args[1] as i32),
+        SYSCALL_TIMERFD_SETTIME => sys_timerfd_settime(
+            args[0], args[1] as i32,
+            args[2] as *const u8, args[3] as *mut u8,
+        ),
+        SYSCALL_TIMERFD_GETTIME => sys_timerfd_gettime(args[0], args[1] as *mut u8),
         SYSCALL_READV => sys_readv(args[0], args[1] as *const usize, args[2]),
         SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const usize, args[2]),
         SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *const u8, args[2], args[3] as isize),

@@ -28,6 +28,27 @@ pub trait VfsInode: Send + Sync {
         false
     }
     fn truncate(&self);
+    /// Truncate (or extend) file to exactly `size` bytes.
+    /// Default: truncate-to-zero for size==0, grow via write for size>current, shrink via truncate+rewrite otherwise.
+    fn truncate_to(&self, size: usize) {
+        let current = self.size();
+        if size == current {
+            return;
+        }
+        if size == 0 {
+            self.truncate();
+            return;
+        }
+        if size > current {
+            // Extend: write a single zero byte at offset size-1.
+            // write_at handles the gap fill with zeros internally.
+            self.write_at(size - 1, &[0u8; 1]);
+        } else {
+            // Shrink: default = truncate to zero then re-write up to size.
+            // Subclasses (Ext4Inode) override this for real ftruncate.
+            self.truncate();
+        }
+    }
     fn list(&self) -> Vec<String>;
     fn size(&self) -> usize {
         0

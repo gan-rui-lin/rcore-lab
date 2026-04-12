@@ -4,7 +4,7 @@ use super::process::{get_current_umask, TimeSpec};
 use crate::config::PAGE_SIZE;
 use crate::fs::{
     create_dir, make_pipe, open_file, path_exists, path_is_dir, remove_path, DevNull, DevUrandom,
-    DevZero, MemFdFile, OpenFlags, PollEvents, Stat, StatMode,
+    DevZero, MemFdFile, OpenFlags, PollEvents, Stat, StatMode, TimerFdFile, TIMERFD_EAGAIN,
 };
 use crate::mm::{
     translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
@@ -415,14 +415,31 @@ fn effective_path_mode(path: &str) -> u32 {
     path_mode_get(path).unwrap_or_else(|| default_path_mode(path))
 }
 
-fn access_allowed(full_path: &str, mode: u32, uid: u32) -> Result<(), isize> {
+/// Check whether `uid`/`egid` is allowed to access `full_path` with `mode` (rwx bits).
+/// Callers that already hold the process inner lock must pass `egid` directly to
+/// avoid a re-entrant lock acquisition.
+fn access_allowed_egid(full_path: &str, mode: u32, uid: u32, egid: u32) -> Result<(), isize> {
     let exists =
         is_char_device(full_path) || open_file(full_path, OpenFlags::empty()).is_some() || path_is_dir(full_path);
     if !exists {
         return Err(errno(ENOENT));
     }
 
+    // Helper: resolve which rwx bits apply for uid/egid on a given path's mode
+    let applicable_bits = |path: &str| -> u32 {
+        let (file_uid, file_gid) = effective_path_owner(path);
+        let perm = effective_path_mode(path);
+        if uid == file_uid {
+            (perm >> 6) & 0o7
+        } else if egid == file_gid {
+            (perm >> 3) & 0o7
+        } else {
+            perm & 0o7
+        }
+    };
+
     if uid != 0 {
+        // Check execute permission on every intermediate directory component
         let mut partial = String::new();
         let mut comps = full_path.split('/').filter(|part| !part.is_empty()).peekable();
         while let Some(comp) = comps.next() {
@@ -431,7 +448,7 @@ fn access_allowed(full_path: &str, mode: u32, uid: u32) -> Result<(), isize> {
             if comps.peek().is_none() {
                 break;
             }
-            if path_is_dir(&partial) && (effective_path_mode(&partial) & 0o001) == 0 {
+            if path_is_dir(&partial) && (applicable_bits(&partial) & 0o1) == 0 {
                 return Err(errno(EACCES));
             }
         }
@@ -453,11 +470,20 @@ fn access_allowed(full_path: &str, mode: u32, uid: u32) -> Result<(), isize> {
         return Ok(());
     }
 
-    if (requested & !(perm & 0o7)) != 0 {
+    // Non-root: check appropriate permission set based on uid/gid relationship
+    let bits = applicable_bits(full_path);
+    if (requested & !bits) != 0 {
         return Err(errno(EACCES));
     }
 
     Ok(())
+}
+
+/// Convenience wrapper that reads egid from the current process.
+/// Do NOT call while holding the process inner lock — use access_allowed_egid instead.
+fn access_allowed(full_path: &str, mode: u32, uid: u32) -> Result<(), isize> {
+    let egid = current_process().inner_exclusive_access().effective_gid;
+    access_allowed_egid(full_path, mode, uid, egid)
 }
 
 fn apply_chown_to_path(path: &str, owner: u32, group: u32) {
@@ -891,6 +917,9 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
         let raw = file.read(UserBuffer::new(buffers));
         if raw == usize::MAX {
             return errno(EINTR); // interrupted by signal
+        }
+        if raw == TIMERFD_EAGAIN {
+            return errno(EAGAIN); // timerfd: timer hasn't fired, O_NONBLOCK set
         }
         raw as isize
     } else {
@@ -2422,7 +2451,9 @@ pub fn sys_fchdir(fd: usize) -> isize {
         return errno(ENOTDIR);
     };
     let uid = inner.effective_uid;
-    if let Err(err) = access_allowed(path, 0o1, uid) {
+    let egid = inner.effective_gid;
+    // Use egid-aware variant since inner is still held
+    if let Err(err) = access_allowed_egid(path, 0o1, uid, egid) {
         return err;
     }
     inner.cwd = String::from(path);
@@ -3360,46 +3391,62 @@ pub fn sys_ftruncate(fd: usize, length: isize) -> isize {
         return errno(EBADF);
     }
 
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = inner.fd_table[fd].clone() else {
         return errno(EBADF);
     };
+    drop(inner);
 
-    // Check if file is writable
+    // POSIX: EINVAL if file is not open for writing (O_RDONLY) or not a regular file
     if !file.writable() {
         return errno(EINVAL);
     }
 
-    // For now, we'll accept the call but won't actually truncate
-    // Full implementation would require:
-    // 1. OSInode to support truncate operation
-    // 2. File system layer to handle block allocation/deallocation
-    // 3. Handling of growing files (filling with zeros)
-    // 4. Handling of shrinking files (freeing blocks)
-
-    // Get current file size
     if let Some(inode) = file.inode() {
-        let current_size = inode.size();
-        let new_size = length as usize;
-
-        if new_size > current_size {
-            // Growing file - would need to allocate blocks and zero-fill
-            // For simplicity, we'll just accept it
-            debug!(
-                "[sys_ftruncate] fd={} grow from {} to {} (not fully implemented)",
-                fd, current_size, new_size
-            );
-        } else if new_size < current_size {
-            // Shrinking file - would need to free blocks
-            debug!(
-                "[sys_ftruncate] fd={} shrink from {} to {} (not fully implemented)",
-                fd, current_size, new_size
-            );
+        if inode.is_dir() {
+            return errno(EINVAL);
         }
-        // If new_size == current_size, nothing to do
-
+        inode.truncate_to(length as usize);
         0
     } else {
-        // File has no size (pipe, socket, etc.)
+        // File has no inode (pipe, socket, unix socket, etc.) → EINVAL
+        errno(EINVAL)
+    }
+}
+
+/// truncate system call - Truncate file by path to specified length
+///
+/// # Arguments
+/// - path: pathname of the file
+/// - length: new file size in bytes
+///
+/// # Returns
+/// - Success: 0
+/// - Failure: -errno
+pub fn sys_truncate(path: *const u8, length: isize) -> isize {
+    if length < 0 {
+        return errno(EINVAL);
+    }
+
+    let token = current_user_token();
+    let Some(raw_path) = translated_str_checked(token, path) else {
+        return errno(EFAULT);
+    };
+
+    let full_path = if raw_path.starts_with('/') {
+        normalize_path(&raw_path)
+    } else {
+        let base = current_process().inner_exclusive_access().cwd.clone();
+        resolve_path(&base, &raw_path)
+    };
+
+    let Some(file) = open_file(&full_path, OpenFlags::RDWR) else {
+        return errno(ENOENT);
+    };
+
+    if let Some(inode) = file.inode() {
+        inode.truncate_to(length as usize);
+        0
+    } else {
         errno(EINVAL)
     }
 }
@@ -4428,7 +4475,7 @@ pub fn sys_get_robust_list(pid: usize, head: *mut u8, len: *mut u8) -> isize {
 }
 
 /// sys_fchmodat (syscall 53)
-pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32, _flags: u32) -> isize {
+pub fn sys_fchmodat(dirfd: isize, path: *const u8, mut mode: u32, _flags: u32) -> isize {
     if path.is_null() {
         return errno(EFAULT);
     }
@@ -4471,9 +4518,15 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32, _flags: u32) -> is
         if let Err(err) = access_allowed(&full_path, 0, euid) {
             return err;
         }
-        let (uid, _) = effective_path_owner(&full_path);
+        let (uid, file_gid) = effective_path_owner(&full_path);
         if uid != euid {
             return errno(EPERM);
+        }
+        // POSIX: if caller's effective GID doesn't match the file's GID,
+        // the S_ISGID bit must be silently cleared (non-root can't set it).
+        let egid = process.inner_exclusive_access().effective_gid;
+        if egid != file_gid {
+            mode &= !0o2000u32; // clear S_ISGID
         }
     }
     path_mode_set(&full_path, mode);
@@ -4481,7 +4534,7 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32, _flags: u32) -> is
 }
 
 /// sys_fchmod (syscall 52)
-pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
+pub fn sys_fchmod(fd: usize, mut mode: u32) -> isize {
     let process = current_process();
     let inner = process.inner_exclusive_access();
     if fd >= inner.fd_table.len() {
@@ -4497,9 +4550,13 @@ pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
         return errno(EROFS);
     }
     if inner.effective_uid != 0 {
-        let (uid, _) = effective_path_owner(path);
+        let (uid, file_gid) = effective_path_owner(path);
         if uid != inner.effective_uid {
             return errno(EPERM);
+        }
+        // POSIX: clear S_ISGID if caller's egid doesn't match the file's GID
+        if inner.effective_gid != file_gid {
+            mode &= !0o2000u32;
         }
     }
     path_mode_set(path, mode);
@@ -4609,4 +4666,193 @@ pub fn sys_fchown(fd: usize, owner: u32, group: u32) -> isize {
     apply_chown_to_path(&path, owner, group);
     apply_mode_side_effects_after_chown(&path);
     0
+}
+
+// ─── timerfd syscalls ─────────────────────────────────────────────────────────
+
+/// itimerspec: used by timerfd_settime / timerfd_gettime.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ITimerSpec {
+    it_interval: TimeSpec,
+    it_value: TimeSpec,
+}
+
+fn read_itimerspec_from_user(token: usize, ptr: *const u8) -> Option<ITimerSpec> {
+    if ptr.is_null() {
+        return None;
+    }
+    let size = core::mem::size_of::<ITimerSpec>();
+    let bufs = translated_byte_buffer_checked(token, ptr, size, false)?;
+    let mut raw = [0u8; 32];
+    let mut off = 0usize;
+    for slice in bufs.iter() {
+        let n = slice.len().min(size - off);
+        raw[off..off + n].copy_from_slice(&slice[..n]);
+        off += n;
+        if off >= size { break; }
+    }
+    if off < size { return None; }
+    Some(unsafe { core::mem::transmute(raw) })
+}
+
+fn write_itimerspec_to_user(token: usize, ptr: *mut u8, spec: ITimerSpec) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+    let size = core::mem::size_of::<ITimerSpec>();
+    let raw: [u8; 32] = unsafe { core::mem::transmute(spec) };
+    let bufs = match translated_byte_buffer_checked(token, ptr, size, true) {
+        Some(b) => b,
+        None => return false,
+    };
+    let mut off = 0usize;
+    for slice in bufs.iter() {
+        let n = slice.len().min(size - off);
+        let dst = unsafe { core::slice::from_raw_parts_mut(slice.as_ptr() as *mut u8, n) };
+        dst.copy_from_slice(&raw[off..off + n]);
+        off += n;
+        if off >= size { break; }
+    }
+    off >= size
+}
+
+fn timespec_to_us(ts: &TimeSpec) -> u64 {
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(ts.tv_nsec as u64 / 1_000)
+}
+
+fn us_to_timespec(us: u64) -> TimeSpec {
+    TimeSpec {
+        tv_sec: (us / 1_000_000) as usize,
+        tv_nsec: ((us % 1_000_000) * 1_000) as usize,
+    }
+}
+
+const TFD_CLOEXEC: i32 = 0o2000000; // same as O_CLOEXEC
+const TFD_NONBLOCK: i32 = 0o4000;   // same as O_NONBLOCK
+const TFD_TIMER_ABSTIME: i32 = 1;
+
+/// timerfd_create(2)
+pub fn sys_timerfd_create(clockid: i32, flags: i32) -> isize {
+    // Accept CLOCK_REALTIME(0), CLOCK_MONOTONIC(1), CLOCK_BOOTTIME(7).
+    if !matches!(clockid, 0 | 1 | 7) {
+        return errno(EINVAL);
+    }
+    if flags & !(TFD_CLOEXEC | TFD_NONBLOCK) != 0 {
+        return errno(EINVAL);
+    }
+    let nonblock = (flags & TFD_NONBLOCK) != 0;
+    let cloexec  = (flags & TFD_CLOEXEC)  != 0;
+    let file = Arc::new(TimerFdFile::new(clockid, nonblock, cloexec));
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = match inner.alloc_fd() {
+        Some(fd) => fd,
+        None => return errno(EMFILE),
+    };
+    inner.fd_table[fd] = Some(file);
+    fd as isize
+}
+
+/// timerfd_settime(2)
+pub fn sys_timerfd_settime(fd: usize, flags: i32, new_value: *const u8, old_value: *mut u8) -> isize {
+    if new_value.is_null() {
+        return errno(EFAULT);
+    }
+    let token = current_user_token();
+    let new_spec = match read_itimerspec_from_user(token, new_value) {
+        Some(s) => s,
+        None => return errno(EFAULT),
+    };
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(file) = inner.fd_table[fd].clone() else {
+        return errno(EBADF);
+    };
+    drop(inner);
+    if !file.is_timerfd() {
+        return errno(EINVAL);
+    }
+    // Write old timer state if requested.
+    if !old_value.is_null() {
+        let (remaining_us, interval_us) = file.timerfd_gettime().unwrap_or((0, 0));
+        let old_spec = ITimerSpec {
+            it_interval: us_to_timespec(interval_us),
+            it_value: us_to_timespec(remaining_us),
+        };
+        if !write_itimerspec_to_user(token, old_value, old_spec) {
+            return errno(EFAULT);
+        }
+    }
+    // Arm or disarm.
+    let value_us = timespec_to_us(&new_spec.it_value);
+    let interval_us = timespec_to_us(&new_spec.it_interval);
+    if value_us == 0 {
+        file.timerfd_disarm();
+    } else {
+        let abstime = (flags & TFD_TIMER_ABSTIME) != 0;
+        let expiry_us = if abstime {
+            value_us
+        } else {
+            (get_time_us() as u64).saturating_add(value_us)
+        };
+        file.timerfd_arm(expiry_us, interval_us);
+    }
+    0
+}
+
+/// timerfd_gettime(2)
+pub fn sys_timerfd_gettime(fd: usize, curr_value: *mut u8) -> isize {
+    if curr_value.is_null() {
+        return errno(EFAULT);
+    }
+    let token = current_user_token();
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(file) = inner.fd_table[fd].clone() else {
+        return errno(EBADF);
+    };
+    drop(inner);
+    if !file.is_timerfd() {
+        return errno(EINVAL);
+    }
+    let (remaining_us, interval_us) = file.timerfd_gettime().unwrap_or((0, 0));
+    let spec = ITimerSpec {
+        it_interval: us_to_timespec(interval_us),
+        it_value: us_to_timespec(remaining_us),
+    };
+    if !write_itimerspec_to_user(token, curr_value, spec) {
+        return errno(EFAULT);
+    }
+    0
+}
+
+// ─── fdatasync / fsync stubs ───────────────────────────────────────────────────
+
+/// fdatasync(2) — flush file data and essential metadata to storage.
+/// Stub: always succeeds (no actual disk sync needed in our memory-backed FS).
+pub fn sys_fdatasync(fd: usize) -> isize {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    if inner.fd_table[fd].is_none() {
+        return errno(EBADF);
+    }
+    0
+}
+
+/// fsync(2) — flush file data and all metadata to storage.
+/// Stub: always succeeds.
+pub fn sys_fsync(fd: usize) -> isize {
+    sys_fdatasync(fd)
 }
