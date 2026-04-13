@@ -3406,6 +3406,9 @@ pub fn sys_ftruncate(fd: usize, length: isize) -> isize {
             return errno(EINVAL);
         }
         inode.truncate_to(length as usize);
+        if let Some(path) = file.path() {
+            crate::mm::invalidate_shared_file_pages_by_path(path);
+        }
         0
     } else {
         // File has no inode (pipe, socket, unix socket, etc.) → EINVAL
@@ -3445,6 +3448,7 @@ pub fn sys_truncate(path: *const u8, length: isize) -> isize {
 
     if let Some(inode) = file.inode() {
         inode.truncate_to(length as usize);
+        crate::mm::invalidate_shared_file_pages_by_path(full_path.as_str());
         0
     } else {
         errno(EINVAL)

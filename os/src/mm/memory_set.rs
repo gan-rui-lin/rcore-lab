@@ -40,6 +40,69 @@ lazy_static! {
     /// The kernel's initial memory mapping(kernel address space)
     pub static ref KERNEL_SPACE: Arc<UPIntrFreeCell<MemorySet>> =
         Arc::new(unsafe { UPIntrFreeCell::new(MemorySet::new_kernel()) });
+    /// Global shared page cache for MAP_SHARED file-backed mmap pages.
+    /// Keyed by `(file_id, page_offset)` so independent mmaps in different
+    /// processes can map the same physical frame and observe each other's writes.
+    static ref SHARED_FILE_PAGE_CACHE: UPIntrFreeCell<BTreeMap<SharedFilePageKey, Arc<FrameTracker>>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SharedFilePageKey {
+    file_id: String,
+    page_offset: usize,
+}
+
+fn shared_file_id(file: &Arc<dyn File + Send + Sync>) -> Option<String> {
+    if let Some(path) = file.path() {
+        return Some(format!("path:{path}"));
+    }
+    file.inode()
+        .map(|inode| format!("inode:{:p}", Arc::as_ptr(&inode)))
+}
+
+fn alloc_file_page_from_backing(
+    file: &Arc<dyn File + Send + Sync>,
+    page_offset: usize,
+) -> Option<Arc<FrameTracker>> {
+    let frame = frame_alloc()?;
+    let mut frame = Arc::new(frame);
+    let page = Arc::get_mut(&mut frame).unwrap().ppn.get_bytes_array();
+    let nread = file.read_at_kernel(page_offset, page);
+    if nread < PAGE_SIZE {
+        page[nread..].fill(0);
+    }
+    Some(frame)
+}
+
+fn get_or_alloc_shared_file_page(
+    file: &Arc<dyn File + Send + Sync>,
+    page_offset: usize,
+) -> Option<Arc<FrameTracker>> {
+    let file_id = shared_file_id(file)?;
+    let key = SharedFilePageKey {
+        file_id,
+        page_offset,
+    };
+    if let Some(frame) = SHARED_FILE_PAGE_CACHE.exclusive_access().get(&key).cloned() {
+        return Some(frame);
+    }
+    let new_frame = alloc_file_page_from_backing(file, page_offset)?;
+    let mut cache = SHARED_FILE_PAGE_CACHE.exclusive_access();
+    if let Some(frame) = cache.get(&key).cloned() {
+        return Some(frame);
+    }
+    cache.insert(key, new_frame.clone());
+    Some(new_frame)
+}
+
+/// Invalidate cached shared mmap pages for a given path.
+/// Used by truncate paths so a resized file does not reuse stale shared pages.
+pub fn invalidate_shared_file_pages_by_path(path: &str) {
+    let key_prefix = format!("path:{path}");
+    SHARED_FILE_PAGE_CACHE
+        .exclusive_access()
+        .retain(|k, _| k.file_id != key_prefix);
 }
 
 /// the kernel token
@@ -216,6 +279,54 @@ impl MemorySet {
             .with_area_type(MapAreaType::MmapFile);
         if meta.shared {
             area = area.with_kind(MapAreaKind::Shared).with_shared_frames();
+        }
+        self.areas.push(area);
+    }
+    /// Insert a MAP_SHARED file-backed mmap region eagerly.
+    ///
+    /// We populate all pages at mmap-time so that `fork()` can share the same
+    /// materialized frames instead of faulting private pages in parent/child
+    /// independently. This keeps MAP_SHARED semantics for userspace shared
+    /// state (e.g. LTP shared summary counters in `/dev/shm` files).
+    pub fn insert_shared_file_mmap_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+        file: Arc<dyn File + Send + Sync>,
+        file_offset: u64,
+        meta: MmapMeta,
+    ) {
+        let mut area = MapArea::new_with_kind(
+            start_va,
+            end_va,
+            MapType::Framed,
+            permission,
+            MapAreaKind::Shared,
+        )
+        .with_mmap_meta(meta)
+        .with_shared_frames()
+        .with_area_type(MapAreaType::MmapFile);
+        let pte_flags = map_perm_to_pte_flags(permission);
+        let start_vpn = area.vpn_range.get_start();
+        let end_vpn = area.vpn_range.get_end();
+        let base_off = file_offset as usize;
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            let page_idx = vpn.0.saturating_sub(start_vpn.0);
+            let Some(read_off) = base_off.checked_add(page_idx * PAGE_SIZE) else {
+                continue;
+            };
+            let frame = get_or_alloc_shared_file_page(&file, read_off)
+                .or_else(|| alloc_file_page_from_backing(&file, read_off));
+            let Some(frame) = frame else {
+                error!(
+                    "[insert_shared_file_mmap_area] frame alloc failed vpn={:#x} off={:#x}",
+                    vpn.0, read_off
+                );
+                continue;
+            };
+            self.page_table.map(vpn, frame.ppn, pte_flags);
+            area.data_frames.insert(vpn, frame);
         }
         self.areas.push(area);
     }

@@ -22,7 +22,8 @@ pub use frame_allocator::{
 };
 pub use memory_set::remap_test;
 pub use memory_set::{
-    kernel_token, MapAreaType, MapPermission, MemorySet, MmapMeta, ProtectError, KERNEL_SPACE,
+    invalidate_shared_file_pages_by_path, kernel_token, MapAreaType, MapPermission, MemorySet,
+    MmapMeta, ProtectError, KERNEL_SPACE,
 };
 
 static KERNEL_PT_READY: AtomicBool = AtomicBool::new(false);

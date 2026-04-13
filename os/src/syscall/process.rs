@@ -2780,14 +2780,29 @@ pub fn sys_mmap(
         };
         match file {
             Some(file) => {
-                inner.memory_set.insert_lazy_file_area(
-                    VirtAddr(start),
-                    VirtAddr(start + len),
-                    map_perm,
-                    file,
-                    offset as u64,
-                    meta,
-                );
+                if is_shared {
+                    // MAP_SHARED file-backed mappings must materialize shared
+                    // frames before fork(). Keeping them lazy can cause parent
+                    // and child to fault different private pages, corrupting
+                    // shared userspace state (e.g. LTP summary counters).
+                    inner.memory_set.insert_shared_file_mmap_area(
+                        VirtAddr(start),
+                        VirtAddr(start + len),
+                        map_perm,
+                        file,
+                        offset as u64,
+                        meta,
+                    );
+                } else {
+                    inner.memory_set.insert_lazy_file_area(
+                        VirtAddr(start),
+                        VirtAddr(start + len),
+                        map_perm,
+                        file,
+                        offset as u64,
+                        meta,
+                    );
+                }
             }
             None => return errno(EBADF),
         }

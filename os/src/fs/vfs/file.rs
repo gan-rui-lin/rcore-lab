@@ -196,6 +196,7 @@ pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<dyn File>> {
         if let Some(inode) = vfs.resolve_quiet(&path) {
             if flags.contains(OpenFlags::TRUNC) {
                 inode.truncate();
+                crate::mm::invalidate_shared_file_pages_by_path(path.as_str());
             }
             return Some(Arc::new(VfsFile::new_with_flags(
                 readable,
@@ -211,6 +212,7 @@ pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<dyn File>> {
         // existing inode (some backends may take that path).
         if flags.contains(OpenFlags::TRUNC) {
             inode.truncate();
+            crate::mm::invalidate_shared_file_pages_by_path(path.as_str());
         }
         Some(Arc::new(VfsFile::new_with_flags(
             readable,
@@ -223,6 +225,7 @@ pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<dyn File>> {
         let inode = vfs.resolve_quiet(&path)?;
         if flags.contains(OpenFlags::TRUNC) {
             inode.truncate();
+            crate::mm::invalidate_shared_file_pages_by_path(path.as_str());
         }
         Some(Arc::new(VfsFile::new_with_flags(
             readable,
