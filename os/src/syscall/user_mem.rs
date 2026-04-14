@@ -107,6 +107,58 @@ pub fn copy_to_user(
     }
 }
 
+pub fn copy_from_user(
+    token: usize,
+    src: *const u8,
+    dst: &mut [u8],
+    policy: UserReadPolicy,
+) -> Result<(), isize> {
+    if dst.is_empty() {
+        return Ok(());
+    }
+    let Some(slices) = translated_user_read_buffer(token, src, dst.len(), policy) else {
+        return Err(errno(EFAULT));
+    };
+    let mut offset = 0usize;
+    for slice in slices {
+        let len = slice.len().min(dst.len() - offset);
+        dst[offset..offset + len].copy_from_slice(&slice[..len]);
+        offset += len;
+        if offset >= dst.len() {
+            break;
+        }
+    }
+    if offset == dst.len() {
+        Ok(())
+    } else {
+        Err(errno(EFAULT))
+    }
+}
+
+pub fn ensure_user_readable(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    policy: UserReadPolicy,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    translated_user_read_buffer(token, ptr, len, policy).is_some()
+}
+
+pub fn ensure_user_writable(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    policy: UserWritePolicy,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    translated_user_write_buffer(token, ptr, len, policy).is_some()
+}
+
 pub fn read_from_user<T: Copy>(
     token: usize,
     src: *const T,

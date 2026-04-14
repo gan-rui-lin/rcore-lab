@@ -7,8 +7,7 @@ use crate::fs::{
     DevZero, MemFdFile, OpenFlags, PollEvents, Stat, StatMode, TimerFdFile, TIMERFD_EAGAIN,
 };
 use crate::mm::{
-    translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
-    translated_str_checked, UserBuffer,
+    translated_ref, translated_refmut, translated_str_checked, UserBuffer,
 };
 use crate::net::unix_socket::unix_registry_remove;
 #[allow(unused_imports)] // for debug
@@ -1094,17 +1093,10 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsize: usiz
 
     let bytes = target.as_bytes();
     let write_len = bytes.len().min(bufsize);
-    let slices = translated_byte_buffer(token, buf, write_len);
-    let mut off = 0usize;
-    for slice in slices {
-        if off >= write_len {
-            break;
-        }
-        let n = slice.len().min(write_len - off);
-        slice[..n].copy_from_slice(&bytes[off..off + n]);
-        off += n;
+    match copy_to_user(token, buf, &bytes[..write_len]) {
+        Ok(_) => write_len as isize,
+        Err(err) => err,
     }
-    off as isize
 }
 
 pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> isize {
@@ -1126,8 +1118,12 @@ pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> isize {
     }
 
     let token = current_user_token();
-    // Use the checked version to detect invalid/kernel addresses and return EFAULT.
-    let Some(slices) = translated_byte_buffer_checked(token, buf, len, true) else {
+    let Some(slices) = user_mem::translated_user_write_buffer(
+        token,
+        buf as *const u8,
+        len,
+        UserWritePolicy::DemandCowWithForkFallback,
+    ) else {
         return errno(EFAULT);
     };
     let mut state = GETRANDOM_STATE
@@ -1373,12 +1369,15 @@ fn read_times_from_user(token: usize, times: *const TimeSpec) -> Option<(TimeSpe
     }
     let size = core::mem::size_of::<TimeSpec>() * 2;
     let mut data = [0u8; 32]; // 2 * TimeSpec (each 16 bytes on rv64)
-    let slices = translated_byte_buffer(token, times as *const u8, size);
-    let mut offset = 0usize;
-    for slice in slices {
-        let len = slice.len().min(size - offset);
-        data[offset..offset + len].copy_from_slice(&slice[..len]);
-        offset += len;
+    if user_mem::copy_from_user(
+        token,
+        times as *const u8,
+        &mut data[..size],
+        UserReadPolicy::DemandPaged,
+    )
+    .is_err()
+    {
+        return None;
     }
     let ts0 = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const TimeSpec) };
     let ts1 = unsafe {
@@ -2743,21 +2742,10 @@ pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 
     for i in 0..iovcnt {
         let iov_ptr = unsafe { (iov as *const u8).add(i * 16) };
-        let Some(iov_buffers) = translated_byte_buffer_checked(token, iov_ptr, 16, false) else {
-            return if total_read > 0 { total_read } else { errno(EFAULT) };
-        };
-
         let mut iov_data = [0u8; 16];
-        let mut offset = 0;
-        for slice in iov_buffers {
-            let len = slice.len().min(16 - offset);
-            iov_data[offset..offset + len].copy_from_slice(&slice[..len]);
-            offset += len;
-            if offset >= 16 {
-                break;
-            }
-        }
-        if offset < 16 {
+        if user_mem::copy_from_user(token, iov_ptr, &mut iov_data, UserReadPolicy::DemandPaged)
+            .is_err()
+        {
             return if total_read > 0 { total_read } else { errno(EFAULT) };
         }
 
@@ -2861,21 +2849,10 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
     // Read iovec structures from user space
     for i in 0..iovcnt {
         let iov_ptr = unsafe { (iov as *const u8).add(i * 16) };
-        let Some(iov_buffers) = translated_byte_buffer_checked(token, iov_ptr, 16, false) else {
-            return if total_written > 0 { total_written } else { errno(EFAULT) };
-        };
-
         let mut iov_data = [0u8; 16];
-        let mut offset = 0;
-        for slice in iov_buffers {
-            let len = slice.len().min(16 - offset);
-            iov_data[offset..offset + len].copy_from_slice(&slice[..len]);
-            offset += len;
-            if offset >= 16 {
-                break;
-            }
-        }
-        if offset < 16 {
+        if user_mem::copy_from_user(token, iov_ptr, &mut iov_data, UserReadPolicy::DemandPaged)
+            .is_err()
+        {
             return if total_written > 0 { total_written } else { errno(EFAULT) };
         }
 
@@ -2910,7 +2887,7 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
             return if total_written > 0 { total_written } else { errno(EFAULT) };
         }
 
-        let Some(buffers) = translated_byte_buffer_checked(token, base as *const u8, len, false)
+        let Some(buffers) = translated_user_read_buffer(token, base as *const u8, len)
         else {
             return if total_written > 0 { total_written } else { errno(EFAULT) };
         };
@@ -3075,7 +3052,12 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
                 return errno(EFAULT);
             }
             let size = core::mem::size_of::<Flock>();
-            if translated_byte_buffer_checked(token, ptr as *const u8, size, false).is_none() {
+            if !user_mem::ensure_user_readable(
+                token,
+                ptr as *const u8,
+                size,
+                UserReadPolicy::DemandPaged,
+            ) {
                 return errno(EFAULT);
             }
             let mut flock = *translated_ref(token, ptr as *const Flock);
@@ -3086,7 +3068,12 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
             let bytes = unsafe {
                 core::slice::from_raw_parts((&flock as *const Flock) as *const u8, size)
             };
-            if translated_byte_buffer_checked(token, ptr as *const u8, size, true).is_none() {
+            if !user_mem::ensure_user_writable(
+                token,
+                ptr as *const u8,
+                size,
+                UserWritePolicy::DemandCowWithForkFallback,
+            ) {
                 return errno(EFAULT);
             }
             match copy_to_user(token, ptr as *mut u8, bytes) {
@@ -3101,7 +3088,12 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
                 return errno(EFAULT);
             }
             let size = core::mem::size_of::<Flock>();
-            if translated_byte_buffer_checked(token, ptr as *const u8, size, false).is_none() {
+            if !user_mem::ensure_user_readable(
+                token,
+                ptr as *const u8,
+                size,
+                UserReadPolicy::DemandPaged,
+            ) {
                 return errno(EFAULT);
             }
             let flock = *translated_ref(token, ptr);
@@ -3677,21 +3669,7 @@ fn read_user_bytes(token: usize, src: *const u8, len: usize) -> Result<Vec<u8>, 
         return Ok(Vec::new());
     }
     let mut out = vec![0u8; len];
-    let mut offset = 0usize;
-    let Some(slices) = translated_byte_buffer_checked(token, src, len, false) else {
-        return Err(errno(EFAULT));
-    };
-    for slice in slices {
-        let n = slice.len().min(len - offset);
-        out[offset..offset + n].copy_from_slice(&slice[..n]);
-        offset += n;
-        if offset >= len {
-            break;
-        }
-    }
-    if offset < len {
-        return Err(errno(EFAULT));
-    }
+    user_mem::copy_from_user(token, src, out.as_mut_slice(), UserReadPolicy::DemandPaged)?;
     Ok(out)
 }
 
@@ -4088,7 +4066,7 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, count: usize, offset: isize) -> i
             return errno(EINVAL);
         }
     }
-    let Some(slices) = translated_byte_buffer_checked(token, buf, count, false) else {
+    let Some(slices) = translated_user_read_buffer(token, buf, count) else {
         return errno(EFAULT);
     };
     let mut total = 0usize;
@@ -4173,25 +4151,10 @@ pub fn sys_pwritev(fd: usize, iov: *const usize, iovcnt: usize, offset: isize) -
     let mut total_written = 0usize;
     for i in 0..iovcnt {
         let iov_ptr = unsafe { (iov as *const u8).add(i * 16) };
-        let Some(iov_buffers) = translated_byte_buffer_checked(token, iov_ptr, 16, false) else {
-            return if total_written > 0 {
-                total_written as isize
-            } else {
-                errno(EFAULT)
-            };
-        };
-
         let mut iov_data = [0u8; 16];
-        let mut copied = 0usize;
-        for slice in iov_buffers {
-            let n = slice.len().min(16 - copied);
-            iov_data[copied..copied + n].copy_from_slice(&slice[..n]);
-            copied += n;
-            if copied >= 16 {
-                break;
-            }
-        }
-        if copied < 16 {
+        if user_mem::copy_from_user(token, iov_ptr, &mut iov_data, UserReadPolicy::DemandPaged)
+            .is_err()
+        {
             return if total_written > 0 {
                 total_written as isize
             } else {
@@ -4247,7 +4210,7 @@ pub fn sys_pwritev(fd: usize, iov: *const usize, iovcnt: usize, offset: isize) -
             }
         }
 
-        let Some(buffers) = translated_byte_buffer_checked(token, base as *const u8, len, false)
+        let Some(buffers) = translated_user_read_buffer(token, base as *const u8, len)
         else {
             return if total_written > 0 {
                 total_written as isize
@@ -4607,16 +4570,12 @@ fn read_itimerspec_from_user(token: usize, ptr: *const u8) -> Option<ITimerSpec>
         return None;
     }
     let size = core::mem::size_of::<ITimerSpec>();
-    let bufs = translated_byte_buffer_checked(token, ptr, size, false)?;
     let mut raw = [0u8; 32];
-    let mut off = 0usize;
-    for slice in bufs.iter() {
-        let n = slice.len().min(size - off);
-        raw[off..off + n].copy_from_slice(&slice[..n]);
-        off += n;
-        if off >= size { break; }
+    if user_mem::copy_from_user(token, ptr, &mut raw[..size], UserReadPolicy::DemandPaged)
+        .is_err()
+    {
+        return None;
     }
-    if off < size { return None; }
     Some(unsafe { core::mem::transmute(raw) })
 }
 
@@ -4626,19 +4585,13 @@ fn write_itimerspec_to_user(token: usize, ptr: *mut u8, spec: ITimerSpec) -> boo
     }
     let size = core::mem::size_of::<ITimerSpec>();
     let raw: [u8; 32] = unsafe { core::mem::transmute(spec) };
-    let bufs = match translated_byte_buffer_checked(token, ptr, size, true) {
-        Some(b) => b,
-        None => return false,
-    };
-    let mut off = 0usize;
-    for slice in bufs.iter() {
-        let n = slice.len().min(size - off);
-        let dst = unsafe { core::slice::from_raw_parts_mut(slice.as_ptr() as *mut u8, n) };
-        dst.copy_from_slice(&raw[off..off + n]);
-        off += n;
-        if off >= size { break; }
-    }
-    off >= size
+    user_mem::copy_to_user(
+        token,
+        ptr,
+        &raw[..size],
+        UserWritePolicy::DemandCowWithForkFallback,
+    )
+    .is_ok()
 }
 
 fn timespec_to_us(ts: &TimeSpec) -> u64 {

@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use super::errno::*;
+use super::user_mem::{self, UserReadPolicy, UserWritePolicy};
 use crate::{
     config::PAGE_SIZE,
     mm::{frame_alloc, FrameTracker, MapPermission, VirtAddr},
@@ -332,8 +333,6 @@ pub fn sys_msgget(key: IpcKey, msgflg: i32) -> isize {
 /// - Success: 0
 /// - Failure: -errno
 pub fn sys_msgsnd(msqid: i32, msgp: usize, msgsz: usize, _msgflg: i32) -> isize {
-    use crate::mm::translated_byte_buffer_checked;
-
     if msgsz > MSGMAX {
         return errno(EINVAL);
     }
@@ -355,40 +354,30 @@ pub fn sys_msgsnd(msqid: i32, msgp: usize, msgsz: usize, _msgflg: i32) -> isize 
 
     // Read mtype (first sizeof(isize) bytes)
     let mtype_size = core::mem::size_of::<isize>();
-    let Some(mtype_buffers) =
-        translated_byte_buffer_checked(token, msgp as *const u8, mtype_size, false)
-    else {
-        return errno(EFAULT);
+    let mtype = match user_mem::read_from_user::<isize>(
+        token,
+        msgp as *const isize,
+        UserReadPolicy::DemandPaged,
+    ) {
+        Ok(v) => v,
+        Err(_) => return errno(EFAULT),
     };
-    let mut mtype_bytes = [0u8; 8];
-    let mut offset = 0;
-    for buf in mtype_buffers {
-        let len = buf.len().min(mtype_size - offset);
-        mtype_bytes[offset..offset + len].copy_from_slice(&buf[..len]);
-        offset += len;
-    }
-    if offset < mtype_size {
-        return errno(EFAULT);
-    }
-    let mtype = isize::from_ne_bytes(mtype_bytes);
 
     if mtype <= 0 {
         return errno(EINVAL);
     }
 
     // Read mtext
-    let Some(mtext_buffers) =
-        translated_byte_buffer_checked(token, (msgp + mtype_size) as *const u8, msgsz, false)
-    else {
-        return errno(EFAULT);
-    };
-    let mut mtext = Vec::with_capacity(msgsz);
-    let mut copied = 0usize;
-    for buf in mtext_buffers {
-        mtext.extend_from_slice(buf);
-        copied += buf.len();
-    }
-    if copied < msgsz {
+    let mut mtext = Vec::new();
+    mtext.resize(msgsz, 0);
+    if user_mem::copy_from_user(
+        token,
+        (msgp + mtype_size) as *const u8,
+        mtext.as_mut_slice(),
+        UserReadPolicy::DemandPaged,
+    )
+    .is_err()
+    {
         return errno(EFAULT);
     }
 
@@ -414,8 +403,6 @@ pub fn sys_msgsnd(msqid: i32, msgp: usize, msgsz: usize, _msgflg: i32) -> isize 
 /// - Success: number of bytes in message text
 /// - Failure: -errno
 pub fn sys_msgrcv(msqid: i32, msgp: usize, msgsz: usize, msgtyp: isize, msgflg: i32) -> isize {
-    use crate::mm::translated_byte_buffer_checked;
-
     if msgp == 0 {
         return errno(EFAULT);
     }
@@ -450,47 +437,26 @@ pub fn sys_msgrcv(msqid: i32, msgp: usize, msgsz: usize, msgtyp: isize, msgflg: 
 
     // Write mtype
     let mtype_size = core::mem::size_of::<isize>();
-    let mtype_bytes = msg.mtype.to_ne_bytes();
-    let Some(mtype_buffers) =
-        translated_byte_buffer_checked(token, msgp as *const u8, mtype_size, true)
-    else {
-        return errno(EFAULT);
-    };
-    let mut offset = 0;
-    for buf in mtype_buffers {
-        let len = buf.len().min(mtype_size - offset);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                mtype_bytes[offset..].as_ptr(),
-                buf.as_ptr() as *mut u8,
-                len,
-            );
-        }
-        offset += len;
-    }
-    if offset < mtype_size {
+    if user_mem::copy_to_user(
+        token,
+        msgp as *mut u8,
+        &msg.mtype.to_ne_bytes()[..mtype_size],
+        UserWritePolicy::DemandCowWithForkFallback,
+    )
+    .is_err()
+    {
         return errno(EFAULT);
     }
 
     // Write mtext
-    let Some(mtext_buffers) =
-        translated_byte_buffer_checked(token, (msgp + mtype_size) as *const u8, actual_size, true)
-    else {
-        return errno(EFAULT);
-    };
-    offset = 0;
-    for buf in mtext_buffers {
-        let len = buf.len().min(actual_size - offset);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                msg.mtext[offset..].as_ptr(),
-                buf.as_ptr() as *mut u8,
-                len,
-            );
-        }
-        offset += len;
-    }
-    if offset < actual_size {
+    if user_mem::copy_to_user(
+        token,
+        (msgp + mtype_size) as *mut u8,
+        &msg.mtext[..actual_size],
+        UserWritePolicy::DemandCowWithForkFallback,
+    )
+    .is_err()
+    {
         return errno(EFAULT);
     }
 

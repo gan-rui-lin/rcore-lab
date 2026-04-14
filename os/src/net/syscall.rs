@@ -12,7 +12,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 use spin::Mutex;
 
 use crate::fs::{open_file, path_is_dir, OpenFlags};
-use crate::mm::{translated_byte_buffer, translated_byte_buffer_checked, translated_refmut};
+use crate::mm::translated_refmut;
 use crate::syscall::user_mem::{self, UserReadPolicy, UserWritePolicy};
 use crate::task::{current_process, current_user_token, has_pending_unmasked_signal, suspend_current_and_run_next};
 
@@ -84,18 +84,9 @@ fn read_sockaddr(addr_ptr: *const u8, addr_len: usize, token: usize) -> Option<I
     if addr_ptr.is_null() || addr_len < size {
         return None;
     }
-    let bufs = translated_byte_buffer_checked(token, addr_ptr, size, false)?;
     let mut raw = [0u8; 16];
-    let mut offset = 0;
-    for buf in bufs.iter() {
-        let n = buf.len().min(16 - offset);
-        raw[offset..offset + n].copy_from_slice(&buf[..n]);
-        offset += n;
-        if offset >= 16 {
-            break;
-        }
-    }
-    if offset < 16 {
+    if user_mem::copy_from_user(token, addr_ptr, &mut raw, UserReadPolicy::StrictChecked).is_err()
+    {
         return None;
     }
     let family = u16::from_ne_bytes([raw[0], raw[1]]);
@@ -123,22 +114,9 @@ fn read_sockaddr_for_connect(
     if (addr_ptr as usize) >= 0x4000_0000_0000 {
         return Err(EFAULT);
     }
-    let size = core::mem::size_of::<SockAddrIn>();
-    if translated_byte_buffer_checked(token, addr_ptr, size, false).is_none() {
-        return Err(EFAULT);
-    }
-    let bufs = translated_byte_buffer(token, addr_ptr, size);
     let mut raw = [0u8; 16];
-    let mut offset = 0usize;
-    for buf in bufs.iter() {
-        let n = buf.len().min(size - offset);
-        raw[offset..offset + n].copy_from_slice(&buf[..n]);
-        offset += n;
-        if offset >= size {
-            break;
-        }
-    }
-    if offset < size {
+    if user_mem::copy_from_user(token, addr_ptr, &mut raw, UserReadPolicy::StrictChecked).is_err()
+    {
         return Err(EFAULT);
     }
     let family = u16::from_ne_bytes([raw[0], raw[1]]);
@@ -403,18 +381,9 @@ fn read_sockaddr_family(addr_ptr: *const u8, addr_len: usize, token: usize) -> O
     if addr_ptr.is_null() || addr_len < 2 {
         return None;
     }
-    let bufs = translated_byte_buffer_checked(token, addr_ptr, 2, false)?;
     let mut raw = [0u8; 2];
-    let mut offset = 0;
-    for buf in bufs.iter() {
-        let n = buf.len().min(2 - offset);
-        raw[offset..offset + n].copy_from_slice(&buf[..n]);
-        offset += n;
-        if offset >= 2 {
-            break;
-        }
-    }
-    if offset < 2 {
+    if user_mem::copy_from_user(token, addr_ptr, &mut raw, UserReadPolicy::StrictChecked).is_err()
+    {
         return None;
     }
     Some(u16::from_ne_bytes(raw))
@@ -428,18 +397,15 @@ fn read_unix_sockaddr(addr_ptr: *const u8, addr_len: usize, token: usize) -> Opt
     }
     // sockaddr_un: { sa_family: u16, sun_path: [u8; 108] }
     let max_len = addr_len.min(110);
-    let bufs = translated_byte_buffer_checked(token, addr_ptr, max_len, false)?;
     let mut raw = vec![0u8; max_len];
-    let mut offset = 0;
-    for buf in bufs.iter() {
-        let n = buf.len().min(max_len - offset);
-        raw[offset..offset + n].copy_from_slice(&buf[..n]);
-        offset += n;
-        if offset >= max_len {
-            break;
-        }
-    }
-    if offset < max_len {
+    if user_mem::copy_from_user(
+        token,
+        addr_ptr,
+        raw.as_mut_slice(),
+        UserReadPolicy::StrictChecked,
+    )
+    .is_err()
+    {
         return None;
     }
     // raw[0..2] = family, raw[2..] = sun_path
@@ -1201,15 +1167,16 @@ pub fn sys_sendto(
     }
 
     // Read user data into kernel buffer
-    let Some(user_bufs) = translated_byte_buffer_checked(token, buf, len, false) else {
-        return EFAULT;
-    };
     let mut data = vec![0u8; len];
-    let mut offset = 0;
-    for ubuf in user_bufs.iter() {
-        let n = ubuf.len().min(len - offset);
-        data[offset..offset + n].copy_from_slice(&ubuf[..n]);
-        offset += n;
+    if user_mem::copy_from_user(
+        token,
+        buf,
+        data.as_mut_slice(),
+        UserReadPolicy::DemandPaged,
+    )
+    .is_err()
+    {
+        return EFAULT;
     }
 
     // AF_UNIX sendto path.
@@ -1397,15 +1364,8 @@ pub fn sys_recvfrom(
                 let n = file.unix_read(&mut tmp);
                 if n > 0 {
                     let n = n as usize;
-                    let user_bufs = translated_byte_buffer(token, buf, n);
-                    let mut off = 0;
-                    for ubuf in user_bufs.iter() {
-                        let copy = ubuf.len().min(n - off);
-                        let dst = unsafe {
-                            core::slice::from_raw_parts_mut(ubuf.as_ptr() as *mut u8, copy)
-                        };
-                        dst.copy_from_slice(&tmp[off..off + copy]);
-                        off += copy;
+                    if copy_to_user(token, buf, &tmp[..n]).is_err() {
+                        return EFAULT;
                     }
                     // Return AF_UNIX family. For bind05 this is enough; sendto falls back to connected peer.
                     if !src_addr.is_null() {
@@ -1447,15 +1407,8 @@ pub fn sys_recvfrom(
                         let pid = current_process().getpid();
                         trace!("[net] recvfrom TCP fd={} pid={} got {} bytes state={:?}", fd, pid, n, state);
                         // Write back to user buffer
-                        let user_bufs = translated_byte_buffer(token, buf, n);
-                        let mut off = 0;
-                        for ubuf in user_bufs.iter() {
-                            let copy = ubuf.len().min(n - off);
-                            let dst = unsafe {
-                                core::slice::from_raw_parts_mut(ubuf.as_ptr() as *mut u8, copy)
-                            };
-                            dst.copy_from_slice(&tmp[off..off + copy]);
-                            off += copy;
+                        if copy_to_user(token, buf, &tmp[..n]).is_err() {
+                            return EFAULT;
                         }
                         return n as isize;
                     }
@@ -1489,15 +1442,8 @@ pub fn sys_recvfrom(
                 match socket.recv_slice(&mut tmp) {
                     Ok((n, endpoint)) => {
                         // Write data to user buffer
-                        let user_bufs = translated_byte_buffer(token, buf, n);
-                        let mut off = 0;
-                        for ubuf in user_bufs.iter() {
-                            let copy = ubuf.len().min(n - off);
-                            let dst = unsafe {
-                                core::slice::from_raw_parts_mut(ubuf.as_ptr() as *mut u8, copy)
-                            };
-                            dst.copy_from_slice(&tmp[off..off + copy]);
-                            off += copy;
+                        if copy_to_user(token, buf, &tmp[..n]).is_err() {
+                            return EFAULT;
                         }
                         // Write source address
                         if !src_addr.is_null() {
@@ -1601,17 +1547,13 @@ pub fn sys_getsockopt(
                 if file.is_unix_socket() {
                     let unix_type = file.unix_socket_type() as u32;
                     drop(inner);
-                    let write_u32 = |val: u32| {
-                        let bufs = translated_byte_buffer(token, optval, 4);
-                        let bytes = val.to_ne_bytes();
-                        if let Some(buf) = bufs.first() {
-                            let dst = unsafe {
-                                core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, 4)
-                            };
-                            dst.copy_from_slice(&bytes);
+                    let write_u32 = |val: u32| -> isize {
+                        if copy_to_user(token, optval, &val.to_ne_bytes()).is_err() {
+                            return EFAULT;
                         }
                         let len_ref = translated_refmut(token, optlen);
                         *len_ref = 4;
+                        0
                     };
                     if level == SOL_SOCKET {
                         const SO_TYPE: usize = 3;
@@ -1624,12 +1566,12 @@ pub fn sys_getsockopt(
                         const SO_KEEPALIVE_OPT: usize = 9;
                         const SO_PEERCRED: usize = 17;
                         match optname {
-                            SO_TYPE => { write_u32(unix_type); return 0; }
-                            SO_DOMAIN => { write_u32(1); return 0; } // AF_UNIX = 1
-                            SO_PROTOCOL => { write_u32(0); return 0; }
+                            SO_TYPE => return write_u32(unix_type),
+                            SO_DOMAIN => return write_u32(1), // AF_UNIX = 1
+                            SO_PROTOCOL => return write_u32(0),
                             SO_ERROR_OPT | SO_SNDBUF_OPT | SO_RCVBUF_OPT |
                             SO_REUSEADDR_OPT | SO_KEEPALIVE_OPT => {
-                                write_u32(0); return 0;
+                                return write_u32(0);
                             }
                             SO_PEERCRED => {
                                 // Write struct ucred { pid: u32, uid: u32, gid: u32 }
@@ -1642,16 +1584,8 @@ pub fn sys_getsockopt(
                                     b[8..12].copy_from_slice(&g.to_ne_bytes());
                                     b
                                 };
-                                let bufs = translated_byte_buffer(token, optval, 12);
-                                let mut off = 0usize;
-                                for buf in bufs {
-                                    let dst = unsafe {
-                                        core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, buf.len())
-                                    };
-                                    let n = dst.len().min(12 - off);
-                                    dst[..n].copy_from_slice(&ucred_bytes[off..off + n]);
-                                    off += n;
-                                    if off >= 12 { break; }
+                                if copy_to_user(token, optval, &ucred_bytes).is_err() {
+                                    return EFAULT;
                                 }
                                 let len_ref = translated_refmut(token, optlen);
                                 *len_ref = 12;
@@ -1672,16 +1606,13 @@ pub fn sys_getsockopt(
     };
 
     // Helper to write a u32 value to user optval/optlen
-    let write_u32 = |val: u32| {
-        let bufs = translated_byte_buffer(token, optval, 4);
-        let bytes = val.to_ne_bytes();
-        if let Some(buf) = bufs.first() {
-            let dst =
-                unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, 4) };
-            dst.copy_from_slice(&bytes);
+    let write_u32 = |val: u32| -> isize {
+        if copy_to_user(token, optval, &val.to_ne_bytes()).is_err() {
+            return EFAULT;
         }
         let len_ref = translated_refmut(token, optlen);
         *len_ref = 4;
+        0
     };
 
     // Validate level and return appropriate errors for invalid/unsupported options.
@@ -1690,11 +1621,11 @@ pub fn sys_getsockopt(
         SOL_SOCKET => {
             // Return default values for common socket options
             match optname {
-                SO_ERROR => { write_u32(0); 0 }
-                SO_SNDBUF => { write_u32(65536); 0 }
-                SO_RCVBUF => { write_u32(65536); 0 }
-                SO_REUSEADDR => { write_u32(1); 0 }
-                SO_KEEPALIVE => { write_u32(0); 0 }
+                SO_ERROR => write_u32(0),
+                SO_SNDBUF => write_u32(65536),
+                SO_RCVBUF => write_u32(65536),
+                SO_REUSEADDR => write_u32(1),
+                SO_KEEPALIVE => write_u32(0),
                 _ => {
                     warn!("[net] getsockopt SOL_SOCKET unsupported optname={}", optname);
                     EOPNOTSUPP
@@ -1810,15 +1741,12 @@ pub fn sys_socketpair(domain: usize, sock_type: usize, protocol: usize, sv: *mut
     }
 
     let token = current_user_token();
-    if translated_byte_buffer_checked(token, sv as *const u8, core::mem::size_of::<i32>(), false)
-        .is_none()
-        || translated_byte_buffer_checked(
-            token,
-            unsafe { sv.add(1) } as *const u8,
-            core::mem::size_of::<i32>(),
-            false,
-        )
-        .is_none()
+    if !user_mem::ensure_user_readable(
+        token,
+        sv as *const u8,
+        core::mem::size_of::<i32>() * 2,
+        UserReadPolicy::StrictChecked,
+    )
     {
         return EFAULT;
     }

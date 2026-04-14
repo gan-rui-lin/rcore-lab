@@ -12,8 +12,8 @@ use lazy_static::lazy_static;
 use crate::{
     fs::{open_file, path_exists, path_is_dir, File, OpenFlags},
     mm::{
-        translated_byte_buffer_checked, translated_ref, translated_refmut, translated_str_checked,
-        MapAreaType, MapPermission, MmapMeta, PageTable, ProtectError, VirtAddr,
+        translated_ref, translated_refmut, translated_str_checked, MapAreaType, MapPermission,
+        MmapMeta, PageTable, ProtectError, VirtAddr,
     },
     task::{
         add_task, current_process, current_task, current_trap_cx, current_user_token,
@@ -268,16 +268,13 @@ pub fn sys_futex(
     let opt = FutexOpt::from_bits_truncate(futex_op);
     let token = current_user_token();
     let uaddr1_va = uaddr1 as usize;
-    // Handle lazy mmap pages: if VA isn't mapped yet, trigger demand page allocation.
-    {
-        let pt = PageTable::from_token(token);
-        if pt.translate_va(VirtAddr::from(uaddr1_va)).is_none() {
-            let process = current_process();
-            let mut inner = process.inner_exclusive_access();
-            if !inner.memory_set.handle_demand_fault(uaddr1_va) {
-                return errno(EFAULT);
-            }
-        }
+    if !user_mem::ensure_user_readable(
+        token,
+        uaddr1 as *const u8,
+        core::mem::size_of::<i32>(),
+        UserReadPolicy::DemandPaged,
+    ) {
+        return errno(EFAULT);
     }
     let page_table = PageTable::from_token(token);
     let pa = match page_table.translate_va(VirtAddr::from(uaddr1_va)) {
@@ -4106,17 +4103,13 @@ pub fn sys_capget(header_ptr: *mut u8, data_ptr: *mut u8) -> isize {
         // Determine data count (V2/V3 have 2 sets)
         let data_count: usize = if hdr.version == _LINUX_CAPABILITY_VERSION_1 { 1 } else { 2 };
         let data_bytes_len = data_count * core::mem::size_of::<CapData>();
-        // Accept regular writable mappings and COW read-only PTEs (writable VMA),
-        // but keep EFAULT for PROT_NONE/readonly user buffers.
-        if translated_byte_buffer_checked(token, data_ptr, data_bytes_len, true).is_none() {
-            let process = current_process();
-            let inner = process.inner_exclusive_access();
-            if !inner
-                .memory_set
-                .is_user_range_writable(data_ptr as usize, data_bytes_len)
-            {
-                return errno(EFAULT);
-            }
+        if !user_mem::ensure_user_writable(
+            token,
+            data_ptr,
+            data_bytes_len,
+            UserWritePolicy::DemandCowWithForkFallback,
+        ) {
+            return errno(EFAULT);
         }
 
         // Get caps for the target process
