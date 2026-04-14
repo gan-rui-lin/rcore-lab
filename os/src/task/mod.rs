@@ -26,7 +26,7 @@ use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
 mod initproc_embed;
 #[allow(unused_imports)]
 use crate::fs::{open_file, OpenFlags};
-use crate::mm::{translated_byte_buffer, translated_refmut, PageTable, VirtAddr};
+use crate::mm::{translated_byte_buffer_checked, translated_refmut, PageTable, VirtAddr};
 use crate::timer::remove_timer;
 use alloc::sync::Arc;
 #[allow(unused_imports)]
@@ -122,8 +122,13 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), ()> {
     if dst.is_null() {
         return Err(());
     }
+    if data.is_empty() {
+        return Ok(());
+    }
     let mut offset = 0usize;
-    let slices = translated_byte_buffer(token, dst, data.len());
+    let Some(slices) = translated_byte_buffer_checked(token, dst, data.len(), true) else {
+        return Err(());
+    };
     for slice in slices {
         let len = slice.len().min(data.len() - offset);
         slice[..len].copy_from_slice(&data[offset..offset + len]);

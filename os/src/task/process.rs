@@ -7,7 +7,7 @@ use super::{
 use crate::config::{USER_MMAP_TOP, USER_STACK_SIZE};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{
-    translated_byte_buffer, translated_ref, translated_refmut, translated_str, MemorySet,
+    translated_byte_buffer_checked, translated_ref, translated_refmut, translated_str, MemorySet,
 };
 use crate::sync::UPIntrRefMut;
 use crate::sync::{Condvar, Mutex, Semaphore, UPIntrFreeCell};
@@ -477,14 +477,18 @@ impl ProcessControlBlock {
         let new_token = memory_set.token();
         if exec_name == "sh" || exec_name == "busybox" {
             let mut bytes = [0u8; 8];
-            let mut offset = 0usize;
             let debug_entry = main_entry;
-            for slice in translated_byte_buffer(new_token, debug_entry as *const u8, bytes.len()) {
-                let len = slice.len().min(bytes.len() - offset);
-                bytes[offset..offset + len].copy_from_slice(&slice[..len]);
-                offset += len;
-                if offset >= bytes.len() {
-                    break;
+            if let Some(slices) =
+                translated_byte_buffer_checked(new_token, debug_entry as *const u8, bytes.len(), false)
+            {
+                let mut offset = 0usize;
+                for slice in slices {
+                    let len = slice.len().min(bytes.len() - offset);
+                    bytes[offset..offset + len].copy_from_slice(&slice[..len]);
+                    offset += len;
+                    if offset >= bytes.len() {
+                        break;
+                    }
                 }
             }
             debug!("[kernel] exec: entry mem bytes={:02x?}", bytes);
