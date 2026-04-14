@@ -697,6 +697,36 @@ fn translated_user_read_buffer(
     user_mem::translated_user_read_buffer(token, ptr, len, UserReadPolicy::DemandPaged)
 }
 
+fn max_user_write_len(token: usize, ptr: *const u8, len: usize) -> usize {
+    if len == 0 || ptr.is_null() {
+        return 0;
+    }
+    if user_mem::ensure_user_writable(
+        token,
+        ptr,
+        len,
+        UserWritePolicy::DemandCowWithForkFallback,
+    ) {
+        return len;
+    }
+    let mut lo = 0usize;
+    let mut hi = len;
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        if user_mem::ensure_user_writable(
+            token,
+            ptr,
+            mid,
+            UserWritePolicy::DemandCowWithForkFallback,
+        ) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
 fn build_statfs() -> StatFs {
     StatFs {
         f_type: 0xEF53, // ext4 magic; used as a generic placeholder
@@ -2446,6 +2476,13 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> isize {
         return errno(EINVAL);
     }
     let token = current_user_token();
+    // Some userspace runtimes pass large len while the backing user mapping
+    // is only partially writable. Probe the maximal writable prefix so we can
+    // return partial directory entries instead of failing with EFAULT.
+    let effective_len = max_user_write_len(token, buf as *const u8, len);
+    if effective_len < LINUX_DIRENT64_MIN_RECLEN {
+        return errno(EFAULT);
+    }
     let process = current_process();
     let inner = process.inner_exclusive_access();
     if fd >= inner.fd_table.len() {
@@ -2477,7 +2514,7 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> isize {
     while idx < entries.len() {
         let name = entries[idx].as_bytes();
         let reclen = align_up(19 + name.len() + 1, 8);
-        if out.len() + reclen > len {
+        if out.len() + reclen > effective_len {
             break;
         }
         let ino = (idx + 1) as u64;
