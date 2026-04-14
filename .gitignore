@@ -1,7 +1,6 @@
 .*/*
 .merge_chain_state
 .github/*
-!.vscode/settings.json
 .idea
 Cargo.lock
 target
