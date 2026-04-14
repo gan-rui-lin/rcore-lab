@@ -8,7 +8,7 @@ use lwext4_rust::bindings::{O_CREAT, O_RDONLY, O_RDWR, O_TRUNC};
 use lwext4_rust::{Ext4File, InodeTypes};
 
 const SEEK_SET: u32 = 0;
-const SEEK_END: u32 = 2;
+const ZERO_PAD_CHUNK: usize = 1024 * 1024;
 
 pub struct Ext4Inode {
     path: String,
@@ -164,38 +164,27 @@ impl VfsInode for Ext4Inode {
         self.with_data_file(true, |file| {
             if file.file_seek(offset as i64, SEEK_SET).is_err() {
                 // lwext4 rejects SEEK_SET beyond EOF with EINVAL.
-                // To extend: seek to end, write zeros from EOF to the target position,
-                // then write the actual data (or return early if buf is all zeros).
+                // Extend from EOF to `offset` by writing zero chunks, then write `buf`.
+                // Use reasonably large chunks so large sparse extensions (e.g. fallocate)
+                // do not degenerate into tiny-byte loops.
                 let size = file.file_size() as usize;
                 if offset < size {
                     // offset is within file but seek failed — reopen
                     return None;
                 }
-                let new_size = offset.checked_add(buf.len())?;
-                let pad_len = new_size - size;
-                // Seek to end of file (SEEK_END with offset=0 always succeeds)
-                if file.file_seek(0, SEEK_END).is_err() {
+                if file.file_seek(size as i64, SEEK_SET).is_err() {
                     return None;
                 }
-                // Write zeros to extend the file; use a 512-byte stack buffer
-                let zeros = [0u8; 512];
-                let mut remaining = pad_len;
+                let mut remaining = offset - size;
+                let mut zeros = Vec::with_capacity(ZERO_PAD_CHUNK);
+                zeros.resize(ZERO_PAD_CHUNK, 0);
                 while remaining > 0 {
                     let chunk = remaining.min(zeros.len());
-                    let written = file.file_write(&zeros[..chunk]).unwrap_or(0) as usize;
-                    if written == 0 {
+                    let wrote = file.file_write(&zeros[..chunk]).unwrap_or(0) as usize;
+                    if wrote == 0 {
                         return None;
                     }
-                    remaining -= written;
-                }
-                // If buf is all zeros (e.g. fallocate emulation), we're done —
-                // the file has been extended with zeros already.
-                if buf.iter().all(|&b| b == 0) {
-                    return Some(buf.len());
-                }
-                // Seek back to offset to write the actual data
-                if file.file_seek(offset as i64, SEEK_SET).is_err() {
-                    return None;
+                    remaining -= wrote;
                 }
             }
             Some(file.file_write(buf).unwrap_or(0) as usize)

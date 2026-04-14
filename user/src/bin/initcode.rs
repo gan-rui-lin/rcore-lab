@@ -918,7 +918,17 @@ run_case_with_timeout() {
     while kill -0 \"$case_pid\" 2>/dev/null; do
         if [ \"$elapsed\" -ge \"$case_timeout\" ]; then
             kill -9 \"$case_pid\" 2>/dev/null
-            wait \"$case_pid\" 2>/dev/null
+            # Avoid blocking forever when the task is stuck in uninterruptible
+            # kernel state; best-effort reap only if it exits quickly.
+            loops=0
+            while kill -0 \"$case_pid\" 2>/dev/null && [ \"$loops\" -lt 2 ]; do
+                sleep 1
+                loops=$((loops + 1))
+            done
+            if ! kill -0 \"$case_pid\" 2>/dev/null; then
+                wait \"$case_pid\" 2>/dev/null
+            fi
+            echo \"TIMEOUT LTP CASE $(basename \"$case_file\")\"
             return 124
         fi
         sleep 1

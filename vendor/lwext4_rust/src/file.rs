@@ -179,11 +179,18 @@ impl Ext4File {
 
     pub fn file_seek(&mut self, offset: i64, seek_type: u32) -> Result<usize, i32> {
         let r = unsafe { ext4_fseek(&mut self.file_desc, offset, seek_type) };
-        if r != EOK as i32 {
-            error!("ext4_fseek: rc = {}", r);
-            return Err(r);
+        if r == EOK as i32 {
+            return Ok(EOK as usize);
         }
-        Ok(EOK as usize)
+        // lwext4 rejects SEEK_SET beyond EOF with EINVAL.
+        // Linux file semantics allow positioning beyond EOF and extending on write.
+        // Emulate this by updating in-memory fpos only; fsize is still updated by fwrite.
+        if r == EINVAL as i32 && seek_type == 0 && offset >= 0 {
+            self.file_desc.fpos = offset as u64;
+            return Ok(EOK as usize);
+        }
+        error!("ext4_fseek: rc = {}", r);
+        Err(r)
     }
 
     pub fn file_read(&mut self, buff: &mut [u8]) -> Result<usize, i32> {
