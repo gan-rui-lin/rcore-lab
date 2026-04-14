@@ -2890,7 +2890,19 @@ pub fn sys_sbrk(arg: isize) -> isize {
         // sbrk(delta) is equivalent to brk(current_brk + delta)
         arg
     };
-    let new_brk = (current_brk as isize + delta) as usize;
+    let Some(new_brk_signed) = (current_brk as isize).checked_add(delta) else {
+        error!(
+            "[sys_sbrk] pid={} name={} sepc={:#x} arg={} cur={:#x} heap_bottom={:#x} overflow -> ENOMEM",
+            pid,
+            name,
+            sepc,
+            arg,
+            current_brk,
+            heap_bottom
+        );
+        return errno(ENOMEM);
+    };
+    let new_brk = new_brk_signed as usize;
     if new_brk < heap_bottom {
         // new_brk is below the heap bottom, which is invalid
         error!(
@@ -2902,6 +2914,20 @@ pub fn sys_sbrk(arg: isize) -> isize {
             current_brk,
             heap_bottom,
             new_brk
+        );
+        return errno(ENOMEM);
+    }
+    if new_brk >= USER_ADDR_MAX {
+        error!(
+            "[sys_sbrk] pid={} name={} sepc={:#x} arg={} cur={:#x} heap_bottom={:#x} new={:#x} exceeds USER_ADDR_MAX={:#x} -> ENOMEM",
+            pid,
+            name,
+            sepc,
+            arg,
+            current_brk,
+            heap_bottom,
+            new_brk,
+            USER_ADDR_MAX
         );
         return errno(ENOMEM);
     }

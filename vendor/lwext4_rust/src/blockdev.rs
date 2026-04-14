@@ -191,7 +191,6 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
     ) -> ::core::ffi::c_int {
         unsafe {
             // debug!("WRITE Ext4 block id: {}, count: {}", blk_id, blk_cnt);
-
             let devt = &mut *((*(*bdev).bdif).p_user as *mut K::DevType);
             //let mut devt = K::DevType::borrow_mut((*(*bdev).bdif).p_user);
             //let mut devt = K::DevType::from_foreign((*(*bdev).bdif).p_user);

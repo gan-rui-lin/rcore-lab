@@ -738,6 +738,41 @@ fn try_resolve_user_cow_writable(token: usize, ptr: *const u8, len: usize) -> bo
     true
 }
 
+fn try_resolve_user_readable(token: usize, ptr: *const u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let start = ptr as usize;
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    let page_table = crate::mm::PageTable::from_token(token);
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let mut va = start;
+    while va < end {
+        let vpn = crate::mm::VirtAddr::from(va).floor();
+        let mut pte = page_table.translate(vpn);
+        if pte.is_none() && !inner.memory_set.handle_demand_fault(va) {
+            return false;
+        }
+        pte = page_table.translate(vpn);
+        let Some(pte) = pte else {
+            return false;
+        };
+        let flags = pte.flags();
+        if !pte.is_valid()
+            || !flags.contains(crate::mm::PTEFlags::U)
+            || !flags.contains(crate::mm::PTEFlags::R)
+        {
+            return false;
+        }
+        let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
+        va = next_page.max(va + 1);
+    }
+    true
+}
+
 fn translated_user_write_buffer(
     token: usize,
     ptr: *const u8,
@@ -776,6 +811,22 @@ fn translated_user_write_buffer(
         return None;
     }
     Some(translated_byte_buffer(token, ptr, len))
+}
+
+fn translated_user_read_buffer(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+) -> Option<Vec<&'static mut [u8]>> {
+    if let Some(buffers) = translated_byte_buffer_checked(token, ptr, len, false) {
+        return Some(buffers);
+    }
+    if try_resolve_user_readable(token, ptr, len) {
+        if let Some(buffers) = translated_byte_buffer_checked(token, ptr, len, false) {
+            return Some(buffers);
+        }
+    }
+    None
 }
 
 fn build_statfs() -> StatFs {
@@ -825,7 +876,7 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
                 return errno(EINVAL);
             }
         }
-        let Some(buffers) = translated_byte_buffer_checked(token, buf, len, false) else {
+        let Some(buffers) = translated_user_read_buffer(token, buf, len) else {
             return errno(EFAULT);
         };
         let written = match file.write_user_buffer(UserBuffer::new(buffers)) {

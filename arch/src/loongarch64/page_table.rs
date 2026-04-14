@@ -186,6 +186,19 @@ impl PageTable {
     }
     /// set the map between virtual page number and physical page number
     pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
+        if flags.contains(PTEFlags::U) {
+            let max_user_ppn = PhysAddr::from(crate::MEMORY_END).floor().0;
+            if ppn.0 >= max_user_ppn {
+                error!(
+                    "[page_table.map] reject invalid user ppn: vpn={:#x} ppn={:#x} max={:#x} flags={:#x}",
+                    vpn.0,
+                    ppn.0,
+                    max_user_ppn,
+                    flags.bits()
+                );
+                return;
+            }
+        }
         let pte = self.find_pte_create(vpn).unwrap();
         // Allow overwriting existing PTE (needed for MAP_FIXED).
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
@@ -262,6 +275,7 @@ pub fn translated_byte_buffer_checked(
     if len == 0 {
         return Some(Vec::new());
     }
+    let max_user_ppn = PhysAddr::from(crate::MEMORY_END).floor().0;
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
     let end = start.checked_add(len)?;
@@ -282,6 +296,9 @@ pub fn translated_byte_buffer_checked(
             return None;
         }
         let ppn = pte.ppn();
+        if flags.contains(PTEFlags::U) && ppn.0 >= max_user_ppn {
+            return None;
+        }
         vpn.step();
         let mut end_va: VirtAddr = vpn.into();
         end_va = end_va.min(VirtAddr::from(end));

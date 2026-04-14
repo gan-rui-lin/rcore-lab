@@ -65,11 +65,17 @@ extern "C" fn kernel_trap_dispatch(_trap_cx: &context::KernelTrapContext) {
         Trap::Exception(Exception::Breakpoint) => TrapType::Breakpoint,
         _ => {
             error!(
-                "[rv-ktrap] unsupported kernel trap: bits={:#x} cause={:?} stval={:#x} sepc={:#x}",
+                "[rv-ktrap] unsupported kernel trap: bits={:#x} cause={:?} stval={:#x} sepc={:#x} ra={:#x} sp={:#x} a0={:#x} a1={:#x} a2={:#x} a7={:#x}",
                 scause.bits(),
                 scause.cause(),
                 stval,
-                _trap_cx.sepc
+                _trap_cx.sepc,
+                _trap_cx.x[1],
+                _trap_cx.x[2],
+                _trap_cx.x[10],
+                _trap_cx.x[11],
+                _trap_cx.x[12],
+                _trap_cx.x[17]
             );
             panic!(
                 "Unsupported trap from kernel: {:?}, stval = {:#x}!",

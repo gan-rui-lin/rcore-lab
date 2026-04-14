@@ -365,6 +365,17 @@ impl MemorySet {
 
         // map_one uses &mut area and &mut page_table — split borrows on two fields
         self.areas[area_idx].map_one(&mut self.page_table, fault_vpn);
+        if !self
+            .page_table
+            .translate(fault_vpn)
+            .map_or(false, |p| p.is_valid())
+        {
+            error!(
+                "[demand_fault] map failed vpn={:#x} addr={:#x}",
+                fault_vpn.0, addr
+            );
+            return false;
+        }
 
         // If file-backed, overwrite the zero page with file content
         if let Some((file, file_off)) = file_info {
@@ -867,15 +878,16 @@ impl MemorySet {
                 pte.bits
             );
         }
-        // Map heap with Heap type (initially zero-sized)
+        // Register heap VMA as lazy:
+        // brk/sbrk may move the program break far forward, but physical pages
+        // should still be allocated on first touch via page fault.
         memory_set.push(
-            MapArea::new_with_type(
+            MapArea::new_lazy(
                 heap_bottom.into(),
                 heap_bottom.into(),
-                MapType::Framed,
                 MapPermission::R | MapPermission::W | MapPermission::U,
-                MapAreaType::Heap,
-            ),
+            )
+            .with_area_type(MapAreaType::Heap),
             None,
         );
         (heap_bottom, user_stack_top)
@@ -1442,6 +1454,20 @@ impl MemorySet {
         self.areas.iter().position(|area| area.area_type == MapAreaType::Heap)
     }
 
+    /// Check whether expanding heap to `new_end` would overlap non-heap VMAs.
+    fn heap_expand_conflicts(&self, heap_bottom: VirtAddr, new_end: VirtAddr) -> bool {
+        let heap_start_vpn = heap_bottom.floor();
+        let heap_end_vpn = new_end.ceil();
+        self.areas.iter().any(|area| {
+            if area.area_type == MapAreaType::Heap {
+                return false;
+            }
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            area_start < heap_end_vpn && area_end > heap_start_vpn
+        })
+    }
+
     /// shrink the heap area to new_end
     pub fn shrink_heap_to(&mut self, new_end: VirtAddr) -> bool {
         if let Some(idx) = self.find_heap_index() {
@@ -1455,6 +1481,13 @@ impl MemorySet {
 
     /// append the heap area to new_end using type-based lookup
     pub fn append_heap_to(&mut self, new_end: VirtAddr, heap_bottom: VirtAddr) -> bool {
+        if self.heap_expand_conflicts(heap_bottom, new_end) {
+            warn!(
+                "[append_heap_to] conflict when expanding heap: start={:#x} new_end={:#x}",
+                heap_bottom.0, new_end.0
+            );
+            return false;
+        }
         if let Some(idx) = self.find_heap_index() {
             trace!(
                 "[append_heap_to] found heap: start={:#x} old_end={:#x} new_end={:#x}",
@@ -1471,13 +1504,12 @@ impl MemorySet {
             "[append_heap_to] creating new heap: start={:#x} end={:#x}",
             heap_bottom.0, new_end.0
         );
-        let map_area = MapArea::new_with_type(
+        let map_area = MapArea::new_lazy(
             heap_bottom,
             new_end,
-            MapType::Framed,
             MapPermission::R | MapPermission::W | MapPermission::U,
-            MapAreaType::Heap,
-        );
+        )
+        .with_area_type(MapAreaType::Heap);
         self.push(map_area, None);
         true
     }
@@ -1973,8 +2005,10 @@ impl MapArea {
     }
     #[allow(unused)]
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
-        for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
-            self.map_one(page_table, vpn)
+        if !self.lazy {
+            for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
+                self.map_one(page_table, vpn)
+            }
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
