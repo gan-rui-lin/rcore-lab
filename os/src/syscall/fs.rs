@@ -1,7 +1,7 @@
 //! File and filesystem-related syscalls
 use super::errno::*;
 use super::process::{get_current_umask, TimeSpec};
-use crate::config::PAGE_SIZE;
+use super::user_mem::{self, UserReadPolicy, UserWritePolicy};
 use crate::fs::{
     create_dir, make_pipe, open_file, path_exists, path_is_dir, remove_path, DevNull, DevUrandom,
     DevZero, MemFdFile, OpenFlags, PollEvents, Stat, StatMode, TimerFdFile, TIMERFD_EAGAIN,
@@ -669,108 +669,12 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
     if dst.is_null() {
         return Err(errno(EFAULT));
     }
-    if data.is_empty() {
-        return Ok(());
-    }
-    let mut offset = 0usize;
-    let Some(slices) = translated_user_write_buffer(token, dst as *const u8, data.len()) else {
-        return Err(errno(EFAULT));
-    };
-    for slice in slices {
-        let len = slice.len().min(data.len() - offset);
-        slice[..len].copy_from_slice(&data[offset..offset + len]);
-        offset += len;
-        if offset >= data.len() {
-            break;
-        }
-    }
-    if offset == data.len() {
-        Ok(())
-    } else {
-        Err(errno(EFAULT))
-    }
-}
-
-fn try_resolve_user_cow_writable(token: usize, ptr: *const u8, len: usize) -> bool {
-    if len == 0 {
-        return true;
-    }
-    let start = ptr as usize;
-    let Some(end) = start.checked_add(len) else {
-        return false;
-    };
-    let page_table = crate::mm::PageTable::from_token(token);
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let mut va = start;
-    while va < end {
-        let vpn = crate::mm::VirtAddr::from(va).floor();
-        // For lazy mmap areas, kernel writes can legitimately touch pages
-        // before user mode faults them in. Resolve demand fault first.
-        let mut pte = page_table.translate(vpn);
-        if pte.is_none() && !inner.memory_set.handle_demand_fault(va) {
-            return false;
-        }
-        pte = page_table.translate(vpn);
-        let Some(pte) = pte else {
-            return false;
-        };
-        let flags = pte.flags();
-        if !pte.is_valid() || !flags.contains(crate::mm::PTEFlags::U) {
-            return false;
-        }
-        if !flags.contains(crate::mm::PTEFlags::W) && !inner.memory_set.handle_cow_fault(va) {
-            return false;
-        }
-        let Some(pte_after) = page_table.translate(vpn) else {
-            return false;
-        };
-        let flags_after = pte_after.flags();
-        if !pte_after.is_valid()
-            || !flags_after.contains(crate::mm::PTEFlags::U)
-            || !flags_after.contains(crate::mm::PTEFlags::W)
-        {
-            return false;
-        }
-        let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
-        va = next_page.max(va + 1);
-    }
-    true
-}
-
-fn try_resolve_user_readable(token: usize, ptr: *const u8, len: usize) -> bool {
-    if len == 0 {
-        return true;
-    }
-    let start = ptr as usize;
-    let Some(end) = start.checked_add(len) else {
-        return false;
-    };
-    let page_table = crate::mm::PageTable::from_token(token);
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let mut va = start;
-    while va < end {
-        let vpn = crate::mm::VirtAddr::from(va).floor();
-        let mut pte = page_table.translate(vpn);
-        if pte.is_none() && !inner.memory_set.handle_demand_fault(va) {
-            return false;
-        }
-        pte = page_table.translate(vpn);
-        let Some(pte) = pte else {
-            return false;
-        };
-        let flags = pte.flags();
-        if !pte.is_valid()
-            || !flags.contains(crate::mm::PTEFlags::U)
-            || !flags.contains(crate::mm::PTEFlags::R)
-        {
-            return false;
-        }
-        let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
-        va = next_page.max(va + 1);
-    }
-    true
+    user_mem::copy_to_user(
+        token,
+        dst,
+        data,
+        UserWritePolicy::DemandCowWithForkFallback,
+    )
 }
 
 fn translated_user_write_buffer(
@@ -778,39 +682,12 @@ fn translated_user_write_buffer(
     ptr: *const u8,
     len: usize,
 ) -> Option<Vec<&'static mut [u8]>> {
-    if let Some(buffers) = translated_byte_buffer_checked(token, ptr, len, true) {
-        return Some(buffers);
-    }
-    if try_resolve_user_cow_writable(token, ptr, len) {
-        if let Some(buffers) = translated_byte_buffer_checked(token, ptr, len, true) {
-            return Some(buffers);
-        }
-    }
-    // Legacy fallback for a few fork-* tests that still rely on permissive
-    // kernel writes even when PTE.W is temporarily absent.
-    let process = current_process();
-    let proc_name = process.inner_exclusive_access().name.clone();
-    if !proc_name.starts_with("fork") {
-        return None;
-    }
-    let start = ptr as usize;
-    let end = start.checked_add(len)?;
-    let page_table = crate::mm::PageTable::from_token(token);
-    let mut va = start;
-    while va < end {
-        let vpn = crate::mm::VirtAddr::from(va).floor();
-        let pte = page_table.translate(vpn)?;
-        let flags = pte.flags();
-        if !pte.is_valid() || !flags.contains(crate::mm::PTEFlags::U) {
-            return None;
-        }
-        let next_page = ((va / 4096) + 1) * 4096;
-        va = next_page.max(va + 1);
-    }
-    if translated_byte_buffer_checked(token, ptr, len, false).is_none() {
-        return None;
-    }
-    Some(translated_byte_buffer(token, ptr, len))
+    user_mem::translated_user_write_buffer(
+        token,
+        ptr,
+        len,
+        UserWritePolicy::DemandCowWithForkFallback,
+    )
 }
 
 fn translated_user_read_buffer(
@@ -818,15 +695,7 @@ fn translated_user_read_buffer(
     ptr: *const u8,
     len: usize,
 ) -> Option<Vec<&'static mut [u8]>> {
-    if let Some(buffers) = translated_byte_buffer_checked(token, ptr, len, false) {
-        return Some(buffers);
-    }
-    if try_resolve_user_readable(token, ptr, len) {
-        if let Some(buffers) = translated_byte_buffer_checked(token, ptr, len, false) {
-            return Some(buffers);
-        }
-    }
-    None
+    user_mem::translated_user_read_buffer(token, ptr, len, UserReadPolicy::DemandPaged)
 }
 
 fn build_statfs() -> StatFs {

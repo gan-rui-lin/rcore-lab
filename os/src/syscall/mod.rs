@@ -344,6 +344,7 @@ mod errno;
 mod fs;
 mod ipc;
 pub(crate) mod process;
+pub(crate) mod user_mem;
 mod sync;
 mod thread;
 

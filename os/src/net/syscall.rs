@@ -13,6 +13,7 @@ use spin::Mutex;
 
 use crate::fs::{open_file, path_is_dir, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_byte_buffer_checked, translated_refmut};
+use crate::syscall::user_mem::{self, UserReadPolicy, UserWritePolicy};
 use crate::task::{current_process, current_user_token, has_pending_unmasked_signal, suspend_current_and_run_next};
 
 use super::socket_file::{SocketFile, SocketType};
@@ -150,71 +151,20 @@ fn read_sockaddr_for_connect(
 }
 
 fn read_user_u32(token: usize, ptr: *const u32) -> Result<u32, isize> {
-    let Some(bufs) =
-        translated_byte_buffer_checked(token, ptr as *const u8, core::mem::size_of::<u32>(), false)
-    else {
-        return Err(EFAULT);
-    };
-    let mut raw = [0u8; 4];
-    let mut offset = 0usize;
-    for buf in bufs.iter() {
-        let n = buf.len().min(4 - offset);
-        raw[offset..offset + n].copy_from_slice(&buf[..n]);
-        offset += n;
-        if offset >= 4 {
-            break;
-        }
-    }
-    if offset < 4 {
-        return Err(EFAULT);
-    }
-    Ok(u32::from_ne_bytes(raw))
+    user_mem::read_from_user(token, ptr, UserReadPolicy::StrictChecked)
 }
 
 fn write_user_u32(token: usize, ptr: *mut u32, val: u32) -> Result<(), isize> {
-    let Some(bufs) =
-        translated_byte_buffer_checked(token, ptr as *const u8, core::mem::size_of::<u32>(), true)
-    else {
-        return Err(EFAULT);
-    };
-    let bytes = val.to_ne_bytes();
-    let mut offset = 0usize;
-    for buf in bufs.iter() {
-        let n = buf.len().min(4 - offset);
-        let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, n) };
-        dst.copy_from_slice(&bytes[offset..offset + n]);
-        offset += n;
-        if offset >= 4 {
-            break;
-        }
-    }
-    if offset < 4 {
-        return Err(EFAULT);
-    }
-    Ok(())
+    user_mem::copy_to_user(
+        token,
+        ptr as *mut u8,
+        &val.to_ne_bytes(),
+        UserWritePolicy::StrictChecked,
+    )
 }
 
 fn copy_to_user(token: usize, dst_ptr: *mut u8, src: &[u8]) -> Result<(), isize> {
-    if src.is_empty() {
-        return Ok(());
-    }
-    let Some(bufs) = translated_byte_buffer_checked(token, dst_ptr, src.len(), true) else {
-        return Err(EFAULT);
-    };
-    let mut offset = 0usize;
-    for buf in bufs.iter() {
-        let n = buf.len().min(src.len() - offset);
-        let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, n) };
-        dst.copy_from_slice(&src[offset..offset + n]);
-        offset += n;
-        if offset >= src.len() {
-            break;
-        }
-    }
-    if offset < src.len() {
-        return Err(EFAULT);
-    }
-    Ok(())
+    user_mem::copy_to_user(token, dst_ptr, src, UserWritePolicy::StrictChecked)
 }
 
 /// Write smoltcp IpEndpoint back to user-space sockaddr.

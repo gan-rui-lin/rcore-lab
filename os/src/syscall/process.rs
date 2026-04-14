@@ -12,9 +12,8 @@ use lazy_static::lazy_static;
 use crate::{
     fs::{open_file, path_exists, path_is_dir, File, OpenFlags},
     mm::{
-        translated_byte_buffer, translated_byte_buffer_checked, translated_ref, translated_refmut,
-        translated_str_checked, MapAreaType, MapPermission, MmapMeta, PTEFlags, PageTable,
-        ProtectError, VirtAddr,
+        translated_byte_buffer_checked, translated_ref, translated_refmut, translated_str_checked,
+        MapAreaType, MapPermission, MmapMeta, PageTable, ProtectError, VirtAddr,
     },
     task::{
         add_task, current_process, current_task, current_trap_cx, current_user_token,
@@ -31,6 +30,7 @@ use crate::{
 use arch::TrapFrameArgs;
 
 use super::errno::*;
+use super::user_mem::{self, UserReadPolicy, UserWritePolicy};
 use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
 use crate::config::{CLOCK_FREQ, PAGE_SIZE};
 use crate::sync::UPIntrFreeCell;
@@ -245,68 +245,11 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
     if start >= USER_ADDR_MAX || end > USER_ADDR_MAX {
         return Err(errno(EFAULT));
     }
-    let mut offset = 0usize;
-    let slices = if let Some(slices) = translated_byte_buffer_checked(token, dst, data.len(), true)
-    {
-        slices
-    } else {
-        // COW fork marks writable user pages read-only until a write fault.
-        // Some copy_to_user() paths (e.g., clock_gettime/capget) should still
-        // work for mapped user buffers. Keep strict user-mapping validation,
-        // but relax write-bit enforcement here to avoid false EFAULT.
-        let page_table = PageTable::from_token(token);
-        let mut va = start;
-        while va < end {
-            let vpn = VirtAddr::from(va).floor();
-            let Some(pte) = page_table.translate(vpn) else {
-                return Err(errno(EFAULT));
-            };
-            let flags = pte.flags();
-            if !pte.is_valid() || !flags.contains(PTEFlags::U) || !flags.contains(PTEFlags::R) {
-                return Err(errno(EFAULT));
-            }
-            let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
-            va = next_page.max(va + 1);
-        }
-        translated_byte_buffer(token, dst, data.len())
-    };
-    for slice in slices {
-        let len = slice.len().min(data.len() - offset);
-        slice[..len].copy_from_slice(&data[offset..offset + len]);
-        offset += len;
-        if offset >= data.len() {
-            break;
-        }
-    }
-    if offset == data.len() {
-        Ok(())
-    } else {
-        Err(errno(EFAULT))
-    }
+    user_mem::copy_to_user(token, dst, data, UserWritePolicy::RelaxedReadableMapping)
 }
 
 fn read_from_user<T: Copy>(token: usize, src: *const T) -> Result<T, isize> {
-    if src.is_null() {
-        return Err(errno(EFAULT));
-    }
-    let size = core::mem::size_of::<T>();
-    let mut data = vec![0u8; size];
-    let slices = translated_byte_buffer_checked(token, src as *const u8, size, false)
-        .ok_or_else(|| errno(EFAULT))?;
-    let mut offset = 0usize;
-    for slice in slices {
-        let len = slice.len().min(size - offset);
-        data[offset..offset + len].copy_from_slice(&slice[..len]);
-        offset += len;
-        if offset >= size {
-            break;
-        }
-    }
-    if offset != size {
-        return Err(errno(EFAULT));
-    }
-    let value = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const T) };
-    Ok(value)
+    user_mem::read_from_user(token, src, UserReadPolicy::StrictChecked)
 }
 
 pub fn sys_futex(
