@@ -2,6 +2,9 @@
 .merge_chain_state
 .github/*
 .idea
+.codex
+.codex-home/
+codex-skills/
 Cargo.lock
 target
 os/src/link_app.S
