@@ -205,7 +205,10 @@ fn try_resolve_user_cow_writable(token: usize, ptr: *const u8, len: usize) -> bo
     while va < end {
         let vpn = VirtAddr::from(va).floor();
         let mut pte = page_table.translate(vpn);
-        if pte.is_none() && !inner.memory_set.handle_demand_fault(va) {
+        // `translate()` may return a present leaf entry that is invalid (V=0).
+        // Treat that the same as "missing" for demand-paged VMAs.
+        if pte.map_or(true, |entry| !entry.is_valid()) && !inner.memory_set.handle_demand_fault(va)
+        {
             return false;
         }
         pte = page_table.translate(vpn);
@@ -250,7 +253,10 @@ fn try_resolve_user_readable(token: usize, ptr: *const u8, len: usize) -> bool {
     while va < end {
         let vpn = VirtAddr::from(va).floor();
         let mut pte = page_table.translate(vpn);
-        if pte.is_none() && !inner.memory_set.handle_demand_fault(va) {
+        // `translate()` may return an invalid leaf entry (V=0) when the page
+        // table page exists but the specific user page has not been materialized.
+        if pte.map_or(true, |entry| !entry.is_valid()) && !inner.memory_set.handle_demand_fault(va)
+        {
             return false;
         }
         pte = page_table.translate(vpn);
