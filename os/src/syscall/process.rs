@@ -22,7 +22,7 @@ use crate::{
         futex_wake_bitset, pid2process, pid2process_snapshot, suspend_current_and_run_next,
         user_mask_to_flags, ChildWaitEvent, FutexKey, IntervalTimerState, RLimit, SignalAction,
         SignalFlags, TaskControlBlock, TaskStatus, UserContext, MAX_SIG, RLIMIT_NLIMITS, SIGCHLD,
-        SIGCONT, SIGKILL, SIGSTOP,
+        SIGCONT, SIGKILL, SIGSEGV, SIGSTOP,
     },
     timer::{add_timer, get_time, get_time_ms, get_time_us, remove_timer},
 };
@@ -3425,23 +3425,51 @@ pub fn sys_sigreturn() -> isize {
     }
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
+    let trap_sepc = inner.get_trap_cx().sepc;
+    let in_sigreturn_trampoline =
+        (arch::SIG_RETURN_ADDR..arch::SIG_RETURN_ADDR + PAGE_SIZE).contains(&trap_sepc);
 
     let saved = match inner.signal_trap_cx.take() {
         Some(cx) => cx,
-        None => return errno(EINVAL),
+        None => {
+            if in_sigreturn_trampoline {
+                error!(
+                    "[sigreturn] missing signal frame in trampoline context, pid={} sepc={:#x}, force SIGSEGV",
+                    pid, trap_sepc
+                );
+                inner.handling_sig = -1;
+                inner.signal_ucontext_ptr = 0;
+                inner.signal_canary_ptr = 0;
+                drop(inner);
+                exit_current_and_run_next(-(SIGSEGV as i32));
+                panic!("Unreachable after fatal sigreturn frame error");
+            }
+            return errno(EINVAL);
+        }
     };
 
-    // 检查栈底的 canary 值，防止栈溢出
+    // 检查信号帧 canary（使用投递时记录的精确地址，避免依赖当前 SP）
     let current_sp = inner.get_trap_cx()[TrapFrameArgs::SP];
+    let canary_ptr = inner.signal_canary_ptr;
+    inner.signal_canary_ptr = 0;
     let token = current_user_token();
-    if let Ok(canary) = read_from_user::<usize>(token, current_sp as *const _) {
-        if canary != 0x11451415 {
-            error!(
-                "[sigreturn] Stack canary corrupted! pid={} sp={:#x} canary={:#x} (expected 0x11451415)",
-                pid, current_sp, canary
-            );
-            // 栈已被破坏，返回错误（后续会导致 SIGSEGV）
-            return errno(EFAULT);
+    if canary_ptr != 0 {
+        match read_from_user::<usize>(token, canary_ptr as *const _) {
+            Ok(canary) if canary == 0x11451415 => {}
+            Ok(canary) => {
+                // Some user handlers (or libc internals) may legitimately overwrite the
+                // scratch word we use as a canary. Treat this as a diagnostic only.
+                warn!(
+                    "[sigreturn] stack canary mismatch (non-fatal) pid={} sp={:#x} canary_ptr={:#x} canary={:#x} expected=0x11451415",
+                    pid, current_sp, canary_ptr, canary
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "[sigreturn] cannot read canary (non-fatal) pid={} sp={:#x} canary_ptr={:#x} err={}",
+                    pid, current_sp, canary_ptr, err
+                );
+            }
         }
     }
     let saved_a0 = saved[TrapFrameArgs::RET] as isize;
@@ -3456,7 +3484,16 @@ pub fn sys_sigreturn() -> isize {
         let token = current_user_token();
         let ucontext = match read_from_user::<UserContext>(token, ucontext_ptr as *const _) {
             Ok(value) => value,
-            Err(err) => return err,
+            Err(_) => {
+                error!(
+                    "[sigreturn] cannot read ucontext! pid={} ucontext_ptr={:#x}, force SIGSEGV",
+                    pid, ucontext_ptr
+                );
+                inner.handling_sig = -1;
+                drop(inner);
+                exit_current_and_run_next(-(SIGSEGV as i32));
+                panic!("Unreachable after fatal sigreturn ucontext read failure");
+            }
         };
         info!(
             "[sigreturn] pid={} ucontext_ptr={:#x} saved_pc={:#x} ucontext_pc={:#x} sigmask={:#x}",

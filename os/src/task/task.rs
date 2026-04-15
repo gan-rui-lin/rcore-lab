@@ -83,6 +83,7 @@ pub struct TaskControlBlockInner {
     pub signal_mask_backup: super::SignalFlags,
     pub signal_pending: super::SignalFlags,
     pub signal_ucontext_ptr: usize,
+    pub signal_canary_ptr: usize,
     pub clear_child_tid: usize,
     pub interrupted_by_signal: bool,
     /// 当前正在处理的信号编号（-1 表示未处理信号，用于防止信号重入）
@@ -92,6 +93,8 @@ pub struct TaskControlBlockInner {
     // SIGCANCEL loop detection to prevent pthread_cancel hanging
     pub sigcancel_last_pc: usize,
     pub sigcancel_loop_count: usize,
+    pub illegal_last_sepc: usize,
+    pub illegal_repeat_count: usize,
 }
 
 impl TaskControlBlockInner {
@@ -133,12 +136,15 @@ impl TaskControlBlock {
                     signal_mask_backup: super::SignalFlags::empty(),
                     signal_pending: super::SignalFlags::empty(),
                     signal_ucontext_ptr: 0,
+                    signal_canary_ptr: 0,
                     clear_child_tid: 0,
                     interrupted_by_signal: false,
                     handling_sig: -1, // -1 表示未处理信号
                     last_syscall: 0,
                     sigcancel_last_pc: 0,
                     sigcancel_loop_count: 0,
+                    illegal_last_sepc: 0,
+                    illegal_repeat_count: 0,
                 })
             },
         }

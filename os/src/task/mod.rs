@@ -449,7 +449,7 @@ fn setup_signal_stack(
     signal_mask_backup: SignalFlags,
     token: usize,
     need_siginfo: bool,
-) -> usize {
+) -> (usize, usize) {
     let mut user_sp = trap_cx[TrapFrameArgs::SP] & !0xf;
 
     if need_siginfo {
@@ -496,7 +496,7 @@ fn setup_signal_stack(
         let _ = copy_to_user(token, user_sp as *mut u8, &canary_bytes);
 
         trap_cx[TrapFrameArgs::SP] = user_sp;
-        ucontext_ptr // 返回 ucontext_ptr
+        (ucontext_ptr, user_sp) // 返回 (ucontext_ptr, canary_ptr)
     } else {
         // 没有 siginfo，只设置参数
         trap_cx[TrapFrameArgs::ARG0] = signum;
@@ -508,7 +508,7 @@ fn setup_signal_stack(
         let _ = copy_to_user(token, user_sp as *mut u8, &canary_bytes);
 
         trap_cx[TrapFrameArgs::SP] = user_sp;
-        0 // 没有 ucontext_ptr
+        (0, user_sp) // 没有 ucontext_ptr
     }
 }
 
@@ -829,7 +829,7 @@ pub fn handle_signals() {
     let token = process_inner.memory_set.token();
     let need_siginfo = (action.flags & SA_SIGINFO) != 0 || signum == 32 || signum == 33;
 
-    let ucontext_ptr = setup_signal_stack(
+    let (ucontext_ptr, canary_ptr) = setup_signal_stack(
         signum,
         pid,
         trap_cx,
@@ -840,6 +840,7 @@ pub fn handle_signals() {
     );
 
     task_inner.signal_ucontext_ptr = ucontext_ptr;
+    task_inner.signal_canary_ptr = canary_ptr;
     if signum == 32 || signum == 33 {
         let trap_cx = task_inner.get_trap_cx();
         info!(
