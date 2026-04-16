@@ -19,7 +19,8 @@ use crate::{
         add_task, current_process, current_task, current_trap_cx, current_user_token,
         exit_current_and_run_next, flags_to_user_mask, futex_remove_waiter,
         futex_remove_waiter_any, futex_requeue, futex_wait, futex_wait_bitset, futex_wake,
-        futex_wake_bitset, pid2process, pid2process_snapshot, suspend_current_and_run_next,
+        futex_wake_bitset, pid2process, pid2process_snapshot, remove_from_pid2process,
+        suspend_current_and_run_next,
         user_mask_to_flags, ChildWaitEvent, FutexKey, IntervalTimerState, RLimit, SignalAction,
         SignalFlags, TaskControlBlock, TaskStatus, UserContext, MAX_SIG, RLIMIT_NLIMITS, SIGCHLD,
         SIGCONT, SIGKILL, SIGSEGV, SIGSTOP,
@@ -1534,6 +1535,18 @@ impl LinuxSigInfo {
         info._pad[8..12].copy_from_slice(&status.to_ne_bytes());
         info
     }
+
+    fn for_signal(signum: i32, sender_pid: i32, code: i32) -> Self {
+        let mut info = Self {
+            si_signo: signum,
+            si_errno: 0,
+            si_code: code,
+            _align_pad: 0,
+            _pad: [0; 112],
+        };
+        info._pad[0..4].copy_from_slice(&sender_pid.to_ne_bytes());
+        info
+    }
 }
 
 fn write_waitid_siginfo(info_ptr: *mut u8, info: LinuxSigInfo) -> Result<(), isize> {
@@ -1594,6 +1607,12 @@ pub(crate) fn has_unmasked_user_signal_without_restart() -> bool {
         return true;
     }
     false
+}
+
+#[inline]
+fn signal_default_ignored(signum: usize) -> bool {
+    // Linux default ignored signals relevant for EINTR decisions in wait loops.
+    matches!(signum, SIGCHLD | 23 | 28)
 }
 
 pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *mut u8) -> isize {
@@ -1689,17 +1708,20 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
                 matched && child_inner.is_zombie
             });
             if let Some((idx, _)) = pair {
-                let (found_pid, exit_code) = if nowait {
+                let (found_pid, exit_code, reaped) = if nowait {
                     let child = inner.children[idx].clone();
                     let found_pid = child.getpid();
                     let exit_code = child.inner_exclusive_access().exit_code;
-                    (found_pid, exit_code)
+                    (found_pid, exit_code, false)
                 } else {
                     let child = inner.children.remove(idx);
                     let found_pid = child.getpid();
                     let exit_code = child.inner_exclusive_access().exit_code;
-                    (found_pid, exit_code)
+                    (found_pid, exit_code, true)
                 };
+                if reaped {
+                    remove_from_pid2process(found_pid);
+                }
                 let (status, code) = exit_code_to_waitid(exit_code);
                 let info = LinuxSigInfo::for_sigchld(found_pid as i32, status, code);
                 drop(inner);
@@ -1841,6 +1863,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
             let child = inner.children.remove(idx);
             let found_pid = child.getpid();
             let exit_code = child.inner_exclusive_access().exit_code;
+            remove_from_pid2process(found_pid);
             if !exit_code_ptr.is_null() {
                 let status = encode_wait_status(exit_code);
                 *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
@@ -3165,6 +3188,8 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
         inner.group_stopped = false;
         yielded_after_continue = true;
     }
+    // Preserve sender metadata for sigwaitinfo/sigtimedwait.
+    inner.set_pending_signal_siginfo(signum as usize, pid_now as i32, 0);
     inner.signal_pending |= flag;
     for task in inner.tasks.iter().filter_map(|t| t.as_ref()) {
         wake_task_for_signal(task, flag);
@@ -4586,6 +4611,8 @@ pub fn sys_rt_sigtimedwait(
     timeout: *const TimeSpec,
     _sigsetsize: usize,
 ) -> isize {
+    const SIG_IGN_HANDLER: usize = 1;
+
     // Validate pointers
     if set.is_null() {
         return errno(EFAULT);
@@ -4597,9 +4624,6 @@ pub fn sys_rt_sigtimedwait(
         Ok(v) => v,
         Err(_) => return errno(EFAULT),
     };
-    if sigset == 0 {
-        return errno(EINVAL);
-    }
 
     // Read timeout if provided
     let timeout_us = if !timeout.is_null() {
@@ -4618,38 +4642,93 @@ pub fn sys_rt_sigtimedwait(
     } else {
         None
     };
+    // musl's sigtimedwait wrapper retries internally on EINTR. With an empty
+    // wait-set and no timeout this can spin forever when peer threads keep
+    // delivering signals (observed in LTP sigtimedwait01 on musl).
+    if sigset == 0 && timeout_us.is_none() {
+        return errno(EINVAL);
+    }
 
     let start = get_time_us();
     let deadline = timeout_us.map(|delta| start.saturating_add(delta));
 
     loop {
-        let mut found = None;
+        let mut found: Option<(usize, bool, i32, i32)> = None;
+        let mut interrupted_by_other = false;
         {
             let process = current_process();
-            let mut inner = process.inner_exclusive_access();
+            let process_inner = process.inner_exclusive_access();
+            let task = current_task().unwrap();
+            let task_inner = task.inner_exclusive_access();
+            let process_pending = process_inner.signal_pending;
+            let task_pending = task_inner.signal_pending;
+            let pending_any = process_pending | task_pending;
+
+            // SIGKILL/SIGSTOP must break out of kernel wait loops immediately.
+            // Otherwise a task blocked in rt_sigtimedwait() can become unkillable.
+            if pending_any.intersects(SignalFlags::SIGKILL | SignalFlags::SIGSTOP) {
+                interrupted_by_other = true;
+            }
+
             for signum in 1..=MAX_SIG {
+                if interrupted_by_other {
+                    break;
+                }
                 // SIGKILL 和 SIGSTOP 不能被等待
                 if signum == SIGKILL || signum == SIGSTOP {
                     continue;
                 }
-                if (sigset & (1usize << (signum - 1))) == 0 {
+                let flag = SignalFlags::from_bits_truncate(1u64 << (signum - 1));
+                if !pending_any.contains(flag) {
                     continue;
                 }
-                // bit (signum-1) 对应 signum
-                let flag = SignalFlags::from_bits_truncate(1u64 << (signum - 1));
-                if inner.signal_pending.contains(flag) {
-                    inner.signal_pending.remove(flag);
-                    found = Some(signum as isize);
+                if (sigset & (1usize << (signum - 1))) != 0 {
+                    if process_pending.contains(flag) {
+                        let (sender_pid, si_code) =
+                            process_inner.get_pending_signal_siginfo(signum);
+                        found = Some((signum, true, sender_pid, si_code));
+                    } else {
+                        found = Some((signum, false, 0, 0));
+                    }
+                    break;
+                }
+                // Non-waited unmasked signal interrupts with EINTR.
+                if !task_inner.signal_mask.contains(flag) {
+                    let action = process_inner.signal_actions.table[signum];
+                    if action.handler == SIG_IGN_HANDLER
+                        || (action.handler == 0 && signal_default_ignored(signum))
+                    {
+                        continue;
+                    }
+                    interrupted_by_other = true;
                     break;
                 }
             }
         }
 
-        if let Some(signum) = found {
+        if let Some((signum, from_process, sender_pid, si_code)) = found {
             if !info.is_null() {
-                let _info_ref = translated_refmut(token, info);
+                let si = LinuxSigInfo::for_signal(signum as i32, sender_pid, si_code);
+                if let Err(err) = write_waitid_siginfo(info as *mut u8, si) {
+                    return err;
+                }
             }
-            return signum;
+            let process = current_process();
+            let mut process_inner = process.inner_exclusive_access();
+            let task = current_task().unwrap();
+            let mut task_inner = task.inner_exclusive_access();
+            let flag = SignalFlags::from_bits_truncate(1u64 << (signum - 1));
+            if from_process {
+                process_inner.signal_pending.remove(flag);
+                process_inner.clear_pending_signal_siginfo(signum);
+            } else {
+                task_inner.signal_pending.remove(flag);
+            }
+            return signum as isize;
+        }
+
+        if interrupted_by_other {
+            return errno(EINTR);
         }
 
         if let Some(dl) = deadline {

@@ -2,7 +2,7 @@ use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
 use super::{
     add_task, pid_alloc, PidHandle, SignalAction, SignalActions, SignalFlags, TaskControlBlock,
-    TlsArea,
+    TlsArea, MAX_SIG,
 };
 use crate::config::{USER_MMAP_TOP, USER_STACK_SIZE};
 use crate::fs::{File, Stdin, Stdout};
@@ -108,6 +108,10 @@ pub struct ProcessControlBlockInner {
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     pub signals: SignalFlags,
     pub signal_pending: SignalFlags,
+    /// Lightweight siginfo metadata for process-level pending signals.
+    /// Index `i` corresponds to signal number `i + 1`.
+    pub pending_signal_sender_pid: [i32; MAX_SIG],
+    pub pending_signal_si_code: [i32; MAX_SIG],
     pub signal_actions: SignalActions,
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,
@@ -159,6 +163,38 @@ pub struct ProcessControlBlockInner {
 impl ProcessControlBlockInner {
     pub fn get_user_token(&self) -> usize {
         self.memory_set.token()
+    }
+
+    #[inline]
+    pub fn set_pending_signal_siginfo(&mut self, signum: usize, sender_pid: i32, si_code: i32) {
+        if signum == 0 || signum > MAX_SIG {
+            return;
+        }
+        let idx = signum - 1;
+        self.pending_signal_sender_pid[idx] = sender_pid;
+        self.pending_signal_si_code[idx] = si_code;
+    }
+
+    #[inline]
+    pub fn get_pending_signal_siginfo(&self, signum: usize) -> (i32, i32) {
+        if signum == 0 || signum > MAX_SIG {
+            return (0, 0);
+        }
+        let idx = signum - 1;
+        (
+            self.pending_signal_sender_pid[idx],
+            self.pending_signal_si_code[idx],
+        )
+    }
+
+    #[inline]
+    pub fn clear_pending_signal_siginfo(&mut self, signum: usize) {
+        if signum == 0 || signum > MAX_SIG {
+            return;
+        }
+        let idx = signum - 1;
+        self.pending_signal_sender_pid[idx] = 0;
+        self.pending_signal_si_code[idx] = 0;
     }
 
     /// Allocate a new file descriptor. Returns None if RLIMIT_NOFILE is reached.
@@ -298,6 +334,8 @@ impl ProcessControlBlock {
                     ],
                     signals: SignalFlags::empty(),
                     signal_pending: SignalFlags::empty(),
+                    pending_signal_sender_pid: [0; MAX_SIG],
+                    pending_signal_si_code: [0; MAX_SIG],
                     signal_actions: SignalActions::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -771,6 +809,8 @@ impl ProcessControlBlock {
                     fd_table: new_fd_table,
                     signals: SignalFlags::empty(),
                     signal_pending: SignalFlags::empty(),
+                    pending_signal_sender_pid: [0; MAX_SIG],
+                    pending_signal_si_code: [0; MAX_SIG],
                     signal_actions: parent.signal_actions.clone(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),

@@ -238,7 +238,6 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             shutdown();
         }
         crate::syscall::cleanup_shm_for_process_exit(pid);
-        remove_from_pid2process(pid);
         let mut process_inner = process.inner_exclusive_access();
         process_inner.is_zombie = true;
         process_inner.exit_code = exit_code;
@@ -248,6 +247,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         if let Some(parent) = parent {
             let mut parent_inner = parent.inner_exclusive_access();
             parent_inner.signal_pending |= SignalFlags::SIGCHLD;
+            parent_inner.set_pending_signal_siginfo(SIGCHLD, pid as i32, 0);
         }
         let process_inner = process.inner_exclusive_access();
         if let Some(vfork_parent) = process_inner.vfork_vm_parent.as_ref().and_then(|p| p.upgrade()) {
@@ -322,8 +322,15 @@ pub fn add_initproc() {
 
 pub fn current_add_signal(signal: SignalFlags) {
     let process = current_process();
+    let pid = process.getpid() as i32;
     let mut process_inner = process.inner_exclusive_access();
     process_inner.signal_pending |= signal;
+    let mut bits = signal.bits();
+    while bits != 0 {
+        let idx = bits.trailing_zeros() as usize;
+        process_inner.set_pending_signal_siginfo(idx + 1, pid, 0);
+        bits &= bits - 1;
+    }
 }
 
 fn wake_process_for_signal(process: &Arc<ProcessControlBlock>) {
@@ -376,6 +383,7 @@ pub fn process_interval_timers(on_user_tick: bool) {
         if should_signal {
             let mut inner = process.inner_exclusive_access();
             inner.signal_pending |= SignalFlags::SIGALRM;
+            inner.set_pending_signal_siginfo(signal::SIGALRM, 0, 0);
             drop(inner);
             wake_process_for_signal(&process);
         }
@@ -398,6 +406,12 @@ pub fn process_interval_timers(on_user_tick: bool) {
         }
         if !pending.is_empty() {
             inner.signal_pending |= pending;
+            let mut bits = pending.bits();
+            while bits != 0 {
+                let idx = bits.trailing_zeros() as usize;
+                inner.set_pending_signal_siginfo(idx + 1, 0, 0);
+                bits &= bits - 1;
+            }
         }
     }
     if !pending.is_empty() {
@@ -443,7 +457,8 @@ fn find_pending_signal(
 /// 设置用户态信号栈（UserContext + LinuxSigInfo + canary）
 fn setup_signal_stack(
     signum: usize,
-    sender_pid: usize,
+    sender_pid: i32,
+    si_code: i32,
     trap_cx: &mut TrapContext,
     saved_cx: &TrapContext,
     signal_mask_backup: SignalFlags,
@@ -470,11 +485,11 @@ fn setup_signal_stack(
         let info_ptr = user_sp;
         let mut siginfo = LinuxSigInfo::default();
         siginfo.si_signo = signum as i32;
-        // glibc sigcancel_handler expects SI_TKILL and si_pid in siginfo.
-        if signum == 32 || signum == 33 {
+        siginfo.si_code = si_code;
+        siginfo._pad[0..4].copy_from_slice(&sender_pid.to_ne_bytes()); // si_pid at offset 16
+        // glibc sigcancel_handler expects SI_TKILL for SIG32/SIG33.
+        if (signum == 32 || signum == 33) && siginfo.si_code == 0 {
             siginfo.si_code = -6; // SI_TKILL
-            let pid_bytes = (sender_pid as i32).to_le_bytes();
-            siginfo._pad[0..4].copy_from_slice(&pid_bytes); // si_pid at offset 16
         }
         let siginfo_bytes = unsafe {
             core::slice::from_raw_parts(
@@ -603,9 +618,16 @@ pub fn handle_signals() {
         return;
     }
 
+    let (sender_pid, si_code) = if from_process {
+        process_inner.get_pending_signal_siginfo(signum)
+    } else {
+        (0, 0)
+    };
+
     // 8. 清除 pending 信号
     if from_process {
         process_inner.signal_pending.remove(flag);
+        process_inner.clear_pending_signal_siginfo(signum);
     } else {
         task_inner.signal_pending.remove(flag);
     }
@@ -831,7 +853,8 @@ pub fn handle_signals() {
 
     let (ucontext_ptr, canary_ptr) = setup_signal_stack(
         signum,
-        pid,
+        sender_pid,
+        si_code,
         trap_cx,
         saved_cx,
         task_inner.signal_mask_backup,
@@ -949,6 +972,7 @@ pub fn block_and_yield() {
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
     process_inner.signal_pending.remove(SignalFlags::SIGCONT);
+    process_inner.clear_pending_signal_siginfo(SIGCONT);
     drop(process_inner);
     block_current_and_run_next();
 }
