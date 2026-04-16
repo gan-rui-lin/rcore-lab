@@ -383,7 +383,7 @@ const TRACE_PID: Option<usize> = match option_env!("TRACE_PID") {
 const TRACE_NAME: Option<&str> = option_env!("TRACE_NAME");
 
 /// Global switch for syscall tracing, useful for toggling via a debugger.
-pub static SYSCALL_TRACE_ALL: AtomicBool = AtomicBool::new(true);
+pub static SYSCALL_TRACE_ALL: AtomicBool = AtomicBool::new(false);
 
 const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (1, "fork"),
