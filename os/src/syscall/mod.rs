@@ -14,6 +14,14 @@
 const SYSCALL_CAPGET: usize = 90;
 /// capset syscall
 const SYSCALL_CAPSET: usize = 91;
+/// eventfd2 syscall
+const SYSCALL_EVENTFD2: usize = 19;
+/// epoll_create1 syscall
+const SYSCALL_EPOLL_CREATE1: usize = 20;
+/// epoll_ctl syscall
+const SYSCALL_EPOLL_CTL: usize = 21;
+/// epoll_pwait syscall
+const SYSCALL_EPOLL_PWAIT: usize = 22;
 /// getcwd syscall
 const SYSCALL_GETCWD: usize = 17;
 /// dup syscall
@@ -676,6 +684,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     }
     let mut known = true;
     let ret = match syscall_id {
+        SYSCALL_EVENTFD2 => sys_eventfd2(args[0] as u32, args[1] as i32),
+        SYSCALL_EPOLL_CREATE1 => sys_epoll_create1(args[0] as i32),
+        SYSCALL_EPOLL_CTL => sys_epoll_ctl(args[0], args[1] as i32, args[2] as i32, args[3] as *const crate::fs::EpollEvent),
+        SYSCALL_EPOLL_PWAIT => sys_epoll_pwait(args[0], args[1] as *mut crate::fs::EpollEvent, args[2] as i32, args[3] as i32, args[4], args[5]),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2] as u32),
@@ -857,7 +869,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SCHED_SETAFFINITY => sys_sched_setaffinity(args[0], args[1], args[2] as *const u8),
         SYSCALL_SCHED_GETAFFINITY => sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8),
         SYSCALL_YIELD => sys_yield(),
-        SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
+        SYSCALL_KILL => sys_kill(args[0] as isize, args[1] as i32),
         SYSCALL_TKILL => process::sys_tkill(args[0] as isize, args[1] as i32),
         SYSCALL_TGKILL => process::sys_tgkill(args[0] as isize, args[1] as isize, args[2] as i32),
         SYSCALL_RT_SIGSUSPEND => process::sys_rt_sigsuspend(args[0] as *const usize, args[1]),

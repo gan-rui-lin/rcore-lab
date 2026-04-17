@@ -4,7 +4,8 @@ use super::process::{get_current_umask, TimeSpec};
 use super::user_mem::{self, UserReadPolicy, UserWritePolicy};
 use crate::fs::{
     create_dir, make_pipe, open_file, path_exists, path_is_dir, remove_path, DevNull, DevUrandom,
-    DevZero, MemFdFile, OpenFlags, PollEvents, Stat, StatMode, TimerFdFile, TIMERFD_EAGAIN,
+    DevZero, EpollEvent, EpollFile, EventFdFile, MemFdFile, OpenFlags, PollEvents, Stat, StatMode,
+    TimerFdFile, TIMERFD_EAGAIN,
 };
 use crate::mm::{
     translated_ref, translated_refmut, translated_str_checked, UserBuffer,
@@ -381,6 +382,37 @@ fn resolve_access_path(full_path: &str) -> Result<String, isize> {
         if is_final {
             return Ok(resolved);
         }
+        if path_is_dir(&resolved) {
+            current = resolved;
+            continue;
+        }
+        return Err(errno(if path_exists_for_access(&resolved) {
+            ENOTDIR
+        } else {
+            ENOENT
+        }));
+    }
+    Ok(String::from("/"))
+}
+
+/// Like `resolve_access_path` but does NOT follow the final symlink component.
+/// Used by lstat / lchown (AT_SYMLINK_NOFOLLOW semantics).
+fn resolve_access_path_nofollow(full_path: &str) -> Result<String, isize> {
+    let mut current = String::from("/");
+    let comps: Vec<&str> = full_path.split('/').filter(|part| !part.is_empty()).collect();
+    for (i, comp) in comps.iter().enumerate() {
+        let next = if current == "/" {
+            format!("/{}", comp)
+        } else {
+            format!("{}/{}", current, comp)
+        };
+        let is_final = i == comps.len() - 1;
+        if is_final {
+            // Do NOT follow symlink on the last component
+            return Ok(next);
+        }
+        // Intermediate components: follow symlinks
+        let resolved = resolve_final_symlink_checked(&next)?;
         if path_is_dir(&resolved) {
             current = resolved;
             continue;
@@ -1309,20 +1341,20 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
         }
     };
     let full_path = resolve_user_path(&base, &raw_path);
-    let full_path = match resolve_access_path(&full_path) {
-        Ok(path) => path,
-        Err(err) => return err,
+    let nofollow = flags & AT_SYMLINK_NOFOLLOW != 0;
+    let full_path = if nofollow {
+        match resolve_access_path_nofollow(&full_path) {
+            Ok(path) => path,
+            Err(err) => return err,
+        }
+    } else {
+        match resolve_access_path(&full_path) {
+            Ok(path) => path,
+            Err(err) => return err,
+        }
     };
-    // trace!(
-    //     "[sys_fstatat] pid={} dirfd={} flags={:#x} path={} full={}",
-    //     pid,
-    //     dirfd,
-    //     flags,
-    //     raw_path,
-    //     full_path
-    // );
 
-        // Check for path traversal through non-directory (e.g. /dev/null/invalid)
+    // Check for path traversal through non-directory (e.g. /dev/null/invalid)
     let comps: Vec<&str> = full_path.split('/').filter(|s| !s.is_empty()).collect();
     for i in 0..comps.len().saturating_sub(1) {
         let partial = format!("/{}", comps[..=i].join("/"));
@@ -1332,6 +1364,41 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
     }
 
     let mut stat = Stat::default();
+    // AT_SYMLINK_NOFOLLOW: if the final component is a symlink, stat the symlink itself
+    if nofollow {
+        if let Some(target) = symlink_target_get(&full_path) {
+            stat.mode = StatMode::LNK.bits() | 0o777;
+            stat.nlink = 1;
+            stat.size = target.len() as i64;
+            stat.blksize = 512;
+            stat.blocks = 0;
+            let (uid, gid) = effective_path_owner(&full_path);
+            stat.uid = uid;
+            stat.gid = gid;
+            // Generate unique (dev, ino)
+            stat.dev = 1;
+            if !full_path.is_empty() {
+                let mut h: u64 = 5381;
+                for b in full_path.bytes() {
+                    h = h.wrapping_mul(33).wrapping_add(b as u64);
+                }
+                stat.ino = h & 0x7FFF_FFFF;
+            }
+            fill_stat_timestamps(&mut stat, None);
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&stat as *const Stat) as *const u8,
+                    core::mem::size_of::<Stat>(),
+                )
+            };
+            return match copy_to_user(token, st as *mut u8, bytes) {
+                Ok(_) => 0,
+                Err(err) => err,
+            };
+        }
+        // Not a symlink — fall through to normal stat logic
+    }
+
     // Handle character devices specially
     if is_char_device(&full_path) {
         stat.mode = StatMode::CHR.bits() | 0o666;
@@ -3119,6 +3186,11 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
             }
         }
         F_SETLK | F_SETLKW => {
+            // Locking is only supported on regular files. Pipes, sockets,
+            // and character devices must return EINVAL.
+            if file.inode().is_none() {
+                return errno(EINVAL);
+            }
             let token = current_user_token();
             let ptr = arg as *const Flock;
             if ptr.is_null() {
@@ -4521,6 +4593,7 @@ pub fn sys_fchownat(
     {
         return errno(ENAMETOOLONG);
     }
+    let nofollow = flags & AT_SYMLINK_NOFOLLOW != 0;
     let full_path = if raw_path.starts_with('/') {
         normalize_path(&raw_path)
     } else {
@@ -4530,9 +4603,16 @@ pub fn sys_fchownat(
         };
         resolve_path(&base, &raw_path)
     };
-    let full_path = match resolve_access_path(&full_path) {
-        Ok(path) => path,
-        Err(err) => return err,
+    let full_path = if nofollow {
+        match resolve_access_path_nofollow(&full_path) {
+            Ok(path) => path,
+            Err(err) => return err,
+        }
+    } else {
+        match resolve_access_path(&full_path) {
+            Ok(path) => path,
+            Err(err) => return err,
+        }
     };
     if !path_exists_for_access(&full_path) {
         return errno(ENOENT);
@@ -4769,4 +4849,197 @@ pub fn sys_fdatasync(fd: usize) -> isize {
 /// Stub: always succeeds.
 pub fn sys_fsync(fd: usize) -> isize {
     sys_fdatasync(fd)
+}
+
+// ── epoll syscalls ──────────────────────────────────────────────────────────
+
+const EPOLL_CLOEXEC: i32 = 0x8_0000;
+
+/// epoll_create1(2)
+pub fn sys_epoll_create1(flags: i32) -> isize {
+    if flags & !EPOLL_CLOEXEC != 0 {
+        return errno(EINVAL);
+    }
+    let cloexec = (flags & EPOLL_CLOEXEC) != 0;
+    let file: Arc<dyn crate::fs::File> = Arc::new(EpollFile::new(cloexec));
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = match inner.alloc_fd() {
+        Some(fd) => fd,
+        None => return errno(EMFILE),
+    };
+    inner.fd_table[fd] = Some(file);
+    fd as isize
+}
+
+/// epoll_ctl(2)
+pub fn sys_epoll_ctl(epfd: usize, op: i32, fd: i32, event_ptr: *const EpollEvent) -> isize {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    // Validate epfd
+    if epfd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(epfile) = inner.fd_table[epfd].clone() else {
+        return errno(EBADF);
+    };
+    if !epfile.is_epoll_file() {
+        return errno(EINVAL);
+    }
+    // Cannot add epfd to itself
+    if fd as usize == epfd {
+        return errno(EINVAL);
+    }
+    // Validate target fd
+    if fd < 0 || (fd as usize) >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    if inner.fd_table[fd as usize].is_none() {
+        return errno(EBADF);
+    }
+    drop(inner);
+
+    // Read event from user for ADD and MOD (not needed for DEL)
+    let event = if op != 2 {
+        // EPOLL_CTL_DEL == 2
+        if event_ptr.is_null() {
+            return errno(EFAULT);
+        }
+        let token = current_user_token();
+        let mut ev = EpollEvent::default();
+        let ev_bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                &mut ev as *mut EpollEvent as *mut u8,
+                core::mem::size_of::<EpollEvent>(),
+            )
+        };
+        if user_mem::copy_from_user(token, event_ptr as *const u8, ev_bytes, UserReadPolicy::DemandPaged).is_err() {
+            return errno(EFAULT);
+        }
+        ev
+    } else {
+        EpollEvent::default()
+    };
+    epfile.epoll_ctl_inner(op, fd, event)
+}
+
+/// epoll_pwait(2) — busy-poll implementation
+pub fn sys_epoll_pwait(
+    epfd: usize,
+    events_ptr: *mut EpollEvent,
+    maxevents: i32,
+    timeout: i32,
+    _sigmask: usize,
+    _sigsetsize: usize,
+) -> isize {
+    if maxevents <= 0 {
+        return errno(EINVAL);
+    }
+    if events_ptr.is_null() {
+        return errno(EFAULT);
+    }
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if epfd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(epfile) = inner.fd_table[epfd].clone() else {
+        return errno(EBADF);
+    };
+    if !epfile.is_epoll_file() {
+        return errno(EINVAL);
+    }
+    // Get registered fds and their corresponding file objects
+    let registered = match epfile.epoll_get_registered() {
+        Some(r) => r,
+        None => return errno(EINVAL),
+    };
+    // Collect file objects for each registered fd
+    let mut watch_list: Vec<(i32, EpollEvent, Arc<dyn crate::fs::File>)> = Vec::new();
+    for (fd, event) in &registered {
+        if (*fd as usize) < inner.fd_table.len() {
+            if let Some(file) = &inner.fd_table[*fd as usize] {
+                watch_list.push((*fd, *event, file.clone()));
+            }
+        }
+    }
+    drop(inner);
+
+    let deadline_ms = if timeout < 0 {
+        None // infinite
+    } else if timeout == 0 {
+        Some(0u64) // poll once
+    } else {
+        Some(get_time_ms() as u64 + timeout as u64)
+    };
+
+    let maxevents = maxevents as usize;
+    loop {
+        // Poll all watched fds
+        let mut ready: Vec<EpollEvent> = Vec::new();
+        for (_fd, event, file) in &watch_list {
+            // Map epoll events to PollEvents
+            let mut poll_req = PollEvents::empty();
+            if event.events & 0x001 != 0 { poll_req |= PollEvents::POLLIN; }    // EPOLLIN
+            if event.events & 0x004 != 0 { poll_req |= PollEvents::POLLOUT; }   // EPOLLOUT
+            if event.events & 0x002 != 0 { poll_req |= PollEvents::POLLPRI; }   // EPOLLPRI
+
+            let revents = file.poll(poll_req);
+            if !revents.is_empty() {
+                // Map PollEvents back to epoll events
+                let mut ev_bits: u32 = 0;
+                if revents.contains(PollEvents::POLLIN) { ev_bits |= 0x001; }
+                if revents.contains(PollEvents::POLLOUT) { ev_bits |= 0x004; }
+                if revents.contains(PollEvents::POLLERR) { ev_bits |= 0x008; }
+                if revents.contains(PollEvents::POLLHUP) { ev_bits |= 0x010; }
+                if revents.contains(PollEvents::POLLPRI) { ev_bits |= 0x002; }
+                ready.push(EpollEvent { events: ev_bits, data: event.data });
+                if ready.len() >= maxevents { break; }
+            }
+        }
+
+        if !ready.is_empty() {
+            // Write ready events to user
+            let token = current_user_token();
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    ready.as_ptr() as *const u8,
+                    ready.len() * core::mem::size_of::<EpollEvent>(),
+                )
+            };
+            if user_mem::copy_to_user(token, events_ptr as *mut u8, bytes, UserWritePolicy::DemandCowWithForkFallback).is_err() {
+                return errno(EFAULT);
+            }
+            return ready.len() as isize;
+        }
+
+        // No ready events — check timeout
+        if let Some(deadline) = deadline_ms {
+            if deadline == 0 || get_time_ms() as u64 >= deadline {
+                return 0;
+            }
+        }
+
+        // Check for pending signals
+        if crate::task::has_pending_unmasked_signal(false) {
+            return errno(EINTR);
+        }
+
+        suspend_current_and_run_next();
+    }
+}
+
+// ── eventfd syscall ─────────────────────────────────────────────────────────
+
+/// eventfd2(2)
+pub fn sys_eventfd2(initval: u32, flags: i32) -> isize {
+    let file = EventFdFile::new(initval as u64, flags);
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = match inner.alloc_fd() {
+        Some(fd) => fd,
+        None => return errno(EMFILE),
+    };
+    inner.fd_table[fd] = Some(file);
+    fd as isize
 }
