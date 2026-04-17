@@ -1598,8 +1598,16 @@ pub(crate) fn has_unmasked_user_signal_without_restart() -> bool {
             continue;
         }
         let action = &actions.table[signum];
-        if action.handler <= 1 {
-            continue; // SIG_DFL/SIG_IGN
+        if action.handler == 1 {
+            continue; // SIG_IGN
+        }
+        if action.handler == 0 {
+            // Default dispositions should still break wait loops unless the
+            // signal is one of the Linux default-ignored ones (e.g. SIGCHLD).
+            if signal_default_ignored(signum) {
+                continue;
+            }
+            return true;
         }
         if (action.flags & SA_RESTART) != 0 {
             continue;
