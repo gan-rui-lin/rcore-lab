@@ -83,26 +83,34 @@ impl File for Stdin {
         false
     }
     fn read(&self, mut user_buf: UserBuffer) -> usize {
-        assert_eq!(user_buf.len(), 1);
-        // busy loop
-        let mut c: usize;
-        loop {
-            c = console_getchar();
-            if c == 0 {
-                if has_pending_unmasked_signal(true) {
-                    return usize::MAX; // EINTR sentinel
+        if user_buf.len() == 0 {
+            return 0;
+        }
+
+        let mut total = 0usize;
+        let mut got_first_byte = false;
+        for buffer in user_buf.buffers.iter_mut() {
+            for byte in buffer.iter_mut() {
+                loop {
+                    let c = console_getchar();
+                    if c == 0 {
+                        if !got_first_byte {
+                            if has_pending_unmasked_signal(true) {
+                                return usize::MAX; // EINTR sentinel
+                            }
+                            suspend_current_and_run_next();
+                            continue;
+                        }
+                        return total;
+                    }
+                    *byte = c as u8;
+                    total += 1;
+                    got_first_byte = true;
+                    break;
                 }
-                suspend_current_and_run_next();
-                continue;
-            } else {
-                break;
             }
         }
-        let ch = c as u8;
-        unsafe {
-            user_buf.buffers[0].as_mut_ptr().write_volatile(ch);
-        }
-        1
+        total
     }
     fn write(&self, _user_buf: UserBuffer) -> usize {
         panic!("Cannot write to stdin!");
