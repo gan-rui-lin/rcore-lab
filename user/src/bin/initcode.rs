@@ -833,7 +833,7 @@ case_count=0
 
 is_skip_case() {
   case \"$1\" in
-    *.sh|*_helper|*_helper.sh|*_child|busy_poll_lib.sh|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|cpuctl_fj_*|cpuhotplug_do_*|cpuhotplug_report_*|cpuset*|crash*|dio_read|dio_sparse|epoll*|eventfd*|event_generator|execveat*|fanotify*|fanout*|f00f|faccessat201|faccessat202|fallocate02|fallocate04|fallocate05|fallocate06|fchmod02|fchmod05|fchown01_16|fchown02_16|fchown03_16|fchown04|fchown04_16|fchown05_16|fchownat02|fcntl01|fcntl01_64|fcntl07|fcntl07_64|fcntl09|fcntl09_64|fcntl10|fcntl10_64|fcntl11|fcntl11_64|fcntl12|fcntl12_64|fcntl14|fcntl14_64|fcntl15|fcntl15_64|fcntl16|fcntl16_64|fcntl17|fcntl17_64|fcntl19|fcntl19_64|fcntl20|fcntl20_64|fcntl21|fcntl21_64|fcntl2[2-7]*|fcntl30|fcntl30_64|fcntl31|fcntl31_64|fcntl32|fcntl32_64|fcntl33|fcntl33_64|fcntl34|fcntl34_64|fcntl35|fcntl35_64|fcntl36|fcntl36_64|fcntl37|fcntl37_64|fcntl38|fcntl38_64|fcntl39|fcntl39_64|fdatasync02|fdatasync03|fgetxattr*|flistxattr*|find_portbundle|finit_module*|float_*|flock01|flock02|flock03|flock04|fork05|fork07|fork09|fork13|fork14|fork_exec_loop|fptest*|frag|fremovexattr*|fs_di|fs_fill|fs_inod|fs_perms|fsconfig*|fsetxattr*|fsmount*|fsopen*|fspick*|fsstress|fstatfs01|fstatfs01_64|fsx-linux|fsync*|ftest01|ftest02|ftest03|ftest04|ftest05|ftest06|ftest07|ftest08|ftruncate01|ftruncate01_64|ftruncate04|ftruncate04_64|futex_cmp_requeue*|futex_wait03|futex_wait05|futex_wait_bitset*|futex_waitv*|futex_wake02|futex_wake04|futimesat01|fw_load|gen*|\
+    *.sh|*_helper|*_helper.sh|*_child|busy_poll_lib.sh|tst_*|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|cpuctl_fj_*|cpuhotplug_do_*|cpuhotplug_report_*|cpuset*|crash*|dio_read|dio_sparse|epoll*|eventfd*|event_generator|execveat*|fanotify*|fanout*|f00f|faccessat201|faccessat202|fallocate02|fallocate04|fallocate05|fallocate06|fchmod02|fchmod05|fchown01_16|fchown02_16|fchown03_16|fchown04|fchown04_16|fchown05_16|fchownat02|fcntl01|fcntl01_64|fcntl07|fcntl07_64|fcntl09|fcntl09_64|fcntl10|fcntl10_64|fcntl11|fcntl11_64|fcntl12|fcntl12_64|fcntl14|fcntl14_64|fcntl15|fcntl15_64|fcntl16|fcntl16_64|fcntl17|fcntl17_64|fcntl19|fcntl19_64|fcntl20|fcntl20_64|fcntl21|fcntl21_64|fcntl2[2-7]*|fcntl30|fcntl30_64|fcntl31|fcntl31_64|fcntl32|fcntl32_64|fcntl33|fcntl33_64|fcntl34|fcntl34_64|fcntl35|fcntl35_64|fcntl36|fcntl36_64|fcntl37|fcntl37_64|fcntl38|fcntl38_64|fcntl39|fcntl39_64|fdatasync02|fdatasync03|fgetxattr*|flistxattr*|find_portbundle|finit_module*|float_*|flock01|flock02|flock03|flock04|fork05|fork07|fork09|fork13|fork14|fork_exec_loop|fptest*|frag|fremovexattr*|fs_di|fs_fill|fs_inod|fs_perms|fsconfig*|fsetxattr*|fsmount*|fsopen*|fspick*|fsstress|fstatfs01|fstatfs01_64|fsx-linux|fsync*|ftest01|ftest02|ftest03|ftest04|ftest05|ftest06|ftest07|ftest08|ftruncate01|ftruncate01_64|ftruncate04|ftruncate04_64|futex_cmp_requeue*|futex_wait03|futex_wait05|futex_wait_bitset*|futex_waitv*|futex_wake02|futex_wake04|futimesat01|fw_load|gen*|\
     creat04|creat05|creat07|creat08|creat09|copy_file_range*|crypto_user*|cve-*|delete_module*|diotest2|dio_append|dio_truncate|dirtyc0w*|dirtypipe|dma_thread_diotest|dup05|ebizzy|eject_check_tray|endian_switch01|exec_with_inh|exec_without_inh|execve02|execve04|execve05|getxattr0[2-4]|hackbench|inode02|kill08|kill10|kill11|leapsec01|lftest|mallocstress|memcg*|mmap1|mmap3|mmapstress*|mmstress|mremap*|mtest*|nanosleep04|nptl01|pause*|pids_task*|pipe13|ppoll*|prot_hsymlinks|pselect02*|pthcli|pthserv|select04*|sendfile07*|setfsgid03*|shm_test*|signal01*|starvation*|tgkill*|timed_forkbomb*|waitpid08*|chdir01|clock_nanosleep*|close_range01|sched_datafile*|capset04|io_control*|clone04)
       return 0
       ;;
@@ -845,20 +845,29 @@ is_skip_case() {
 
 run_case_with_timeout() {
   case_file=\"$1\"
+    timeout_flag=\"/tmp/.ltp_timeout_$$.$case_count\"
+    rm -f \"$timeout_flag\"
   \"$case_file\" &
   case_pid=$!
-  elapsed=0
-  while kill -0 \"$case_pid\" 2>/dev/null; do
-    if [ \"$elapsed\" -ge \"$case_timeout\" ]; then
+    (
+        sleep \"$case_timeout\"
+        if kill -0 \"$case_pid\" 2>/dev/null; then
+            echo 1 > \"$timeout_flag\"
       kill -9 \"$case_pid\" 2>/dev/null
-      echo \"TIMEOUT LTP CASE $(basename \"$case_file\")\"
-      return 124
     fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  wait \"$case_pid\"
-  return $?
+    ) &
+    timer_pid=$!
+    wait \"$case_pid\"
+    ret=$?
+    kill -9 \"$timer_pid\" 2>/dev/null
+    wait \"$timer_pid\" 2>/dev/null
+    if [ -f \"$timeout_flag\" ]; then
+        rm -f \"$timeout_flag\"
+        echo \"TIMEOUT LTP CASE $(basename \"$case_file\")\"
+        return 124
+    fi
+    rm -f \"$timeout_flag\"
+    return $ret
 }
 
 for file in \"$target_dir\"/*; do
@@ -900,7 +909,7 @@ case_count=0
 
 is_skip_case() {
     case \"$1\" in
-        *.sh|*_helper|*_helper.sh|*_child|busy_poll_lib.sh|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|cpuctl_fj_*|cpuhotplug_do_*|cpuhotplug_report_*|cpuset*|crash*|dio_read|dio_sparse|epoll*|eventfd*|event_generator|execveat*|fanotify*|fanout*|f00f|faccessat201|faccessat202|fallocate02|fallocate04|fallocate05|fallocate06|fchmod02|fchmod05|fchown01_16|fchown02_16|fchown03_16|fchown04|fchown04_16|fchown05_16|fchownat02|fcntl01|fcntl01_64|fcntl07|fcntl07_64|fcntl09|fcntl09_64|fcntl10|fcntl10_64|fcntl11|fcntl11_64|fcntl12|fcntl12_64|fcntl14|fcntl14_64|fcntl15|fcntl15_64|fcntl16|fcntl16_64|fcntl17|fcntl17_64|fcntl19|fcntl19_64|fcntl20|fcntl20_64|fcntl21|fcntl21_64|fcntl2[2-7]*|fcntl30|fcntl30_64|fcntl31|fcntl31_64|fcntl32|fcntl32_64|fcntl33|fcntl33_64|fcntl34|fcntl34_64|fcntl35|fcntl35_64|fcntl36|fcntl36_64|fcntl37|fcntl37_64|fcntl38|fcntl38_64|fcntl39|fcntl39_64|fdatasync02|fdatasync03|fgetxattr*|flistxattr*|find_portbundle|finit_module*|float_*|flock01|flock02|flock03|flock04|fork05|fork07|fork09|fork13|fork14|fork_exec_loop|fptest*|frag|fremovexattr*|fs_di|fs_fill|fs_inod|fs_perms|fsconfig*|fsetxattr*|fsmount*|fsopen*|fspick*|fsstress|fstatfs01|fstatfs01_64|fsx-linux|fsync*|ftest01|ftest02|ftest03|ftest04|ftest05|ftest06|ftest07|ftest08|ftruncate01|ftruncate01_64|ftruncate04|ftruncate04_64|futex_cmp_requeue*|futex_wait03|futex_wait05|futex_wait_bitset*|futex_waitv*|futex_wake02|futex_wake04|futimesat01|fw_load|gen*|\
+        *.sh|*_helper|*_helper.sh|*_child|busy_poll_lib.sh|tst_*|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|cpuctl_fj_*|cpuhotplug_do_*|cpuhotplug_report_*|cpuset*|crash*|dio_read|dio_sparse|epoll*|eventfd*|event_generator|execveat*|fanotify*|fanout*|f00f|faccessat201|faccessat202|fallocate02|fallocate04|fallocate05|fallocate06|fchmod02|fchmod05|fchown01_16|fchown02_16|fchown03_16|fchown04|fchown04_16|fchown05_16|fchownat02|fcntl01|fcntl01_64|fcntl07|fcntl07_64|fcntl09|fcntl09_64|fcntl10|fcntl10_64|fcntl11|fcntl11_64|fcntl12|fcntl12_64|fcntl14|fcntl14_64|fcntl15|fcntl15_64|fcntl16|fcntl16_64|fcntl17|fcntl17_64|fcntl19|fcntl19_64|fcntl20|fcntl20_64|fcntl21|fcntl21_64|fcntl2[2-7]*|fcntl30|fcntl30_64|fcntl31|fcntl31_64|fcntl32|fcntl32_64|fcntl33|fcntl33_64|fcntl34|fcntl34_64|fcntl35|fcntl35_64|fcntl36|fcntl36_64|fcntl37|fcntl37_64|fcntl38|fcntl38_64|fcntl39|fcntl39_64|fdatasync02|fdatasync03|fgetxattr*|flistxattr*|find_portbundle|finit_module*|float_*|flock01|flock02|flock03|flock04|fork05|fork07|fork09|fork13|fork14|fork_exec_loop|fptest*|frag|fremovexattr*|fs_di|fs_fill|fs_inod|fs_perms|fsconfig*|fsetxattr*|fsmount*|fsopen*|fspick*|fsstress|fstatfs01|fstatfs01_64|fsx-linux|fsync*|ftest01|ftest02|ftest03|ftest04|ftest05|ftest06|ftest07|ftest08|ftruncate01|ftruncate01_64|ftruncate04|ftruncate04_64|futex_cmp_requeue*|futex_wait03|futex_wait05|futex_wait_bitset*|futex_waitv*|futex_wake02|futex_wake04|futimesat01|fw_load|gen*|\
         creat04|creat05|creat07|creat08|creat09|copy_file_range*|crypto_user*|cve-*|delete_module*|diotest2|dio_append|dio_truncate|dirtyc0w*|dirtypipe|dma_thread_diotest|dup05|ebizzy|eject_check_tray|endian_switch01|exec_with_inh|exec_without_inh|execve02|execve04|execve05|getxattr0[2-4]|hackbench|inode02|kill08|kill10|kill11|leapsec01|lftest|mallocstress|memcg*|mmap1|mmap3|mmapstress*|mmstress|mremap*|mtest*|nanosleep04|pause*|pids_task*|pipe13|ppoll*|prot_hsymlinks|pselect02*|pthcli|pthserv|select04*|sendfile07*|setfsgid03*|shm_test*|signal01*|starvation*|tgkill*|timed_forkbomb*|waitpid08*|chdir01|clock_nanosleep*|close_range01|sched_datafile*|capset04|io_control*|clone04)
             return 0
             ;;
@@ -912,30 +921,29 @@ is_skip_case() {
 
 run_case_with_timeout() {
     case_file=\"$1\"
+    timeout_flag=\"/tmp/.ltp_timeout_$$.$case_count\"
+    rm -f \"$timeout_flag\"
     \"$case_file\" &
     case_pid=$!
-    elapsed=0
-    while kill -0 \"$case_pid\" 2>/dev/null; do
-        if [ \"$elapsed\" -ge \"$case_timeout\" ]; then
+    (
+        sleep \"$case_timeout\"
+        if kill -0 \"$case_pid\" 2>/dev/null; then
+            echo 1 > \"$timeout_flag\"
             kill -9 \"$case_pid\" 2>/dev/null
-            # Avoid blocking forever when the task is stuck in uninterruptible
-            # kernel state; best-effort reap only if it exits quickly.
-            loops=0
-            while kill -0 \"$case_pid\" 2>/dev/null && [ \"$loops\" -lt 2 ]; do
-                sleep 1
-                loops=$((loops + 1))
-            done
-            if ! kill -0 \"$case_pid\" 2>/dev/null; then
-                wait \"$case_pid\" 2>/dev/null
-            fi
+        fi
+    ) &
+    timer_pid=$!
+    wait \"$case_pid\"
+    ret=$?
+    kill -9 \"$timer_pid\" 2>/dev/null
+    wait \"$timer_pid\" 2>/dev/null
+    if [ -f \"$timeout_flag\" ]; then
+            rm -f \"$timeout_flag\"
             echo \"TIMEOUT LTP CASE $(basename \"$case_file\")\"
             return 124
-        fi
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
-    wait \"$case_pid\"
-    return $?
+    fi
+    rm -f \"$timeout_flag\"
+    return $ret
 }
 
 for file in \"$target_dir\"/*; do
