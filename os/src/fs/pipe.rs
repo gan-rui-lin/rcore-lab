@@ -67,6 +67,7 @@ pub struct PipeEnd {
     readable: bool,
     writable: bool,
     pipe: Arc<UPIntrFreeCell<Pipe>>,
+    nonblock: UPIntrFreeCell<bool>,
 }
 
 impl PipeEnd {
@@ -75,6 +76,7 @@ impl PipeEnd {
             readable,
             writable,
             pipe,
+            nonblock: unsafe { UPIntrFreeCell::new(false) },
         }
     }
 }
@@ -100,7 +102,16 @@ impl File for PipeEnd {
         self.writable
     }
 
+    fn status_flags(&self) -> u32 {
+        if *self.nonblock.exclusive_access() { 0x800 } else { 0 }
+    }
+
+    fn set_status_flags(&self, flags: u32) {
+        *self.nonblock.exclusive_access() = (flags & 0x800) != 0;
+    }
+
     fn read(&self, mut user_buf: UserBuffer) -> usize {
+        let is_nonblock = *self.nonblock.exclusive_access();
         let mut total = 0;
         for slice in user_buf.buffers.iter_mut() {
             loop {
@@ -115,6 +126,9 @@ impl File for PipeEnd {
                 }
                 if total > 0 {
                     return total;
+                }
+                if is_nonblock {
+                    return usize::MAX - 1; // EAGAIN sentinel
                 }
                 if has_pending_unmasked_signal(true) {
                     return usize::MAX; // EINTR sentinel

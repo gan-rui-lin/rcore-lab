@@ -3136,8 +3136,7 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
             flags as isize
         }
         F_SETFL => {
-            // Set file status flags
-            // For simplicity, accept but ignore (would need to modify File trait)
+            file.set_status_flags(arg as u32);
             0
         }
         F_GETLK => {
