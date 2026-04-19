@@ -394,6 +394,32 @@ fn resolve_access_path(full_path: &str) -> Result<String, isize> {
     Ok(String::from("/"))
 }
 
+fn resolve_access_path_nofollow(full_path: &str) -> Result<String, isize> {
+    let mut current = String::from("/");
+    let comps: Vec<&str> = full_path.split('/').filter(|part| !part.is_empty()).collect();
+    for (i, comp) in comps.iter().enumerate() {
+        let next = if current == "/" {
+            format!("/{}", comp)
+        } else {
+            format!("{}/{}", current, comp)
+        };
+        if i == comps.len() - 1 {
+            return Ok(next);
+        }
+        let resolved = resolve_final_symlink_checked(&next)?;
+        if path_is_dir(&resolved) {
+            current = resolved;
+            continue;
+        }
+        return Err(errno(if path_exists_for_access(&resolved) {
+            ENOTDIR
+        } else {
+            ENOENT
+        }));
+    }
+    Ok(String::from("/"))
+}
+
 fn default_path_mode(path: &str) -> u32 {
     if is_char_device(path) {
         0o666
@@ -1309,20 +1335,20 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
         }
     };
     let full_path = resolve_user_path(&base, &raw_path);
-    let full_path = match resolve_access_path(&full_path) {
-        Ok(path) => path,
-        Err(err) => return err,
+    let nofollow = flags & AT_SYMLINK_NOFOLLOW != 0;
+    let full_path = if nofollow {
+        match resolve_access_path_nofollow(&full_path) {
+            Ok(path) => path,
+            Err(err) => return err,
+        }
+    } else {
+        match resolve_access_path(&full_path) {
+            Ok(path) => path,
+            Err(err) => return err,
+        }
     };
-    // trace!(
-    //     "[sys_fstatat] pid={} dirfd={} flags={:#x} path={} full={}",
-    //     pid,
-    //     dirfd,
-    //     flags,
-    //     raw_path,
-    //     full_path
-    // );
 
-        // Check for path traversal through non-directory (e.g. /dev/null/invalid)
+    // Check for path traversal through non-directory (e.g. /dev/null/invalid)
     let comps: Vec<&str> = full_path.split('/').filter(|s| !s.is_empty()).collect();
     for i in 0..comps.len().saturating_sub(1) {
         let partial = format!("/{}", comps[..=i].join("/"));
@@ -1332,6 +1358,38 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
     }
 
     let mut stat = Stat::default();
+    if nofollow {
+        if let Some(target) = symlink_target_get(&full_path) {
+            stat.mode = StatMode::LNK.bits() | 0o777;
+            stat.nlink = 1;
+            stat.size = target.len() as i64;
+            stat.blksize = 512;
+            stat.blocks = 0;
+            let (uid, gid) = effective_path_owner(&full_path);
+            stat.uid = uid;
+            stat.gid = gid;
+            stat.dev = 1;
+            if !full_path.is_empty() {
+                let mut h: u64 = 5381;
+                for b in full_path.bytes() {
+                    h = h.wrapping_mul(33).wrapping_add(b as u64);
+                }
+                stat.ino = h & 0x7FFF_FFFF;
+            }
+            fill_stat_timestamps(&mut stat, None);
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&stat as *const Stat) as *const u8,
+                    core::mem::size_of::<Stat>(),
+                )
+            };
+            return match copy_to_user(token, st as *mut u8, bytes) {
+                Ok(_) => 0,
+                Err(err) => err,
+            };
+        }
+    }
+
     // Handle character devices specially
     if is_char_device(&full_path) {
         stat.mode = StatMode::CHR.bits() | 0o666;
@@ -3119,6 +3177,9 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
             }
         }
         F_SETLK | F_SETLKW => {
+            if file.inode().is_none() {
+                return errno(EINVAL);
+            }
             let token = current_user_token();
             let ptr = arg as *const Flock;
             if ptr.is_null() {
@@ -4521,6 +4582,7 @@ pub fn sys_fchownat(
     {
         return errno(ENAMETOOLONG);
     }
+    let nofollow = flags & AT_SYMLINK_NOFOLLOW != 0;
     let full_path = if raw_path.starts_with('/') {
         normalize_path(&raw_path)
     } else {
@@ -4530,11 +4592,18 @@ pub fn sys_fchownat(
         };
         resolve_path(&base, &raw_path)
     };
-    let full_path = match resolve_access_path(&full_path) {
-        Ok(path) => path,
-        Err(err) => return err,
+    let full_path = if nofollow {
+        match resolve_access_path_nofollow(&full_path) {
+            Ok(path) => path,
+            Err(err) => return err,
+        }
+    } else {
+        match resolve_access_path(&full_path) {
+            Ok(path) => path,
+            Err(err) => return err,
+        }
     };
-    if !path_exists_for_access(&full_path) {
+    if !path_exists_for_access(&full_path) && symlink_target_get(&full_path).is_none() {
         return errno(ENOENT);
     }
     if readonly_mount_contains(&full_path) {

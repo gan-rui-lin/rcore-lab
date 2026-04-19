@@ -1481,10 +1481,15 @@ impl MemorySet {
 
     /// append the heap area to new_end using type-based lookup
     pub fn append_heap_to(&mut self, new_end: VirtAddr, heap_bottom: VirtAddr) -> bool {
-        if self.heap_expand_conflicts(heap_bottom, new_end) {
+        let check_start = if let Some(idx) = self.find_heap_index() {
+            VirtAddr::from(self.areas[idx].vpn_range.get_end())
+        } else {
+            heap_bottom
+        };
+        if self.heap_expand_conflicts(check_start, new_end) {
             warn!(
                 "[append_heap_to] conflict when expanding heap: start={:#x} new_end={:#x}",
-                heap_bottom.0, new_end.0
+                check_start.0, new_end.0
             );
             return false;
         }

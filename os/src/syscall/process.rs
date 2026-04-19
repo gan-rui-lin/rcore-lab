@@ -3152,14 +3152,14 @@ pub fn sys_ptrace(request: usize, pid: isize, _addr: usize, _data: usize) -> isi
                 0
             } else {
                 // Keep behavior consistent with signal path: traced task gets SIGKILL.
-                sys_kill(pid, SIGKILL as i32)
+                sys_kill(pid as isize, SIGKILL as i32)
             }
         }
         _ => errno(ENOSYS),
     }
 }
 
-pub fn sys_kill(pid: usize, signum: i32) -> isize {
+pub fn sys_kill(pid: isize, signum: i32) -> isize {
     let pid_now = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid_now) {
         syscall!(
@@ -3169,45 +3169,94 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
             signum
         );
     }
+    let flag = if signum == 0 {
+        None
+    } else {
+        Some(match signal_flag_from_signum(signum) {
+            Ok(flag) => flag,
+            Err(err) => return err,
+        })
+    };
+
+    if pid > 0 {
+        kill_single(pid as usize, signum, flag, pid_now)
+    } else if pid == 0 {
+        let caller_pgid = current_process().inner_exclusive_access().pgid;
+        kill_group(Some(caller_pgid), signum, flag, pid_now)
+    } else if pid == -1 {
+        kill_group(None, signum, flag, pid_now)
+    } else {
+        let target_pgid = (-pid) as usize;
+        kill_group(Some(target_pgid), signum, flag, pid_now)
+    }
+}
+
+fn kill_single(
+    pid: usize,
+    signum: i32,
+    flag: Option<SignalFlags>,
+    sender_pid: usize,
+) -> isize {
     let process = match pid2process(pid) {
-        Some(process) => process,
+        Some(p) => p,
         None => return errno(ESRCH),
     };
-    // Keep initproc alive as test harness root process.
-    // Linux pid 1 has special signal semantics; for our lab runtime we
-    // conservatively reject external kill to pid 1.
-    if process.getpid() == 1 && pid_now != 1 {
+    if process.getpid() == 1 && sender_pid != 1 {
         return errno(EPERM);
     }
-    // Linux semantics: kill(pid, 0) performs existence/permission checks only.
-    // It must not enqueue any pending signal.
     if signum == 0 {
         return 0;
     }
-    let flag = match signal_flag_from_signum(signum) {
-        Ok(flag) => flag,
-        Err(err) => return err,
-    };
+    let flag = flag.unwrap();
     let mut inner = process.inner_exclusive_access();
     let mut yielded_after_continue = false;
     if flag == SignalFlags::SIGCONT && inner.group_stopped {
-        // Report CLD_CONTINUED promptly when SIGCONT resumes a stopped child.
         inner.child_wait_event = Some(ChildWaitEvent::Continued(SIGCONT as i32));
         inner.group_stopped = false;
         yielded_after_continue = true;
     }
-    // Preserve sender metadata for sigwaitinfo/sigtimedwait.
-    inner.set_pending_signal_siginfo(signum as usize, pid_now as i32, 0);
+    inner.set_pending_signal_siginfo(signum as usize, sender_pid as i32, 0);
     inner.signal_pending |= flag;
     for task in inner.tasks.iter().filter_map(|t| t.as_ref()) {
         wake_task_for_signal(task, flag);
     }
     drop(inner);
     if yielded_after_continue {
-        // Give resumed child a chance to run first; avoids waitid07/08 checkpoint races.
         suspend_current_and_run_next();
     }
     0
+}
+
+fn kill_group(
+    target_pgid: Option<usize>,
+    signum: i32,
+    flag: Option<SignalFlags>,
+    sender_pid: usize,
+) -> isize {
+    let mut found = false;
+    for (p, process) in pid2process_snapshot() {
+        if p == 1 { continue; }
+        let matches = if let Some(pgid) = target_pgid {
+            process.inner_exclusive_access().pgid == pgid
+        } else {
+            true
+        };
+        if !matches { continue; }
+        found = true;
+        if signum == 0 { continue; }
+        let flag = flag.unwrap();
+        let mut inner = process.inner_exclusive_access();
+        if flag == SignalFlags::SIGCONT && inner.group_stopped {
+            inner.child_wait_event = Some(ChildWaitEvent::Continued(SIGCONT as i32));
+            inner.group_stopped = false;
+        }
+        inner.set_pending_signal_siginfo(signum as usize, sender_pid as i32, 0);
+        inner.signal_pending |= flag;
+        for task in inner.tasks.iter().filter_map(|t| t.as_ref()) {
+            wake_task_for_signal(task, flag);
+        }
+    }
+    if found { 0 } else { errno(ESRCH) }
 }
 
 fn signal_flag_from_signum(signum: i32) -> Result<SignalFlags, isize> {
