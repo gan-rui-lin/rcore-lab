@@ -1481,19 +1481,10 @@ impl MemorySet {
 
     /// append the heap area to new_end using type-based lookup
     pub fn append_heap_to(&mut self, new_end: VirtAddr, heap_bottom: VirtAddr) -> bool {
-        // Only check for conflicts in the EXPANSION region, not the entire heap.
-        // When the heap area already exists, its current end is the safe boundary;
-        // checking from heap_bottom would falsely detect overlaps with ELF data/BSS
-        // segments that share the boundary page.
-        let check_start = if let Some(idx) = self.find_heap_index() {
-            VirtAddr::from(self.areas[idx].vpn_range.get_end())
-        } else {
-            heap_bottom
-        };
-        if self.heap_expand_conflicts(check_start, new_end) {
+        if self.heap_expand_conflicts(heap_bottom, new_end) {
             warn!(
                 "[append_heap_to] conflict when expanding heap: start={:#x} new_end={:#x}",
-                check_start.0, new_end.0
+                heap_bottom.0, new_end.0
             );
             return false;
         }

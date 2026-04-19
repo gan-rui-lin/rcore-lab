@@ -1,7 +1,5 @@
 //! File trait & inode(dir, file, pipe, stdin, stdout)
 
-pub mod epoll;
-pub mod eventfd;
 mod memfd;
 mod pipe;
 mod stdio;
@@ -142,16 +140,6 @@ pub trait File: Send + Sync {
     fn timerfd_gettime(&self) -> Option<(u64, u64)> { None }
     /// For timerfd: clockid (0=REALTIME, 1=MONOTONIC).
     fn timerfd_clockid(&self) -> i32 { -1 }
-    /// Returns true if this file is an epoll instance.
-    fn is_epoll_file(&self) -> bool { false }
-    /// For epoll: nesting depth.
-    fn epoll_depth(&self) -> usize { 0 }
-    /// For epoll: set nesting depth.
-    fn set_epoll_depth(&self, _depth: usize) {}
-    /// For epoll: add/modify/delete a watched fd.
-    fn epoll_ctl_inner(&self, _op: i32, _fd: i32, _event: EpollEvent) -> isize { -22 }
-    /// For epoll: get all registered (fd, event) pairs.
-    fn epoll_get_registered(&self) -> Option<Vec<(i32, EpollEvent)>> { None }
 }
 
 /// Linux-compatible stat layout (riscv64, matches musl struct stat).
@@ -253,18 +241,6 @@ bitflags::bitflags! {
     }
 }
 
-/// epoll event structure, matches Linux struct epoll_event (packed on x86, natural on riscv/la).
-#[repr(C)]
-#[derive(Debug, Copy, Clone, Default)]
-pub struct EpollEvent {
-    /// Epoll events bitmask (EPOLLIN, EPOLLOUT, etc.)
-    pub events: u32,
-    /// User data (opaque, returned as-is by epoll_wait)
-    pub data: u64,
-}
-
-pub use epoll::EpollFile;
-pub use eventfd::EventFdFile;
 pub use pipe::make_pipe;
 #[cfg(feature = "ext4")]
 /// Mount ext4 as root with explicit device size.
