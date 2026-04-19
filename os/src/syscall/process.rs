@@ -733,6 +733,7 @@ pub fn sys_clone(
     tls: *mut i32,
     ctid: *mut i32,
 ) -> isize {
+    const CLONE_NEWPID: usize = 0x2000_0000;
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         trace!(
@@ -744,6 +745,12 @@ pub fn sys_clone(
             tls as usize,
             ctid as usize
         );
+    }
+    // We do not support PID namespaces yet. Silently truncating this flag is
+    // dangerous: tests like pidns10 may run container-only logic (kill(-1))
+    // against the global process table and terminate unrelated workloads.
+    if (flags & CLONE_NEWPID) != 0 {
+        return errno(EINVAL);
     }
     let exit_signal = (flags & 0xff) as i32;
     if exit_signal != 0 && (exit_signal <= 0 || exit_signal > MAX_SIG as i32) {
@@ -3234,6 +3241,7 @@ fn kill_group(
     let mut found = false;
     for (p, process) in pid2process_snapshot() {
         if p == 1 { continue; }
+        if target_pgid.is_none() && p == sender_pid { continue; }
         let matches = if let Some(pgid) = target_pgid {
             process.inner_exclusive_access().pgid == pgid
         } else {
