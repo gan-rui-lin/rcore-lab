@@ -3296,7 +3296,12 @@ fn task_matches_linux_tid(
         return false;
     };
     let internal_tid = res.tid;
-    internal_tid == target_tid || (internal_tid == 0 && process_pid == target_tid)
+    // Userspace sees Linux-style TID where non-leader threads are reported as
+    // (internal_tid + 1). Keep thread-group leader mapped to process pid.
+    if internal_tid == 0 {
+        return process_pid == target_tid;
+    }
+    (internal_tid + 1) == target_tid
 }
 
 fn send_signal_to_task_from_list(
