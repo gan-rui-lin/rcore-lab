@@ -36,41 +36,36 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     new_task_tid as isize
 }
 
-/// Return the caller's TID.
-/// CRITICAL: musl's __tl_lock uses CAS(&lock, 0, tid) with 0 as "unlocked"
-/// sentinel. TID must be > 0 and unique within the process.
-/// We return internal_tid + 1 to guarantee > 0 and avoid collision.
-pub fn sys_gettid() -> isize {
-    let task = current_task().unwrap();
-    let process = current_process();
-    let process_pid = process.pid.0 as isize;
-    let tid = task.inner_exclusive_access().res.as_ref().unwrap().tid as isize;
-    if tid == 0 {
+/// Convert (process_pid, internal_tid) to the Linux-visible TID.
+///   - Main thread (internal_tid == 0): TID = process_pid
+///   - Non-main thread: TID = process_pid + internal_tid
+/// Guarantees: TID > 0, unique per thread, main thread TID == TGID.
+pub fn to_user_tid(process_pid: usize, internal_tid: usize) -> usize {
+    if internal_tid == 0 {
         process_pid
     } else {
-        // Non-main threads: use process_pid + internal_tid to guarantee:
-        //   1. TID > 0 (required for musl __tl_lock)
-        //   2. TID != process_pid (Linux guarantee: thread TID != process PID)
-        //   3. Unique per thread within the process
-        process_pid + tid
+        process_pid + internal_tid
     }
 }
 
-/// Save clear_child_tid pointer and return the caller's TID.
-/// CRITICAL: musl's __tl_lock uses CAS(&lock, 0, tid) with 0 as "unlocked"
-/// sentinel. TID must be > 0 and unique within the process.
-/// We return internal_tid + 1 to guarantee > 0 and avoid collision.
+/// Check if `target_tid` (Linux-visible) matches (process_pid, internal_tid).
+pub fn match_user_tid(process_pid: usize, internal_tid: usize, target_tid: usize) -> bool {
+    to_user_tid(process_pid, internal_tid) == target_tid
+}
+
+pub fn sys_gettid() -> isize {
+    let task = current_task().unwrap();
+    let process = current_process();
+    let tid = task.inner_exclusive_access().res.as_ref().unwrap().tid;
+    to_user_tid(process.pid.0, tid) as isize
+}
+
 pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
     let task = current_task().unwrap();
     let process = current_process();
     let mut task_inner = task.inner_exclusive_access();
-    let raw_tid = task_inner.res.as_ref().unwrap().tid as i32;
-    let tid = if raw_tid == 0 {
-        process.pid.0 as i32
-    } else {
-        // Must match sys_gettid: non-main thread TID = process_pid + internal_tid
-        process.pid.0 as i32 + raw_tid
-    };
+    let internal_tid = task_inner.res.as_ref().unwrap().tid;
+    let tid = to_user_tid(process.pid.0, internal_tid);
     task_inner.clear_child_tid = tidptr as usize;
     drop(task_inner);
     info!(

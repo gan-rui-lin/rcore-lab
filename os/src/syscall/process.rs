@@ -907,9 +907,7 @@ pub fn sys_clone(
         );
     }
 
-    // System TID = internal_tid + 1, ensuring TID > 0 and unique within process.
-    // CRITICAL: musl's __tl_lock uses CAS(&lock, 0, tid) — tid=0 breaks the lock.
-    let system_tid = (new_task_tid + 1) as i32;
+    let system_tid = super::thread::to_user_tid(pid, new_task_tid) as i32;
     if clone_flags.contains(CloneFlags::PARENT_SETTID) && !ptid.is_null() {
         let token = current_user_token();
         info!(
@@ -3295,8 +3293,7 @@ fn task_matches_linux_tid(
     let Some(res) = task_inner.res.as_ref() else {
         return false;
     };
-    let internal_tid = res.tid;
-    internal_tid == target_tid || (internal_tid == 0 && process_pid == target_tid)
+    super::thread::match_user_tid(process_pid, res.tid, target_tid)
 }
 
 fn send_signal_to_task_from_list(
