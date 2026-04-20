@@ -549,7 +549,7 @@ fn activate_runtime_profile(root: &str) -> bool {
         } else {
             force_link("/lib64/ld-linux-loongarch-lp64d.so.1", "/musl/lib/libc.so");
             force_link("/lib64/ld-musl-loongarch-lp64d.so.1", "/musl/lib/libc.so");
-            // WORKAROUND: Skip mkdir due to fork+exec hang bug on LoongArch
+            let _ = run_busybox_mkdir_p("/musl", busybox_path, "/code/lmbench_src/bin/build");
             force_link("/code/lmbench_src/bin/build/lmbench_all", "/musl/lmbench_all");
         }
     }
