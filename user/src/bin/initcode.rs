@@ -543,8 +543,8 @@ fn activate_runtime_profile(root: &str) -> bool {
                 "/lib64/ld-linux-loongarch-lp64d.so.1",
                 "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
             );
-            // WORKAROUND: Skip mkdir due to fork+exec hang bug on LoongArch
-            // See docs/GRLDocs/LA-fork-exec-hang-bug-2026-04-03.md
+            let _ = run_busybox_mkdir_p("/glibc", busybox_path, "/code/lmbench_src/bin/build");
+
             force_link("/code/lmbench_src/bin/build/lmbench_all", "/glibc/lmbench_all");
         } else {
             force_link("/lib64/ld-linux-loongarch-lp64d.so.1", "/musl/lib/libc.so");
