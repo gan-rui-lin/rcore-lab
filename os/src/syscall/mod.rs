@@ -275,12 +275,12 @@ const SYSCALL_GETEGID: usize = 177;
 const SYSCALL_SYSINFO: usize = 179;
 /// msgget syscall
 const SYSCALL_MSGGET: usize = 186;
-/// msgsnd syscall
-const SYSCALL_MSGSND: usize = 187;
+/// msgctl syscall
+const SYSCALL_MSGCTL: usize = 187;
 /// msgrcv syscall
 const SYSCALL_MSGRCV: usize = 188;
-/// msgctl syscall
-const SYSCALL_MSGCTL: usize = 189;
+/// msgsnd syscall
+const SYSCALL_MSGSND: usize = 189;
 /// shmget syscall
 const SYSCALL_SHMGET: usize = 194;
 /// shmctl syscall
@@ -295,6 +295,8 @@ const SYSCALL_SBRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
 /// fork syscall
 const SYSCALL_FORK: usize = 220;
+/// clone3 syscall
+const SYSCALL_CLONE3: usize = 435;
 /// exec syscall
 const SYSCALL_EXEC: usize = 221;
 /// mmap syscall
@@ -384,6 +386,11 @@ const TRACE_NAME: Option<&str> = option_env!("TRACE_NAME");
 
 /// Global switch for syscall tracing, useful for toggling via a debugger.
 pub static SYSCALL_TRACE_ALL: AtomicBool = AtomicBool::new(false);
+
+/// Procfs helper for `/proc/sysvipc/msg`.
+pub fn proc_sysvipc_msg() -> alloc::string::String {
+    ipc::proc_sysvipc_msg()
+}
 
 const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (1, "fork"),
@@ -537,9 +544,9 @@ const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (178, "gettid"),
     (179, "sysinfo"),
     (186, "msgget"),
-    (187, "msgsnd"),
+    (187, "msgctl"),
     (188, "msgrcv"),
-    (189, "msgctl"),
+    (189, "msgsnd"),
     (190, "semget"),
     (191, "semctl"),
     (192, "semtimedop"),
@@ -960,6 +967,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
                 )
             }
         }
+        SYSCALL_CLONE3 => process::sys_clone3(args[0] as *const u8, args[1]),
         SYSCALL_EXEC => sys_exec(
             args[0] as *const u8,
             args[1] as *const usize,

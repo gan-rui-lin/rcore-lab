@@ -145,6 +145,15 @@ pub enum ProtectError {
     AccessDenied,
 }
 
+/// Error classes returned by `msync_file_range()`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MsyncError {
+    /// `MS_INVALIDATE` was requested on a locked mapping.
+    Busy,
+    /// The target range does not overlap any mapped area.
+    Unmapped,
+}
+
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum MapAreaKind {
     Private,
@@ -307,6 +316,7 @@ impl MemorySet {
         .with_mmap_meta(meta)
         .with_shared_frames()
         .with_area_type(MapAreaType::MmapFile);
+        area.file_back = Some((file.clone(), file_offset));
         let pte_flags = map_perm_to_pte_flags(permission);
         let start_vpn = area.vpn_range.get_start();
         let end_vpn = area.vpn_range.get_end();
@@ -329,6 +339,101 @@ impl MemorySet {
             area.data_frames.insert(vpn, frame);
         }
         self.areas.push(area);
+    }
+
+    /// Synchronize MAP_SHARED file-backed mappings in `[start, end)`.
+    /// - `ms_invalidate`: refresh mapped pages from the backing file.
+    /// - `ms_writeback`: write mapped pages back to the backing file.
+    pub fn msync_file_range(
+        &mut self,
+        start: VirtAddr,
+        end: VirtAddr,
+        ms_invalidate: bool,
+        ms_writeback: bool,
+    ) -> Result<usize, MsyncError> {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        if start_vpn >= end_vpn {
+            return Ok(0);
+        }
+        let mut covered = false;
+        let mut flushed = 0usize;
+        for area in self.areas.iter() {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if area_end <= start_vpn || area_start >= end_vpn {
+                continue;
+            }
+            covered = true;
+            let Some(meta) = area.mmap_meta else {
+                continue;
+            };
+            if ms_invalidate && meta.map_locked {
+                return Err(MsyncError::Busy);
+            }
+            if !(meta.file_backed && meta.shared) {
+                continue;
+            }
+            let Some((file, base_off_u64)) = area.file_back.as_ref() else {
+                continue;
+            };
+            let Some(inode) = file.inode() else {
+                continue;
+            };
+            let overlap_start = if area_start > start_vpn {
+                area_start
+            } else {
+                start_vpn
+            };
+            let overlap_end = if area_end < end_vpn { area_end } else { end_vpn };
+            let mut vpn = overlap_start;
+            while vpn < overlap_end {
+                let page_start: usize = VirtAddr::from(vpn).into();
+                let page_end = page_start.saturating_add(PAGE_SIZE);
+                let sync_start = if start.0 > page_start {
+                    start.0
+                } else {
+                    page_start
+                };
+                let sync_end = if end.0 < page_end { end.0 } else { page_end };
+                if sync_start < sync_end {
+                    if let Some(pte) = self.page_table.translate(vpn) {
+                        if pte.is_valid() {
+                            let page_idx = vpn.0.saturating_sub(area_start.0);
+                            let Some(base_off) =
+                                (*base_off_u64 as usize).checked_add(page_idx * PAGE_SIZE)
+                            else {
+                                vpn.step();
+                                continue;
+                            };
+                            let delta = sync_start - page_start;
+                            let Some(file_off) = base_off.checked_add(delta) else {
+                                vpn.step();
+                                continue;
+                            };
+                            let bytes = pte.ppn().get_bytes_array();
+                            if ms_invalidate && !ms_writeback {
+                                let nread = file.read_at_kernel(base_off, bytes);
+                                if nread < PAGE_SIZE {
+                                    bytes[nread..].fill(0);
+                                }
+                            } else {
+                                flushed += inode.write_at(
+                                    file_off,
+                                    &bytes[delta..delta + (sync_end - sync_start)],
+                                );
+                            }
+                        }
+                    }
+                }
+                vpn.step();
+            }
+        }
+        if covered {
+            Ok(flushed)
+        } else {
+            Err(MsyncError::Unmapped)
+        }
     }
     /// Handle a demand-paging fault at `addr`.
     /// Returns `true` if the fault was resolved (lazy VMA found and page installed),
@@ -2075,6 +2180,8 @@ pub struct MmapMeta {
     pub file_backed: bool,
     /// Whether the originating file descriptor allowed writes.
     pub file_writable: bool,
+    /// Whether the mapping was created with `MAP_LOCKED`.
+    pub map_locked: bool,
 }
 
 fn map_perm_to_pte_flags(map_perm: MapPermission) -> PTEFlags {

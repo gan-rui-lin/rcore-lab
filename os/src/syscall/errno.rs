@@ -13,6 +13,7 @@ pub const EAGAIN: isize = 11;
 pub const ENOMEM: isize = 12;
 pub const EACCES: isize = 13;
 pub const EFAULT: isize = 14;
+pub const EBUSY: isize = 16;
 pub const EEXIST: isize = 17;
 pub const EXDEV: isize = 18;
 pub const ENODEV: isize = 19;

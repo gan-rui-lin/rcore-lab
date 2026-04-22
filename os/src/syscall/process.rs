@@ -224,6 +224,22 @@ bitflags! {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct CloneArgsUser {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+}
+
 impl Default for UtsName {
     fn default() -> Self {
         Self {
@@ -724,6 +740,43 @@ pub fn sys_fork() -> isize {
         trap_cx[TrapFrameArgs::SP] = clone_stack;
     }
     new_pid as isize
+}
+
+pub fn sys_clone3(args_ptr: *const u8, size: usize) -> isize {
+    if args_ptr.is_null() {
+        return errno(EFAULT);
+    }
+    if size < core::mem::size_of::<CloneArgsUser>() {
+        return errno(EINVAL);
+    }
+
+    let token = current_user_token();
+    let args = match read_from_user(token, args_ptr as *const CloneArgsUser) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // clone3 extensions we don't support yet.
+    if args.pidfd != 0 || args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0 {
+        return errno(EINVAL);
+    }
+
+    let flags = args.flags;
+    if flags & !CloneFlags::all().bits() != 0 {
+        return errno(EINVAL);
+    }
+
+    let exit_signal = args.exit_signal as i32;
+    if args.exit_signal > 0xff || (exit_signal != 0 && (exit_signal <= 0 || exit_signal > MAX_SIG as i32)) {
+        return errno(EINVAL);
+    }
+
+    let stack = args.stack as *const u8;
+    let ptid = args.parent_tid as *mut i32;
+    let tls = args.tls as *mut i32;
+    let ctid = args.child_tid as *mut i32;
+    let clone_flags = flags | args.exit_signal;
+    sys_clone(clone_flags as usize, stack, ptid, tls, ctid)
 }
 
 pub fn sys_clone(
@@ -2447,6 +2500,10 @@ pub fn sys_sysinfo(info: *mut SysInfo) -> isize {
 }
 
 pub fn sys_msync(start: usize, len: usize, _flags: usize) -> isize {
+    const MS_ASYNC: usize = 0x1;
+    const MS_INVALIDATE: usize = 0x2;
+    const MS_SYNC: usize = 0x4;
+
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         syscall!(
@@ -2459,7 +2516,35 @@ pub fn sys_msync(start: usize, len: usize, _flags: usize) -> isize {
     if start == 0 || len == 0 {
         return errno(EINVAL);
     }
-    0
+    if (start & (PAGE_SIZE - 1)) != 0 {
+        return errno(EINVAL);
+    }
+    if _flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 {
+        return errno(EINVAL);
+    }
+    if (_flags & MS_ASYNC) != 0 && (_flags & MS_SYNC) != 0 {
+        return errno(EINVAL);
+    }
+    let Some(end) = start.checked_add(len) else {
+        return errno(EINVAL);
+    };
+    let ms_invalidate = (_flags & MS_INVALIDATE) != 0;
+    let ms_writeback = (_flags & (MS_SYNC | MS_ASYNC)) != 0;
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    match inner
+        .memory_set
+        .msync_file_range(
+            VirtAddr::from(start),
+            VirtAddr::from(end),
+            ms_invalidate,
+            ms_writeback,
+        )
+    {
+        Ok(_) => 0,
+        Err(crate::mm::MsyncError::Busy) => errno(EBUSY),
+        Err(crate::mm::MsyncError::Unmapped) => errno(ENOMEM),
+    }
 }
 
 /// YOUR JOB: Implement mmap.
@@ -2478,6 +2563,7 @@ pub fn sys_mmap(
     const MAP_PRIVATE: usize = 0x02;
     const MAP_FIXED: usize = 0x10;
     const MAP_ANON: usize = 0x20;
+    const MAP_LOCKED: usize = 0x2000;
     const MAP_TYPE_MASK: usize = MAP_SHARED | MAP_PRIVATE;
 
     let pid = current_process().pid.0;
@@ -2727,6 +2813,7 @@ pub fn sys_mmap(
             .as_ref()
             .map(|(_, writable)| *writable)
             .unwrap_or(true),
+        map_locked: (flags & MAP_LOCKED) != 0,
     };
     if is_anon || fd == usize::MAX {
         if is_shared {
