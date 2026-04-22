@@ -137,12 +137,17 @@ fn write_user_u32(token: usize, ptr: *mut u32, val: u32) -> Result<(), isize> {
         token,
         ptr as *mut u8,
         &val.to_ne_bytes(),
-        UserWritePolicy::StrictChecked,
+        UserWritePolicy::DemandCowWithForkFallback,
     )
 }
 
 fn copy_to_user(token: usize, dst_ptr: *mut u8, src: &[u8]) -> Result<(), isize> {
-    user_mem::copy_to_user(token, dst_ptr, src, UserWritePolicy::StrictChecked)
+    user_mem::copy_to_user(
+        token,
+        dst_ptr,
+        src,
+        UserWritePolicy::DemandCowWithForkFallback,
+    )
 }
 
 /// Write smoltcp IpEndpoint back to user-space sockaddr.

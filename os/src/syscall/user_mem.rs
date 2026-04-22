@@ -16,7 +16,6 @@ pub enum UserReadPolicy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserWritePolicy {
-    StrictChecked,
     DemandCowWithForkFallback,
     RelaxedReadableMapping,
 }
@@ -54,7 +53,6 @@ pub fn translated_user_write_buffer(
         return Some(Vec::new());
     }
     match policy {
-        UserWritePolicy::StrictChecked => translated_byte_buffer_checked(token, ptr, len, true),
         UserWritePolicy::DemandCowWithForkFallback => {
             if let Some(buffers) = translated_byte_buffer_checked(token, ptr, len, true) {
                 return Some(buffers);
