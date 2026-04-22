@@ -83,7 +83,7 @@ SINGLE_TEST=/glibc/ltp/testcases/bin/setitimer01 LOG=OFF bash run.sh | tee glibc
 
 ### 3.1 根因一句话
 
-RISC-V 信号投递路径中，内核过早、过宽松地接受了用户态传入的 `sa_restorer`，导致 signal handler 返回时跳转到不可用地址 `0x2000000`，从而触发页故障。
+RISC-V 路径里，glibc 通过 `rt_sigaction` 传入了“`SA_RESTORER` 未设置但 `sa_restorer` 非零”的组合；该字段在 Linux 语义下本应视为无语义，但旧逻辑曾可能误用该值，最终在 signal handler 返回时跳到 `0x2000000` 并触发页故障。
 
 ### 3.2 为什么会跳到 0x2000000
 
@@ -92,7 +92,16 @@ RISC-V 信号投递路径中，内核过早、过宽松地接受了用户态传�
 1. `sepc = handler`，让用户态先进入 signal handler。
 2. `ra = restorer` 或者 `ra = kernel trampoline`，让 handler 返回时有一个“收尾动作”。
 
-RISC-V 上原先的逻辑对 `sa_restorer` 的判定偏启发式：只要看起来像个“像样的地址”就可能被接受。但 glibc 动态程序里的 `sa_restorer` 并不总是一个可直接使用的绝对地址，它可能是：
+二次定位时在 `sys_sigaction` 增加了证据日志，捕捉到如下实际输入（节选）：
+
+```text
+[sigaction] pid=5 signum=26 handler=0x40006508 flags=0x10000000 restorer=0x2000000 has_sa_restorer=false ...
+[sigaction] pid=6 signum=27 handler=0x40006508 flags=0x10000000 restorer=0x4000000 has_sa_restorer=false ...
+```
+
+其中 `flags=0x10000000` 仅表示 `SA_RESTART`，并不包含 `SA_RESTORER`。这意味着 `restorer` 字段即使非零，也不应被当作有效返回地址使用。
+
+RISC-V 上原先逻辑对 `sa_restorer` 的判定偏启发式，但 glibc 动态程序里的 `sa_restorer` 并不总是一个可直接使用的绝对地址，它可能是：
 
 1. 未重定位的偏移值；
 2. 不是用户映射中的有效地址；
@@ -132,7 +141,7 @@ let use_restorer = action.restorer != 0
 
 只靠“地址大于某个阈值”判断，很容易把错误值当成合法值。
 
-### 4.2 修复后的策略
+### 4.2 第一阶段修复：投递阶段严格校验 restorer 可用性
 
 本次修复将判定升级为：
 
@@ -145,7 +154,26 @@ let use_restorer = action.restorer != 0
 
 这个策略的意义在于：**内核不再猜测 glibc 想做什么，而是只接受“明确声明 + 实际可达”的 restorer。**
 
-### 4.3 相关常量补充
+### 4.3 第二阶段修复：在 `sys_sigaction` 入库时做语义规范化
+
+为了避免“无语义 restorer”污染后续路径，在 `os/src/syscall/process.rs::sys_sigaction` 增加了规范化逻辑：
+
+1. 若 `SA_RESTORER` 未设置且 `restorer != 0`，则入库前将 `restorer` 清零。
+2. 若 `SA_RESTORER` 已设置但 `restorer == 0`，则清掉 `SA_RESTORER`，保持动作自洽。
+
+这样可以从源头消除“字段有值但语义无效”导致的误判。
+
+### 4.4 关联修复：ITIMER_REAL 旧值间隔精度
+
+在同一次回归中发现了另一个独立失败：`setitimer01` 的 `ITIMER_REAL` 分支出现
+
+```text
+TFAIL: ovalue->it_interval.tv_usec (0) != time_usec (3)
+```
+
+根因是旧代码用毫秒缓存字段 `itimer_real_interval_ms` 回填 `old_value.it_interval`，导致微秒部分丢失。修复为从 canonical 状态 `inner.itimers[0].interval_us` 回填，保留微秒精度。
+
+### 4.5 相关常量补充
 
 为了让代码更清晰，本次在 `os/src/task/action.rs` 中补充了：
 
@@ -164,7 +192,7 @@ pub const SA_RESTORER: usize = 0x04000000;
 修复目标不是“强行兼容所有奇怪的 restorer 地址”，而是让行为更接近 Linux：
 
 1. glibc 正常情况可以走用户态 restorer。
-2. restorer 无效时，内核应安全地回退到 trampoline。
+2. 这里的“无效”不是说测试代码主动传了错地址，而是 glibc 通过 `rt_sigaction` 交给内核的 restorer 在 Linux 语义上可能本就无效（例如未设置 `SA_RESTORER`），或在当前地址空间视角下不可用，内核应安全回退。
 3. 不允许 handler 返回到一个不可达地址并把进程直接送进页故障。
 
 ### 5.2 为什么这样更安全
@@ -172,7 +200,7 @@ pub const SA_RESTORER: usize = 0x04000000;
 如果内核不验证 restorer，就等于让用户态能把返回地址任意塞进 `ra`。这不仅导致页故障，还可能引入更复杂的安全问题。修复后：
 
 1. 只有合法映射的用户页才能作为返回路径。
-2. 对 glibc 动态程序中未重定位/暂不可用的地址，会自动回退。
+2. 对 glibc 动态程序中未重定位、布局不匹配或暂不可用的地址，会自动回退。
 3. LoongArch 维持原有稳定路径，不会受到影响。
 
 ---
@@ -181,22 +209,33 @@ pub const SA_RESTORER: usize = 0x04000000;
 
 ### 6.1 静态检查
 
-在修改后对相关文件进行了错误检查，触发过一次格式错误，随后已修正。当前相关文件没有新的编译错误。
+在修改后对相关文件进行了错误检查，当前相关文件没有新的编译错误。
 
 涉及文件：
 
 - `os/src/task/action.rs`
 - `os/src/task/mod.rs`
+- `os/src/syscall/process.rs`
 
 ### 6.2 回归验证
 
-执行了单测验证：
+执行了两轮关键验证：
+
+1. 根因证据采集：
 
 ```bash
-SINGLE_TEST=/glibc/ltp/testcases/bin/setitimer01 LOG=OFF bash run.sh | tee glibc-itimer-info.log
+SINGLE_TEST=/glibc/ltp/testcases/bin/setitimer01 LOG=INFO bash run.sh > /tmp/setitimer-rootcause.log 2>&1
 ```
 
-结果：退出码为 `0`。
+并提取到 `has_sa_restorer=false` 且 `restorer!=0` 的关键日志。
+
+2. 修复后回归：
+
+```bash
+SINGLE_TEST=/glibc/ltp/testcases/bin/setitimer01 LOG=OFF bash run.sh > /tmp/setitimer-verify2.log 2>&1
+```
+
+结果：退出码为 `0`，并且 LTP 汇总从 `passed 17 / failed 1` 提升到 `passed 18 / failed 0`。
 
 这说明本次修复至少已经消除了该单测在当前环境下的页故障/卡死表现。
 
@@ -210,9 +249,9 @@ SINGLE_TEST=/glibc/ltp/testcases/bin/setitimer01 LOG=OFF bash run.sh | tee glibc
 
 修复后：
 
-1. 该页故障不再出现。
-2. `setitimer01` 单测能够正常结束。
-3. 说明 signal handler 返回链路恢复为可用路径。
+1. `sepc/ra=0x2000000` 的页故障不再出现。
+2. `setitimer01` 三个子项（REAL/VIRTUAL/PROF）均通过。
+3. `ITIMER_REAL` 的 `ovalue->it_interval.tv_usec` 恢复正确，不再丢精度。
 
 ---
 
@@ -242,4 +281,4 @@ SINGLE_TEST=/glibc/ltp/testcases/bin/setitimer01 LOG=OFF bash run.sh | tee glibc
 
 ## 9. 结论
 
-本次 `glibc setitimer01` 的问题，本质上是 **RISC-V 信号返回地址选择过宽松** 导致的页故障，而不是 `setitimer()` 或 timer interrupt 本身失效。修复后，内核只有在 `SA_RESTORER` 明确存在且地址真的可达时才使用用户态 restorer，否则就稳妥地回退到内核 trampoline。这个改动既解释了为什么 LA 没有卡死，也解释了为什么 musl 没有触发，而 glibc 在 RV 上会暴露问题。
+本次 `glibc setitimer01` 的最终根因，是 **RISC-V 下对 sigaction/restorer 语义处理不够严格**：当 `SA_RESTORER` 未设置时，非零 `sa_restorer` 仍可能干扰返回路径。通过“投递阶段严格校验 + `sys_sigaction` 入库规范化”两层修复，页故障问题被消除；同时补齐了 `ITIMER_REAL` 旧值微秒精度，最终该用例达到 `passed 18 / failed 0`。

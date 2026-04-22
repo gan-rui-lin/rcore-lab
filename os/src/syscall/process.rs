@@ -23,7 +23,7 @@ use crate::{
         suspend_current_and_run_next,
         user_mask_to_flags, ChildWaitEvent, FutexKey, IntervalTimerState, RLimit, SignalAction,
         SignalFlags, TaskControlBlock, TaskStatus, UserContext, MAX_SIG, RLIMIT_NLIMITS, SIGCHLD,
-        SIGCONT, SIGKILL, SIGSEGV, SIGSTOP,
+        SA_RESTORER, SIGCONT, SIGKILL, SIGSEGV, SIGSTOP,
     },
     timer::{add_timer, get_time, get_time_ms, get_time_us, remove_timer},
 };
@@ -2267,8 +2267,11 @@ pub fn sys_setitimer(
                 let now_ms = get_time_ms();
                 if expire_ms > now_ms { (expire_ms - now_ms) * 1000 } else { 0 }
             };
+            // Keep user-visible interval precision from the canonical itimer state,
+            // instead of the millisecond scheduling cache field.
+            let interval_us = inner.itimers[0].interval_us;
             ITimerVal {
-                it_interval: us_to_timeval(inner.itimer_real_interval_ms * 1000),
+                it_interval: us_to_timeval(interval_us),
                 it_value: us_to_timeval(remaining_us),
             }
         } else {
@@ -3508,10 +3511,30 @@ pub fn sys_sigaction(
         }
     }
     if !action.is_null() {
-        let new_action = match read_from_user::<SignalAction>(token, action) {
+        let mut new_action = match read_from_user::<SignalAction>(token, action) {
             Ok(v) => v,
             Err(err) => return err,
         };
+
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            // Linux only uses sa_restorer when SA_RESTORER is set.
+            // glibc may leave a non-zero value in sa_restorer even when SA_RESTORER
+            // is clear; that value is semantically irrelevant and must not be used.
+            if (new_action.flags & SA_RESTORER) == 0 {
+                if new_action.restorer != 0 {
+                    debug!(
+                        "[sigaction] pid={} signum={} clear restorer={:#x} because SA_RESTORER is not set",
+                        pid, signum, new_action.restorer
+                    );
+                    new_action.restorer = 0;
+                }
+            } else if new_action.restorer == 0 {
+                // Keep stored action self-consistent to avoid confusing downstream logic.
+                new_action.flags &= !SA_RESTORER;
+            }
+        }
+
         if signum == 32 || signum == 33 || signum == crate::task::SIGCHLD as i32 {
             info!(
                 "[sigaction] pid={} signum={} handler={:#x} flags={:#x} restorer={:#x} mask={:?}",
