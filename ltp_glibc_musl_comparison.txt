@@ -1,0 +1,214 @@
+========================================================================
+LTP glibc vs musl：基于 htmls-9000/开放课程.html 的 pass/all 差分分析
+========================================================================
+
+一、原始统计
+------------------------------------------------------------------------
+- HTML 来源: /home/grl/codeRepo/rcore-lab/htmls-9000/开放课程.html
+- LTP 目录: /home/grl/codeRepo/testsuits-for-oskernel/ltp-full-20240524/testcases
+- ltp-glibc: 1627 个测试点, pass=3744, all=5845
+- ltp-musl : 1887 个测试点, pass=4923, all=7207
+- 总差值   : pass +1179, all +1362
+- 共享测试点: 1627
+- musl 独有 : 260
+
+二、先看结论
+------------------------------------------------------------------------
+1. 如果只看“共享测试里 glibc 落后 musl 的部分”，最值得优先修的是：
+   文件权限/路径语义 -> SysV IPC 消息队列 -> 凭证/身份切换 -> 调度/时钟/优先级。
+2. 如果把“musl 已跑到、glibc 还没进入表”的新增空间也算上，最大增量反而来自：
+   进程等待/回收/时间统计（waitpid/waitid/times）和文件权限/路径语义。
+3. `waitpid01` 单项就有 pass +292 / all +292，是当前页面里最大的单点差值；
+   但它属于 musl-only，需要先确认是 glibc 侧没有编进来、没有跑到，还是被运行环境屏蔽。
+4. `access01` 仍然是“共享测试中的头号目标”，因为它不是覆盖问题，而是 glibc 已在表中但明显落后。
+
+三、按改动方向排序（综合 shared + musl-only）
+------------------------------------------------------------------------
+ 1. 进程等待/回收/时间统计: pass +442, all +458, 28 个测试点 (shared 0, musl-only 28)
+  - waitpid01: pass +292, all +292 (musl-only, kernel/syscalls/waitpid/waitpid01.c)
+  - waitid08: pass +20, all +20 (musl-only, kernel/syscalls/waitid/waitid08.c)
+  - times03: pass +14, all +24 (musl-only, kernel/syscalls/times/times03.c)
+  - waitid06: pass +12, all +12 (musl-only, kernel/syscalls/waitid/waitid06.c)
+  - waitid05: pass +12, all +12 (musl-only, kernel/syscalls/waitid/waitid05.c)
+  - waitid11: pass +10, all +10 (musl-only, kernel/syscalls/waitid/waitid11.c)
+ 2. 文件权限/路径语义: pass +368, all +392, 46 个测试点 (shared 33, musl-only 13)
+  - access01: pass +199, all +198 (shared, kernel/syscalls/access/access01.c)
+  - access02: pass +16, all +15 (shared, kernel/syscalls/access/access02.c)
+  - unlinkat01: pass +12, all +14 (musl-only, kernel/syscalls/unlinkat/unlinkat01.c)
+  - stat01_64: pass +12, all +11 (shared, kernel/syscalls/stat/stat01.c)
+  - stat01: pass +12, all +11 (shared, kernel/syscalls/stat/stat01.c)
+  - access04: pass +12, all +11 (shared, kernel/syscalls/access/access04.c)
+ 3. SysV IPC: 消息队列: pass +144, all +126, 11 个测试点 (shared 11, musl-only 0)
+  - msgrcv07: pass +30, all +28 (shared, kernel/syscalls/ipc/msgrcv/msgrcv07.c)
+  - msgctl01: pass +28, all +26 (shared, kernel/syscalls/ipc/msgctl/msgctl01.c)
+  - msgctl04: pass +24, all +26 (shared, kernel/syscalls/ipc/msgctl/msgctl04.c)
+  - msgrcv02: pass +16, all +14 (shared, kernel/syscalls/ipc/msgrcv/msgrcv02.c)
+  - msgsnd02: pass +12, all +10 (shared, kernel/syscalls/ipc/msgsnd/msgsnd02.c)
+  - msgget02: pass +12, all +10 (shared, kernel/syscalls/ipc/msgget/msgget02.c)
+ 4. 凭证/身份切换: pass +105, all +89, 25 个测试点 (shared 25, musl-only 0)
+  - setregid03: pass +22, all +21 (shared, kernel/syscalls/setregid/setregid03.c)
+  - setreuid05: pass +14, all +13 (shared, kernel/syscalls/setreuid/setreuid05.c)
+  - setreuid03: pass +14, all +13 (shared, kernel/syscalls/setreuid/setreuid03.c)
+  - setreuid02: pass +7, all +6 (shared, kernel/syscalls/setreuid/setreuid02.c)
+  - setresuid02: pass +4, all +3 (shared, kernel/syscalls/setresuid/setresuid02.c)
+  - setresgid03: pass +4, all +3 (shared, kernel/syscalls/setresgid/setresgid03.c)
+ 5. 调度/时钟/优先级: pass +80, all +70, 18 个测试点 (shared 13, musl-only 5)
+  - adjtimex02: pass +14, all +12 (shared, kernel/syscalls/adjtimex/adjtimex02.c)
+  - timerfd02: pass +12, all +12 (musl-only, kernel/syscalls/timerfd/timerfd02.c)
+  - gettid02: pass +11, all +10 (shared, kernel/syscalls/gettid/gettid02.c)
+  - setpriority02: pass +7, all +6 (shared, kernel/syscalls/setpriority/setpriority02.c)
+  - timerfd_settime01: pass +6, all +8 (musl-only, kernel/syscalls/timerfd/timerfd_settime01.c)
+  - clock_gettime04: pass +5, all +0 (shared, kernel/syscalls/clock_gettime/clock_gettime04.c)
+ 6. 内存映射/IO 边角语义: pass +46, all +90, 16 个测试点 (shared 2, musl-only 14)
+  - writev01: pass +12, all +12 (musl-only, kernel/syscalls/writev/writev01.c)
+  - writev07: pass +8, all +12 (musl-only, kernel/syscalls/writev/writev07.c)
+  - write05: pass +5, all +6 (musl-only, kernel/syscalls/write/write05.c)
+  - write06: pass +4, all +4 (musl-only, kernel/syscalls/write/write06.c)
+  - write02: pass +4, all +4 (musl-only, kernel/syscalls/write/write02.c)
+  - truncate03_64: pass +2, all +16 (musl-only, kernel/syscalls/truncate/truncate03.c)
+ 7. SysV IPC: 共享内存: pass +26, all +64, 7 个测试点 (shared 7, musl-only 0)
+  - shmctl02: pass +12, all +46 (shared, kernel/syscalls/ipc/shmctl/shmctl02.c)
+  - shmat02: pass +4, all +4 (shared, kernel/syscalls/ipc/shmat/shmat02.c)
+  - shmdt02: pass +4, all +2 (shared, kernel/syscalls/ipc/shmdt/shmdt02.c)
+  - shmdt01: pass +4, all +2 (shared, kernel/syscalls/ipc/shmdt/shmdt01.c)
+  - shmat04: pass +2, all +0 (shared, kernel/syscalls/ipc/shmat/shmat04.c)
+  - shmat01: pass +0, all +6 (shared, kernel/syscalls/ipc/shmat/shmat01.c)
+ 8. 网络基础能力: pass +23, all +23, 6 个测试点 (shared 6, musl-only 0)
+  - bind04: pass +10, all +10 (shared, kernel/syscalls/bind/bind04.c)
+  - bind05: pass +8, all +8 (shared, kernel/syscalls/bind/bind05.c)
+  - getaddrinfo_01: pass +4, all +4 (shared, network/lib6/getaddrinfo_01.c)
+  - bind02: pass +1, all +0 (shared, kernel/syscalls/bind/bind02.c)
+  - accept02: pass +1, all +0 (shared, kernel/syscalls/accept/accept02.c)
+  - select03: pass -1, all +1 (shared, kernel/syscalls/select/select03.c)
+ 9. 信号处理: pass +16, all +14, 6 个测试点 (shared 4, musl-only 2)
+  - tkill02: pass +4, all +4 (musl-only, kernel/syscalls/tkill/tkill02.c)
+  - tkill01: pass +4, all +4 (musl-only, kernel/syscalls/tkill/tkill01.c)
+  - sigaltstack02: pass +4, all +0 (shared, kernel/syscalls/sigaltstack/sigaltstack02.c)
+  - signal05: pass +2, all +2 (shared, kernel/syscalls/signal/signal05.c)
+  - signal03: pass +2, all +2 (shared, kernel/syscalls/signal/signal03.c)
+  - kill05: pass +0, all +2 (shared, kernel/syscalls/kill/kill05.c)
+10. 系统信息/容器边界: pass +14, all +42, 9 个测试点 (shared 0, musl-only 9)
+  - utsname04: pass +4, all +4 (musl-only, kernel/containers/utsname/utsname04.c)
+  - uname01: pass +4, all +4 (musl-only, kernel/syscalls/uname/uname01.c)
+  - uname04: pass +2, all +4 (musl-only, kernel/syscalls/uname/uname04.c)
+  - utsname01: pass +2, all +2 (musl-only, kernel/containers/utsname/utsname01.c)
+  - uname02: pass +2, all +2 (musl-only, kernel/syscalls/uname/uname02.c)
+  - utsname02: pass +0, all +12 (musl-only, kernel/containers/utsname/utsname02.c)
+11. 其他/待细分: pass +10, all +94, 47 个测试点 (shared 13, musl-only 34)
+  - execve03: pass +4, all +3 (shared, kernel/syscalls/execve/execve03.c)
+  - umask01: pass +2, all +2 (musl-only, kernel/syscalls/umask/umask01.c)
+  - setrlimit02: pass +1, all +1 (shared, kernel/syscalls/setrlimit/setrlimit02.c)
+  - fchdir03: pass +1, all +0 (shared, kernel/syscalls/fchdir/fchdir03.c)
+  - execve06: pass +1, all +0 (shared, kernel/syscalls/execve/execve06.c)
+  - execve01: pass +1, all +0 (shared, kernel/syscalls/execve/execve01.c)
+
+四、共享测试中的高价值方向（更像“直接补语义拿分”）
+------------------------------------------------------------------------
+ 1. 文件权限/路径语义: pass +337, all +312, 33 个共享测试点
+  - access01: pass +199, all +198 (shared, kernel/syscalls/access/access01.c)
+  - access02: pass +16, all +15 (shared, kernel/syscalls/access/access02.c)
+  - stat01_64: pass +12, all +11 (shared, kernel/syscalls/stat/stat01.c)
+  - stat01: pass +12, all +11 (shared, kernel/syscalls/stat/stat01.c)
+  - access04: pass +12, all +11 (shared, kernel/syscalls/access/access04.c)
+ 2. SysV IPC: 消息队列: pass +144, all +126, 11 个共享测试点
+  - msgrcv07: pass +30, all +28 (shared, kernel/syscalls/ipc/msgrcv/msgrcv07.c)
+  - msgctl01: pass +28, all +26 (shared, kernel/syscalls/ipc/msgctl/msgctl01.c)
+  - msgctl04: pass +24, all +26 (shared, kernel/syscalls/ipc/msgctl/msgctl04.c)
+  - msgrcv02: pass +16, all +14 (shared, kernel/syscalls/ipc/msgrcv/msgrcv02.c)
+  - msgsnd02: pass +12, all +10 (shared, kernel/syscalls/ipc/msgsnd/msgsnd02.c)
+ 3. 凭证/身份切换: pass +105, all +89, 25 个共享测试点
+  - setregid03: pass +22, all +21 (shared, kernel/syscalls/setregid/setregid03.c)
+  - setreuid05: pass +14, all +13 (shared, kernel/syscalls/setreuid/setreuid05.c)
+  - setreuid03: pass +14, all +13 (shared, kernel/syscalls/setreuid/setreuid03.c)
+  - setreuid02: pass +7, all +6 (shared, kernel/syscalls/setreuid/setreuid02.c)
+  - setresuid02: pass +4, all +3 (shared, kernel/syscalls/setresuid/setresuid02.c)
+ 4. 调度/时钟/优先级: pass +52, all +36, 13 个共享测试点
+  - adjtimex02: pass +14, all +12 (shared, kernel/syscalls/adjtimex/adjtimex02.c)
+  - gettid02: pass +11, all +10 (shared, kernel/syscalls/gettid/gettid02.c)
+  - setpriority02: pass +7, all +6 (shared, kernel/syscalls/setpriority/setpriority02.c)
+  - clock_gettime04: pass +5, all +0 (shared, kernel/syscalls/clock_gettime/clock_gettime04.c)
+  - adjtimex01: pass +4, all +2 (shared, kernel/syscalls/adjtimex/adjtimex01.c)
+ 5. SysV IPC: 共享内存: pass +26, all +64, 7 个共享测试点
+  - shmctl02: pass +12, all +46 (shared, kernel/syscalls/ipc/shmctl/shmctl02.c)
+  - shmat02: pass +4, all +4 (shared, kernel/syscalls/ipc/shmat/shmat02.c)
+  - shmdt02: pass +4, all +2 (shared, kernel/syscalls/ipc/shmdt/shmdt02.c)
+  - shmdt01: pass +4, all +2 (shared, kernel/syscalls/ipc/shmdt/shmdt01.c)
+  - shmat04: pass +2, all +0 (shared, kernel/syscalls/ipc/shmat/shmat04.c)
+ 6. 网络基础能力: pass +23, all +23, 6 个共享测试点
+  - bind04: pass +10, all +10 (shared, kernel/syscalls/bind/bind04.c)
+  - bind05: pass +8, all +8 (shared, kernel/syscalls/bind/bind05.c)
+  - getaddrinfo_01: pass +4, all +4 (shared, network/lib6/getaddrinfo_01.c)
+  - bind02: pass +1, all +0 (shared, kernel/syscalls/bind/bind02.c)
+  - accept02: pass +1, all +0 (shared, kernel/syscalls/accept/accept02.c)
+
+五、musl-only 的高价值方向（更像“补覆盖/补启用”）
+------------------------------------------------------------------------
+ 1. 进程等待/回收/时间统计: pass +442, all +458, 28 个 musl-only 测试点
+  - waitpid01: pass +292, all +292 (musl-only, kernel/syscalls/waitpid/waitpid01.c)
+  - waitid08: pass +20, all +20 (musl-only, kernel/syscalls/waitid/waitid08.c)
+  - times03: pass +14, all +24 (musl-only, kernel/syscalls/times/times03.c)
+  - waitid06: pass +12, all +12 (musl-only, kernel/syscalls/waitid/waitid06.c)
+  - waitid05: pass +12, all +12 (musl-only, kernel/syscalls/waitid/waitid05.c)
+ 2. 内存映射/IO 边角语义: pass +44, all +92, 14 个 musl-only 测试点
+  - writev01: pass +12, all +12 (musl-only, kernel/syscalls/writev/writev01.c)
+  - writev07: pass +8, all +12 (musl-only, kernel/syscalls/writev/writev07.c)
+  - write05: pass +5, all +6 (musl-only, kernel/syscalls/write/write05.c)
+  - write06: pass +4, all +4 (musl-only, kernel/syscalls/write/write06.c)
+  - write02: pass +4, all +4 (musl-only, kernel/syscalls/write/write02.c)
+ 3. 文件权限/路径语义: pass +31, all +80, 13 个 musl-only 测试点
+  - unlinkat01: pass +12, all +14 (musl-only, kernel/syscalls/unlinkat/unlinkat01.c)
+  - unlink07: pass +6, all +12 (musl-only, kernel/syscalls/unlink/unlink07.c)
+  - utimes01: pass +4, all +8 (musl-only, kernel/syscalls/utimes/utimes01.c)
+  - unlink08: pass +4, all +8 (musl-only, kernel/syscalls/unlink/unlink08.c)
+  - utime06: pass +2, all +8 (musl-only, kernel/syscalls/utime/utime06.c)
+ 4. 调度/时钟/优先级: pass +28, all +34, 5 个 musl-only 测试点
+  - timerfd02: pass +12, all +12 (musl-only, kernel/syscalls/timerfd/timerfd02.c)
+  - timerfd_settime01: pass +6, all +8 (musl-only, kernel/syscalls/timerfd/timerfd_settime01.c)
+  - timerfd_create01: pass +4, all +4 (musl-only, kernel/syscalls/timerfd/timerfd_create01.c)
+  - time01: pass +4, all +4 (musl-only, kernel/syscalls/time/time01.c)
+  - timerfd_gettime01: pass +2, all +6 (musl-only, kernel/syscalls/timerfd/timerfd_gettime01.c)
+ 5. 系统信息/容器边界: pass +14, all +42, 9 个 musl-only 测试点
+  - utsname04: pass +4, all +4 (musl-only, kernel/containers/utsname/utsname04.c)
+  - uname01: pass +4, all +4 (musl-only, kernel/syscalls/uname/uname01.c)
+  - uname04: pass +2, all +4 (musl-only, kernel/syscalls/uname/uname04.c)
+  - utsname01: pass +2, all +2 (musl-only, kernel/containers/utsname/utsname01.c)
+  - uname02: pass +2, all +2 (musl-only, kernel/syscalls/uname/uname02.c)
+ 6. 信号处理: pass +8, all +8, 2 个 musl-only 测试点
+  - tkill02: pass +4, all +4 (musl-only, kernel/syscalls/tkill/tkill02.c)
+  - tkill01: pass +4, all +4 (musl-only, kernel/syscalls/tkill/tkill01.c)
+
+六、全局 Top 20 单项差值
+------------------------------------------------------------------------
+ 1. waitpid01            | pass +292 | all +292 | musl-only | kernel/syscalls/waitpid/waitpid01.c
+ 2. access01             | pass +199 | all +198 | shared    | kernel/syscalls/access/access01.c
+ 3. msgrcv07             | pass +30  | all +28  | shared    | kernel/syscalls/ipc/msgrcv/msgrcv07.c
+ 4. msgctl01             | pass +28  | all +26  | shared    | kernel/syscalls/ipc/msgctl/msgctl01.c
+ 5. msgctl04             | pass +24  | all +26  | shared    | kernel/syscalls/ipc/msgctl/msgctl04.c
+ 6. setregid03           | pass +22  | all +21  | shared    | kernel/syscalls/setregid/setregid03.c
+ 7. waitid08             | pass +20  | all +20  | musl-only | kernel/syscalls/waitid/waitid08.c
+ 8. access02             | pass +16  | all +15  | shared    | kernel/syscalls/access/access02.c
+ 9. msgrcv02             | pass +16  | all +14  | shared    | kernel/syscalls/ipc/msgrcv/msgrcv02.c
+10. times03              | pass +14  | all +24  | musl-only | kernel/syscalls/times/times03.c
+11. setreuid05           | pass +14  | all +13  | shared    | kernel/syscalls/setreuid/setreuid05.c
+12. setreuid03           | pass +14  | all +13  | shared    | kernel/syscalls/setreuid/setreuid03.c
+13. adjtimex02           | pass +14  | all +12  | shared    | kernel/syscalls/adjtimex/adjtimex02.c
+14. shmctl02             | pass +12  | all +46  | shared    | kernel/syscalls/ipc/shmctl/shmctl02.c
+15. unlinkat01           | pass +12  | all +14  | musl-only | kernel/syscalls/unlinkat/unlinkat01.c
+16. writev01             | pass +12  | all +12  | musl-only | kernel/syscalls/writev/writev01.c
+17. waitid06             | pass +12  | all +12  | musl-only | kernel/syscalls/waitid/waitid06.c
+18. waitid05             | pass +12  | all +12  | musl-only | kernel/syscalls/waitid/waitid05.c
+19. timerfd02            | pass +12  | all +12  | musl-only | kernel/syscalls/timerfd/timerfd02.c
+20. stat01_64            | pass +12  | all +11  | shared    | kernel/syscalls/stat/stat01.c
+
+七、建议的优先级
+------------------------------------------------------------------------
+A. 想要“更稳地回收 glibc 已经在跑的分数”：
+   先修 `access/stat/open/chmod/chown` 这一组文件权限语义，再修 `msg*`，再修 `setreuid/setregid/setresuid`。
+B. 想要“冲更大分差，但要先排查测试覆盖链路”：
+   先核查 `waitpid01 + waitid* + times03` 为什么只在 musl 表里出现，再决定是补 glibc 构建、运行脚本，还是补内核语义。
+C. `all` 差值明显大于 `pass` 的点需要额外警惕：
+   例如 `shmctl02`、`truncate03`、`times03`，这类通常意味着 musl 跑到了更多子项，而 glibc 侧不是单纯“少过了几个”。
+
+八、使用说明
+------------------------------------------------------------------------
+重新生成命令: `python3 scripts/analyze_ltp_html.py --html htmls-9000/开放课程.html --ltp-root /home/grl/codeRepo/testsuits-for-oskernel/ltp-full-20240524/testcases --output ltp_glibc_musl_comparison.txt`
