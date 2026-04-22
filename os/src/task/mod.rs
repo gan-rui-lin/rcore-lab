@@ -27,8 +27,10 @@ mod initproc_embed;
 #[allow(unused_imports)]
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{
-    translated_byte_buffer_checked, translated_refmut, PageTable, PTEFlags, VirtAddr,
+    translated_byte_buffer_checked, translated_refmut, PageTable, VirtAddr,
 };
+#[cfg(not(target_arch = "loongarch64"))]
+use crate::mm::PTEFlags;
 use crate::timer::remove_timer;
 use alloc::sync::Arc;
 #[allow(unused_imports)]

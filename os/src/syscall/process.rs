@@ -23,10 +23,12 @@ use crate::{
         suspend_current_and_run_next,
         user_mask_to_flags, ChildWaitEvent, FutexKey, IntervalTimerState, RLimit, SignalAction,
         SignalFlags, TaskControlBlock, TaskStatus, UserContext, MAX_SIG, RLIMIT_NLIMITS, SIGCHLD,
-        SA_RESTORER, SIGCONT, SIGKILL, SIGSEGV, SIGSTOP,
+        SIGCONT, SIGKILL, SIGSEGV, SIGSTOP,
     },
     timer::{add_timer, get_time, get_time_ms, get_time_us, remove_timer},
 };
+#[cfg(not(target_arch = "loongarch64"))]
+use crate::task::SA_RESTORER;
 
 use arch::TrapFrameArgs;
 
@@ -3511,10 +3513,12 @@ pub fn sys_sigaction(
         }
     }
     if !action.is_null() {
-        let mut new_action = match read_from_user::<SignalAction>(token, action) {
+        let new_action = match read_from_user::<SignalAction>(token, action) {
             Ok(v) => v,
             Err(err) => return err,
         };
+        #[cfg(not(target_arch = "loongarch64"))]
+        let mut new_action = new_action;
 
         #[cfg(not(target_arch = "loongarch64"))]
         {

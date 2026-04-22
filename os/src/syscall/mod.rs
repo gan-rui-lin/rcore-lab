@@ -385,7 +385,7 @@ const TRACE_PID: Option<usize> = match option_env!("TRACE_PID") {
 const TRACE_NAME: Option<&str> = option_env!("TRACE_NAME");
 
 /// Global switch for syscall tracing, useful for toggling via a debugger.
-pub static SYSCALL_TRACE_ALL: AtomicBool = AtomicBool::new(false);
+pub static SYSCALL_TRACE_ALL: AtomicBool = AtomicBool::new(true);
 
 /// Procfs helper for `/proc/sysvipc/msg`.
 pub fn proc_sysvipc_msg() -> alloc::string::String {
