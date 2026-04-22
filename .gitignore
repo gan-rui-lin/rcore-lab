@@ -47,3 +47,4 @@ user/target-user/
 user/__pycache__/
 *.err
 qemu-9.2.1.tar.xz
+htmls-*/*
