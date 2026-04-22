@@ -26,7 +26,9 @@ use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
 mod initproc_embed;
 #[allow(unused_imports)]
 use crate::fs::{open_file, OpenFlags};
-use crate::mm::{translated_byte_buffer_checked, translated_refmut, PageTable, VirtAddr};
+use crate::mm::{
+    translated_byte_buffer_checked, translated_refmut, PageTable, PTEFlags, VirtAddr,
+};
 use crate::timer::remove_timer;
 use alloc::sync::Arc;
 #[allow(unused_imports)]
@@ -37,7 +39,9 @@ use lazy_static::*;
 use manager::fetch_task;
 use process::ProcessControlBlock;
 
-pub use action::{SignalAction, SignalActions, SA_RESTART, SA_SIGINFO, SA_RESETHAND};
+pub use action::{
+    SignalAction, SignalActions, SA_RESETHAND, SA_RESTART, SA_RESTORER, SA_SIGINFO,
+};
 pub use auxv::AuxvInfo;
 pub use context::TaskContext;
 pub use futex::{
@@ -800,6 +804,7 @@ pub fn handle_signals() {
     let old_ra = task_inner.get_trap_cx()[TrapFrameArgs::RA];
     let trap_cx = task_inner.get_trap_cx();
     trap_cx.sepc = action.handler;
+    let token = process_inner.memory_set.token();
     // LoongArch: no SA_RESTORER, always use kernel trampoline for sigreturn
     #[cfg(target_arch = "loongarch64")]
     {
@@ -826,19 +831,26 @@ pub fn handle_signals() {
     // Our kernel trampoline does the same thing (calls rt_sigreturn).
     #[cfg(not(target_arch = "loongarch64"))]
     {
-        // Heuristic: a valid restorer should be above 0x10000 (PIE load base or
-        // mmap region). Values below 0x10000 are clearly unrelocated offsets from
-        // glibc shared libraries (e.g., raw offset 0x200 instead of libc_base + 0x200).
-        let use_restorer = action.restorer != 0
-            && action.restorer < USER_ADDR_MAX
-            && action.restorer >= 0x10000;
+        let page_table = PageTable::from_token(token);
+        let use_restorer = if (action.flags & SA_RESTORER) == 0 {
+            false
+        } else if action.restorer == 0 || action.restorer >= USER_ADDR_MAX {
+            false
+        } else {
+            let restorer_va = VirtAddr::from(action.restorer);
+            page_table.translate(restorer_va.floor()).map_or(false, |pte| {
+                pte.is_valid()
+                    && pte.flags().contains(PTEFlags::U)
+                    && (pte.executable() || pte.readable())
+            })
+        };
         if use_restorer {
             trap_cx[TrapFrameArgs::RA] = action.restorer;
         } else {
-            if action.restorer != 0 && action.restorer < 0x10000 {
+            if action.restorer != 0 {
                 warn!(
-                    "[signal] pid={} signum={} restorer={:#x} looks unrelocated, using kernel trampoline",
-                    pid, signum, action.restorer
+                    "[signal] pid={} signum={} ignore restorer={:#x} flags={:#x}, using kernel trampoline",
+                    pid, signum, action.restorer, action.flags
                 );
             }
             trap_cx[TrapFrameArgs::RA] =
@@ -848,7 +860,6 @@ pub fn handle_signals() {
 
     // 14. 设置信号栈
     let saved_cx = task_inner.signal_trap_cx.as_ref().unwrap();
-    let token = process_inner.memory_set.token();
     let need_siginfo = (action.flags & SA_SIGINFO) != 0 || signum == 32 || signum == 33;
 
     let (ucontext_ptr, canary_ptr) = setup_signal_stack(
