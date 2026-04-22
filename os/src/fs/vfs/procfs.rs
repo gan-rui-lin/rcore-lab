@@ -717,6 +717,11 @@ fn proc_sys_kernel() -> Arc<dyn VfsInode> {
         String::from("pid_max"),
         ProcFileInode::new(|| String::from("32768\n")),
     );
+    // LTP tst_pid helpers read this to size process-related stress loops.
+    entries.insert(
+        String::from("threads-max"),
+        ProcFileInode::new(|| String::from("32768\n")),
+    );
     // cyclictest reads this to check if RT scheduling is available
     entries.insert(
         String::from("sched_rt_runtime_us"),
@@ -748,6 +753,11 @@ fn proc_sys_kernel() -> Arc<dyn VfsInode> {
     entries.insert(
         String::from("ngroups_max"),
         ProcFileInode::new(|| String::from("65536\n")),
+    );
+    // SysV message queue limit used by msgstress01 setup.
+    entries.insert(
+        String::from("msgmni"),
+        ProcFileInode::new(|| String::from("128\n")),
     );
     // /proc/sys/kernel/ostype and /proc/sys/kernel/osrelease.
     entries.insert(
@@ -873,6 +883,15 @@ fn proc_sys() -> Arc<dyn VfsInode> {
     ProcStaticDirInode::new(entries)
 }
 
+fn proc_sysvipc() -> Arc<dyn VfsInode> {
+    let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
+    entries.insert(
+        String::from("msg"),
+        ProcFileInode::new(crate::syscall::proc_sysvipc_msg),
+    );
+    ProcStaticDirInode::new(entries)
+}
+
 pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
     let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
     entries.insert(String::from("mounts"), ProcFileInode::new(proc_mounts));
@@ -907,5 +926,6 @@ pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
         }),
     );
     entries.insert(String::from("sys"), proc_sys());
+    entries.insert(String::from("sysvipc"), proc_sysvipc());
     ProcRootInode::new(entries)
 }
