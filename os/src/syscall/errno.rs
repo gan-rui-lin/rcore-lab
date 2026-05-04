@@ -23,6 +23,7 @@ pub const EINVAL: isize = 22;
 pub const ENFILE: isize = 23;
 pub const EMFILE: isize = 24;
 pub const ENOTTY: isize = 25;
+pub const EFBIG: isize = 27;
 pub const EPIPE: isize = 32;
 pub const ERANGE: isize = 34;
 pub const ENAMETOOLONG: isize = 36;

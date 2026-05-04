@@ -40,6 +40,7 @@ const IPPROTO_UDP: usize = 17;
 const SO_REUSEADDR: usize = 2;
 const SO_ERROR: usize = 4;
 const SO_KEEPALIVE: usize = 9;
+const SO_OOBINLINE: usize = 10;
 const SO_SNDBUF: usize = 7;
 const SO_RCVBUF: usize = 8;
 const SO_RCVTIMEO: usize = 20;
@@ -1476,15 +1477,27 @@ pub fn sys_setsockopt(
     fd: usize,
     level: usize,
     optname: usize,
-    _optval: *const u8,
-    _optlen: usize,
+    optval: *const u8,
+    optlen: usize,
 ) -> isize {
     let (handle, _sock_type) = match get_socket_info(fd) {
         Ok(info) => info,
         Err(e) => return e,
     };
 
-    // Stub: accept common options silently
+    if optlen == 0 {
+        return EINVAL;
+    }
+    if optval.is_null() {
+        return EFAULT;
+    }
+    let token = current_user_token();
+    let mut probe = [0u8; 1];
+    if user_mem::copy_from_user(token, optval, &mut probe, UserReadPolicy::StrictChecked).is_err()
+    {
+        return EFAULT;
+    }
+
     match (level, optname) {
         (SOL_IP, MCAST_JOIN_GROUP) => {
             mcast_mark_joined(handle);
@@ -1504,12 +1517,15 @@ pub fn sys_setsockopt(
         (SOL_SOCKET, SO_RCVTIMEO) => 0,
         (SOL_SOCKET, SO_SNDTIMEO) => 0,
         (IPPROTO_TCP, TCP_NODELAY) => 0,
+        (SOL_SOCKET, SO_OOBINLINE) => ENOPROTOOPT,
+        (SOL_IP, _) | (IPPROTO_TCP, _) | (IPPROTO_UDP, _) => ENOPROTOOPT,
+        (SOL_SOCKET, _) => 0,
         _ => {
             warn!(
                 "[net] setsockopt: unsupported level={} optname={}",
                 level, optname
             );
-            0 // Return success to avoid breaking applications
+            ENOPROTOOPT
         }
     }
 }

@@ -3772,12 +3772,49 @@ pub fn sys_truncate(path: *const u8, length: isize) -> isize {
         return errno(EFAULT);
     };
 
+    if raw_path.is_empty() {
+        return errno(ENOENT);
+    }
+    if raw_path.len() > PATH_MAX
+        || raw_path
+            .split('/')
+            .any(|component| component.len() > NAME_MAX)
+    {
+        return errno(ENAMETOOLONG);
+    }
+
     let full_path = if raw_path.starts_with('/') {
         normalize_path(&raw_path)
     } else {
         let base = current_process().inner_exclusive_access().cwd.clone();
         resolve_path(&base, &raw_path)
     };
+
+    let full_path = match resolve_access_path(&full_path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    if path_is_dir(&full_path) {
+        return errno(EISDIR);
+    }
+    if !path_exists_for_access(&full_path) {
+        return errno(ENOENT);
+    }
+
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let euid = inner.effective_uid;
+    let egid = inner.effective_gid;
+    let file_limit = inner.rlimits[1].rlim_cur;
+    drop(inner);
+
+    if (length as u64) > file_limit {
+        return errno(EFBIG);
+    }
+    if let Err(err) = access_allowed_egid(&full_path, 0o2, euid, egid) {
+        return err;
+    }
 
     let Some(file) = open_file(&full_path, OpenFlags::RDWR) else {
         return errno(ENOENT);
@@ -4444,6 +4481,174 @@ pub fn sys_pread64(fd: usize, buf: *const u8, count: usize, offset: isize) -> is
         }
     }
     total as isize
+}
+
+fn read_user_iovec(token: usize, iov: *const usize, index: usize) -> Result<(usize, usize), isize> {
+    let iov_ptr = unsafe { (iov as *const u8).add(index * 16) };
+    let mut iov_data = [0u8; 16];
+    user_mem::copy_from_user(token, iov_ptr, &mut iov_data, UserReadPolicy::DemandPaged)?;
+    let base = usize::from_le_bytes([
+        iov_data[0],
+        iov_data[1],
+        iov_data[2],
+        iov_data[3],
+        iov_data[4],
+        iov_data[5],
+        iov_data[6],
+        iov_data[7],
+    ]);
+    let len = usize::from_le_bytes([
+        iov_data[8],
+        iov_data[9],
+        iov_data[10],
+        iov_data[11],
+        iov_data[12],
+        iov_data[13],
+        iov_data[14],
+        iov_data[15],
+    ]);
+    Ok((base, len))
+}
+
+fn sys_preadv_common(
+    fd: usize,
+    iov: *const usize,
+    iovcnt: usize,
+    offset: isize,
+    flags: usize,
+    offset_minus_one_uses_file_pos: bool,
+) -> isize {
+    if flags != 0 {
+        return errno(ENOTSUP);
+    }
+    if iov.is_null() {
+        return errno(EFAULT);
+    }
+    const UIO_MAXIOV: usize = 1024;
+    if iovcnt > UIO_MAXIOV {
+        return errno(EINVAL);
+    }
+    if iovcnt == 0 {
+        return 0;
+    }
+
+    let use_file_pos = offset_minus_one_uses_file_pos && offset == -1;
+    if offset < 0 && !use_file_pos {
+        return errno(EINVAL);
+    }
+
+    let token = current_user_token();
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+    let file = file.clone();
+    drop(inner);
+
+    if !file.readable() {
+        return errno(EBADF);
+    }
+    let Some(inode) = file.inode() else {
+        return errno(ESPIPE);
+    };
+    if inode.is_dir() {
+        return errno(EISDIR);
+    }
+
+    let mut off = if use_file_pos {
+        file.get_offset().unwrap_or(0)
+    } else {
+        offset as usize
+    };
+    let mut total_read = 0usize;
+
+    for i in 0..iovcnt {
+        let (base, len) = match read_user_iovec(token, iov, i) {
+            Ok(v) => v,
+            Err(_) => return if total_read > 0 { total_read as isize } else { errno(EFAULT) },
+        };
+        if len == 0 {
+            continue;
+        }
+        if len > isize::MAX as usize {
+            return if total_read > 0 { total_read as isize } else { errno(EINVAL) };
+        }
+        if base == 0 {
+            return if total_read > 0 { total_read as isize } else { errno(EFAULT) };
+        }
+        let Some(buffers) = translated_user_write_buffer(token, base as *const u8, len) else {
+            return if total_read > 0 { total_read as isize } else { errno(EFAULT) };
+        };
+
+        let mut iov_read = 0usize;
+        for slice in buffers {
+            let n = inode.read_at(off, slice);
+            if n == 0 {
+                break;
+            }
+            let Some(next_off) = off.checked_add(n) else {
+                return if total_read > 0 { total_read as isize } else { errno(EINVAL) };
+            };
+            let Some(next_total) = total_read.checked_add(n) else {
+                return if total_read > 0 { total_read as isize } else { errno(EINVAL) };
+            };
+            off = next_off;
+            total_read = next_total;
+            iov_read += n;
+            if n < slice.len() {
+                break;
+            }
+        }
+        if iov_read < len {
+            break;
+        }
+    }
+
+    if use_file_pos {
+        file.set_offset(off);
+    }
+    total_read as isize
+}
+
+/// sys_preadv (syscall 69) - vectored read at offset without changing file position
+pub fn sys_preadv(fd: usize, iov: *const usize, iovcnt: usize, offset: isize) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!(
+            "kernel:pid[{}] sys_preadv fd={} iovcnt={} offset={}",
+            pid,
+            fd,
+            iovcnt,
+            offset
+        );
+    }
+    sys_preadv_common(fd, iov, iovcnt, offset, 0, false)
+}
+
+/// sys_preadv2 (syscall 286) - vectored read with flags.
+pub fn sys_preadv2(
+    fd: usize,
+    iov: *const usize,
+    iovcnt: usize,
+    offset: isize,
+    flags: usize,
+) -> isize {
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!(
+            "kernel:pid[{}] sys_preadv2 fd={} iovcnt={} offset={} flags={:#x}",
+            pid,
+            fd,
+            iovcnt,
+            offset,
+            flags
+        );
+    }
+    sys_preadv_common(fd, iov, iovcnt, offset, flags, true)
 }
 
 /// sys_pwrite64 (syscall 68) - write at a given offset without changing file position

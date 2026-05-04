@@ -45,6 +45,8 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(0o022) };
     static ref REALTIME_OFFSET_US: UPIntrFreeCell<i64> =
         unsafe { UPIntrFreeCell::new(0) };
+    static ref UTS_STATE: UPIntrFreeCell<(String, String)> =
+        unsafe { UPIntrFreeCell::new((String::from("rcore"), String::from("ruos"))) };
 }
 
 #[allow(dead_code)]
@@ -2430,14 +2432,16 @@ pub fn sys_uname(uts: *mut UtsName) -> isize {
         dst[len] = 0;
     }
     fill(&mut uname.sysname, "Linux");
-    fill(&mut uname.nodename, "rcore");
+    let uts_state = UTS_STATE.exclusive_access();
+    fill(&mut uname.nodename, uts_state.0.as_str());
     fill(&mut uname.release, "5.10.0");
     fill(&mut uname.version, "rcore");
     #[cfg(target_arch = "riscv64")]
     fill(&mut uname.machine, "riscv64");
     #[cfg(target_arch = "loongarch64")]
     fill(&mut uname.machine, "loongarch64");
-    fill(&mut uname.domainname, "ruos");
+    fill(&mut uname.domainname, uts_state.1.as_str());
+    drop(uts_state);
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&uname as *const UtsName) as *const u8,
@@ -2449,6 +2453,52 @@ pub fn sys_uname(uts: *mut UtsName) -> isize {
         Ok(_) => 0,
         Err(err) => err,
     }
+}
+
+fn sys_set_uts_name(name: *const u8, len: usize, is_hostname: bool) -> isize {
+    const UTS_NAME_MAX: usize = 64;
+    if len > UTS_NAME_MAX {
+        return errno(EINVAL);
+    }
+    if name.is_null() {
+        return errno(EFAULT);
+    }
+
+    let process = current_process();
+    if process.inner_exclusive_access().effective_uid != 0 {
+        return errno(EPERM);
+    }
+
+    let token = current_user_token();
+    let mut bytes = [0u8; UTS_NAME_MAX];
+    if len > 0
+        && user_mem::copy_from_user(
+            token,
+            name,
+            &mut bytes[..len],
+            UserReadPolicy::StrictChecked,
+        )
+        .is_err()
+    {
+        return errno(EFAULT);
+    }
+
+    let new_name = core::str::from_utf8(&bytes[..len]).unwrap_or("").into();
+    let mut uts_state = UTS_STATE.exclusive_access();
+    if is_hostname {
+        uts_state.0 = new_name;
+    } else {
+        uts_state.1 = new_name;
+    }
+    0
+}
+
+pub fn sys_sethostname(name: *const u8, len: usize) -> isize {
+    sys_set_uts_name(name, len, true)
+}
+
+pub fn sys_setdomainname(name: *const u8, len: usize) -> isize {
+    sys_set_uts_name(name, len, false)
 }
 
 fn user_range_in_area(start: usize, len: usize) -> bool {
@@ -4613,22 +4663,57 @@ pub fn sys_capset(header_ptr: *const u8, data_ptr: *const u8) -> isize {
 
 /// prctl(option, arg2, arg3, arg4, arg5) - syscall 167
 /// Process control operations.
-pub fn sys_prctl(option: usize, arg2: usize, _arg3: usize, _arg4: usize, _arg5: usize) -> isize {
+pub fn sys_prctl(option: usize, arg2: usize, arg3: usize, _arg4: usize, _arg5: usize) -> isize {
+    const PR_SET_PDEATHSIG: usize = 1;
     const PR_SET_DUMPABLE: usize = 4;
     const PR_GET_DUMPABLE: usize = 3;
     const PR_SET_KEEPCAPS: usize = 8;
     const PR_GET_KEEPCAPS: usize = 7;
+    const PR_SET_TIMING: usize = 14;
     const PR_SET_NAME: usize = 15;
     const PR_GET_NAME: usize = 16;
     const PR_CAPBSET_READ: usize = 23;
     const PR_CAPBSET_DROP: usize = 24;
+    const PR_SET_SECUREBITS: usize = 28;
     const PR_SET_SECCOMP: usize = 22;
     const PR_GET_SECCOMP: usize = 21;
+    const SECCOMP_MODE_FILTER: usize = 2;
+    const CAP_SETPCAP: u64 = 1 << 8;
 
     match option {
-        PR_SET_DUMPABLE | PR_SET_KEEPCAPS | PR_SET_SECCOMP => {
-            // Silently accept (don't track dumpable/keepcaps state for now)
+        PR_SET_PDEATHSIG => {
+            if arg2 > MAX_SIG {
+                return errno(EINVAL);
+            }
             0
+        }
+        PR_SET_DUMPABLE => {
+            if arg2 > 1 {
+                return errno(EINVAL);
+            }
+            0
+        }
+        PR_SET_KEEPCAPS => 0,
+        PR_SET_SECCOMP => {
+            if arg2 != SECCOMP_MODE_FILTER {
+                return errno(EINVAL);
+            }
+            if arg3 == 0 {
+                return errno(EFAULT);
+            }
+            let token = current_user_token();
+            let mut raw = [0u8; 16];
+            if user_mem::copy_from_user(
+                token,
+                arg3 as *const u8,
+                &mut raw,
+                UserReadPolicy::StrictChecked,
+            )
+            .is_err()
+            {
+                return errno(EFAULT);
+            }
+            errno(EACCES)
         }
         PR_GET_DUMPABLE => {
             // Return 1 (SUID_DUMP_USER) - process is dumpable
@@ -4656,14 +4741,37 @@ pub fn sys_prctl(option: usize, arg2: usize, _arg3: usize, _arg4: usize, _arg5: 
             }
             let process = current_process();
             let mut inner = process.inner_exclusive_access();
-            if inner.effective_uid != 0 {
+            if (inner.cap_effective & CAP_SETPCAP) == 0 {
                 return errno(EPERM);
             }
             inner.cap_bounding &= !(1u64 << arg2);
             0
         }
+        PR_SET_SECUREBITS => {
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            if (inner.cap_effective & CAP_SETPCAP) == 0 {
+                return errno(EPERM);
+            }
+            0
+        }
+        PR_SET_TIMING => errno(EINVAL),
         PR_SET_NAME => {
-            // Set process name (ignore for now)
+            if arg2 == 0 {
+                return errno(EFAULT);
+            }
+            let token = current_user_token();
+            let mut name = [0u8; 16];
+            if user_mem::copy_from_user(
+                token,
+                arg2 as *const u8,
+                &mut name,
+                UserReadPolicy::StrictChecked,
+            )
+            .is_err()
+            {
+                return errno(EFAULT);
+            }
             0
         }
         PR_GET_NAME => {

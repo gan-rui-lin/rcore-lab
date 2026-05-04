@@ -96,6 +96,8 @@ const SYSCALL_WRITEV: usize = 66;
 const SYSCALL_PREAD64: usize = 67;
 /// pwrite64 syscall
 const SYSCALL_PWRITE64: usize = 68;
+/// preadv syscall
+const SYSCALL_PREADV: usize = 69;
 /// pwritev syscall
 const SYSCALL_PWRITEV: usize = 70;
 /// sendfile syscall
@@ -128,6 +130,8 @@ const SYSCALL_TIMERFD_GETTIME: usize = 87;
 const SYSCALL_UTIMENSAT: usize = 88;
 /// statx syscall
 const SYSCALL_STATX: usize = 291;
+/// preadv2 syscall
+const SYSCALL_PREADV2: usize = 286;
 /// renameat2 syscall
 const SYSCALL_RENAMEAT2: usize = 276;
 /// getrandom syscall
@@ -253,6 +257,10 @@ const SYSCALL_ADJTIMEX: usize = 171;
 const SYSCALL_PRCTL: usize = 167;
 /// uname syscall
 const SYSCALL_UNAME: usize = 160;
+/// sethostname syscall
+const SYSCALL_SETHOSTNAME: usize = 161;
+/// setdomainname syscall
+const SYSCALL_SETDOMAINNAME: usize = 162;
 /// getrlimit syscall
 const SYSCALL_GETRLIMIT: usize = 163;
 /// getrusage syscall
@@ -852,6 +860,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const usize, args[2]),
         SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *const u8, args[2], args[3] as isize),
         SYSCALL_PWRITE64 => sys_pwrite64(args[0], args[1] as *const u8, args[2], args[3] as isize),
+        SYSCALL_PREADV => sys_preadv(args[0], args[1] as *const usize, args[2], args[3] as isize),
         SYSCALL_PWRITEV => sys_pwritev(args[0], args[1] as *const usize, args[2], args[3] as isize),
         SYSCALL_FADVISE64 => {
             sys_posix_fadvise(args[0], args[1] as isize, args[2] as isize, args[3] as i32)
@@ -893,6 +902,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as u32,
             args[4] as *mut Statx,
         ),
+        SYSCALL_PREADV2 => {
+            let offset = (((args[4] as u32 as u64) << 32) | (args[3] as u32 as u64)) as i64;
+            sys_preadv2(
+                args[0],
+                args[1] as *const usize,
+                args[2],
+                offset as isize,
+                args[5],
+            )
+        }
         SYSCALL_UTIMENSAT => sys_utimensat(
             args[0] as isize,
             args[1] as *const u8,
@@ -1065,6 +1084,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_ADJTIMEX => process::sys_adjtimex(args[0] as *mut u8),
         SYSCALL_PRCTL => process::sys_prctl(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
+        SYSCALL_SETHOSTNAME => process::sys_sethostname(args[0] as *const u8, args[1]),
+        SYSCALL_SETDOMAINNAME => process::sys_setdomainname(args[0] as *const u8, args[1]),
         SYSCALL_CLOCK_SETTIME => sys_clock_settime(args[0], args[1] as *const TimeSpec),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut TimeSpec),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0], args[1] as *mut TimeSpec),
