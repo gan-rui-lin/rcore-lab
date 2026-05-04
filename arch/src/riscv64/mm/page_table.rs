@@ -6,7 +6,7 @@
 
 #![allow(missing_docs)]
 
-use super::address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use super::address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, PAGE_SIZE};
 use crate::pagetable;
 use alloc::string::String;
 use alloc::vec;
@@ -339,7 +339,7 @@ pub fn translated_byte_buffer_checked(
     let mut v = Vec::new();
     while start < end {
         let start_va = VirtAddr::from(start);
-        let mut vpn = start_va.floor();
+        let vpn = start_va.floor();
         let pte = page_table.translate(vpn)?;
         let flags = pte.flags();
         if !pte.is_valid() || !flags.contains(PTEFlags::U) {
@@ -356,15 +356,19 @@ pub fn translated_byte_buffer_checked(
         if flags.contains(PTEFlags::U) && ppn.0 >= max_user_ppn {
             return None;
         }
-        vpn.step();
-        let mut end_va: VirtAddr = vpn.into();
-        end_va = end_va.min(VirtAddr::from(end));
-        if end_va.page_offset() == 0 {
-            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
+        let next_page = start.checked_add(PAGE_SIZE - start_va.page_offset())?;
+        let chunk_end = next_page.min(end);
+        let start_offset = start_va.page_offset();
+        let end_offset = if chunk_end == next_page {
+            PAGE_SIZE
         } else {
-            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+            VirtAddr::from(chunk_end).page_offset()
+        };
+        if start_offset >= end_offset || end_offset > PAGE_SIZE {
+            return None;
         }
-        start = end_va.into();
+        v.push(&mut ppn.get_bytes_array()[start_offset..end_offset]);
+        start = chunk_end;
     }
     Some(v)
 }

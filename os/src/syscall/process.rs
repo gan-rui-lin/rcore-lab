@@ -2536,10 +2536,24 @@ pub fn sys_mincore(addr: usize, len: usize, vec_ptr: *mut u8) -> isize {
     if len == 0 {
         return 0;
     }
+    let Some(end) = addr.checked_add(len) else {
+        return errno(ENOMEM);
+    };
+    if addr >= USER_ADDR_MAX || end > USER_ADDR_MAX {
+        return errno(ENOMEM);
+    }
+    if !user_range_in_area(addr, len) {
+        return errno(ENOMEM);
+    }
     if vec_ptr.is_null() {
         return errno(EFAULT);
     }
-    let pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    let Some(pages) = len
+        .checked_add(PAGE_SIZE - 1)
+        .map(|rounded| rounded / PAGE_SIZE)
+    else {
+        return errno(ENOMEM);
+    };
     if !user_mem::ensure_user_writable(
         current_user_token(),
         vec_ptr,
@@ -2547,9 +2561,6 @@ pub fn sys_mincore(addr: usize, len: usize, vec_ptr: *mut u8) -> isize {
         UserWritePolicy::DemandCowWithForkFallback,
     ) {
         return errno(EFAULT);
-    }
-    if !user_range_in_area(addr, len) {
-        return errno(ENOMEM);
     }
     let present = user_page_resident_bitmap(addr, pages);
     match copy_to_user(current_user_token(), vec_ptr, present.as_slice()) {
