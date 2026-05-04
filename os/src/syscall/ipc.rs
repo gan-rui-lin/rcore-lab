@@ -21,6 +21,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 /// IPC key type (used to identify IPC objects)
@@ -51,7 +52,9 @@ pub const MSG_INFO: i32 = 12;
 /// Message queue limits
 const MSGMAX: usize = 8192; // Max message size
 const MSGMNB: usize = 16384; // Max queue size in bytes
-const MSGMNI: usize = 128; // Max number of message queues
+const MSGMNI_DEFAULT: usize = 16; // Conservative default keeps msgstress within heap budget.
+
+static MSGMNI_LIMIT: AtomicUsize = AtomicUsize::new(MSGMNI_DEFAULT);
 
 /// Shared memory limits
 const SHMMAX: usize = 32 * 1024 * 1024; // Max segment size (32MB)
@@ -421,7 +424,16 @@ impl IpcManager {
         }
     }
 
-    pub fn create_msgq(&mut self, key: IpcKey, permissions: u32, uid: u32, gid: u32) -> IpcId {
+    pub fn create_msgq(
+        &mut self,
+        key: IpcKey,
+        permissions: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<IpcId, isize> {
+        if self.message_queues.len() >= msgmni_limit() {
+            return Err(errno(ENOSPC));
+        }
         let id = self.next_msgid;
         self.next_msgid += 1;
         let msgq = Arc::new(Mutex::new(MessageQueue::new(
@@ -433,7 +445,7 @@ impl IpcManager {
             now_epoch_sec(),
         )));
         self.message_queues.insert(id, msgq);
-        id
+        Ok(id)
     }
 
     pub fn get_msgq(&self, id: IpcId) -> Option<Arc<Mutex<MessageQueue>>> {
@@ -520,6 +532,27 @@ fn align_up(value: usize, align: usize) -> usize {
 /// Global IPC manager instance
 static IPC_MANAGER: Mutex<IpcManager> = Mutex::new(IpcManager::new());
 
+pub fn msgmni_limit() -> usize {
+    MSGMNI_LIMIT.load(Ordering::Relaxed)
+}
+
+pub fn proc_kernel_msgmni() -> String {
+    alloc::format!("{}\n", msgmni_limit())
+}
+
+pub fn set_msgmni_from_proc_write(buf: &[u8]) -> usize {
+    let Ok(raw) = core::str::from_utf8(buf) else {
+        return buf.len();
+    };
+    let trimmed = raw.trim();
+    if let Ok(limit) = trimmed.parse::<usize>() {
+        if limit > 0 {
+            MSGMNI_LIMIT.store(limit, Ordering::Relaxed);
+        }
+    }
+    buf.len()
+}
+
 /// Render `/proc/sysvipc/msg` in a Linux-compatible tabular layout.
 pub fn proc_sysvipc_msg() -> String {
     let queues: Vec<Arc<Mutex<MessageQueue>>> = {
@@ -576,8 +609,10 @@ pub fn sys_msgget(key: IpcKey, msgflg: i32) -> isize {
     // Check if we're creating a private queue
     if key == IPC_PRIVATE {
         let permissions = (msgflg & 0o777) as u32;
-        let id = manager.create_msgq(key, permissions, euid, egid);
-        return id as isize;
+        return match manager.create_msgq(key, permissions, euid, egid) {
+            Ok(id) => id as isize,
+            Err(e) => e,
+        };
     }
 
     // Try to find existing queue with this key
@@ -606,8 +641,10 @@ pub fn sys_msgget(key: IpcKey, msgflg: i32) -> isize {
 
     // Create new queue
     let permissions = (msgflg & 0o777) as u32;
-    let id = manager.create_msgq(key, permissions, euid, egid);
-    id as isize
+    match manager.create_msgq(key, permissions, euid, egid) {
+        Ok(id) => id as isize,
+        Err(e) => e,
+    }
 }
 
 /// msgsnd - Send a message to a message queue
@@ -870,10 +907,10 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, _buf: usize) -> isize {
             }
             let info = MsgInfoUser {
                 msgpool: MSGMNB as i32,
-                msgmap: MSGMNI as i32,
+                msgmap: msgmni_limit() as i32,
                 msgmax: MSGMAX as i32,
                 msgmnb: MSGMNB as i32,
-                msgmni: MSGMNI as i32,
+                msgmni: msgmni_limit() as i32,
                 msgssz: 0,
                 msgtql: 0,
                 msgseg: 0,

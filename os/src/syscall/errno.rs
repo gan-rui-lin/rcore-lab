@@ -28,6 +28,7 @@ pub const ERANGE: isize = 34;
 pub const ENAMETOOLONG: isize = 36;
 pub const ESPIPE: isize = 29;
 pub const EROFS: isize = 30;
+pub const ENOSPC: isize = 28;
 pub const ENOSYS: isize = 38;
 pub const ENOTEMPTY: isize = 39;
 pub const ELOOP: isize = 40;

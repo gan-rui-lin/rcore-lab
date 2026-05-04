@@ -106,6 +106,7 @@ impl VfsInode for ProcRootInode {
 
 struct ProcFileInode {
     content: Arc<dyn Fn() -> String + Send + Sync>,
+    writer: Option<Arc<dyn Fn(&[u8]) -> usize + Send + Sync>>,
 }
 
 impl ProcFileInode {
@@ -115,6 +116,18 @@ impl ProcFileInode {
     {
         Arc::new(Self {
             content: Arc::new(content),
+            writer: None,
+        })
+    }
+
+    fn new_writable<F, W>(content: F, writer: W) -> Arc<Self>
+    where
+        F: Fn() -> String + Send + Sync + 'static,
+        W: Fn(&[u8]) -> usize + Send + Sync + 'static,
+    {
+        Arc::new(Self {
+            content: Arc::new(content),
+            writer: Some(Arc::new(writer)),
         })
     }
 }
@@ -136,7 +149,11 @@ impl VfsInode for ProcFileInode {
     }
 
     fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
-        buf.len()
+        if let Some(writer) = &self.writer {
+            writer(buf)
+        } else {
+            buf.len()
+        }
     }
 
     fn lookup(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
@@ -757,7 +774,10 @@ fn proc_sys_kernel() -> Arc<dyn VfsInode> {
     // SysV message queue limit used by msgstress01 setup.
     entries.insert(
         String::from("msgmni"),
-        ProcFileInode::new(|| String::from("128\n")),
+        ProcFileInode::new_writable(
+            crate::syscall::proc_kernel_msgmni,
+            crate::syscall::set_msgmni_from_proc_write,
+        ),
     );
     // /proc/sys/kernel/ostype and /proc/sys/kernel/osrelease.
     entries.insert(

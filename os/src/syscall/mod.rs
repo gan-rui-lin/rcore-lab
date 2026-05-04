@@ -411,6 +411,16 @@ pub fn proc_sysvipc_msg() -> alloc::string::String {
     ipc::proc_sysvipc_msg()
 }
 
+/// Procfs helper for `/proc/sys/kernel/msgmni`.
+pub fn proc_kernel_msgmni() -> alloc::string::String {
+    ipc::proc_kernel_msgmni()
+}
+
+/// Procfs writer for `/proc/sys/kernel/msgmni`.
+pub fn set_msgmni_from_proc_write(buf: &[u8]) -> usize {
+    ipc::set_msgmni_from_proc_write(buf)
+}
+
 const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (1, "fork"),
     (3, "wait"),
