@@ -16,6 +16,18 @@ const SYSCALL_CAPGET: usize = 90;
 const SYSCALL_CAPSET: usize = 91;
 /// getcwd syscall
 const SYSCALL_GETCWD: usize = 17;
+const SYSCALL_SETXATTR: usize = 5;
+const SYSCALL_LSETXATTR: usize = 6;
+const SYSCALL_FSETXATTR: usize = 7;
+const SYSCALL_GETXATTR: usize = 8;
+const SYSCALL_LGETXATTR: usize = 9;
+const SYSCALL_FGETXATTR: usize = 10;
+const SYSCALL_LISTXATTR: usize = 11;
+const SYSCALL_LLISTXATTR: usize = 12;
+const SYSCALL_FLISTXATTR: usize = 13;
+const SYSCALL_REMOVEXATTR: usize = 14;
+const SYSCALL_LREMOVEXATTR: usize = 15;
+const SYSCALL_FREMOVEXATTR: usize = 16;
 /// dup syscall
 const SYSCALL_DUP: usize = 23;
 /// dup3 syscall
@@ -26,6 +38,8 @@ const SYSCALL_FCNTL: usize = 25;
 const SYSCALL_IOCTL: usize = 29;
 /// flock syscall
 const SYSCALL_FLOCK: usize = 32;
+/// mknodat syscall
+const SYSCALL_MKNODAT: usize = 33;
 /// unlinkat syscall
 const SYSCALL_UNLINKAT: usize = 35;
 /// mkdirat syscall
@@ -307,6 +321,11 @@ const SYSCALL_FADVISE64: usize = 223;
 const SYSCALL_MPROTECT: usize = 226;
 /// msync syscall
 const SYSCALL_MSYNC: usize = 227;
+const SYSCALL_MLOCK: usize = 228;
+const SYSCALL_MUNLOCK: usize = 229;
+const SYSCALL_MLOCKALL: usize = 230;
+const SYSCALL_MUNLOCKALL: usize = 231;
+const SYSCALL_MINCORE: usize = 232;
 /// madvise syscall
 const SYSCALL_MADVISE: usize = 233;
 /// waitpid syscall
@@ -683,12 +702,62 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     }
     let mut known = true;
     let ret = match syscall_id {
+        SYSCALL_SETXATTR => sys_setxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4] as u32,
+            true,
+        ),
+        SYSCALL_LSETXATTR => sys_setxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4] as u32,
+            false,
+        ),
+        SYSCALL_FSETXATTR => sys_fsetxattr(
+            args[0],
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4] as u32,
+        ),
+        SYSCALL_GETXATTR => sys_getxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+            true,
+        ),
+        SYSCALL_LGETXATTR => sys_getxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+            false,
+        ),
+        SYSCALL_FGETXATTR => sys_fgetxattr(
+            args[0],
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+        ),
+        SYSCALL_LISTXATTR => sys_listxattr(args[0] as *const u8, args[1] as *mut u8, args[2], true),
+        SYSCALL_LLISTXATTR => sys_listxattr(args[0] as *const u8, args[1] as *mut u8, args[2], false),
+        SYSCALL_FLISTXATTR => sys_flistxattr(args[0], args[1] as *mut u8, args[2]),
+        SYSCALL_REMOVEXATTR => sys_removexattr(args[0] as *const u8, args[1] as *const u8, true),
+        SYSCALL_LREMOVEXATTR => sys_removexattr(args[0] as *const u8, args[1] as *const u8, false),
+        SYSCALL_FREMOVEXATTR => sys_fremovexattr(args[0], args[1] as *const u8),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2] as u32),
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1] as i32, args[2]),
         SYSCALL_FLOCK => sys_flock(args[0], args[1] as i32),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
+        SYSCALL_MKNODAT => sys_mknodat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32),
         SYSCALL_TRUNCATE => sys_truncate(args[0] as *const u8, args[1] as isize),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as isize),
         SYSCALL_FALLOCATE => {
@@ -996,6 +1065,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2]),
+        SYSCALL_MLOCK => sys_mlock(args[0], args[1]),
+        SYSCALL_MUNLOCK => sys_munlock(args[0], args[1]),
+        SYSCALL_MLOCKALL => sys_mlockall(args[0]),
+        SYSCALL_MUNLOCKALL => sys_munlockall(),
+        SYSCALL_MINCORE => sys_mincore(args[0], args[1], args[2] as *mut u8),
         SYSCALL_MADVISE => 0, // stub: madvise hints are advisory only
         SYSCALL_SBRK => sys_sbrk(args[0] as isize),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),

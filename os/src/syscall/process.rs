@@ -2433,7 +2433,10 @@ pub fn sys_uname(uts: *mut UtsName) -> isize {
     fill(&mut uname.nodename, "rcore");
     fill(&mut uname.release, "5.10.0");
     fill(&mut uname.version, "rcore");
+    #[cfg(target_arch = "riscv64")]
     fill(&mut uname.machine, "riscv64");
+    #[cfg(target_arch = "loongarch64")]
+    fill(&mut uname.machine, "loongarch64");
     fill(&mut uname.domainname, "ruos");
     let bytes = unsafe {
         core::slice::from_raw_parts(
@@ -2443,6 +2446,113 @@ pub fn sys_uname(uts: *mut UtsName) -> isize {
     };
     let token = current_user_token();
     match copy_to_user(token, uts as *mut u8, bytes) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
+}
+
+fn user_range_in_area(start: usize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    inner.memory_set.is_user_range_mapped_area(start, len)
+}
+
+fn user_page_resident_bitmap(start: usize, pages: usize) -> Vec<u8> {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let mut out = Vec::new();
+    for i in 0..pages {
+        let va = start.saturating_add(i * PAGE_SIZE);
+        out.push(if inner.memory_set.translate(VirtAddr::from(va).floor()).is_some() {
+            1
+        } else {
+            0
+        });
+    }
+    out
+}
+
+pub fn sys_mlock(addr: usize, len: usize) -> isize {
+    const RLIMIT_MEMLOCK: usize = 8;
+    if len == 0 {
+        return 0;
+    }
+    let Some(_end) = addr.checked_add(len) else {
+        return errno(ENOMEM);
+    };
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let euid = inner.effective_uid;
+    let limit = inner.rlimits[RLIMIT_MEMLOCK].rlim_cur as usize;
+    drop(inner);
+    if euid != 0 {
+        if limit == 0 {
+            return errno(EPERM);
+        }
+        if len > limit {
+            return errno(ENOMEM);
+        }
+    }
+    if !user_range_in_area(addr, len) {
+        return errno(ENOMEM);
+    }
+    let readable = user_mem::ensure_user_readable(
+        current_user_token(),
+        addr as *const u8,
+        len,
+        UserReadPolicy::DemandPaged,
+    );
+    let writable = readable || user_mem::ensure_user_writable(
+        current_user_token(),
+        addr as *const u8,
+        len,
+        UserWritePolicy::DemandCowWithForkFallback,
+    );
+    if !writable {
+        return errno(ENOMEM);
+    }
+    0
+}
+
+pub fn sys_munlock(_addr: usize, _len: usize) -> isize {
+    0
+}
+
+pub fn sys_mlockall(_flags: usize) -> isize {
+    0
+}
+
+pub fn sys_munlockall() -> isize {
+    0
+}
+
+pub fn sys_mincore(addr: usize, len: usize, vec_ptr: *mut u8) -> isize {
+    if (addr & (PAGE_SIZE - 1)) != 0 {
+        return errno(EINVAL);
+    }
+    if len == 0 {
+        return 0;
+    }
+    if vec_ptr.is_null() {
+        return errno(EFAULT);
+    }
+    let pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    if !user_mem::ensure_user_writable(
+        current_user_token(),
+        vec_ptr,
+        pages,
+        UserWritePolicy::DemandCowWithForkFallback,
+    ) {
+        return errno(EFAULT);
+    }
+    if !user_range_in_area(addr, len) {
+        return errno(ENOMEM);
+    }
+    let present = user_page_resident_bitmap(addr, pages);
+    match copy_to_user(current_user_token(), vec_ptr, present.as_slice()) {
         Ok(_) => 0,
         Err(err) => err,
     }
@@ -2697,6 +2807,12 @@ pub fn sys_mmap(
         }
         if is_shared && map_perm.contains(MapPermission::W) && !file.writable() {
             return errno(EACCES);
+        }
+        if is_shared
+            && map_perm.contains(MapPermission::W)
+            && file.get_seals().is_some_and(|seals| (seals & 0x0008) != 0)
+        {
+            return errno(EPERM);
         }
         let writable = file.writable();
         let inode = file.inode();

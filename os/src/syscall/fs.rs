@@ -89,6 +89,8 @@ lazy_static! {
     /// (since multiple fds can share the same path but need independent timestamps via tmpfile).
     static ref TIMESTAMPS: UPSafeCell<BTreeMap<usize, FileTimestamps>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
+    static ref XATTRS: UPSafeCell<BTreeMap<(String, String), Vec<u8>>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
     static ref TS_NEXT_ID: UPSafeCell<usize> = unsafe { UPSafeCell::new(1) };
     static ref PATH_MODES: UPSafeCell<BTreeMap<String, u32>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
@@ -958,7 +960,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     // O_TMPFILE (0x410000 on riscv64/loongarch64): create anonymous temp file in dir
     const O_TMPFILE: u32 = 0x410000;
     if (flags & O_TMPFILE) == O_TMPFILE {
-        let memfd: Arc<dyn crate::fs::File + Send + Sync> = Arc::new(MemFdFile::new());
+        let memfd: Arc<dyn crate::fs::File + Send + Sync> = Arc::new(MemFdFile::new(false));
         let mut inner = process.inner_exclusive_access();
         let fd = match inner.alloc_fd() {
             Some(fd) => fd,
@@ -1239,6 +1241,68 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
     } else {
         errno(EIO)
     }
+}
+
+pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, _dev: u32) -> isize {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFIFO: u32 = 0o010000;
+    const S_IFSOCK: u32 = 0o140000;
+    const S_IFCHR: u32 = 0o020000;
+    const S_IFBLK: u32 = 0o060000;
+
+    if path.is_null() {
+        return errno(EFAULT);
+    }
+    let token = current_user_token();
+    let Some(raw) = translated_str_checked(token, path) else {
+        return errno(EFAULT);
+    };
+    if raw.is_empty() {
+        return errno(ENOENT);
+    }
+    if raw.len() >= PATH_MAX {
+        return errno(ENAMETOOLONG);
+    }
+    let node_type = mode & S_IFMT;
+    if !matches!(node_type, S_IFREG | S_IFIFO | S_IFSOCK | S_IFCHR | S_IFBLK) {
+        return errno(EINVAL);
+    }
+    let base = match dirfd_base(dirfd) {
+        Ok(base) => base,
+        Err(err) => return err,
+    };
+    let full_path = resolve_user_path(&base, &raw);
+    if path_exists(&full_path) || path_is_dir(&full_path) {
+        return errno(EEXIST);
+    }
+    if let Some((parent, _)) = full_path.rsplit_once('/') {
+        let parent = if parent.is_empty() { "/" } else { parent };
+        let comps: Vec<&str> = parent.split('/').filter(|s| !s.is_empty()).collect();
+        for i in 0..comps.len() {
+            let partial = format!("/{}", comps[..=i].join("/"));
+            if open_file(partial.as_str(), OpenFlags::empty()).is_some() && !path_is_dir(&partial) {
+                return errno(ENOTDIR);
+            }
+        }
+        if !path_is_dir(parent) {
+            return errno(ENOENT);
+        }
+    }
+    let Some(file) = open_file(
+        full_path.as_str(),
+        OpenFlags::CREATE | OpenFlags::WRONLY,
+    ) else {
+        return errno(EIO);
+    };
+    if let Some(inode) = file.inode() {
+        let _ = inode.write_at(0, &[]);
+    }
+    path_mode_set(&full_path, apply_umask(mode & 0o777) | node_type);
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    path_owner_set(&full_path, inner.effective_uid, inner.effective_gid);
+    0
 }
 
 pub fn sys_close(fd: usize) -> isize {
@@ -2630,15 +2694,35 @@ pub fn sys_pipe2(fds: *mut i32, _flags: u32) -> isize {
     }
 }
 
-pub fn sys_memfd_create(_name: *const u8, _flags: u32) -> isize {
-    let memfd: Arc<dyn crate::fs::File + Send + Sync> = Arc::new(MemFdFile::new());
+pub fn sys_memfd_create(name: *const u8, flags: u32) -> isize {
+    const MFD_CLOEXEC: u32 = 0x0001;
+    const MFD_ALLOW_SEALING: u32 = 0x0002;
+    if name.is_null() {
+        return errno(EFAULT);
+    }
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
+    let Some(name_str) = translated_str_checked(token, name) else {
+        return errno(EFAULT);
+    };
+    if name_str.len() > 249 {
+        return errno(EINVAL);
+    }
+    let memfd: Arc<dyn crate::fs::File + Send + Sync> =
+        Arc::new(MemFdFile::new((flags & MFD_ALLOW_SEALING) != 0));
     let process = current_process();
+    let pid = process.pid.0;
     let mut inner = process.inner_exclusive_access();
     let fd = match inner.alloc_fd() {
         Some(fd) => fd,
         None => return errno(EMFILE),
     };
     inner.fd_table[fd] = Some(memfd);
+    if (flags & MFD_CLOEXEC) != 0 {
+        fd_flags_set(pid, fd, 1);
+    }
     warn!("[memfd] memfd_create -> fd={}", fd);
     fd as isize
 }
@@ -3056,6 +3140,8 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     const F_GETLK: i32 = 5;
     const F_SETLK: i32 = 6;
     const F_SETLKW: i32 = 7;
+    const F_ADD_SEALS: i32 = 1033;
+    const F_GET_SEALS: i32 = 1034;
     const FD_CLOEXEC: u32 = 1;
     const SEEK_SET: i16 = 0;
     const SEEK_CUR: i16 = 1;
@@ -3176,9 +3262,6 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
             }
         }
         F_SETLK | F_SETLKW => {
-            if file.inode().is_none() {
-                return errno(EINVAL);
-            }
             let token = current_user_token();
             let ptr = arg as *const Flock;
             if ptr.is_null() {
@@ -3193,14 +3276,259 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
             ) {
                 return errno(EFAULT);
             }
+            if file.inode().is_none() {
+                return errno(EINVAL);
+            }
             let flock = *translated_ref(token, ptr);
             if !matches!(flock.l_whence, SEEK_SET | SEEK_CUR | SEEK_END) {
                 return errno(EINVAL);
             }
             0
         }
+        F_GET_SEALS => match file.get_seals() {
+            Some(seals) => seals as isize,
+            None => errno(EINVAL),
+        },
+        F_ADD_SEALS => file.add_seals(arg as u32),
         _ => errno(EINVAL),
     }
+}
+
+fn xattr_path_from_user(dirfd: isize, path: *const u8, follow: bool) -> Result<String, isize> {
+    if path.is_null() {
+        return Err(errno(EFAULT));
+    }
+    let token = current_user_token();
+    let Some(raw) = translated_str_checked(token, path) else {
+        return Err(errno(EFAULT));
+    };
+    if raw.is_empty() {
+        return Err(errno(ENOENT));
+    }
+    if raw.len() >= PATH_MAX {
+        return Err(errno(ENAMETOOLONG));
+    }
+    let base = if raw.starts_with('/') {
+        String::from("/")
+    } else {
+        dirfd_base(dirfd)?
+    };
+    let path = resolve_user_path(&base, &raw);
+    if follow {
+        resolve_access_path(&path)
+    } else {
+        resolve_access_path_nofollow(&path)
+    }
+}
+
+fn xattr_name_from_user(name: *const u8) -> Result<String, isize> {
+    if name.is_null() {
+        return Err(errno(EFAULT));
+    }
+    let token = current_user_token();
+    let Some(name) = translated_str_checked(token, name) else {
+        return Err(errno(EFAULT));
+    };
+    if name.is_empty() {
+        return Err(errno(ERANGE));
+    }
+    Ok(name)
+}
+
+fn sys_setxattr_path(path: String, name: *const u8, value: *const u8, size: usize, flags: u32) -> isize {
+    const XATTR_CREATE: u32 = 1;
+    const XATTR_REPLACE: u32 = 2;
+    if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 || flags == (XATTR_CREATE | XATTR_REPLACE) {
+        return errno(EINVAL);
+    }
+    let name = match xattr_name_from_user(name) {
+        Ok(name) => name,
+        Err(err) => return err,
+    };
+    let token = current_user_token();
+    let mut data = Vec::new();
+    if size != 0 {
+        if value.is_null() {
+            return errno(EFAULT);
+        }
+        if !user_mem::ensure_user_readable(
+            token,
+            value,
+            size,
+            UserReadPolicy::DemandPaged,
+        ) {
+            return errno(EFAULT);
+        }
+        let bufs = crate::mm::translated_byte_buffer(token, value, size);
+        for slice in bufs {
+            data.extend_from_slice(slice);
+        }
+    }
+    let key = (path, name);
+    let mut map = XATTRS.exclusive_access();
+    let exists = map.contains_key(&key);
+    if (flags & XATTR_CREATE) != 0 && exists {
+        return errno(EEXIST);
+    }
+    if (flags & XATTR_REPLACE) != 0 && !exists {
+        return errno(ENODATA);
+    }
+    map.insert(key, data);
+    0
+}
+
+fn sys_getxattr_path(path: String, name: *const u8, value: *mut u8, size: usize) -> isize {
+    let name = match xattr_name_from_user(name) {
+        Ok(name) => name,
+        Err(err) => return err,
+    };
+    let data = {
+        let map = XATTRS.exclusive_access();
+        match map.get(&(path, name)) {
+            Some(data) => data.clone(),
+            None => return errno(ENODATA),
+        }
+    };
+    if size == 0 {
+        return data.len() as isize;
+    }
+    if value.is_null() {
+        return errno(EFAULT);
+    }
+    if size < data.len() {
+        return errno(ERANGE);
+    }
+    match user_mem::copy_to_user(
+        current_user_token(),
+        value,
+        data.as_slice(),
+        UserWritePolicy::DemandCowWithForkFallback,
+    ) {
+        Ok(_) => data.len() as isize,
+        Err(err) => err,
+    }
+}
+
+fn sys_listxattr_path(path: String, list: *mut u8, size: usize) -> isize {
+    let mut names = Vec::new();
+    {
+        let map = XATTRS.exclusive_access();
+        for ((p, name), _) in map.iter() {
+            if *p == path {
+                names.extend_from_slice(name.as_bytes());
+                names.push(0);
+            }
+        }
+    }
+    if size == 0 {
+        return names.len() as isize;
+    }
+    if list.is_null() {
+        return errno(EFAULT);
+    }
+    if size < names.len() {
+        return errno(ERANGE);
+    }
+    match user_mem::copy_to_user(
+        current_user_token(),
+        list,
+        names.as_slice(),
+        UserWritePolicy::DemandCowWithForkFallback,
+    ) {
+        Ok(_) => names.len() as isize,
+        Err(err) => err,
+    }
+}
+
+fn sys_removexattr_path(path: String, name: *const u8) -> isize {
+    let name = match xattr_name_from_user(name) {
+        Ok(name) => name,
+        Err(err) => return err,
+    };
+    match XATTRS.exclusive_access().remove(&(path, name)) {
+        Some(_) => 0,
+        None => errno(ENODATA),
+    }
+}
+
+fn xattr_path_from_fd(fd: usize) -> Result<String, isize> {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return Err(errno(EBADF));
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return Err(errno(EBADF));
+    };
+    if let Some(path) = file.path() {
+        Ok(String::from(path))
+    } else {
+        Ok(format!("fd:{}:{}", process.pid.0, fd))
+    }
+}
+
+pub fn sys_setxattr(path: *const u8, name: *const u8, value: *const u8, size: usize, flags: u32, follow: bool) -> isize {
+    let path = match xattr_path_from_user(AT_FDCWD, path, follow) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    sys_setxattr_path(path, name, value, size, flags)
+}
+
+pub fn sys_fsetxattr(fd: usize, name: *const u8, value: *const u8, size: usize, flags: u32) -> isize {
+    let path = match xattr_path_from_fd(fd) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    sys_setxattr_path(path, name, value, size, flags)
+}
+
+pub fn sys_getxattr(path: *const u8, name: *const u8, value: *mut u8, size: usize, follow: bool) -> isize {
+    let path = match xattr_path_from_user(AT_FDCWD, path, follow) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    sys_getxattr_path(path, name, value, size)
+}
+
+pub fn sys_fgetxattr(fd: usize, name: *const u8, value: *mut u8, size: usize) -> isize {
+    let path = match xattr_path_from_fd(fd) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    sys_getxattr_path(path, name, value, size)
+}
+
+pub fn sys_listxattr(path: *const u8, list: *mut u8, size: usize, follow: bool) -> isize {
+    let path = match xattr_path_from_user(AT_FDCWD, path, follow) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    sys_listxattr_path(path, list, size)
+}
+
+pub fn sys_flistxattr(fd: usize, list: *mut u8, size: usize) -> isize {
+    let path = match xattr_path_from_fd(fd) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    sys_listxattr_path(path, list, size)
+}
+
+pub fn sys_removexattr(path: *const u8, name: *const u8, follow: bool) -> isize {
+    let path = match xattr_path_from_user(AT_FDCWD, path, follow) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    sys_removexattr_path(path, name)
+}
+
+pub fn sys_fremovexattr(fd: usize, name: *const u8) -> isize {
+    let path = match xattr_path_from_fd(fd) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    sys_removexattr_path(path, name)
 }
 
 pub fn sys_flock(fd: usize, operation: i32) -> isize {

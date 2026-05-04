@@ -10,6 +10,8 @@ use alloc::vec::Vec;
 struct MemFdInner {
     buf: Vec<u8>,
     size: usize,
+    seals: u32,
+    allow_sealing: bool,
 }
 
 /// VfsInode backed by an in-memory buffer (anonymous file).
@@ -19,9 +21,16 @@ pub struct MemFdInode {
 
 impl MemFdInode {
     /// Create an empty memfd inode.
-    pub fn new() -> Self {
+    pub fn new(allow_sealing: bool) -> Self {
         Self {
-            inner: unsafe { UPIntrFreeCell::new(MemFdInner { buf: Vec::new(), size: 0 }) },
+            inner: unsafe {
+                UPIntrFreeCell::new(MemFdInner {
+                    buf: Vec::new(),
+                    size: 0,
+                    seals: if allow_sealing { 0 } else { 0x0001 },
+                    allow_sealing,
+                })
+            },
         }
     }
 }
@@ -82,9 +91,9 @@ pub struct MemFdFile {
 
 impl MemFdFile {
     /// Create a new empty memfd file.
-    pub fn new() -> Self {
+    pub fn new(allow_sealing: bool) -> Self {
         Self {
-            inode: Arc::new(MemFdInode::new()),
+            inode: Arc::new(MemFdInode::new(allow_sealing)),
             offset: unsafe { UPIntrFreeCell::new(0) },
         }
     }
@@ -115,6 +124,9 @@ impl File for MemFdFile {
     }
 
     fn write(&self, buf: UserBuffer) -> usize {
+        if (self.inode.inner.exclusive_access().seals & 0x0008) != 0 {
+            return 0;
+        }
         let mut off = self.offset.exclusive_access();
         let mut total = 0;
         for slice in buf.buffers.iter() {
@@ -123,6 +135,13 @@ impl File for MemFdFile {
             total += n;
         }
         total
+    }
+
+    fn write_user_buffer(&self, buf: UserBuffer) -> Result<usize, isize> {
+        if (self.inode.inner.exclusive_access().seals & 0x0008) != 0 {
+            return Err(-1);
+        }
+        Ok(self.write(buf))
     }
 
     fn inode(&self) -> Option<Arc<dyn VfsInode>> {
@@ -135,6 +154,19 @@ impl File for MemFdFile {
 
     fn set_offset(&self, offset: usize) {
         *self.offset.exclusive_access() = offset;
+    }
+
+    fn get_seals(&self) -> Option<u32> {
+        Some(self.inode.inner.exclusive_access().seals)
+    }
+
+    fn add_seals(&self, seals: u32) -> isize {
+        let mut inner = self.inode.inner.exclusive_access();
+        if !inner.allow_sealing || (inner.seals & 0x0001) != 0 {
+            return -1; // EPERM
+        }
+        inner.seals |= seals;
+        0
     }
 
     fn poll(&self, _events: PollEvents) -> PollEvents {

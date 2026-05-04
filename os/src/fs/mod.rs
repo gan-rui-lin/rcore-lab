@@ -76,6 +76,10 @@ pub trait File: Send + Sync {
     }
     /// Optional: set file status flags (O_NONBLOCK, O_APPEND, etc.).
     fn set_status_flags(&self, _flags: u32) {}
+    /// Optional: get/add memfd seals. Regular files do not support them.
+    fn get_seals(&self) -> Option<u32> { None }
+    /// Optional: add memfd seals.
+    fn add_seals(&self, _seals: u32) -> isize { -22 }
     /// Check if O_NONBLOCK is set.
     fn is_nonblock(&self) -> bool {
         self.status_flags() & 0x800 != 0 // O_NONBLOCK = 0x800

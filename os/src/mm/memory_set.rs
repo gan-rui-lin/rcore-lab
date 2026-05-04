@@ -1517,6 +1517,31 @@ impl MemorySet {
         true
     }
 
+    /// Check whether every page in `[start, start + len)` belongs to a user VMA.
+    pub fn is_user_range_mapped_area(&self, start: usize, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        let mut va = start;
+        while va < end {
+            let vpn = VirtAddr::from(va).floor();
+            let in_user_area = self.areas.iter().any(|area| {
+                area.vpn_range.get_start() <= vpn
+                    && vpn < area.vpn_range.get_end()
+                    && area.map_perm.contains(MapPermission::U)
+            });
+            if !in_user_area {
+                return false;
+            }
+            let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
+            va = next_page.max(va + 1);
+        }
+        true
+    }
+
     /// Count mapped areas that overlap with [start, end).
     pub fn overlap_count(&self, start: VirtAddr, end: VirtAddr) -> usize {
         let start_vpn = start.floor();
