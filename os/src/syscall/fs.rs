@@ -2,6 +2,7 @@
 use super::errno::*;
 use super::process::{get_current_umask, TimeSpec};
 use super::user_mem::{self, UserReadPolicy, UserWritePolicy};
+use crate::config::USER_STACK_TOP;
 use crate::fs::{
     create_dir, make_pipe, open_file, path_exists, path_is_dir, remove_path, DevNull, DevUrandom,
     DevZero, MemFdFile, OpenFlags, PollEvents, Stat, StatMode, TimerFdFile, TIMERFD_EAGAIN,
@@ -312,8 +313,19 @@ fn readonly_mount_contains(path: &str) -> bool {
     })
 }
 
+fn readonly_mount_exact(path: &str) -> bool {
+    READONLY_MOUNTS.exclusive_access().contains(path)
+}
+
 fn path_exists_for_access(path: &str) -> bool {
     is_char_device(path) || symlink_target_get(path).is_some() || open_file(path, OpenFlags::empty()).is_some() || path_is_dir(path)
+}
+
+fn raw_path_too_long(raw: &str) -> bool {
+    raw.len() >= PATH_MAX
+        || raw
+            .split('/')
+            .any(|component| !component.is_empty() && component.len() > NAME_MAX)
 }
 
 #[allow(dead_code)]
@@ -372,12 +384,19 @@ fn resolve_final_symlink_checked(path: &str) -> Result<String, isize> {
 fn resolve_access_path(full_path: &str) -> Result<String, isize> {
     let mut current = String::from("/");
     let mut comps = full_path.split('/').filter(|part| !part.is_empty()).peekable();
+    let mut symlinks = 0usize;
     while let Some(comp) = comps.next() {
         let next = if current == "/" {
             format!("/{}", comp)
         } else {
             format!("{}/{}", current, comp)
         };
+        if symlink_target_get(&next).is_some() {
+            symlinks += 1;
+            if symlinks > 40 {
+                return Err(errno(ELOOP));
+            }
+        }
         let resolved = resolve_final_symlink_checked(&next)?;
         let is_final = comps.peek().is_none();
         if is_final {
@@ -399,6 +418,7 @@ fn resolve_access_path(full_path: &str) -> Result<String, isize> {
 fn resolve_access_path_nofollow(full_path: &str) -> Result<String, isize> {
     let mut current = String::from("/");
     let comps: Vec<&str> = full_path.split('/').filter(|part| !part.is_empty()).collect();
+    let mut symlinks = 0usize;
     for (i, comp) in comps.iter().enumerate() {
         let next = if current == "/" {
             format!("/{}", comp)
@@ -407,6 +427,12 @@ fn resolve_access_path_nofollow(full_path: &str) -> Result<String, isize> {
         };
         if i == comps.len() - 1 {
             return Ok(next);
+        }
+        if symlink_target_get(&next).is_some() {
+            symlinks += 1;
+            if symlinks > 40 {
+                return Err(errno(ELOOP));
+            }
         }
         let resolved = resolve_final_symlink_checked(&next)?;
         if path_is_dir(&resolved) {
@@ -504,6 +530,50 @@ fn access_allowed_egid(full_path: &str, mode: u32, uid: u32, egid: u32) -> Resul
     }
 
     Ok(())
+}
+
+fn check_search_permissions(full_path: &str, uid: u32, egid: u32) -> Result<(), isize> {
+    if uid == 0 {
+        return Ok(());
+    }
+    let mut partial = String::new();
+    let mut comps = full_path.split('/').filter(|part| !part.is_empty()).peekable();
+    while let Some(comp) = comps.next() {
+        if comps.peek().is_none() {
+            break;
+        }
+        partial.push('/');
+        partial.push_str(comp);
+        if !path_is_dir(&partial) {
+            continue;
+        }
+        let (file_uid, file_gid) = effective_path_owner(&partial);
+        let perm = effective_path_mode(&partial);
+        let bits = if uid == file_uid {
+            (perm >> 6) & 0o7
+        } else if egid == file_gid {
+            (perm >> 3) & 0o7
+        } else {
+            perm & 0o7
+        };
+        if (bits & 0o1) == 0 {
+            return Err(errno(EACCES));
+        }
+    }
+    Ok(())
+}
+
+fn directory_is_empty(path: &str) -> bool {
+    let Some(file) = open_file(path, OpenFlags::DIRECTORY) else {
+        return false;
+    };
+    let Some(inode) = file.inode() else {
+        return false;
+    };
+    inode
+        .list()
+        .iter()
+        .all(|name| name.as_str() == "." || name.as_str() == "..")
 }
 
 /// Convenience wrapper that reads egid from the current process.
@@ -1108,7 +1178,7 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsize: usiz
     if path.is_null() || buf.is_null() {
         return errno(EFAULT);
     }
-    if bufsize == 0 {
+    if bufsize == 0 || bufsize > PATH_MAX {
         return errno(EINVAL);
     }
 
@@ -1119,6 +1189,9 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsize: usiz
     if raw_path.is_empty() {
         return errno(ENOENT);
     }
+    if raw_path_too_long(&raw_path) {
+        return errno(ENAMETOOLONG);
+    }
     let full_path = if raw_path.starts_with('/') {
         normalize_path(&raw_path)
     } else {
@@ -1127,6 +1200,10 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsize: usiz
             Err(err) => return err,
         };
         resolve_path(&base, &raw_path)
+    };
+    let full_path = match resolve_access_path_nofollow(&full_path) {
+        Ok(path) => path,
+        Err(err) => return err,
     };
 
     // Minimal procfs compatibility for busybox/glibc probes.
@@ -1145,8 +1222,11 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsize: usiz
     } else if let Some(target) = symlink_target_get(&full_path) {
         target
     } else {
-        // Generic fs symlink read is not available yet in current VFS abstraction.
-        return errno(ENOENT);
+        return if path_exists_for_access(&full_path) {
+            errno(EINVAL)
+        } else {
+            errno(ENOENT)
+        };
     };
 
     let bytes = target.as_bytes();
@@ -1385,10 +1465,13 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
     // AT_EMPTY_PATH: stat the fd itself when path is empty
     if raw_path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
-            return errno(EINVAL);
+            return errno(ENOENT);
         }
         // fstat-like behavior: stat the open fd
         return sys_fstat(dirfd as usize, st);
+    }
+    if raw_path_too_long(&raw_path) {
+        return errno(ENAMETOOLONG);
     }
     let base = if raw_path.starts_with('/') {
         String::from("/")
@@ -1399,6 +1482,16 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
         }
     };
     let full_path = resolve_user_path(&base, &raw_path);
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        let euid = inner.effective_uid;
+        let egid = inner.effective_gid;
+        drop(inner);
+        if let Err(err) = check_search_permissions(&full_path, euid, egid) {
+            return err;
+        }
+    }
     let nofollow = flags & AT_SYMLINK_NOFOLLOW != 0;
     let full_path = if nofollow {
         match resolve_access_path_nofollow(&full_path) {
@@ -2253,6 +2346,9 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
     if raw.is_empty() {
         return errno(ENOENT);
     }
+    if (_flags & AT_REMOVEDIR) != 0 && (raw == "." || raw.ends_with("/.")) {
+        return errno(EINVAL);
+    }
     if raw.len() > PATH_MAX
         || raw
             .split('/')
@@ -2293,6 +2389,15 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
     if _flags & AT_REMOVEDIR != 0 {
         if !is_dir {
             return errno(ENOTDIR);
+        }
+        if readonly_mount_exact(&path) {
+            return errno(EBUSY);
+        }
+        if readonly_mount_contains(&path) {
+            return errno(EROFS);
+        }
+        if !directory_is_empty(&path) {
+            return errno(ENOTEMPTY);
         }
     } else if is_dir {
         return errno(EISDIR);
@@ -3937,7 +4042,10 @@ pub fn sys_statfs(path: *const u8, buf: *mut StatFs) -> isize {
         return errno(EFAULT);
     };
     if raw.is_empty() {
-        return errno(EINVAL);
+        return errno(ENOENT);
+    }
+    if raw_path_too_long(&raw) {
+        return errno(ENAMETOOLONG);
     }
     let cwd = current_process().inner_exclusive_access().cwd.clone();
     let full_path = if raw.starts_with('/') {
@@ -3945,7 +4053,31 @@ pub fn sys_statfs(path: *const u8, buf: *mut StatFs) -> isize {
     } else {
         resolve_path(&cwd, &raw)
     };
-    if open_file(full_path.as_str(), OpenFlags::empty()).is_none() {
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        let euid = inner.effective_uid;
+        let egid = inner.effective_gid;
+        drop(inner);
+        if let Err(err) = check_search_permissions(&full_path, euid, egid) {
+            return err;
+        }
+    }
+    let full_path = match resolve_access_path(&full_path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        let euid = inner.effective_uid;
+        let egid = inner.effective_gid;
+        drop(inner);
+        if let Err(err) = check_search_permissions(&full_path, euid, egid) {
+            return err;
+        }
+    }
+    if !path_exists_for_access(&full_path) {
         return errno(ENOENT);
     }
     let statfs = build_statfs();
@@ -4815,6 +4947,9 @@ pub fn sys_pwritev(fd: usize, iov: *const usize, iovcnt: usize, offset: isize) -
     };
     let file = file.clone();
     drop(inner);
+    if file.is_pipe() {
+        return errno(ESPIPE);
+    }
     if !file.writable() {
         return errno(EBADF);
     }
@@ -4879,6 +5014,16 @@ pub fn sys_pwritev(fd: usize, iov: *const usize, iovcnt: usize, offset: isize) -
                 errno(EFAULT)
             };
         }
+        if base
+            .checked_add(len)
+            .map_or(true, |end| end > USER_STACK_TOP)
+        {
+            return if total_written > 0 {
+                total_written as isize
+            } else {
+                errno(EFAULT)
+            };
+        }
         if (file.status_flags() & OpenFlags::DIRECT.bits()) != 0 {
             if base % DIRECT_IO_ALIGN != 0 || len % DIRECT_IO_ALIGN != 0 || off % DIRECT_IO_ALIGN != 0 {
                 return if total_written > 0 {
@@ -4889,7 +5034,12 @@ pub fn sys_pwritev(fd: usize, iov: *const usize, iovcnt: usize, offset: isize) -
             }
         }
 
-        let Some(buffers) = translated_user_read_buffer(token, base as *const u8, len)
+        let Some(buffers) = user_mem::translated_user_read_buffer(
+            token,
+            base as *const u8,
+            len,
+            UserReadPolicy::StrictChecked,
+        )
         else {
             return if total_written > 0 {
                 total_written as isize
@@ -4947,6 +5097,120 @@ pub fn sys_pwritev(fd: usize, iov: *const usize, iovcnt: usize, offset: isize) -
     }
 
     total_written as isize
+}
+
+pub fn sys_pwritev2(
+    fd: usize,
+    iov: *const usize,
+    iovcnt: usize,
+    offset: isize,
+    flags: usize,
+) -> isize {
+    if flags != 0 {
+        return errno(ENOTSUP);
+    }
+    if offset >= 0 {
+        return sys_pwritev(fd, iov, iovcnt, offset);
+    }
+    if offset != -1 {
+        return errno(EINVAL);
+    }
+
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+    if file.is_pipe() {
+        return errno(ESPIPE);
+    }
+    if !file.writable() {
+        return errno(EBADF);
+    }
+    if file.inode().is_none() {
+        return errno(ESPIPE);
+    }
+    drop(inner);
+    sys_writev(fd, iov, iovcnt)
+}
+
+pub fn sys_vmsplice(fd: usize, iov: *const usize, nr_segs: usize, _flags: u32) -> isize {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return errno(EBADF);
+    };
+    if !file.is_pipe() {
+        return errno(EBADF);
+    }
+    if nr_segs > 1024 {
+        return errno(EINVAL);
+    }
+    let readable = file.readable();
+    let writable = file.writable();
+    drop(inner);
+    if writable {
+        sys_writev(fd, iov, nr_segs)
+    } else if readable {
+        sys_readv(fd, iov, nr_segs)
+    } else {
+        errno(EBADF)
+    }
+}
+
+pub fn sys_tee(fd_in: usize, fd_out: usize, len: usize, _flags: u32) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd_in >= inner.fd_table.len() || fd_out >= inner.fd_table.len() {
+        return errno(EBADF);
+    }
+    let Some(in_file) = &inner.fd_table[fd_in] else {
+        return errno(EBADF);
+    };
+    let Some(out_file) = &inner.fd_table[fd_out] else {
+        return errno(EBADF);
+    };
+    if !in_file.is_pipe() || !out_file.is_pipe() || in_file.pipe_id() == out_file.pipe_id() {
+        return errno(EINVAL);
+    }
+    if !in_file.readable() || !out_file.writable() {
+        return errno(EINVAL);
+    }
+    let in_file = in_file.clone();
+    let out_file = out_file.clone();
+    drop(inner);
+
+    let want = len.min(16 * 1024);
+    let mut kbuf = alloc::vec![0u8; want];
+    let read_buf = unsafe {
+        UserBuffer::new(alloc::vec![core::slice::from_raw_parts_mut(
+            kbuf.as_mut_ptr(),
+            want,
+        )])
+    };
+    let nread = in_file.read(read_buf);
+    if nread == 0 || nread == usize::MAX || nread == TIMERFD_EAGAIN {
+        return nread as isize;
+    }
+    let write_buf = unsafe {
+        UserBuffer::new(alloc::vec![core::slice::from_raw_parts_mut(
+            kbuf.as_mut_ptr(),
+            nread,
+        )])
+    };
+    match out_file.write_user_buffer(write_buf) {
+        Ok(written) => written as isize,
+        Err(err) => err,
+    }
 }
 
 /// sys_posix_fadvise/fadvise64 (syscall 223)

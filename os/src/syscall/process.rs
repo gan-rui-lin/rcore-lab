@@ -675,13 +675,46 @@ pub fn sys_setsid() -> isize {
 }
 
 pub fn sys_setpgid(pid: isize, pgid: isize) -> isize {
-    let process = current_process();
-    let target_pid = if pid == 0 { process.pid.0 } else { pid as usize };
-    let target_pgid = if pgid == 0 { target_pid } else { pgid as usize };
-    if target_pid == process.pid.0 {
-        let mut inner = process.inner_exclusive_access();
-        inner.pgid = target_pgid;
+    if pid < 0 || pgid < 0 {
+        return errno(EINVAL);
     }
+    let process = current_process();
+    let current_pid = process.pid.0;
+    let target_pid = if pid == 0 { current_pid } else { pid as usize };
+    let target_pgid = if pgid == 0 { target_pid } else { pgid as usize };
+    let Some(target) = pid2process(target_pid) else {
+        return errno(ESRCH);
+    };
+
+    if target_pid != current_pid {
+        let parent_pid = target
+            .inner_exclusive_access()
+            .parent
+            .as_ref()
+            .and_then(|p| p.upgrade())
+            .map(|p| p.pid.0);
+        if parent_pid != Some(current_pid) {
+            return errno(ESRCH);
+        }
+    }
+
+    let current_session = process.inner_exclusive_access().session_id;
+    let target_session = target.inner_exclusive_access().session_id;
+    if current_session != target_session {
+        return errno(EPERM);
+    }
+    if target_pgid != target_pid {
+        let group_exists = pid2process(target_pgid)
+            .map(|leader| {
+                let inner = leader.inner_exclusive_access();
+                inner.session_id == current_session && inner.pgid == target_pgid
+            })
+            .unwrap_or(false);
+        if !group_exists {
+            return errno(EPERM);
+        }
+    }
+    target.inner_exclusive_access().pgid = target_pgid;
     0
 }
 

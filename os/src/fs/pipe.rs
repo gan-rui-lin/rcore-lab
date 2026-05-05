@@ -110,6 +110,14 @@ impl File for PipeEnd {
         *self.nonblock.exclusive_access() = (flags & 0x800) != 0;
     }
 
+    fn is_pipe(&self) -> bool {
+        true
+    }
+
+    fn pipe_id(&self) -> usize {
+        Arc::as_ptr(&self.pipe) as usize
+    }
+
     fn read(&self, mut user_buf: UserBuffer) -> usize {
         let is_nonblock = *self.nonblock.exclusive_access();
         let mut total = 0;

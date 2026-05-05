@@ -84,6 +84,10 @@ pub trait File: Send + Sync {
     fn is_nonblock(&self) -> bool {
         self.status_flags() & 0x800 != 0 // O_NONBLOCK = 0x800
     }
+    /// True for pipe endpoints.
+    fn is_pipe(&self) -> bool { false }
+    /// Stable identity for both ends of the same pipe.
+    fn pipe_id(&self) -> usize { 0 }
     /// Optional: get bound port for TCP sockets.
     fn bound_port(&self) -> u16 {
         0

@@ -102,8 +102,12 @@ const SYSCALL_PREADV: usize = 69;
 const SYSCALL_PWRITEV: usize = 70;
 /// sendfile syscall
 const SYSCALL_SENDFILE: usize = 71;
+/// vmsplice syscall
+const SYSCALL_VMSPLICE: usize = 75;
 /// splice syscall
 const SYSCALL_SPLICE: usize = 76;
+/// tee syscall
+const SYSCALL_TEE: usize = 77;
 /// readlinkat syscall
 const SYSCALL_READLINKAT: usize = 78;
 /// pselect6 syscall
@@ -132,6 +136,8 @@ const SYSCALL_UTIMENSAT: usize = 88;
 const SYSCALL_STATX: usize = 291;
 /// preadv2 syscall
 const SYSCALL_PREADV2: usize = 286;
+/// pwritev2 syscall
+const SYSCALL_PWRITEV2: usize = 287;
 /// renameat2 syscall
 const SYSCALL_RENAMEAT2: usize = 276;
 /// getrandom syscall
@@ -496,6 +502,7 @@ const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (74, "signalfd4"),
     (75, "vmsplice"),
     (76, "splice"),
+    (77, "tee"),
     (78, "readlinkat"),
     (79, "fstatat"),
     (80, "fstat"),
@@ -868,6 +875,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             sys_posix_fadvise(args[0], args[1] as isize, args[2] as isize, args[3] as i32)
         }
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut isize, args[3]),
+        SYSCALL_VMSPLICE => sys_vmsplice(args[0], args[1] as *const usize, args[2], args[3] as u32),
         SYSCALL_SPLICE => sys_splice(
             args[0],
             args[1] as *mut isize,
@@ -876,6 +884,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4],
             args[5] as u32,
         ),
+        SYSCALL_TEE => sys_tee(args[0], args[1], args[2], args[3] as u32),
         SYSCALL_PSELECT6 => sys_pselect6(
             args[0],
             args[1] as *mut usize,
@@ -907,6 +916,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PREADV2 => {
             let offset = (((args[4] as u32 as u64) << 32) | (args[3] as u32 as u64)) as i64;
             sys_preadv2(
+                args[0],
+                args[1] as *const usize,
+                args[2],
+                offset as isize,
+                args[5],
+            )
+        }
+        SYSCALL_PWRITEV2 => {
+            let offset = (((args[4] as u32 as u64) << 32) | (args[3] as u32 as u64)) as i64;
+            sys_pwritev2(
                 args[0],
                 args[1] as *const usize,
                 args[2],
