@@ -151,7 +151,7 @@ fn path_mode_get(path: &str) -> Option<u32> {
 fn path_mode_set(path: &str, mode: u32) {
     PATH_MODES
         .exclusive_access()
-        .insert(String::from(path), mode & 0o7777);
+        .insert(String::from(path), mode & 0o177777);
 }
 
 fn apply_umask(mode: u32) -> u32 {
@@ -2251,7 +2251,14 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
         return errno(EFAULT);
     };
     if raw.is_empty() {
-        return errno(EINVAL);
+        return errno(ENOENT);
+    }
+    if raw.len() > PATH_MAX
+        || raw
+            .split('/')
+            .any(|component| component.len() > NAME_MAX)
+    {
+        return errno(ENAMETOOLONG);
     }
     let base = match dirfd_base(_dirfd) {
         Ok(base) => base,
@@ -2262,6 +2269,21 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
     } else {
         resolve_path(&base, &raw)
     };
+    let path = match resolve_access_path_nofollow(&path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if let Some((parent, _)) = path.rsplit_once('/') {
+        let parent = if parent.is_empty() { "/" } else { parent };
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        let euid = inner.effective_uid;
+        let egid = inner.effective_gid;
+        drop(inner);
+        if let Err(err) = access_allowed_egid(parent, 0o3, euid, egid) {
+            return err;
+        }
+    }
     let is_symlink = symlink_target_get(&path).is_some();
     let is_dir = path_is_dir(&path);
     let exists = is_symlink || open_file(path.as_str(), OpenFlags::from_bits_truncate(0)).is_some();
@@ -2659,7 +2681,10 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> isize {
     }
 }
 
-pub fn sys_pipe2(fds: *mut i32, _flags: u32) -> isize {
+pub fn sys_pipe2(fds: *mut i32, flags: u32) -> isize {
+    const O_CLOEXEC: u32 = 0o2000000;
+    const O_DIRECT: u32 = 0o40000;
+    const O_NONBLOCK: u32 = 0o4000;
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_pipe2", pid);
@@ -2667,7 +2692,14 @@ pub fn sys_pipe2(fds: *mut i32, _flags: u32) -> isize {
     if fds.is_null() {
         return errno(EFAULT);
     }
+    if flags & !(O_CLOEXEC | O_DIRECT | O_NONBLOCK) != 0 {
+        return errno(EINVAL);
+    }
     let (read_end, write_end) = make_pipe(0);
+    if flags & O_NONBLOCK != 0 {
+        read_end.set_status_flags(O_NONBLOCK);
+        write_end.set_status_flags(O_NONBLOCK);
+    }
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let fd0 = match inner.alloc_fd() {
@@ -2684,6 +2716,13 @@ pub fn sys_pipe2(fds: *mut i32, _flags: u32) -> isize {
     };
     inner.fd_table[fd1] = Some(write_end);
     drop(inner);
+    if flags & O_CLOEXEC != 0 {
+        fd_flags_set(pid, fd0, 1);
+        fd_flags_set(pid, fd1, 1);
+    } else {
+        fd_flags_set(pid, fd0, 0);
+        fd_flags_set(pid, fd1, 0);
+    }
     let token = current_user_token();
     let mut data = [0u8; 8];
     data[..4].copy_from_slice(&(fd0 as i32).to_le_bytes());
@@ -2837,6 +2876,16 @@ pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> isize {
                 }
                 return new_offset;
             }
+        }
+    }
+
+    if let Some(path) = file.path() {
+        const S_IFMT: u32 = 0o170000;
+        const S_IFIFO: u32 = 0o010000;
+        const S_IFSOCK: u32 = 0o140000;
+        let node_type = effective_path_mode(path) & S_IFMT;
+        if matches!(node_type, S_IFIFO | S_IFSOCK) {
+            return errno(ESPIPE);
         }
     }
 

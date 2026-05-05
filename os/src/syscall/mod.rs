@@ -146,6 +146,8 @@ const SYSCALL_EXIT_GROUP: usize = 94;
 const SYSCALL_WAITID: usize = 95;
 /// set_tid_address syscall
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
+/// unshare syscall
+const SYSCALL_UNSHARE: usize = 97;
 /// futex syscall
 const SYSCALL_FUTEX: usize = 98;
 /// set_robust_list syscall
@@ -931,6 +933,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4] as *mut u8,
         ),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
+        SYSCALL_UNSHARE => process::sys_unshare(args[0]),
         SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => {
             sys_get_robust_list(args[0], args[1] as *mut u8, args[2] as *mut u8)

@@ -47,6 +47,8 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(0) };
     static ref UTS_STATE: UPIntrFreeCell<(String, String)> =
         unsafe { UPIntrFreeCell::new((String::from("rcore"), String::from("ruos"))) };
+    static ref SCHED_POLICIES: UPIntrFreeCell<BTreeMap<usize, i32>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
 }
 
 #[allow(dead_code)]
@@ -5155,22 +5157,89 @@ pub fn sys_membarrier(_cmd: isize, _flags: isize) -> isize {
     0
 }
 
+pub fn sys_unshare(flags: usize) -> isize {
+    const CLONE_FS: usize = 0x0000_0200;
+    const CLONE_FILES: usize = 0x0000_0400;
+    const CLONE_NEWNS: usize = 0x0002_0000;
+    const SUPPORTED: usize = CLONE_FS | CLONE_FILES | CLONE_NEWNS;
+
+    if flags & !SUPPORTED != 0 {
+        return errno(EINVAL);
+    }
+    if flags & CLONE_NEWNS != 0 {
+        let process = current_process();
+        if process.inner_exclusive_access().effective_uid != 0 {
+            return errno(EPERM);
+        }
+    }
+    0
+}
+
+fn normalize_sched_pid(pid: usize) -> Result<usize, isize> {
+    if (pid as isize) < 0 {
+        return Err(errno(EINVAL));
+    }
+    if pid == 0 {
+        Ok(current_process().pid.0)
+    } else if pid2process(pid).is_some() {
+        Ok(pid)
+    } else {
+        Err(errno(ESRCH))
+    }
+}
+
 /// sched_setscheduler(pid, policy, param)
-/// Stub: accept and pretend success — we only support SCHED_OTHER (0).
-pub fn sys_sched_setscheduler(_pid: usize, _policy: i32, _param: *const u8) -> isize {
-    info!("[sched] sched_setscheduler: stub, returning 0");
+pub fn sys_sched_setscheduler(pid: usize, policy: i32, param: *const u8) -> isize {
+    const SCHED_OTHER: i32 = 0;
+    const SCHED_FIFO: i32 = 1;
+    const SCHED_RR: i32 = 2;
+
+    let target_pid = match normalize_sched_pid(pid) {
+        Ok(pid) => pid,
+        Err(err) => return err,
+    };
+    if !matches!(policy, SCHED_OTHER | SCHED_FIFO | SCHED_RR) {
+        return errno(EINVAL);
+    }
+    if param.is_null() {
+        return errno(EFAULT);
+    }
+    let token = current_user_token();
+    let sched_priority = match read_from_user::<i32>(token, param as *const i32) {
+        Ok(priority) => priority,
+        Err(_) => return errno(EFAULT),
+    };
+    let valid_priority = match policy {
+        SCHED_OTHER => sched_priority == 0,
+        SCHED_FIFO | SCHED_RR => (1..=99).contains(&sched_priority),
+        _ => false,
+    };
+    if !valid_priority {
+        return errno(EINVAL);
+    }
+    SCHED_POLICIES.exclusive_access().insert(target_pid, policy);
     0
 }
 
 /// sched_getscheduler(pid) -> policy
-/// Always return SCHED_OTHER (0).
-pub fn sys_sched_getscheduler(_pid: usize) -> isize {
-    0 // SCHED_OTHER
+pub fn sys_sched_getscheduler(pid: usize) -> isize {
+    let target_pid = match normalize_sched_pid(pid) {
+        Ok(pid) => pid,
+        Err(err) => return err,
+    };
+    SCHED_POLICIES
+        .exclusive_access()
+        .get(&target_pid)
+        .copied()
+        .unwrap_or(0) as isize
 }
 
 /// sched_getparam(pid, param)
 /// Write sched_priority = 0 (for SCHED_OTHER).
-pub fn sys_sched_getparam(_pid: usize, param: *mut u8) -> isize {
+pub fn sys_sched_getparam(pid: usize, param: *mut u8) -> isize {
+    if let Err(err) = normalize_sched_pid(pid) {
+        return err;
+    }
     if param.is_null() {
         return errno(EINVAL);
     }
