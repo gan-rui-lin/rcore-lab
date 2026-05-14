@@ -1,0 +1,111 @@
+digraph rcore_lab_architecture_paper {
+  rankdir=TB;
+  splines=ortho;
+  nodesep=0.45;
+  ranksep=0.65;
+
+  graph [
+    fontname="Times New Roman",
+    fontsize=14,
+    labelloc=t,
+    label="RCore-Lab Architecture Overview"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#2e3440",
+    fillcolor="#eceff4",
+    fontname="Times New Roman",
+    fontsize=11,
+    margin="0.08,0.05"
+  ];
+
+  edge [
+    color="#4c566a",
+    arrowsize=0.8,
+    penwidth=1.1,
+    fontname="Times New Roman",
+    fontsize=10
+  ];
+
+  subgraph cluster_user {
+    label="User Space";
+    color="#8fbcbb";
+    style="rounded";
+
+    app [label="Applications\n(BusyBox / libc tests / benchmarks)", fillcolor="#e5f3f2"];
+    ulib [label="User Runtime & Syscall Stubs", fillcolor="#e5f3f2"];
+
+    app -> ulib [label="API calls"];
+  }
+
+  subgraph cluster_boundary {
+    label="Privilege Boundary";
+    color="#88c0d0";
+    style="rounded,dashed";
+
+    trap [label="Trap Entry / Return\n(Exception, Interrupt, Syscall)", fillcolor="#e8f4f8"];
+  }
+
+  subgraph cluster_kernel {
+    label="Kernel Space";
+    color="#a3be8c";
+    style="rounded";
+
+    subgraph cluster_core {
+      label="Kernel Core Services";
+      color="#b9d8ab";
+      style="rounded";
+
+      proc [label="Process & Thread Management\nScheduling, Signal, Futex", fillcolor="#edf6e8"];
+      mem [label="Memory Management\nVM, Page Table, COW, Mapping", fillcolor="#edf6e8"];
+      vfs [label="VFS & File Abstractions\nFD table, inode interface", fillcolor="#edf6e8"];
+      net [label="Network Stack\nSocket API, TCP/UDP, Loopback", fillcolor="#edf6e8"];
+      ipc [label="IPC & Synchronization\nMutex/Sem/Condvar, SysV IPC", fillcolor="#edf6e8"];
+      time [label="Time Services\nTimer, Sleep, Interval Timer", fillcolor="#edf6e8"];
+    }
+
+    subgraph cluster_adapter {
+      label="Architecture & Device Adaptation";
+      color="#d8bfd8";
+      style="rounded";
+
+      hal [label="Architecture Abstraction Layer\n(RISC-V / LoongArch Unified Interface)", fillcolor="#f6edf6"];
+      drv [label="Device Driver Framework\nBlock / Net / Console / Interrupt Ctrl", fillcolor="#f6edf6"];
+      fsimpl [label="Filesystem Implementations\nEasyFS / FAT / EXT4 Adapter", fillcolor="#f6edf6"];
+    }
+  }
+
+  subgraph cluster_hw {
+    label="Platform";
+    color="#d08770";
+    style="rounded";
+
+    hw [label="Hardware & Virtual Platform\nCPU, MMU, Timer, VirtIO, Interrupt Controller", fillcolor="#fdf0ea"];
+  }
+
+  ulib -> trap [label="syscall / ecall", color="#5e81ac"];
+  trap -> proc [label="control transfer", color="#5e81ac"];
+
+  proc -> mem [label="address-space ops"];
+  proc -> vfs [label="I/O & executable loading"];
+  proc -> ipc [label="blocking/wakeup"];
+  proc -> time [label="sleep/accounting"];
+
+  vfs -> fsimpl [label="dispatch"];
+  fsimpl -> drv [label="block I/O"];
+  net -> drv [label="packet I/O"];
+  ipc -> proc [label="synchronization events", dir=both, arrowhead=normal, arrowtail=normal];
+
+  mem -> hal [label="page-table primitives"];
+  proc -> hal [label="context switch/trap context"];
+  trap -> hal [label="trap decode/return"];
+  drv -> hal [label="arch-specific access"];
+
+  hal -> hw [label="privileged instructions"];
+  drv -> hw [label="device interaction"];
+  time -> hw [label="timer source"];
+
+  hw -> trap [label="interrupt/exception", style=dashed, color="#bf616a"];
+}

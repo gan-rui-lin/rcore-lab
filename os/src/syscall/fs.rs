@@ -1298,18 +1298,47 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
         return errno(EFAULT);
     };
     if raw.is_empty() {
-        return errno(EINVAL);
+        return errno(ENOENT);
     }
-    let base = match dirfd_base(dirfd) {
-        Ok(base) => base,
-        Err(err) => return err,
-    };
+    if raw_path_too_long(&raw) {
+        return errno(ENAMETOOLONG);
+    }
     let full_path = if raw.starts_with('/') {
-        normalize_path(&raw)
+        resolve_user_path("/", &raw)
     } else {
+        let base = match dirfd_base(dirfd) {
+            Ok(base) => base,
+            Err(err) => return err,
+        };
         resolve_path(&base, &raw)
     };
-    if path_is_dir(&full_path) {
+    let parent = if let Some((parent, _)) = full_path.rsplit_once('/') {
+        if parent.is_empty() { "/" } else { parent }
+    } else {
+        "/"
+    };
+    let parent = match resolve_access_path(parent) {
+        Ok(parent) => parent,
+        Err(err) => return err,
+    };
+    if !path_is_dir(&parent) {
+        return errno(if path_exists_for_access(&parent) {
+            ENOTDIR
+        } else {
+            ENOENT
+        });
+    }
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        let euid = inner.effective_uid;
+        let egid = inner.effective_gid;
+        drop(inner);
+        if let Err(err) = access_allowed_egid(&parent, 0o3, euid, egid) {
+            return err;
+        }
+    }
+    if path_exists_for_access(&full_path) || path_is_dir(&full_path) {
         return errno(EEXIST);
     }
     if create_dir(&full_path) {
@@ -1979,6 +2008,10 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: i32, _mask: u32, buf: *mu
         // AT_STATX_FORCE_SYNC and AT_STATX_DONT_SYNC are mutually exclusive.
         return errno(EINVAL);
     }
+    if (_mask & 0x8000_0000) != 0 {
+        // STATX__RESERVED must be zero.
+        return errno(EINVAL);
+    }
 
     let token = current_user_token();
     let Some(raw_path) = translated_str_checked(token, path) else {
@@ -1998,6 +2031,9 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: i32, _mask: u32, buf: *mu
             stat_from_fd(dirfd as usize)
         }
     } else {
+        if raw_path_too_long(&raw_path) {
+            return errno(ENAMETOOLONG);
+        }
         let base = if raw_path.starts_with('/') {
             String::new()
         } else {
@@ -2300,16 +2336,48 @@ pub fn sys_symlinkat(target: *const u8, new_dirfd: isize, linkpath: *const u8) -
         return errno(EFAULT);
     };
     if target_raw.is_empty() || link_raw.is_empty() {
-        return errno(EINVAL);
+        return errno(ENOENT);
     }
-    let base = match dirfd_base(new_dirfd) {
-        Ok(base) => base,
+    if raw_path_too_long(&link_raw) {
+        return errno(ENAMETOOLONG);
+    }
+    let new_path = if link_raw.starts_with('/') {
+        resolve_user_path("/", &link_raw)
+    } else {
+        let base = match dirfd_base(new_dirfd) {
+            Ok(base) => base,
+            Err(err) => return err,
+        };
+        if !path_is_dir(&base) {
+            return errno(ENOENT);
+        }
+        resolve_path(&base, &link_raw)
+    };
+    let parent = if let Some((parent, _)) = new_path.rsplit_once('/') {
+        if parent.is_empty() { "/" } else { parent }
+    } else {
+        "/"
+    };
+    let parent = match resolve_access_path(parent) {
+        Ok(parent) => parent,
         Err(err) => return err,
     };
-    let new_path = if link_raw.starts_with('/') {
-        normalize_path(&link_raw)
-    } else {
-        resolve_path(&base, &link_raw)
+    if !path_is_dir(&parent) {
+        return errno(if path_exists_for_access(&parent) {
+            ENOTDIR
+        } else {
+            ENOENT
+        });
+    }
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        let euid = inner.effective_uid;
+        let egid = inner.effective_gid;
+        drop(inner);
+        if let Err(err) = access_allowed_egid(&parent, 0o3, euid, egid) {
+            return err;
+        }
     };
     if symlink_target_get(&new_path).is_some()
         || open_file(new_path.as_str(), OpenFlags::empty()).is_some()
@@ -3066,6 +3134,9 @@ pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 
     if !file.readable() {
         return errno(EBADF);
+    }
+    if file.inode().map(|inode| inode.is_dir()).unwrap_or(false) {
+        return errno(EISDIR);
     }
 
     let file = file.clone();
@@ -5252,8 +5323,12 @@ pub fn sys_posix_fadvise(fd: usize, offset: isize, len: isize, advice: i32) -> i
     }
 }
 
-/// sys_set_robust_list (syscall 99) - stub
+/// sys_set_robust_list (syscall 99) - minimal robust futex list registration.
 pub fn sys_set_robust_list(_head: usize, _len: usize) -> isize {
+    const ROBUST_LIST_HEAD_SIZE: usize = 24;
+    if _len != ROBUST_LIST_HEAD_SIZE {
+        return errno(EINVAL);
+    }
     0
 }
 
@@ -5561,6 +5636,7 @@ fn us_to_timespec(us: u64) -> TimeSpec {
 const TFD_CLOEXEC: i32 = 0o2000000; // same as O_CLOEXEC
 const TFD_NONBLOCK: i32 = 0o4000;   // same as O_NONBLOCK
 const TFD_TIMER_ABSTIME: i32 = 1;
+const TFD_TIMER_CANCEL_ON_SET: i32 = 2;
 
 /// timerfd_create(2)
 pub fn sys_timerfd_create(clockid: i32, flags: i32) -> isize {
@@ -5586,6 +5662,9 @@ pub fn sys_timerfd_create(clockid: i32, flags: i32) -> isize {
 
 /// timerfd_settime(2)
 pub fn sys_timerfd_settime(fd: usize, flags: i32, new_value: *const u8, old_value: *mut u8) -> isize {
+    if flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) != 0 {
+        return errno(EINVAL);
+    }
     if new_value.is_null() {
         return errno(EFAULT);
     }
@@ -5636,9 +5715,6 @@ pub fn sys_timerfd_settime(fd: usize, flags: i32, new_value: *const u8, old_valu
 
 /// timerfd_gettime(2)
 pub fn sys_timerfd_gettime(fd: usize, curr_value: *mut u8) -> isize {
-    if curr_value.is_null() {
-        return errno(EFAULT);
-    }
     let token = current_user_token();
     let process = current_process();
     let inner = process.inner_exclusive_access();
@@ -5651,6 +5727,9 @@ pub fn sys_timerfd_gettime(fd: usize, curr_value: *mut u8) -> isize {
     drop(inner);
     if !file.is_timerfd() {
         return errno(EINVAL);
+    }
+    if curr_value.is_null() {
+        return errno(EFAULT);
     }
     let (remaining_us, interval_us) = file.timerfd_gettime().unwrap_or((0, 0));
     let spec = ITimerSpec {

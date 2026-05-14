@@ -2659,11 +2659,25 @@ pub fn sys_syslog(_log_type: usize, buf: *mut u8, len: usize) -> isize {
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_syslog", pid);
     }
-    if len == 0 {
-        return 0;
+    let log_type = _log_type as isize;
+    match log_type {
+        0..=10 => {}
+        _ => return errno(EINVAL),
+    }
+    if current_process().inner_exclusive_access().effective_uid != 0 {
+        return errno(EPERM);
+    }
+    if log_type == 8 && len > 8 {
+        return errno(EINVAL);
+    }
+    if len > isize::MAX as usize {
+        return errno(EINVAL);
     }
     if buf.is_null() {
-        return errno(EFAULT);
+        return errno(EINVAL);
+    }
+    if len == 0 {
+        return 0;
     }
     let token = current_user_token();
     let out = [0u8; 1];
