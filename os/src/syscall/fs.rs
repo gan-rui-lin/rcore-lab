@@ -4,7 +4,8 @@ use super::process::{get_current_umask, TimeSpec};
 use super::user_mem::{self, UserReadPolicy, UserWritePolicy};
 use crate::fs::{
     create_dir, make_pipe, open_file, path_exists, path_is_dir, remove_path, DevNull, DevUrandom,
-    DevZero, MemFdFile, OpenFlags, PollEvents, Stat, StatMode, TimerFdFile, TIMERFD_EAGAIN,
+    DevZero, MemFdFile, OpenFlags, PollEvents, Stat, StatMode, TimerFdFile, VfsInode,
+    VfsMetadata, TIMERFD_EAGAIN,
 };
 use crate::mm::{
     translated_ref, translated_refmut, translated_str_checked, UserBuffer,
@@ -1434,13 +1435,9 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
             stat.gid = gid;
             stat.dev = 1;
             if !full_path.is_empty() {
-                let mut h: u64 = 5381;
-                for b in full_path.bytes() {
-                    h = h.wrapping_mul(33).wrapping_add(b as u64);
-                }
-                stat.ino = h & 0x7FFF_FFFF;
+                stat.ino = path_hash_ino(&full_path);
             }
-            fill_stat_timestamps(&mut stat, None);
+            fill_stat_timestamps(&mut stat, None, None);
             let bytes = unsafe {
                 core::slice::from_raw_parts(
                     (&stat as *const Stat) as *const u8,
@@ -1470,38 +1467,24 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
         let Some(file) = open_file(full_path.as_str(), open_flags) else {
             return errno(ENOENT);
         };
-        let (mode_bits, size) = if let Some(inode) = file.inode() {
-            let mode = if inode.is_dir() {
-                StatMode::DIR
-            } else {
-                StatMode::FILE
-            };
-            (
-                mode.bits() | path_mode_get(&full_path).unwrap_or(0o777),
-                inode.size(),
-            )
+        let metadata = if let Some(inode) = file.inode() {
+            fill_regular_stat(&mut stat, &full_path, inode.as_ref())
         } else {
-            (StatMode::FILE.bits() | 0o666, 0)
+            stat.mode = StatMode::FILE.bits() | 0o666;
+            stat.blksize = 512;
+            None
         };
-        stat.mode = mode_bits;
-        stat.nlink = path_nlink_get(&full_path);
-        stat.size = size as i64;
-        stat.blksize = 512;
-        stat.blocks = ((size + 511) / 512) as i64;
-        let (uid, gid) = effective_path_owner(&full_path);
-        stat.uid = uid;
-        stat.gid = gid;
+        fill_stat_timestamps(&mut stat, None, metadata);
     }
-    // Generate unique (dev, ino) so glibc ld-linux doesn't confuse different files
-    stat.dev = 1;
-    if !full_path.is_empty() {
-        let mut h: u64 = 5381;
-        for b in full_path.bytes() {
-            h = h.wrapping_mul(33).wrapping_add(b as u64);
-        }
-        stat.ino = h & 0x7FFF_FFFF;
+    if stat.dev == 0 {
+        stat.dev = 1;
     }
-    fill_stat_timestamps(&mut stat, None);
+    if stat.ino == 0 && !full_path.is_empty() {
+        stat.ino = path_hash_ino(&full_path);
+    }
+    if is_char_device(&full_path) {
+        fill_stat_timestamps(&mut stat, None, None);
+    }
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&stat as *const Stat) as *const u8,
@@ -1649,8 +1632,16 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const TimeSpec, _fla
     }
 }
 
-/// Fill timestamp fields in a Stat from stored timestamps or current time.
-fn fill_stat_timestamps(stat: &mut Stat, ts_id: Option<usize>) {
+fn path_hash_ino(path: &str) -> u64 {
+    let mut h: u64 = 5381;
+    for b in path.bytes() {
+        h = h.wrapping_mul(33).wrapping_add(b as u64);
+    }
+    h & 0x7FFF_FFFF
+}
+
+/// Fill timestamp fields in a Stat from stored timestamps, filesystem metadata, or current time.
+fn fill_stat_timestamps(stat: &mut Stat, ts_id: Option<usize>, metadata: Option<VfsMetadata>) {
     if let Some(id) = ts_id {
         if let Some(ts) = ts_get(id) {
             stat.atime_sec = ts.atime_sec;
@@ -1662,6 +1653,15 @@ fn fill_stat_timestamps(stat: &mut Stat, ts_id: Option<usize>) {
             stat.ctime_nsec = now_nsec;
             return;
         }
+    }
+    if let Some(metadata) = metadata {
+        stat.atime_sec = metadata.atime_sec;
+        stat.atime_nsec = 0;
+        stat.mtime_sec = metadata.mtime_sec;
+        stat.mtime_nsec = 0;
+        stat.ctime_sec = metadata.ctime_sec;
+        stat.ctime_nsec = 0;
+        return;
     }
     // No stored timestamps — return current time as default
     let (sec, nsec) = get_current_timespec();
@@ -1677,6 +1677,45 @@ fn split_rdev(rdev: u64) -> (u32, u32) {
     let major = ((rdev >> 8) & 0xff) as u32;
     let minor = (rdev & 0xff) as u32;
     (major, minor)
+}
+
+fn fill_regular_stat(stat: &mut Stat, path: &str, inode: &dyn VfsInode) -> Option<VfsMetadata> {
+    let metadata = inode.metadata();
+    let mode = if inode.is_dir() {
+        StatMode::DIR
+    } else {
+        StatMode::FILE
+    };
+    let perm = path_mode_get(path)
+        .unwrap_or_else(|| metadata.map(|m| m.mode & 0o7777).unwrap_or(0o777));
+    let size = metadata
+        .map(|m| m.size as usize)
+        .unwrap_or_else(|| inode.size());
+
+    stat.mode = mode.bits() | perm;
+    stat.nlink = metadata
+        .map(|m| m.nlink)
+        .filter(|nlink| *nlink > 0)
+        .unwrap_or_else(|| path_nlink_get(path));
+    stat.size = size as i64;
+    stat.blksize = 512;
+    stat.blocks = metadata
+        .map(|m| m.blocks as i64)
+        .filter(|blocks| *blocks > 0)
+        .unwrap_or_else(|| ((size + 511) / 512) as i64);
+    let (uid, gid) = effective_path_owner(path);
+    stat.uid = uid;
+    stat.gid = gid;
+    stat.dev = metadata
+        .map(|m| m.dev)
+        .filter(|dev| *dev != 0)
+        .unwrap_or(1);
+    stat.ino = metadata
+        .map(|m| m.ino)
+        .filter(|ino| *ino != 0)
+        .unwrap_or_else(|| path_hash_ino(path));
+
+    metadata
 }
 
 fn stat_from_fd(fd: usize) -> Result<Stat, isize> {
@@ -1695,46 +1734,30 @@ fn stat_from_fd(fd: usize) -> Result<Stat, isize> {
     let path = file.path().unwrap_or("");
     if is_char_device(path) {
         stat.mode = StatMode::CHR.bits() | 0o666;
+        stat.nlink = 1;
         stat.rdev = rdev_for_path(path);
         stat.uid = 0;
         stat.gid = 0;
-    } else {
-        let (mode_bits, size) = if let Some(inode) = file.inode() {
-            let mode = if inode.is_dir() {
-                StatMode::DIR
-            } else {
-                StatMode::FILE
-            };
-            (
-                mode.bits() | path_mode_get(path).unwrap_or(0o777),
-                inode.size(),
-            )
-        } else {
-            (StatMode::FILE.bits() | 0o666, 0)
-        };
-        stat.mode = mode_bits;
-        stat.size = size as i64;
-        stat.blksize = 512;
-        stat.blocks = ((size + 511) / 512) as i64;
-        let (uid, gid) = effective_path_owner(path);
-        stat.uid = uid;
-        stat.gid = gid;
-    }
-    stat.nlink = if is_char_device(path) {
-        1
-    } else {
-        path_nlink_get(path)
-    };
-    // Generate unique (dev, ino) so glibc ld-linux doesn't confuse different files
-    stat.dev = 1;
-    if !path.is_empty() {
-        let mut h: u64 = 5381;
-        for b in path.bytes() {
-            h = h.wrapping_mul(33).wrapping_add(b as u64);
+        stat.dev = 1;
+        if !path.is_empty() {
+            stat.ino = path_hash_ino(path);
         }
-        stat.ino = h & 0x7FFF_FFFF;
+        fill_stat_timestamps(&mut stat, file.ts_id(), None);
+    } else {
+        let metadata = if let Some(inode) = file.inode() {
+            fill_regular_stat(&mut stat, path, inode.as_ref())
+        } else {
+            stat.mode = StatMode::FILE.bits() | 0o666;
+            stat.nlink = path_nlink_get(path);
+            stat.blksize = 512;
+            stat.dev = 1;
+            if !path.is_empty() {
+                stat.ino = path_hash_ino(path);
+            }
+            None
+        };
+        fill_stat_timestamps(&mut stat, file.ts_id(), metadata);
     }
-    fill_stat_timestamps(&mut stat, file.ts_id());
     Ok(stat)
 }
 
@@ -1746,7 +1769,9 @@ fn stat_from_path(full_path: &str) -> Result<Stat, isize> {
         stat.rdev = rdev_for_path(full_path);
         stat.uid = 0;
         stat.gid = 0;
-        fill_stat_timestamps(&mut stat, None);
+        stat.dev = 1;
+        stat.ino = path_hash_ino(full_path);
+        fill_stat_timestamps(&mut stat, None, None);
         return Ok(stat);
     }
     let open_flags = if path_is_dir(full_path) {
@@ -1757,35 +1782,17 @@ fn stat_from_path(full_path: &str) -> Result<Stat, isize> {
     let Some(file) = open_file(full_path, open_flags) else {
         return Err(errno(ENOENT));
     };
-    let (mode_bits, size) = if let Some(inode) = file.inode() {
-        let mode = if inode.is_dir() {
-            StatMode::DIR
-        } else {
-            StatMode::FILE
-        };
-        (
-            mode.bits() | path_mode_get(full_path).unwrap_or(0o777),
-            inode.size(),
-        )
+    let metadata = if let Some(inode) = file.inode() {
+        fill_regular_stat(&mut stat, full_path, inode.as_ref())
     } else {
-        (StatMode::FILE.bits() | 0o666, 0)
+        stat.mode = StatMode::FILE.bits() | 0o666;
+        stat.nlink = path_nlink_get(full_path);
+        stat.blksize = 512;
+        stat.dev = 1;
+        stat.ino = path_hash_ino(full_path);
+        None
     };
-    stat.mode = mode_bits;
-    stat.nlink = path_nlink_get(full_path);
-    stat.size = size as i64;
-    stat.blksize = 512;
-    stat.blocks = ((size + 511) / 512) as i64;
-    let (uid, gid) = effective_path_owner(full_path);
-    stat.uid = uid;
-    stat.gid = gid;
-    stat.dev = 1;
-    // Generate unique inode from path
-    let mut h: u64 = 5381;
-    for b in full_path.bytes() {
-        h = h.wrapping_mul(33).wrapping_add(b as u64);
-    }
-    stat.ino = h & 0x7FFF_FFFF; // keep positive when printed as signed
-    fill_stat_timestamps(&mut stat, None);
+    fill_stat_timestamps(&mut stat, None, metadata);
     Ok(stat)
 }
 
@@ -1795,62 +1802,11 @@ pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_fstat", pid);
     }
-    let process = current_process();
     let token = current_user_token();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = &inner.fd_table[fd] else {
-        return errno(EBADF);
+    let stat = match stat_from_fd(fd) {
+        Ok(stat) => stat,
+        Err(err) => return err,
     };
-    let file = file.clone();
-    drop(inner);
-    let mut stat = Stat::default();
-    let path = file.path().unwrap_or("");
-    if is_char_device(path) {
-        stat.mode = StatMode::CHR.bits() | 0o666;
-        stat.rdev = rdev_for_path(path);
-        stat.uid = 0;
-        stat.gid = 0;
-    } else {
-        let (mode_bits, size) = if let Some(inode) = file.inode() {
-            let mode = if inode.is_dir() {
-                StatMode::DIR
-            } else {
-                StatMode::FILE
-            };
-            (
-                mode.bits() | path_mode_get(path).unwrap_or(0o777),
-                inode.size(),
-            )
-        } else {
-            (StatMode::FILE.bits() | 0o666, 0)
-        };
-        stat.mode = mode_bits;
-        stat.size = size as i64;
-        stat.blksize = 512;
-        stat.blocks = ((size + 511) / 512) as i64;
-        let (uid, gid) = effective_path_owner(path);
-        stat.uid = uid;
-        stat.gid = gid;
-    }
-    stat.nlink = if is_char_device(path) {
-        1
-    } else {
-        path_nlink_get(path)
-    };
-    // Generate unique (dev, ino) so glibc ld-linux doesn't confuse different files
-    stat.dev = 1; // non-zero device
-    let path_for_ino = file.path().unwrap_or("");
-    if !path_for_ino.is_empty() {
-        let mut h: u64 = 5381;
-        for b in path_for_ino.bytes() {
-            h = h.wrapping_mul(33).wrapping_add(b as u64);
-        }
-        stat.ino = h & 0x7FFF_FFFF; // keep positive when printed as signed
-    }
-    fill_stat_timestamps(&mut stat, file.ts_id());
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&stat as *const Stat) as *const u8,

@@ -15,6 +15,19 @@ pub enum VfsNodeKind {
     Dir,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VfsMetadata {
+    pub dev: u64,
+    pub ino: u64,
+    pub mode: u32,
+    pub nlink: u32,
+    pub size: u64,
+    pub blocks: u64,
+    pub atime_sec: i64,
+    pub mtime_sec: i64,
+    pub ctime_sec: i64,
+}
+
 pub trait VfsInode: Send + Sync {
     fn kind(&self) -> VfsNodeKind;
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize;
@@ -52,6 +65,10 @@ pub trait VfsInode: Send + Sync {
     fn list(&self) -> Vec<String>;
     fn size(&self) -> usize {
         0
+    }
+
+    fn metadata(&self) -> Option<VfsMetadata> {
+        None
     }
 
     fn is_dir(&self) -> bool {

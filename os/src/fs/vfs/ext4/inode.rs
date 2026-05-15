@@ -1,10 +1,13 @@
-use super::super::core::{VfsInode, VfsNodeKind};
+use super::super::core::{VfsInode, VfsMetadata, VfsNodeKind};
 use crate::sync::UPIntrFreeCell;
+use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use lwext4_rust::bindings::{O_CREAT, O_RDONLY, O_RDWR, O_TRUNC};
+use lwext4_rust::bindings::{
+    ext4_inode, ext4_raw_inode_fill, EOK, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC,
+};
 use lwext4_rust::{Ext4File, InodeTypes};
 
 const SEEK_SET: u32 = 0;
@@ -128,6 +131,40 @@ fn ext4_open_file(path: &str, kind: InodeTypes, flags: u32) -> Option<Ext4File> 
         if file.file_open(stripped, flags).is_ok() {
             return Some(file);
         }
+    }
+    None
+}
+
+fn read_packed<T: Copy>(field: *const T) -> T {
+    unsafe { core::ptr::read_unaligned(field) }
+}
+
+fn ext4_metadata(path: &str) -> Option<VfsMetadata> {
+    let mut try_paths = [path, ""];
+    if let Some(stripped) = path.strip_prefix('/') {
+        try_paths[1] = stripped;
+    }
+    for candidate in try_paths.iter().filter(|p| !p.is_empty()) {
+        let c_path = CString::new(*candidate).ok()?;
+        let mut ino = 0u32;
+        let mut raw: ext4_inode = unsafe { core::mem::zeroed() };
+        let rc = unsafe { ext4_raw_inode_fill(c_path.as_ptr(), &mut ino, &mut raw) };
+        if rc != EOK as i32 {
+            continue;
+        }
+        let size_lo = read_packed(core::ptr::addr_of!(raw.size_lo)) as u64;
+        let size_hi = read_packed(core::ptr::addr_of!(raw.size_hi)) as u64;
+        return Some(VfsMetadata {
+            dev: 1,
+            ino: ino as u64,
+            mode: read_packed(core::ptr::addr_of!(raw.mode)) as u32,
+            nlink: read_packed(core::ptr::addr_of!(raw.links_count)) as u32,
+            size: size_lo | (size_hi << 32),
+            blocks: read_packed(core::ptr::addr_of!(raw.blocks_count_lo)) as u64,
+            atime_sec: read_packed(core::ptr::addr_of!(raw.access_time)) as i64,
+            mtime_sec: read_packed(core::ptr::addr_of!(raw.modification_time)) as i64,
+            ctime_sec: read_packed(core::ptr::addr_of!(raw.change_inode_time)) as i64,
+        });
     }
     None
 }
@@ -338,5 +375,9 @@ impl VfsInode for Ext4Inode {
             trace!("ext4: open failed path={} (size, file may be deleted)", self.path);
             0
         }
+    }
+
+    fn metadata(&self) -> Option<VfsMetadata> {
+        ext4_metadata(self.path.as_str())
     }
 }

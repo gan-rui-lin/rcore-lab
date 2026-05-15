@@ -13,7 +13,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 #[cfg(feature = "ext4")]
 use lwext4_rust::bindings::ext4_flink;
-use vfs::VfsInode;
+pub(crate) use vfs::{VfsInode, VfsMetadata};
 
 /// trait File for all file types
 pub trait File: Send + Sync {
