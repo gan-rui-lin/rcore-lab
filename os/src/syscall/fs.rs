@@ -5,7 +5,7 @@ use super::user_mem::{self, UserReadPolicy, UserWritePolicy};
 use crate::fs::{
     create_dir, make_pipe, open_file, path_exists, path_is_dir, remove_path, DevNull, DevUrandom,
     DevZero, MemFdFile, OpenFlags, PollEvents, Stat, StatMode, TimerFdFile, VfsInode,
-    VfsMetadata, TIMERFD_EAGAIN,
+    VfsMetadata, VfsStatFs, TIMERFD_EAGAIN,
 };
 use crate::mm::{
     translated_ref, translated_refmut, translated_str_checked, UserBuffer,
@@ -54,11 +54,6 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use lazy_static::lazy_static;
 
-#[cfg(feature = "ext4")]
-use alloc::ffi::CString;
-#[cfg(feature = "ext4")]
-use lwext4_rust::bindings::ext4_flink;
-
 const AT_FDCWD: isize = -100;
 const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 const AT_REMOVEDIR: u32 = 0x200;
@@ -75,52 +70,16 @@ const MS_RDONLY: u32 = 1;
 const DIRECT_IO_ALIGN: usize = 4096;
 const LINUX_DIRENT64_MIN_RECLEN: usize = 24;
 
-/// Per-file stored timestamps (atime, mtime).
-#[derive(Clone, Copy, Debug)]
-struct FileTimestamps {
-    atime_sec: i64,
-    atime_nsec: i64,
-    mtime_sec: i64,
-    mtime_nsec: i64,
-}
-
 lazy_static! {
-    /// Global map: fd-unique-key -> timestamps.
-    /// We key by a monotonic counter assigned per open() to track fd-level timestamps
-    /// (since multiple fds can share the same path but need independent timestamps via tmpfile).
-    static ref TIMESTAMPS: UPSafeCell<BTreeMap<usize, FileTimestamps>> =
-        unsafe { UPSafeCell::new(BTreeMap::new()) };
-    static ref XATTRS: UPSafeCell<BTreeMap<(String, String), Vec<u8>>> =
-        unsafe { UPSafeCell::new(BTreeMap::new()) };
-    static ref TS_NEXT_ID: UPSafeCell<usize> = unsafe { UPSafeCell::new(1) };
-    static ref PATH_MODES: UPSafeCell<BTreeMap<String, u32>> =
-        unsafe { UPSafeCell::new(BTreeMap::new()) };
-    static ref PATH_OWNERS: UPSafeCell<BTreeMap<String, (u32, u32)>> =
-        unsafe { UPSafeCell::new(BTreeMap::new()) };
-    static ref SYMLINK_TARGETS: UPSafeCell<BTreeMap<String, String>> =
-        unsafe { UPSafeCell::new(BTreeMap::new()) };
     static ref READONLY_MOUNTS: UPSafeCell<BTreeSet<String>> =
         unsafe { UPSafeCell::new(BTreeSet::new()) };
     static ref FD_FLAGS: UPSafeCell<BTreeMap<(usize, usize), u32>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
     static ref FLOCK_LOCKS: UPSafeCell<BTreeMap<String, (usize, usize)>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
-    static ref PATH_LINK_GROUP: UPSafeCell<BTreeMap<String, u64>> =
-        unsafe { UPSafeCell::new(BTreeMap::new()) };
-    static ref LINK_GROUP_COUNT: UPSafeCell<BTreeMap<u64, u32>> =
-        unsafe { UPSafeCell::new(BTreeMap::new()) };
 }
 
 static GETRANDOM_STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
-static NEXT_LINK_GROUP_ID: AtomicU64 = AtomicU64::new(1);
-
-#[allow(dead_code)]
-fn ts_alloc_id() -> usize {
-    let mut id = TS_NEXT_ID.exclusive_access();
-    let ret = *id;
-    *id += 1;
-    ret
-}
 
 fn get_current_timespec() -> (i64, i64) {
     let us = get_time_us();
@@ -129,115 +88,9 @@ fn get_current_timespec() -> (i64, i64) {
     (sec, nsec)
 }
 
-fn ts_get(id: usize) -> Option<FileTimestamps> {
-    let map = TIMESTAMPS.exclusive_access();
-    map.get(&id).copied()
-}
-
-fn ts_set(id: usize, ts: FileTimestamps) {
-    let mut map = TIMESTAMPS.exclusive_access();
-    map.insert(id, ts);
-}
-
-#[allow(dead_code)]
-fn ts_remove(id: usize) {
-    let mut map = TIMESTAMPS.exclusive_access();
-    map.remove(&id);
-}
-
-fn path_mode_get(path: &str) -> Option<u32> {
-    PATH_MODES.exclusive_access().get(path).copied()
-}
-
-fn path_mode_set(path: &str, mode: u32) {
-    PATH_MODES
-        .exclusive_access()
-        .insert(String::from(path), mode & 0o177777);
-}
-
 fn apply_umask(mode: u32) -> u32 {
     let umask = (get_current_umask() as u32) & 0o777;
     (mode & 0o7777) & !umask
-}
-
-fn path_mode_remove(path: &str) {
-    PATH_MODES.exclusive_access().remove(path);
-}
-
-fn path_owner_get(path: &str) -> Option<(u32, u32)> {
-    PATH_OWNERS.exclusive_access().get(path).copied()
-}
-
-fn path_owner_set(path: &str, uid: u32, gid: u32) {
-    PATH_OWNERS
-        .exclusive_access()
-        .insert(String::from(path), (uid, gid));
-}
-
-fn path_owner_remove(path: &str) {
-    PATH_OWNERS.exclusive_access().remove(path);
-}
-
-fn path_nlink_get(path: &str) -> u32 {
-    let gid = PATH_LINK_GROUP.exclusive_access().get(path).copied();
-    if let Some(gid) = gid {
-        LINK_GROUP_COUNT
-            .exclusive_access()
-            .get(&gid)
-            .copied()
-            .unwrap_or(1)
-    } else {
-        1
-    }
-}
-
-#[allow(dead_code)]
-fn ensure_link_group_for_path(path: &str) -> u64 {
-    if let Some(gid) = PATH_LINK_GROUP.exclusive_access().get(path).copied() {
-        return gid;
-    }
-    let gid = NEXT_LINK_GROUP_ID.fetch_add(1, AtomicOrdering::Relaxed);
-    PATH_LINK_GROUP
-        .exclusive_access()
-        .insert(String::from(path), gid);
-    LINK_GROUP_COUNT.exclusive_access().insert(gid, 1);
-    gid
-}
-
-#[allow(dead_code)]
-fn path_link_add(old_path: &str, new_path: &str) {
-    let gid = ensure_link_group_for_path(old_path);
-    {
-        let mut counts = LINK_GROUP_COUNT.exclusive_access();
-        let cnt = counts.entry(gid).or_insert(1);
-        *cnt = cnt.saturating_add(1);
-    }
-    PATH_LINK_GROUP
-        .exclusive_access()
-        .insert(String::from(new_path), gid);
-}
-
-fn path_link_remove(path: &str) {
-    let gid = PATH_LINK_GROUP.exclusive_access().remove(path);
-    let Some(gid) = gid else {
-        return;
-    };
-    let mut counts = LINK_GROUP_COUNT.exclusive_access();
-    if let Some(cnt) = counts.get_mut(&gid) {
-        if *cnt > 0 {
-            *cnt -= 1;
-        }
-        if *cnt == 0 {
-            counts.remove(&gid);
-        }
-    }
-}
-
-fn path_link_move(old_path: &str, new_path: &str) {
-    let mut groups = PATH_LINK_GROUP.exclusive_access();
-    if let Some(gid) = groups.remove(old_path) {
-        groups.insert(String::from(new_path), gid);
-    }
 }
 
 fn fd_flags_get(pid: usize, fd: usize) -> u32 {
@@ -278,23 +131,29 @@ fn flock_unlock_owner(pid: usize, fd: usize) {
     }
 }
 
+fn inode_for_path(path: &str) -> Option<Arc<dyn VfsInode>> {
+    let flags = if path_is_dir(path) {
+        OpenFlags::DIRECTORY
+    } else {
+        OpenFlags::empty()
+    };
+    open_file(path, flags).and_then(|file| file.inode())
+}
+
+fn metadata_for_path(path: &str) -> Option<VfsMetadata> {
+    inode_for_path(path).and_then(|inode| inode.metadata())
+}
+
 fn effective_path_owner(path: &str) -> (u32, u32) {
-    // No tracked owner means root-owned.
-    path_owner_get(path).unwrap_or((0, 0))
+    metadata_for_path(path)
+        .map(|metadata| (metadata.uid, metadata.gid))
+        .unwrap_or((0, 0))
 }
 
-fn symlink_target_get(path: &str) -> Option<String> {
-    SYMLINK_TARGETS.exclusive_access().get(path).cloned()
-}
-
-fn symlink_target_set(path: &str, target: &str) {
-    SYMLINK_TARGETS
-        .exclusive_access()
-        .insert(String::from(path), String::from(target));
-}
-
-fn symlink_target_remove(path: &str) {
-    SYMLINK_TARGETS.exclusive_access().remove(path);
+fn readlink_path(path: &str) -> Option<String> {
+    let inode = inode_for_path(path)?;
+    let target = inode.readlink().ok()?;
+    String::from_utf8(target).ok()
 }
 
 fn readonly_mount_add(path: &str) {
@@ -314,14 +173,14 @@ fn readonly_mount_contains(path: &str) -> bool {
 }
 
 fn path_exists_for_access(path: &str) -> bool {
-    is_char_device(path) || symlink_target_get(path).is_some() || open_file(path, OpenFlags::empty()).is_some() || path_is_dir(path)
+    is_char_device(path) || open_file(path, OpenFlags::empty()).is_some() || path_is_dir(path)
 }
 
 #[allow(dead_code)]
 fn resolve_final_symlink(path: &str) -> String {
     let mut current = String::from(path);
     for _ in 0..8 {
-        let Some(target) = symlink_target_get(&current) else {
+        let Some(target) = readlink_path(&current) else {
             break;
         };
         let next = if target.starts_with('/') {
@@ -345,7 +204,7 @@ fn resolve_final_symlink(path: &str) -> String {
 fn resolve_final_symlink_checked(path: &str) -> Result<String, isize> {
     let mut current = String::from(path);
     for _ in 0..8 {
-        let Some(target) = symlink_target_get(&current) else {
+        let Some(target) = readlink_path(&current) else {
             return Ok(current);
         };
         let next = if target.starts_with('/') {
@@ -363,7 +222,7 @@ fn resolve_final_symlink_checked(path: &str) -> Result<String, isize> {
         }
         current = next;
     }
-    if symlink_target_get(&current).is_some() {
+    if readlink_path(&current).is_some() {
         Err(errno(ELOOP))
     } else {
         Ok(current)
@@ -440,7 +299,9 @@ fn default_path_mode(path: &str) -> u32 {
 }
 
 fn effective_path_mode(path: &str) -> u32 {
-    path_mode_get(path).unwrap_or_else(|| default_path_mode(path))
+    metadata_for_path(path)
+        .map(|metadata| metadata.mode & 0o7777)
+        .unwrap_or_else(|| default_path_mode(path))
 }
 
 /// Check whether `uid`/`egid` is allowed to access `full_path` with `mode` (rwx bits).
@@ -515,14 +376,11 @@ fn access_allowed(full_path: &str, mode: u32, uid: u32) -> Result<(), isize> {
 }
 
 fn apply_chown_to_path(path: &str, owner: u32, group: u32) {
-    let (mut uid, mut gid) = effective_path_owner(path);
-    if owner != u32::MAX {
-        uid = owner;
+    if let Some(inode) = inode_for_path(path) {
+        let uid = (owner != u32::MAX).then_some(owner);
+        let gid = (group != u32::MAX).then_some(group);
+        let _ = inode.chown(uid, gid);
     }
-    if group != u32::MAX {
-        gid = group;
-    }
-    path_owner_set(path, uid, gid);
 }
 
 fn apply_mode_side_effects_after_chown(path: &str) {
@@ -537,7 +395,9 @@ fn apply_mode_side_effects_after_chown(path: &str) {
         new_mode &= !0o2000;
     }
     if new_mode != old_mode {
-        path_mode_set(path, new_mode);
+        if let Some(inode) = inode_for_path(path) {
+            let _ = inode.chmod(new_mode);
+        }
     }
 }
 
@@ -756,21 +616,25 @@ fn max_user_write_len(token: usize, ptr: *const u8, len: usize) -> usize {
     lo
 }
 
-fn build_statfs() -> StatFs {
+fn build_statfs_from_vfs(vfs: VfsStatFs) -> StatFs {
     StatFs {
-        f_type: 0xEF53, // ext4 magic; used as a generic placeholder
-        f_bsize: 1024,
-        f_blocks: 1024 * 1024,
-        f_bfree: 512 * 1024,
-        f_bavail: 512 * 1024,
-        f_files: 1024 * 1024,
-        f_ffree: 512 * 1024,
+        f_type: vfs.f_type,
+        f_bsize: vfs.f_bsize,
+        f_blocks: vfs.f_blocks,
+        f_bfree: vfs.f_bfree,
+        f_bavail: vfs.f_bavail,
+        f_files: vfs.f_files,
+        f_ffree: vfs.f_ffree,
         f_fsid: [0, 0],
-        f_namelen: 255,
-        f_frsize: 1024,
-        f_flags: 0,
+        f_namelen: vfs.f_namelen,
+        f_frsize: vfs.f_frsize,
+        f_flags: vfs.f_flags,
         f_spare: [0; 4],
     }
+}
+
+fn statfs_for_inode(inode: Arc<dyn VfsInode>) -> Option<StatFs> {
+    inode.statfs().map(build_statfs_from_vfs)
 }
 
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
@@ -1037,9 +901,11 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
             }
         }
         if flags.contains(OpenFlags::CREATE) && !existed {
-            path_mode_set(&full_path, apply_umask(_mode));
             let inner = process.inner_exclusive_access();
-            path_owner_set(&full_path, inner.effective_uid, inner.effective_gid);
+            if let Some(vfs_inode) = inode.inode() {
+                let _ = vfs_inode.chmod(apply_umask(_mode));
+                let _ = vfs_inode.chown(Some(inner.effective_uid), Some(inner.effective_gid));
+            }
             drop(inner);
         }
         let mut inner = process.inner_exclusive_access();
@@ -1143,7 +1009,7 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsize: usiz
         } else {
             format!("/{}", process_name)
         }
-    } else if let Some(target) = symlink_target_get(&full_path) {
+    } else if let Some(target) = readlink_path(&full_path) {
         target
     } else {
         // Generic fs symlink read is not available yet in current VFS abstraction.
@@ -1234,10 +1100,12 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
         return errno(EEXIST);
     }
     if create_dir(&full_path) {
-        path_mode_set(&full_path, apply_umask(_mode));
         let process = current_process();
         let inner = process.inner_exclusive_access();
-        path_owner_set(&full_path, inner.effective_uid, inner.effective_gid);
+        if let Some(inode) = inode_for_path(&full_path) {
+            let _ = inode.chmod(apply_umask(_mode));
+            let _ = inode.chown(Some(inner.effective_uid), Some(inner.effective_gid));
+        }
         0
     } else {
         errno(EIO)
@@ -1290,19 +1158,37 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, _dev: u32) -> isize
             return errno(ENOENT);
         }
     }
-    let Some(file) = open_file(
-        full_path.as_str(),
-        OpenFlags::CREATE | OpenFlags::WRONLY,
-    ) else {
-        return errno(EIO);
-    };
-    if let Some(inode) = file.inode() {
-        let _ = inode.write_at(0, &[]);
-    }
-    path_mode_set(&full_path, apply_umask(mode & 0o777) | node_type);
     let process = current_process();
     let inner = process.inner_exclusive_access();
-    path_owner_set(&full_path, inner.effective_uid, inner.effective_gid);
+    let uid = inner.effective_uid;
+    let gid = inner.effective_gid;
+    drop(inner);
+    let inode = if node_type == S_IFREG {
+        let Some(file) = open_file(
+            full_path.as_str(),
+            OpenFlags::CREATE | OpenFlags::WRONLY,
+        ) else {
+            return errno(EIO);
+        };
+        match file.inode() {
+            Some(inode) => inode,
+            None => return errno(EIO),
+        }
+    } else {
+        let Some((parent_path, name)) = full_path.rsplit_once('/') else {
+            return errno(ENOENT);
+        };
+        let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
+        let Some(parent) = inode_for_path(parent_path) else {
+            return errno(ENOENT);
+        };
+        match parent.mknod(name, mode, _dev) {
+            Ok(inode) => inode,
+            Err(err) => return err,
+        }
+    };
+    let _ = inode.chmod(apply_umask(mode & 0o777) | node_type);
+    let _ = inode.chown(Some(uid), Some(gid));
     0
 }
 
@@ -1424,20 +1310,9 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
 
     let mut stat = Stat::default();
     if nofollow {
-        if let Some(target) = symlink_target_get(&full_path) {
-            stat.mode = StatMode::LNK.bits() | 0o777;
-            stat.nlink = 1;
-            stat.size = target.len() as i64;
-            stat.blksize = 512;
-            stat.blocks = 0;
-            let (uid, gid) = effective_path_owner(&full_path);
-            stat.uid = uid;
-            stat.gid = gid;
-            stat.dev = 1;
-            if !full_path.is_empty() {
-                stat.ino = path_hash_ino(&full_path);
-            }
-            fill_stat_timestamps(&mut stat, None, None);
+        if let Some(inode) = inode_for_path(&full_path) {
+            let metadata = fill_regular_stat(&mut stat, &full_path, inode.as_ref());
+            fill_stat_timestamps(&mut stat, metadata);
             let bytes = unsafe {
                 core::slice::from_raw_parts(
                     (&stat as *const Stat) as *const u8,
@@ -1474,16 +1349,16 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
             stat.blksize = 512;
             None
         };
-        fill_stat_timestamps(&mut stat, None, metadata);
+        fill_stat_timestamps(&mut stat, metadata);
     }
     if stat.dev == 0 {
         stat.dev = 1;
     }
     if stat.ino == 0 && !full_path.is_empty() {
-        stat.ino = path_hash_ino(&full_path);
+        stat.ino = synthetic_ino(&full_path);
     }
     if is_char_device(&full_path) {
-        fill_stat_timestamps(&mut stat, None, None);
+        fill_stat_timestamps(&mut stat, None);
     }
     let bytes = unsafe {
         core::slice::from_raw_parts(
@@ -1523,7 +1398,40 @@ fn read_times_from_user(token: usize, times: *const TimeSpec) -> Option<(TimeSpe
     Some((ts0, ts1))
 }
 
-/// Apply utimensat semantics to a file's stored timestamps.
+/// Apply utimensat semantics through the filesystem metadata backend.
+fn apply_utimensat_to_inode(inode: Arc<dyn VfsInode>, times: *const TimeSpec, token: usize) -> isize {
+    let (now_sec, _) = get_current_timespec();
+    let metadata = inode.metadata();
+    let mut atime = metadata.map(|m| m.atime_sec).unwrap_or(now_sec);
+    let mut mtime = metadata.map(|m| m.mtime_sec).unwrap_or(now_sec);
+    let mut set_atime = true;
+    let mut set_mtime = true;
+
+    if times.is_null() {
+        atime = now_sec;
+        mtime = now_sec;
+    } else if let Some((ts0, ts1)) = read_times_from_user(token, times) {
+        match ts0.tv_nsec as isize {
+            UTIME_NOW => atime = now_sec,
+            UTIME_OMIT => set_atime = false,
+            _ => atime = ts0.tv_sec as i64,
+        }
+        match ts1.tv_nsec as isize {
+            UTIME_NOW => mtime = now_sec,
+            UTIME_OMIT => set_mtime = false,
+            _ => mtime = ts1.tv_sec as i64,
+        }
+    } else {
+        return errno(EFAULT);
+    }
+
+    match inode.utimens(set_atime.then_some(atime), set_mtime.then_some(mtime)) {
+        Ok(()) => 0,
+        Err(err) => err,
+    }
+}
+
+/// Apply utimensat semantics to an open file descriptor.
 fn apply_utimensat_to_fd(fd: usize, times: *const TimeSpec, token: usize) -> isize {
     let process = current_process();
     let inner = process.inner_exclusive_access();
@@ -1532,57 +1440,10 @@ fn apply_utimensat_to_fd(fd: usize, times: *const TimeSpec, token: usize) -> isi
     }
     let file = inner.fd_table[fd].as_ref().unwrap().clone();
     drop(inner);
-
-    let ts_id = match file.ts_id() {
-        Some(id) => id,
-        None => return 0, // pipes/stdio — just succeed silently
-    };
-
-    let (now_sec, now_nsec) = get_current_timespec();
-
-    // Get existing timestamps or default to current time
-    let mut ts = ts_get(ts_id).unwrap_or(FileTimestamps {
-        atime_sec: now_sec,
-        atime_nsec: now_nsec,
-        mtime_sec: now_sec,
-        mtime_nsec: now_nsec,
-    });
-
-    if times.is_null() {
-        // NULL times => set both to current time
-        ts.atime_sec = now_sec;
-        ts.atime_nsec = now_nsec;
-        ts.mtime_sec = now_sec;
-        ts.mtime_nsec = now_nsec;
-    } else if let Some((ts0, ts1)) = read_times_from_user(token, times) {
-        // times[0] = atime
-        match ts0.tv_nsec as isize {
-            UTIME_NOW => {
-                ts.atime_sec = now_sec;
-                ts.atime_nsec = now_nsec;
-            }
-            UTIME_OMIT => { /* don't change */ }
-            _ => {
-                ts.atime_sec = ts0.tv_sec as i64;
-                ts.atime_nsec = ts0.tv_nsec as i64;
-            }
-        }
-        // times[1] = mtime
-        match ts1.tv_nsec as isize {
-            UTIME_NOW => {
-                ts.mtime_sec = now_sec;
-                ts.mtime_nsec = now_nsec;
-            }
-            UTIME_OMIT => { /* don't change */ }
-            _ => {
-                ts.mtime_sec = ts1.tv_sec as i64;
-                ts.mtime_nsec = ts1.tv_nsec as i64;
-            }
-        }
+    match file.inode() {
+        Some(inode) => apply_utimensat_to_inode(inode, times, token),
+        None => 0,
     }
-
-    ts_set(ts_id, ts);
-    0
 }
 
 /// utimensat - update file timestamps.
@@ -1625,14 +1486,16 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const TimeSpec, _fla
             return errno(ENOTDIR);
         }
     }
-    if is_char_device(&full_path) || open_file(full_path.as_str(), OpenFlags::empty()).is_some() {
-        0
-    } else {
-        errno(ENOENT)
+    if is_char_device(&full_path) {
+        return 0;
+    }
+    match inode_for_path(&full_path) {
+        Some(inode) => apply_utimensat_to_inode(inode, times, token),
+        None => errno(ENOENT),
     }
 }
 
-fn path_hash_ino(path: &str) -> u64 {
+fn synthetic_ino(path: &str) -> u64 {
     let mut h: u64 = 5381;
     for b in path.bytes() {
         h = h.wrapping_mul(33).wrapping_add(b as u64);
@@ -1640,20 +1503,8 @@ fn path_hash_ino(path: &str) -> u64 {
     h & 0x7FFF_FFFF
 }
 
-/// Fill timestamp fields in a Stat from stored timestamps, filesystem metadata, or current time.
-fn fill_stat_timestamps(stat: &mut Stat, ts_id: Option<usize>, metadata: Option<VfsMetadata>) {
-    if let Some(id) = ts_id {
-        if let Some(ts) = ts_get(id) {
-            stat.atime_sec = ts.atime_sec;
-            stat.atime_nsec = ts.atime_nsec;
-            stat.mtime_sec = ts.mtime_sec;
-            stat.mtime_nsec = ts.mtime_nsec;
-            let (now_sec, now_nsec) = get_current_timespec();
-            stat.ctime_sec = now_sec;
-            stat.ctime_nsec = now_nsec;
-            return;
-        }
-    }
+/// Fill timestamp fields in a Stat from filesystem metadata or current time.
+fn fill_stat_timestamps(stat: &mut Stat, metadata: Option<VfsMetadata>) {
     if let Some(metadata) = metadata {
         stat.atime_sec = metadata.atime_sec;
         stat.atime_nsec = 0;
@@ -1681,31 +1532,30 @@ fn split_rdev(rdev: u64) -> (u32, u32) {
 
 fn fill_regular_stat(stat: &mut Stat, path: &str, inode: &dyn VfsInode) -> Option<VfsMetadata> {
     let metadata = inode.metadata();
-    let mode = if inode.is_dir() {
-        StatMode::DIR
-    } else {
-        StatMode::FILE
-    };
-    let perm = path_mode_get(path)
-        .unwrap_or_else(|| metadata.map(|m| m.mode & 0o7777).unwrap_or(0o777));
+    let mode = metadata
+        .map(|m| m.mode)
+        .unwrap_or_else(|| if inode.is_dir() { StatMode::DIR.bits() } else { StatMode::FILE.bits() } | 0o777);
     let size = metadata
         .map(|m| m.size as usize)
         .unwrap_or_else(|| inode.size());
 
-    stat.mode = mode.bits() | perm;
+    stat.mode = mode;
     stat.nlink = metadata
         .map(|m| m.nlink)
         .filter(|nlink| *nlink > 0)
-        .unwrap_or_else(|| path_nlink_get(path));
+        .unwrap_or(1);
     stat.size = size as i64;
-    stat.blksize = 512;
+    stat.blksize = metadata.map(|m| m.blksize as i32).filter(|v| *v > 0).unwrap_or(512);
     stat.blocks = metadata
         .map(|m| m.blocks as i64)
         .filter(|blocks| *blocks > 0)
         .unwrap_or_else(|| ((size + 511) / 512) as i64);
-    let (uid, gid) = effective_path_owner(path);
+    let (uid, gid) = metadata
+        .map(|m| (m.uid, m.gid))
+        .unwrap_or_else(|| effective_path_owner(path));
     stat.uid = uid;
     stat.gid = gid;
+    stat.rdev = metadata.map(|m| m.rdev).unwrap_or(0);
     stat.dev = metadata
         .map(|m| m.dev)
         .filter(|dev| *dev != 0)
@@ -1713,7 +1563,7 @@ fn fill_regular_stat(stat: &mut Stat, path: &str, inode: &dyn VfsInode) -> Optio
     stat.ino = metadata
         .map(|m| m.ino)
         .filter(|ino| *ino != 0)
-        .unwrap_or_else(|| path_hash_ino(path));
+        .unwrap_or_else(|| synthetic_ino(path));
 
     metadata
 }
@@ -1740,23 +1590,23 @@ fn stat_from_fd(fd: usize) -> Result<Stat, isize> {
         stat.gid = 0;
         stat.dev = 1;
         if !path.is_empty() {
-            stat.ino = path_hash_ino(path);
+            stat.ino = synthetic_ino(path);
         }
-        fill_stat_timestamps(&mut stat, file.ts_id(), None);
+        fill_stat_timestamps(&mut stat, None);
     } else {
         let metadata = if let Some(inode) = file.inode() {
             fill_regular_stat(&mut stat, path, inode.as_ref())
         } else {
             stat.mode = StatMode::FILE.bits() | 0o666;
-            stat.nlink = path_nlink_get(path);
+            stat.nlink = 1;
             stat.blksize = 512;
             stat.dev = 1;
             if !path.is_empty() {
-                stat.ino = path_hash_ino(path);
+                stat.ino = synthetic_ino(path);
             }
             None
         };
-        fill_stat_timestamps(&mut stat, file.ts_id(), metadata);
+        fill_stat_timestamps(&mut stat, metadata);
     }
     Ok(stat)
 }
@@ -1770,8 +1620,8 @@ fn stat_from_path(full_path: &str) -> Result<Stat, isize> {
         stat.uid = 0;
         stat.gid = 0;
         stat.dev = 1;
-        stat.ino = path_hash_ino(full_path);
-        fill_stat_timestamps(&mut stat, None, None);
+        stat.ino = synthetic_ino(full_path);
+        fill_stat_timestamps(&mut stat, None);
         return Ok(stat);
     }
     let open_flags = if path_is_dir(full_path) {
@@ -1786,13 +1636,13 @@ fn stat_from_path(full_path: &str) -> Result<Stat, isize> {
         fill_regular_stat(&mut stat, full_path, inode.as_ref())
     } else {
         stat.mode = StatMode::FILE.bits() | 0o666;
-        stat.nlink = path_nlink_get(full_path);
+        stat.nlink = 1;
         stat.blksize = 512;
         stat.dev = 1;
-        stat.ino = path_hash_ino(full_path);
+        stat.ino = synthetic_ino(full_path);
         None
     };
-    fill_stat_timestamps(&mut stat, None, metadata);
+    fill_stat_timestamps(&mut stat, metadata);
     Ok(stat)
 }
 
@@ -2041,7 +1891,7 @@ pub fn sys_linkat(
             } else {
                 format!("{}/{}", partial, comp)
             };
-            if symlink_target_get(&partial).is_some() {
+            if readlink_path(&partial).is_some() {
                 saw_symlink = true;
                 break;
             }
@@ -2112,38 +1962,12 @@ pub fn sys_linkat(
         }
     }
 
-    #[cfg(feature = "ext4")]
-    {
-        let old_c = match CString::new(old_path.clone()) {
-            Ok(c) => c,
-            Err(_) => return errno(EINVAL),
-        };
-        let new_c = match CString::new(new_path.clone()) {
-            Ok(c) => c,
-            Err(_) => return errno(EINVAL),
-        };
-        let rc = unsafe { ext4_flink(old_c.as_ptr(), new_c.as_ptr()) };
-        if rc == 0 {
-            path_link_add(old_path.as_str(), new_path.as_str());
-            if let Some(mode) = path_mode_get(&old_path) {
-                path_mode_set(&new_path, mode);
-            }
-            if let Some((uid, gid)) = path_owner_get(&old_path) {
-                path_owner_set(&new_path, uid, gid);
-            }
-            0
-        } else {
-            let err_code = if rc < 0 { (-rc) as isize } else { rc as isize };
-            if err_code > 0 {
-                errno(err_code)
-            } else {
-                errno(EIO)
-            }
-        }
-    }
-    #[cfg(not(feature = "ext4"))]
-    {
-        errno(ENOTSUP)
+    let Some(old_inode) = inode_for_path(&old_path) else {
+        return errno(ENOENT);
+    };
+    match old_inode.link_to(&new_path) {
+        Ok(()) => 0,
+        Err(err) => err,
     }
 }
 
@@ -2174,23 +1998,20 @@ pub fn sys_symlinkat(target: *const u8, new_dirfd: isize, linkpath: *const u8) -
     } else {
         resolve_path(&base, &link_raw)
     };
-    if symlink_target_get(&new_path).is_some()
-        || open_file(new_path.as_str(), OpenFlags::empty()).is_some()
-        || path_is_dir(&new_path)
-    {
+    if path_exists_for_access(&new_path) {
         return errno(EEXIST);
     }
-    if open_file(
-        new_path.as_str(),
-        OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY,
-    )
-    .is_none()
-    {
-        return errno(EIO);
+    let Some((parent_path, name)) = new_path.rsplit_once('/') else {
+        return errno(ENOENT);
+    };
+    let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
+    let Some(parent) = inode_for_path(parent_path) else {
+        return errno(ENOENT);
+    };
+    match parent.symlink(name, &target_raw) {
+        Ok(_) => 0,
+        Err(err) => err,
     }
-    path_mode_set(&new_path, 0o777);
-    symlink_target_set(&new_path, &target_raw);
-    0
 }
 
 /// YOUR JOB: Implement unlinkat.
@@ -2240,9 +2061,8 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
             return err;
         }
     }
-    let is_symlink = symlink_target_get(&path).is_some();
     let is_dir = path_is_dir(&path);
-    let exists = is_symlink || open_file(path.as_str(), OpenFlags::from_bits_truncate(0)).is_some();
+    let exists = open_file(path.as_str(), OpenFlags::from_bits_truncate(0)).is_some();
     if !exists {
         return errno(ENOENT);
     }
@@ -2254,10 +2074,6 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
         return errno(EISDIR);
     }
     if remove_path(&path, is_dir) {
-        path_link_remove(&path);
-        path_mode_remove(&path);
-        path_owner_remove(&path);
-        symlink_target_remove(&path);
         unix_registry_remove(&path);
         0
     } else {
@@ -2325,7 +2141,6 @@ pub fn sys_renameat2(
         if !remove_path(&old_path, true) {
             return errno(EIO);
         }
-        path_link_move(&old_path, &new_path);
         return 0;
     }
 
@@ -2345,9 +2160,6 @@ pub fn sys_renameat2(
         if !remove_path(&new_path, false) {
             return errno(EIO);
         }
-        path_link_remove(&new_path);
-        path_mode_remove(&new_path);
-        path_owner_remove(&new_path);
     }
 
     let new_file = match open_file(
@@ -2382,15 +2194,6 @@ pub fn sys_renameat2(
 
     if !remove_path(&old_path, false) {
         return errno(EIO);
-    }
-    path_link_move(&old_path, &new_path);
-    if let Some(mode) = path_mode_get(&old_path) {
-        path_mode_set(&new_path, mode);
-        path_mode_remove(&old_path);
-    }
-    if let Some((uid, gid)) = path_owner_get(&old_path) {
-        path_owner_set(&new_path, uid, gid);
-        path_owner_remove(&old_path);
     }
     0
 }
@@ -3369,17 +3172,20 @@ fn sys_setxattr_path(path: String, name: *const u8, value: *const u8, size: usiz
             data.extend_from_slice(slice);
         }
     }
-    let key = (path, name);
-    let mut map = XATTRS.exclusive_access();
-    let exists = map.contains_key(&key);
+    let Some(inode) = inode_for_path(&path) else {
+        return errno(ENOENT);
+    };
+    let exists = inode.getxattr(&name).is_ok();
     if (flags & XATTR_CREATE) != 0 && exists {
         return errno(EEXIST);
     }
     if (flags & XATTR_REPLACE) != 0 && !exists {
         return errno(ENODATA);
     }
-    map.insert(key, data);
-    0
+    match inode.setxattr(&name, data.as_slice()) {
+        Ok(()) => 0,
+        Err(err) => err,
+    }
 }
 
 fn sys_getxattr_path(path: String, name: *const u8, value: *mut u8, size: usize) -> isize {
@@ -3387,12 +3193,9 @@ fn sys_getxattr_path(path: String, name: *const u8, value: *mut u8, size: usize)
         Ok(name) => name,
         Err(err) => return err,
     };
-    let data = {
-        let map = XATTRS.exclusive_access();
-        match map.get(&(path, name)) {
-            Some(data) => data.clone(),
-            None => return errno(ENODATA),
-        }
+    let data = match inode_for_path(&path).and_then(|inode| inode.getxattr(&name).ok()) {
+        Some(data) => data,
+        None => return errno(ENODATA),
     };
     if size == 0 {
         return data.len() as isize;
@@ -3415,16 +3218,10 @@ fn sys_getxattr_path(path: String, name: *const u8, value: *mut u8, size: usize)
 }
 
 fn sys_listxattr_path(path: String, list: *mut u8, size: usize) -> isize {
-    let mut names = Vec::new();
-    {
-        let map = XATTRS.exclusive_access();
-        for ((p, name), _) in map.iter() {
-            if *p == path {
-                names.extend_from_slice(name.as_bytes());
-                names.push(0);
-            }
-        }
-    }
+    let names = match inode_for_path(&path).and_then(|inode| inode.listxattr().ok()) {
+        Some(names) => names,
+        None => return errno(ENOENT),
+    };
     if size == 0 {
         return names.len() as isize;
     }
@@ -3450,9 +3247,12 @@ fn sys_removexattr_path(path: String, name: *const u8) -> isize {
         Ok(name) => name,
         Err(err) => return err,
     };
-    match XATTRS.exclusive_access().remove(&(path, name)) {
-        Some(_) => 0,
-        None => errno(ENODATA),
+    let Some(inode) = inode_for_path(&path) else {
+        return errno(ENOENT);
+    };
+    match inode.removexattr(&name) {
+        Ok(()) => 0,
+        Err(_) => errno(ENODATA),
     }
 }
 
@@ -3901,10 +3701,12 @@ pub fn sys_statfs(path: *const u8, buf: *mut StatFs) -> isize {
     } else {
         resolve_path(&cwd, &raw)
     };
-    if open_file(full_path.as_str(), OpenFlags::empty()).is_none() {
+    let Some(inode) = inode_for_path(&full_path) else {
         return errno(ENOENT);
-    }
-    let statfs = build_statfs();
+    };
+    let Some(statfs) = statfs_for_inode(inode) else {
+        return errno(ENOTSUP);
+    };
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&statfs as *const StatFs) as *const u8,
@@ -3930,8 +3732,14 @@ pub fn sys_fstatfs(fd: usize, buf: *mut StatFs) -> isize {
     if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
         return errno(EBADF);
     }
+    let file = inner.fd_table[fd].as_ref().unwrap().clone();
     drop(inner);
-    let statfs = build_statfs();
+    let Some(inode) = file.inode() else {
+        return errno(ENOTSUP);
+    };
+    let Some(statfs) = statfs_for_inode(inode) else {
+        return errno(ENOTSUP);
+    };
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&statfs as *const StatFs) as *const u8,
@@ -5051,8 +4859,13 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mut mode: u32, _flags: u32) -
             mode &= !0o2000u32; // clear S_ISGID
         }
     }
-    path_mode_set(&full_path, mode);
-    0
+    match inode_for_path(&full_path) {
+        Some(inode) => match inode.chmod(mode) {
+            Ok(()) => 0,
+            Err(err) => err,
+        },
+        None => errno(ENOENT),
+    }
 }
 
 /// sys_fchmod (syscall 52)
@@ -5081,8 +4894,13 @@ pub fn sys_fchmod(fd: usize, mut mode: u32) -> isize {
             mode &= !0o2000u32;
         }
     }
-    path_mode_set(path, mode);
-    0
+    match file.inode() {
+        Some(inode) => match inode.chmod(mode) {
+            Ok(()) => 0,
+            Err(err) => err,
+        },
+        None => errno(EBADF),
+    }
 }
 
 pub fn sys_fchownat(
@@ -5140,7 +4958,7 @@ pub fn sys_fchownat(
             Err(err) => return err,
         }
     };
-    if !path_exists_for_access(&full_path) && symlink_target_get(&full_path).is_none() {
+    if !path_exists_for_access(&full_path) {
         return errno(ENOENT);
     }
     if readonly_mount_contains(&full_path) {

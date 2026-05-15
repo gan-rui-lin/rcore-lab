@@ -13,19 +13,50 @@ use super::ext4::Ext4Fs;
 pub enum VfsNodeKind {
     File,
     Dir,
+    Symlink,
+    Char,
+    Block,
+    Fifo,
+    Socket,
+    Unknown,
+}
+
+impl Default for VfsNodeKind {
+    fn default() -> Self {
+        Self::Unknown
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VfsMetadata {
+    pub kind: VfsNodeKind,
     pub dev: u64,
     pub ino: u64,
     pub mode: u32,
     pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u64,
     pub size: u64,
+    pub blksize: u32,
     pub blocks: u64,
     pub atime_sec: i64,
     pub mtime_sec: i64,
     pub ctime_sec: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VfsStatFs {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
 }
 
 pub trait VfsInode: Send + Sync {
@@ -68,6 +99,54 @@ pub trait VfsInode: Send + Sync {
     }
 
     fn metadata(&self) -> Option<VfsMetadata> {
+        None
+    }
+
+    fn chmod(&self, _mode: u32) -> Result<(), isize> {
+        Err(-95)
+    }
+
+    fn chown(&self, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), isize> {
+        Err(-95)
+    }
+
+    fn utimens(&self, _atime_sec: Option<i64>, _mtime_sec: Option<i64>) -> Result<(), isize> {
+        Err(-95)
+    }
+
+    fn link_to(&self, _new_path: &str) -> Result<(), isize> {
+        Err(-95)
+    }
+
+    fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn VfsInode>, isize> {
+        Err(-95)
+    }
+
+    fn readlink(&self) -> Result<Vec<u8>, isize> {
+        Err(-95)
+    }
+
+    fn mknod(&self, _name: &str, _mode: u32, _dev: u32) -> Result<Arc<dyn VfsInode>, isize> {
+        Err(-95)
+    }
+
+    fn setxattr(&self, _name: &str, _value: &[u8]) -> Result<(), isize> {
+        Err(-95)
+    }
+
+    fn getxattr(&self, _name: &str) -> Result<Vec<u8>, isize> {
+        Err(-95)
+    }
+
+    fn listxattr(&self) -> Result<Vec<u8>, isize> {
+        Err(-95)
+    }
+
+    fn removexattr(&self, _name: &str) -> Result<(), isize> {
+        Err(-95)
+    }
+
+    fn statfs(&self) -> Option<VfsStatFs> {
         None
     }
 
