@@ -9,7 +9,7 @@ use lwext4_rust::Ext4BlockWrapper;
 use super::super::core::VfsInode;
 
 pub(crate) struct Ext4Fs {
-    _inner: UPIntrFreeCell<Ext4BlockWrapper<Ext4Disk>>,
+    inner: UPIntrFreeCell<Option<Ext4BlockWrapper<Ext4Disk>>>,
 }
 
 impl Ext4Fs {
@@ -20,11 +20,18 @@ impl Ext4Fs {
             "ext4_fs0",
         )?;
         Ok(Self {
-            _inner: unsafe { UPIntrFreeCell::new(wrapper) },
+            inner: unsafe { UPIntrFreeCell::new(Some(wrapper)) },
         })
     }
 
     pub fn root_inode(&self) -> Arc<dyn VfsInode> {
         Arc::new(Ext4Inode::new_dir(String::from("/")))
+    }
+
+    pub fn shutdown(&self) {
+        let mut inner = self.inner.exclusive_access();
+        if let Some(wrapper) = inner.take() {
+            drop(wrapper);
+        }
     }
 }

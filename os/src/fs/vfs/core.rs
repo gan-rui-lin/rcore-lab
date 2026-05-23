@@ -258,6 +258,15 @@ impl Vfs {
         }
     }
 
+    #[cfg(feature = "ext4")]
+    pub(crate) fn shutdown_ext4(&mut self) {
+        for mount in self.mounts.iter_mut() {
+            if let Some(fs) = mount._ext4_guard.take() {
+                fs.shutdown();
+            }
+        }
+    }
+
     fn resolve_mount<'a>(&'a self, path: &'a str) -> Option<(&'a MountPoint, &'a str)> {
         let mut best: Option<&MountPoint> = None;
         for mount in &self.mounts {

@@ -202,8 +202,10 @@ impl CachedPage {
         }
         let mask = block_mask(block_off);
         self.loaded_mask |= mask;
-        self.dirty_mask |= mask;
-        let _ = end;
+        self.device
+            .write_block(self.page_id * BLOCKS_PER_PAGE + block_off, &self.data[start..end]);
+        CACHE_BACKEND_WRITES.fetch_add(1, Ordering::Relaxed);
+        self.dirty_mask &= !mask;
     }
 
     pub fn has_dirty(&self) -> bool {
@@ -387,13 +389,15 @@ pub struct CacheStats {
 /// Cached block device wrapper.
 pub struct CachedBlockDevice {
     cache: Mutex<CacheManager>,
+    device: Arc<dyn BlockDevice>,
 }
 
 impl CachedBlockDevice {
     /// Wrap a block device with caching.
     pub fn new(device: Arc<dyn BlockDevice>) -> Arc<Self> {
         Arc::new(Self {
-            cache: Mutex::new(CacheManager::new(device)),
+            cache: Mutex::new(CacheManager::new(Arc::clone(&device))),
+            device,
         })
     }
 
@@ -425,7 +429,7 @@ impl BlockDevice for CachedBlockDevice {
     }
 
     fn handle_irq(&self) {
-        // Caching layer does not need special IRQ handling.
+        self.device.handle_irq();
     }
 }
 

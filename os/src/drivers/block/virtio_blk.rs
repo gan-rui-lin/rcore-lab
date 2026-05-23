@@ -41,7 +41,7 @@ impl BlockDevice for VirtIOBlock {
                 let mut resp = BlkResp::default();
                 let task_cx_ptr = self.virtio_blk.exclusive_session(|blk| {
                     match unsafe { blk.read_block_nb(block_id, buf, &mut resp) } {
-                        Ok(token) => self.condvars.get(&token).map(|condvar| condvar.wait_no_sched()),
+                        Ok(token) => Some(self.condvars.get(&token).expect("virtio-blk token without condvar").wait_no_sched()),
                         Err(err) => {
                             warn!(
                                 "virtio-blk nb read failed, fallback to blocking: block_id={} err={:?}",
@@ -63,6 +63,8 @@ impl BlockDevice for VirtIOBlock {
                     }
                     return;
                 }
+                self.read_block_blocking_retry(block_id, buf);
+                return;
             }
         } else {
             self.read_block_blocking_retry(block_id, buf);
@@ -90,7 +92,7 @@ impl BlockDevice for VirtIOBlock {
                 let mut resp = BlkResp::default();
                 let task_cx_ptr = self.virtio_blk.exclusive_session(|blk| {
                     match unsafe { blk.write_block_nb(block_id, buf, &mut resp) } {
-                        Ok(token) => self.condvars.get(&token).map(|condvar| condvar.wait_no_sched()),
+                        Ok(token) => Some(self.condvars.get(&token).expect("virtio-blk token without condvar").wait_no_sched()),
                         Err(err) => {
                             warn!(
                                 "virtio-blk nb write failed, fallback to blocking: block_id={} err={:?}",
@@ -112,6 +114,8 @@ impl BlockDevice for VirtIOBlock {
                     }
                     return;
                 }
+                self.write_block_blocking_retry(block_id, buf);
+                return;
             }
         } else {
             self.write_block_blocking_retry(block_id, buf);

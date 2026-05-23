@@ -4928,6 +4928,7 @@ pub fn sys_exit_group(exit_code: i32) -> ! {
 
 pub fn sys_shutdown() -> ! {
     trace!("kernel:pid[{}] sys_shutdown", current_process().pid.0);
+    crate::fs::shutdown_filesystems();
     arch::shutdown();
 }
 

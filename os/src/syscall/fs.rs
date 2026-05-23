@@ -1102,9 +1102,12 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
     if create_dir(&full_path) {
         let process = current_process();
         let inner = process.inner_exclusive_access();
+        let uid = inner.effective_uid;
+        let gid = inner.effective_gid;
+        drop(inner);
         if let Some(inode) = inode_for_path(&full_path) {
             let _ = inode.chmod(apply_umask(_mode));
-            let _ = inode.chown(Some(inner.effective_uid), Some(inner.effective_gid));
+            let _ = inode.chown(Some(uid), Some(gid));
         }
         0
     } else {

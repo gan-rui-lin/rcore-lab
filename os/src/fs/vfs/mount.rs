@@ -39,6 +39,15 @@ pub fn mount_procfs() {
 }
 
 #[cfg(feature = "ext4")]
+pub fn shutdown_filesystems() {
+    let mut vfs = ROOT_VFS.exclusive_access();
+    vfs.shutdown_ext4();
+}
+
+#[cfg(not(feature = "ext4"))]
+pub fn shutdown_filesystems() {}
+
+#[cfg(feature = "ext4")]
 /// Mount ext4 as root with explicit device size.
 pub fn mount_ext4(total_bytes: i64) -> Result<(), i32> {
     let fs = Arc::new(Ext4Fs::new(BLOCK_DEVICE.clone(), total_bytes)?);
