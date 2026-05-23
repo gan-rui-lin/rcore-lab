@@ -29,10 +29,12 @@
 1. `translated_user_read_buffer()` / `translated_user_write_buffer()`  
    负责“拿到一组可直接访问的页片段”，是最底层的 policy 分发入口。
 2. `copy_from_user()` / `copy_to_user()`  
-   负责按片段完成跨页拷贝，是 syscall 最常用的入口。
-3. `read_from_user<T>()`  
+   负责按片段完成跨页拷贝，是 syscall 的通用入口（适合中大缓冲区）。
+3. `copy_to_user_inline()` / `write_value_to_user()`  
+   面向小对象/高频路径的直写入口，避免构建 `Vec<&mut [u8]>`，直接在页切片遍历时拷贝。
+4. `read_from_user<T>()`  
    负责按值读取小对象，适合读取标量或固定布局结构。
-4. `ensure_user_readable()` / `ensure_user_writable()`  
+5. `ensure_user_readable()` / `ensure_user_writable()`  
    负责探测一个用户地址区间在某种 policy 下是否可访问。
 
 这一层的优点是：上层 syscall 不需要知道底下最终是“纯页表检查成功”，还是“触发了 demand paging”，还是“触发了 COW”。
