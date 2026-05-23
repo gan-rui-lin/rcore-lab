@@ -712,10 +712,6 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
 }
 
 pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
-    let pid = current_process().pid.0;
-    if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_read", pid);
-    }
     let token = current_user_token();
     let process = current_process();
     let inner = process.inner_exclusive_access();
@@ -760,11 +756,17 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
                 }
             }
         }
-        trace!("kernel: sys_read .. file.read");
-        let Some(buffers) = translated_user_write_buffer(token, buf, len) else {
-            return errno(EFAULT);
+        let raw = if let Some(result) = file.read_user_buffer(token, buf, len) {
+            match result {
+                Ok(raw) => raw,
+                Err(err) => return err,
+            }
+        } else {
+            let Some(buffers) = translated_user_write_buffer(token, buf, len) else {
+                return errno(EFAULT);
+            };
+            file.read(UserBuffer::new(buffers))
         };
-        let raw = file.read(UserBuffer::new(buffers));
         if raw == usize::MAX {
             return errno(EINTR); // interrupted by signal
         }

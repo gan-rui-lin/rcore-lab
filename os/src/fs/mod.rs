@@ -25,6 +25,16 @@ pub trait File: Send + Sync {
     fn read(&self, buf: UserBuffer) -> usize;
     /// write to the file from buf, return the number of bytes written
     fn write(&self, buf: UserBuffer) -> usize;
+    /// Optional fast path for reading directly into user memory without first
+    /// collecting page slices into a Vec. Return None to use the generic path.
+    fn read_user_buffer(
+        &self,
+        _token: usize,
+        _ptr: *const u8,
+        _len: usize,
+    ) -> Option<Result<usize, isize>> {
+        None
+    }
     /// write to the file from buf, returning either bytes written or errno
     fn write_user_buffer(&self, buf: UserBuffer) -> Result<usize, isize> {
         Ok(self.write(buf))

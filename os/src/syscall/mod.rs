@@ -670,6 +670,9 @@ fn syscall_name(syscall_id: usize) -> &'static str {
 
 /// Check if a syscall trace should be emitted for the given pid.
 pub fn should_trace_syscall(pid: usize) -> bool {
+    if !crate::logging::syscall_enabled() {
+        return false;
+    }
     if SYSCALL_TRACE_ALL.load(Ordering::Relaxed) {
         return true;
     }
@@ -698,22 +701,29 @@ pub fn cleanup_shm_for_process_exit(pid: usize) {
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     // !Avoid holding Arc<ProcessControlBlock> across potentially non-returning
     // syscalls (e.g. exit/exit_group), which can leak references.
-    let (pid, name, cwd_for_exec_trace) = {
+    let pid = current_process().pid.0;
+    let trace = should_trace_syscall(pid);
+    let (name_for_trace, cwd_for_exec_trace) = if trace || (pid == 4 && syscall_id == SYSCALL_EXEC)
+    {
         let process = current_process();
-        let pid = process.pid.0;
         let inner = process.inner_exclusive_access();
-        let name = inner.name.clone();
-        let cwd = if pid == 4 && syscall_id == 221 {
-            Some(inner.cwd.clone())
+        let name = if trace {
+            Some(inner.name.clone())
         } else {
             None
         };
-        (pid, name, cwd)
+        let cwd = if pid == 4 && syscall_id == 221 {
+            Some((inner.name.clone(), inner.cwd.clone()))
+        } else {
+            None
+        };
+        (name, cwd)
+    } else {
+        (None, None)
     };
-    if let Some(cwd) = cwd_for_exec_trace {
+    if let Some((name, cwd)) = cwd_for_exec_trace {
         trace!("[syscall] pid=4 entry name={} cwd={}", name, cwd);
     }
-    let trace = should_trace_syscall(pid);
     // for debug
     if let Some(task) = current_task() {
         if let Some(mut task_inner) = task.try_inner_exclusive_access() {
@@ -925,6 +935,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => {
+            let name = current_process().inner_exclusive_access().name.clone();
             log::warn!("[exit_group] pid={} name={} code={}", pid, name, args[0] as i32);
             sys_exit_group(args[0] as i32)
         }
@@ -1173,6 +1184,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MEMBARRIER => sys_membarrier(args[0] as isize, args[1] as isize),
         _ => {
             known = false;
+            let name = current_process().inner_exclusive_access().name.clone();
             error!(
                 "{} {}: unimplemented syscall {} ({})",
                 pid,
@@ -1196,7 +1208,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         syscall!(
             "[syscall] pid={} name={} num={}({}) args=[0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x}] ret={}",
             pid,
-            name,
+            name_for_trace.as_deref().unwrap_or(""),
             syscall_id,
             syscall_name(syscall_id),
             args[0],

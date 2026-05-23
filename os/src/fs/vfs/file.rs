@@ -4,6 +4,7 @@ use super::super::{File, OpenFlags};
 use super::core::{normalize_path, VfsInode, VfsNodeKind, ROOT_VFS};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
+use crate::syscall::user_mem::{self, UserWritePolicy};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -111,6 +112,32 @@ impl File for VfsFile {
             }
         }
         total
+    }
+
+    fn read_user_buffer(
+        &self,
+        token: usize,
+        ptr: *const u8,
+        len: usize,
+    ) -> Option<Result<usize, isize>> {
+        let mut inner = self.inner.exclusive_access();
+        let mut total = 0usize;
+        let result = user_mem::for_each_user_write_slice(
+            token,
+            ptr,
+            len,
+            UserWritePolicy::DemandCowWithForkFallback,
+            |slice| {
+                let n = inner.inode.read_at(inner.offset, slice);
+                if n == 0 {
+                    return Ok(0);
+                }
+                inner.offset += n;
+                total += n;
+                Ok(n)
+            },
+        );
+        Some(result.map(|_| total))
     }
 
     fn write(&self, buf: UserBuffer) -> usize {

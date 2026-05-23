@@ -2,9 +2,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::errno::{errno, EFAULT};
-use crate::config::PAGE_SIZE;
+use crate::config::{MEMORY_END, PAGE_SIZE};
 use crate::mm::{
-    translated_byte_buffer, translated_byte_buffer_checked, PageTable, PTEFlags, VirtAddr,
+    translated_byte_buffer, translated_byte_buffer_checked, PageTable, PhysAddr, PTEFlags,
+    VirtAddr,
 };
 use crate::task::current_process;
 
@@ -105,6 +106,90 @@ pub fn copy_to_user(
     }
 }
 
+pub fn for_each_user_write_slice<F>(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    policy: UserWritePolicy,
+    mut f: F,
+) -> Result<usize, isize>
+where
+    F: FnMut(&mut [u8]) -> Result<usize, isize>,
+{
+    if len == 0 {
+        return Ok(0);
+    }
+    match policy {
+        UserWritePolicy::DemandCowWithForkFallback => {
+            if user_write_range_mapped(token, ptr, len, true) {
+                return walk_user_write_slices(token, ptr, len, true, &mut f);
+            }
+            if try_resolve_user_cow_writable(token, ptr, len) {
+                if user_write_range_mapped(token, ptr, len, true) {
+                    return walk_user_write_slices(token, ptr, len, true, &mut f);
+                }
+            }
+            let Some(slices) = legacy_fork_write_fallback(token, ptr, len) else {
+                return Err(errno(EFAULT));
+            };
+            run_write_callback(slices, &mut f)
+        }
+        UserWritePolicy::RelaxedReadableMapping => {
+            if user_write_range_mapped(token, ptr, len, true) {
+                return walk_user_write_slices(token, ptr, len, true, &mut f);
+            }
+            if user_write_range_mapped(token, ptr, len, false) {
+                return walk_user_write_slices(token, ptr, len, false, &mut f);
+            }
+            Err(errno(EFAULT))
+        }
+    }
+}
+
+pub fn copy_to_user_inline(
+    token: usize,
+    dst: *mut u8,
+    data: &[u8],
+    policy: UserWritePolicy,
+) -> Result<(), isize> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    if dst.is_null() {
+        return Err(errno(EFAULT));
+    }
+    let mut offset = 0usize;
+    for_each_user_write_slice(token, dst as *const u8, data.len(), policy, |slice| {
+        let len = slice.len().min(data.len() - offset);
+        slice[..len].copy_from_slice(&data[offset..offset + len]);
+        offset += len;
+        Ok(len)
+    })?;
+    if offset == data.len() {
+        Ok(())
+    } else {
+        Err(errno(EFAULT))
+    }
+}
+
+pub fn write_value_to_user<T: Copy>(
+    token: usize,
+    dst: *mut T,
+    value: T,
+    policy: UserWritePolicy,
+) -> Result<(), isize> {
+    if dst.is_null() {
+        return Err(errno(EFAULT));
+    }
+    let data = unsafe {
+        core::slice::from_raw_parts(
+            (&value as *const T) as *const u8,
+            core::mem::size_of::<T>(),
+        )
+    };
+    copy_to_user_inline(token, dst as *mut u8, data, policy)
+}
+
 pub fn copy_from_user(
     token: usize,
     src: *const u8,
@@ -186,6 +271,130 @@ pub fn read_from_user<T: Copy>(
         return Err(errno(EFAULT));
     }
     Ok(unsafe { core::ptr::read_unaligned(data.as_ptr() as *const T) })
+}
+
+fn walk_user_write_slices<F>(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    writable: bool,
+    f: &mut F,
+) -> Result<usize, isize>
+where
+    F: FnMut(&mut [u8]) -> Result<usize, isize>,
+{
+    if len == 0 {
+        return Ok(0);
+    }
+    let mut start = ptr as usize;
+    let end = start.checked_add(len).ok_or_else(|| errno(EFAULT))?;
+    let page_table = PageTable::from_token(token);
+    let max_user_ppn = PhysAddr::from(MEMORY_END).floor().0;
+    let mut total = 0usize;
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let vpn = start_va.floor();
+        let pte = page_table.translate(vpn).ok_or_else(|| errno(EFAULT))?;
+        let flags = pte.flags();
+        if !pte.is_valid() || !flags.contains(PTEFlags::U) {
+            return Err(errno(EFAULT));
+        }
+        if writable {
+            if !pte.writable() {
+                return Err(errno(EFAULT));
+            }
+        } else if !pte.readable() {
+            return Err(errno(EFAULT));
+        }
+        let ppn = pte.ppn();
+        if flags.contains(PTEFlags::U) && ppn.0 >= max_user_ppn {
+            return Err(errno(EFAULT));
+        }
+        let next_page = start
+            .checked_add(PAGE_SIZE - start_va.page_offset())
+            .ok_or_else(|| errno(EFAULT))?;
+        let chunk_end = next_page.min(end);
+        let start_offset = start_va.page_offset();
+        let end_offset = if chunk_end == next_page {
+            PAGE_SIZE
+        } else {
+            VirtAddr::from(chunk_end).page_offset()
+        };
+        if start_offset >= end_offset || end_offset > PAGE_SIZE {
+            return Err(errno(EFAULT));
+        }
+        let slice = &mut ppn.get_bytes_array()[start_offset..end_offset];
+        let produced = f(slice)?;
+        if produced > slice.len() {
+            return Err(errno(EFAULT));
+        }
+        total += produced;
+        if produced < slice.len() {
+            return Ok(total);
+        }
+        start = chunk_end;
+    }
+    Ok(total)
+}
+
+fn user_write_range_mapped(token: usize, ptr: *const u8, len: usize, writable: bool) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let mut start = ptr as usize;
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    let page_table = PageTable::from_token(token);
+    let max_user_ppn = PhysAddr::from(MEMORY_END).floor().0;
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let vpn = start_va.floor();
+        let Some(pte) = page_table.translate(vpn) else {
+            return false;
+        };
+        let flags = pte.flags();
+        if !pte.is_valid() || !flags.contains(PTEFlags::U) {
+            return false;
+        }
+        if writable {
+            if !pte.writable() {
+                return false;
+            }
+        } else if !pte.readable() {
+            return false;
+        }
+        let ppn = pte.ppn();
+        if flags.contains(PTEFlags::U) && ppn.0 >= max_user_ppn {
+            return false;
+        }
+        let Some(next_page) = start.checked_add(PAGE_SIZE - start_va.page_offset()) else {
+            return false;
+        };
+        start = next_page.min(end);
+    }
+    true
+}
+
+fn run_write_callback<F>(
+    slices: Vec<&'static mut [u8]>,
+    f: &mut F,
+) -> Result<usize, isize>
+where
+    F: FnMut(&mut [u8]) -> Result<usize, isize>,
+{
+    let mut total = 0usize;
+    for slice in slices {
+        let produced = f(slice)?;
+        if produced > slice.len() {
+            return Err(errno(EFAULT));
+        }
+        total += produced;
+        if produced < slice.len() {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 fn try_resolve_user_cow_writable(token: usize, ptr: *const u8, len: usize) -> bool {
