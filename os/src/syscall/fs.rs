@@ -132,12 +132,7 @@ fn flock_unlock_owner(pid: usize, fd: usize) {
 }
 
 fn inode_for_path(path: &str) -> Option<Arc<dyn VfsInode>> {
-    let flags = if path_is_dir(path) {
-        OpenFlags::DIRECTORY
-    } else {
-        OpenFlags::empty()
-    };
-    open_file(path, flags).and_then(|file| file.inode())
+    open_file(path, OpenFlags::empty()).and_then(|file| file.inode())
 }
 
 fn metadata_for_path(path: &str) -> Option<VfsMetadata> {
@@ -173,7 +168,7 @@ fn readonly_mount_contains(path: &str) -> bool {
 }
 
 fn path_exists_for_access(path: &str) -> bool {
-    is_char_device(path) || open_file(path, OpenFlags::empty()).is_some() || path_is_dir(path)
+    is_char_device(path) || metadata_for_path(path).is_some() || path_exists(path)
 }
 
 #[allow(dead_code)]
@@ -304,28 +299,32 @@ fn effective_path_mode(path: &str) -> u32 {
         .unwrap_or_else(|| default_path_mode(path))
 }
 
+fn metadata_is_dir(metadata: VfsMetadata) -> bool {
+    (metadata.mode & 0o170000) == StatMode::DIR.bits()
+}
+
+fn metadata_permission_bits(metadata: Option<VfsMetadata>, path: &str, uid: u32, egid: u32) -> u32 {
+    let (file_uid, file_gid, perm) = metadata
+        .map(|metadata| (metadata.uid, metadata.gid, metadata.mode & 0o7777))
+        .unwrap_or_else(|| (0, 0, default_path_mode(path)));
+    if uid == file_uid {
+        (perm >> 6) & 0o7
+    } else if egid == file_gid {
+        (perm >> 3) & 0o7
+    } else {
+        perm & 0o7
+    }
+}
+
 /// Check whether `uid`/`egid` is allowed to access `full_path` with `mode` (rwx bits).
 /// Callers that already hold the process inner lock must pass `egid` directly to
 /// avoid a re-entrant lock acquisition.
 fn access_allowed_egid(full_path: &str, mode: u32, uid: u32, egid: u32) -> Result<(), isize> {
-    let exists =
-        is_char_device(full_path) || open_file(full_path, OpenFlags::empty()).is_some() || path_is_dir(full_path);
+    let full_metadata = metadata_for_path(full_path);
+    let exists = is_char_device(full_path) || full_metadata.is_some() || path_exists(full_path);
     if !exists {
         return Err(errno(ENOENT));
     }
-
-    // Helper: resolve which rwx bits apply for uid/egid on a given path's mode
-    let applicable_bits = |path: &str| -> u32 {
-        let (file_uid, file_gid) = effective_path_owner(path);
-        let perm = effective_path_mode(path);
-        if uid == file_uid {
-            (perm >> 6) & 0o7
-        } else if egid == file_gid {
-            (perm >> 3) & 0o7
-        } else {
-            perm & 0o7
-        }
-    };
 
     if uid != 0 {
         // Check execute permission on every intermediate directory component
@@ -337,7 +336,11 @@ fn access_allowed_egid(full_path: &str, mode: u32, uid: u32, egid: u32) -> Resul
             if comps.peek().is_none() {
                 break;
             }
-            if path_is_dir(&partial) && (applicable_bits(&partial) & 0o1) == 0 {
+            let metadata = metadata_for_path(&partial);
+            let is_dir = metadata
+                .map(metadata_is_dir)
+                .unwrap_or_else(|| path_is_dir(&partial));
+            if is_dir && (metadata_permission_bits(metadata, &partial, uid, egid) & 0o1) == 0 {
                 return Err(errno(EACCES));
             }
         }
@@ -351,16 +354,21 @@ fn access_allowed_egid(full_path: &str, mode: u32, uid: u32, egid: u32) -> Resul
         return Err(errno(EROFS));
     }
 
-    let perm = effective_path_mode(full_path);
+    let perm = full_metadata
+        .map(|metadata| metadata.mode & 0o7777)
+        .unwrap_or_else(|| default_path_mode(full_path));
     if uid == 0 {
-        if (requested & 0o1) != 0 && !path_is_dir(full_path) && (perm & 0o111) == 0 {
+        let is_dir = full_metadata
+            .map(metadata_is_dir)
+            .unwrap_or_else(|| path_is_dir(full_path));
+        if (requested & 0o1) != 0 && !is_dir && (perm & 0o111) == 0 {
             return Err(errno(EACCES));
         }
         return Ok(());
     }
 
     // Non-root: check appropriate permission set based on uid/gid relationship
-    let bits = applicable_bits(full_path);
+    let bits = metadata_permission_bits(full_metadata, full_path, uid, egid);
     if (requested & !bits) != 0 {
         return Err(errno(EACCES));
     }
@@ -1553,9 +1561,7 @@ fn fill_regular_stat(stat: &mut Stat, path: &str, inode: &dyn VfsInode) -> Optio
         .map(|m| m.blocks as i64)
         .filter(|blocks| *blocks > 0)
         .unwrap_or_else(|| ((size + 511) / 512) as i64);
-    let (uid, gid) = metadata
-        .map(|m| (m.uid, m.gid))
-        .unwrap_or_else(|| effective_path_owner(path));
+    let (uid, gid) = metadata.map(|m| (m.uid, m.gid)).unwrap_or((0, 0));
     stat.uid = uid;
     stat.gid = gid;
     stat.rdev = metadata.map(|m| m.rdev).unwrap_or(0);

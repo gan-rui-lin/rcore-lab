@@ -1,10 +1,12 @@
-use super::super::core::{VfsInode, VfsMetadata, VfsNodeKind, VfsStatFs};
+use super::super::core::{normalize_path, VfsInode, VfsMetadata, VfsNodeKind, VfsStatFs};
 use crate::sync::UPIntrFreeCell;
+use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use lazy_static::lazy_static;
 use lwext4_rust::bindings::{
     ext4_atime_set, ext4_ctime_set, ext4_flink, ext4_fsymlink, ext4_getxattr, ext4_inode,
     ext4_listxattr, ext4_mknod, ext4_mode_set, ext4_mount_point_stats, ext4_mount_stats,
@@ -15,6 +17,17 @@ use lwext4_rust::{Ext4File, InodeTypes};
 
 const SEEK_SET: u32 = 0;
 const ZERO_PAD_CHUNK: usize = 1024 * 1024;
+
+lazy_static! {
+    static ref EXT4_METADATA_CACHE: UPIntrFreeCell<BTreeMap<String, VfsMetadata>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref EXT4_XATTR_CACHE: UPIntrFreeCell<BTreeMap<(String, String), Option<Vec<u8>>>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref EXT4_LISTXATTR_CACHE: UPIntrFreeCell<BTreeMap<String, Vec<u8>>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref EXT4_STATFS_CACHE: UPIntrFreeCell<Option<VfsStatFs>> =
+        unsafe { UPIntrFreeCell::new(None) };
+}
 
 pub struct Ext4Inode {
     path: String,
@@ -98,6 +111,76 @@ fn ext4_path_join(base: &str, name: &str) -> String {
     } else {
         format!("{}/{}", base.trim_end_matches('/'), name)
     }
+}
+
+fn ext4_cache_key(path: &str) -> String {
+    normalize_path(path)
+}
+
+fn ext4_metadata_cache_get(path: &str) -> Option<VfsMetadata> {
+    EXT4_METADATA_CACHE
+        .exclusive_access()
+        .get(&ext4_cache_key(path))
+        .copied()
+}
+
+fn ext4_metadata_cache_set(path: &str, metadata: VfsMetadata) {
+    EXT4_METADATA_CACHE
+        .exclusive_access()
+        .insert(ext4_cache_key(path), metadata);
+}
+
+fn ext4_metadata_cache_remove(path: &str) {
+    EXT4_METADATA_CACHE
+        .exclusive_access()
+        .remove(&ext4_cache_key(path));
+}
+
+fn ext4_metadata_cache_update<F>(path: &str, mut update: F)
+where
+    F: FnMut(&mut VfsMetadata),
+{
+    let key = ext4_cache_key(path);
+    let mut cache = EXT4_METADATA_CACHE.exclusive_access();
+    if let Some(metadata) = cache.get_mut(&key) {
+        update(metadata);
+    }
+}
+
+fn ext4_cache_remove_path(path: &str) {
+    let key = ext4_cache_key(path);
+    ext4_metadata_cache_remove(&key);
+    EXT4_XATTR_CACHE
+        .exclusive_access()
+        .retain(|(cached_path, _), _| cached_path != &key);
+    EXT4_LISTXATTR_CACHE.exclusive_access().remove(&key);
+    *EXT4_STATFS_CACHE.exclusive_access() = None;
+}
+
+fn ext4_cache_touch_write(path: &str, size: Option<u64>) {
+    let now = (crate::timer::get_time_us() / 1_000_000) as i64;
+    ext4_metadata_cache_update(path, |metadata| {
+        if let Some(size) = size {
+            metadata.size = size;
+            metadata.blocks = (size + 511) / 512;
+        }
+        metadata.mtime_sec = now;
+        metadata.ctime_sec = now;
+    });
+    *EXT4_STATFS_CACHE.exclusive_access() = None;
+}
+
+fn ext4_cache_touch_write_extend(path: &str, end: u64) {
+    let now = (crate::timer::get_time_us() / 1_000_000) as i64;
+    ext4_metadata_cache_update(path, |metadata| {
+        if end > metadata.size {
+            metadata.size = end;
+            metadata.blocks = (end + 511) / 512;
+        }
+        metadata.mtime_sec = now;
+        metadata.ctime_sec = now;
+    });
+    *EXT4_STATFS_CACHE.exclusive_access() = None;
 }
 
 fn ext4_inode_exists(path: &str, kind: InodeTypes) -> bool {
@@ -196,6 +279,15 @@ fn ext4_raw_metadata(path: &str) -> Result<VfsMetadata, isize> {
     })
 }
 
+fn ext4_cached_metadata(path: &str) -> Result<VfsMetadata, isize> {
+    if let Some(metadata) = ext4_metadata_cache_get(path) {
+        return Ok(metadata);
+    }
+    let metadata = ext4_raw_metadata(path)?;
+    ext4_metadata_cache_set(path, metadata);
+    Ok(metadata)
+}
+
 fn ext4_set_time(path: &str, atime_sec: Option<i64>, mtime_sec: Option<i64>) -> Result<(), isize> {
     let c_path = path_cstring(path)?;
     if let Some(atime_sec) = atime_sec {
@@ -247,38 +339,43 @@ impl VfsInode for Ext4Inode {
         if self.kind != VfsNodeKind::File {
             return 0;
         }
-        self.with_data_file(true, |file| {
-            if file.file_seek(offset as i64, SEEK_SET).is_err() {
-                // lwext4 rejects SEEK_SET beyond EOF with EINVAL.
-                // Extend from EOF to `offset` by writing zero chunks, then write `buf`.
-                // Use reasonably large chunks so large sparse extensions (e.g. fallocate)
-                // do not degenerate into tiny-byte loops.
-                let size = file.file_size() as usize;
-                if offset < size {
-                    // offset is within file but seek failed — reopen
-                    return None;
-                }
-                if file.file_seek(size as i64, SEEK_SET).is_err() {
-                    return None;
-                }
-                let mut remaining = offset - size;
-                let mut zeros = Vec::with_capacity(ZERO_PAD_CHUNK);
-                zeros.resize(ZERO_PAD_CHUNK, 0);
-                while remaining > 0 {
-                    let chunk = remaining.min(zeros.len());
-                    let wrote = file.file_write(&zeros[..chunk]).unwrap_or(0) as usize;
-                    if wrote == 0 {
+        let written = self
+            .with_data_file(true, |file| {
+                if file.file_seek(offset as i64, SEEK_SET).is_err() {
+                    // lwext4 rejects SEEK_SET beyond EOF with EINVAL.
+                    // Extend from EOF to `offset` by writing zero chunks, then write `buf`.
+                    // Use reasonably large chunks so large sparse extensions (e.g. fallocate)
+                    // do not degenerate into tiny-byte loops.
+                    let size = file.file_size() as usize;
+                    if offset < size {
+                        // offset is within file but seek failed — reopen
                         return None;
                     }
-                    remaining -= wrote;
+                    if file.file_seek(size as i64, SEEK_SET).is_err() {
+                        return None;
+                    }
+                    let mut remaining = offset - size;
+                    let mut zeros = Vec::with_capacity(ZERO_PAD_CHUNK);
+                    zeros.resize(ZERO_PAD_CHUNK, 0);
+                    while remaining > 0 {
+                        let chunk = remaining.min(zeros.len());
+                        let wrote = file.file_write(&zeros[..chunk]).unwrap_or(0) as usize;
+                        if wrote == 0 {
+                            return None;
+                        }
+                        remaining -= wrote;
+                    }
                 }
-            }
-            Some(file.file_write(buf).unwrap_or(0) as usize)
-        })
-        .unwrap_or_else(|| {
-            error!("ext4: open/seek failed path={} (write)", self.path);
-            0
-        })
+                Some(file.file_write(buf).unwrap_or(0) as usize)
+            })
+            .unwrap_or_else(|| {
+                error!("ext4: open/seek failed path={} (write)", self.path);
+                0
+            });
+        if written > 0 {
+            ext4_cache_touch_write_extend(self.path.as_str(), (offset + written) as u64);
+        }
+        written
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn VfsInode>> {
@@ -286,7 +383,7 @@ impl VfsInode for Ext4Inode {
             return None;
         }
         let path = ext4_path_join(self.path.as_str(), name);
-        let metadata = ext4_raw_metadata(&path).ok()?;
+        let metadata = ext4_cached_metadata(&path).ok()?;
         Some(Arc::new(Ext4Inode::new(path, metadata.kind)))
     }
 
@@ -303,6 +400,7 @@ impl VfsInode for Ext4Inode {
             return None;
         }
         let _ = file.file_close();
+        ext4_cache_remove_path(&path);
         Some(Arc::new(Ext4Inode::new_file(path)))
     }
 
@@ -319,6 +417,7 @@ impl VfsInode for Ext4Inode {
             error!("ext4: dir_mk failed path={}", path);
             return None;
         }
+        ext4_cache_remove_path(&path);
         Some(Arc::new(Ext4Inode::new_dir(path)))
     }
 
@@ -327,13 +426,17 @@ impl VfsInode for Ext4Inode {
             return false;
         }
         let path = ext4_path_join(self.path.as_str(), name);
-        if is_dir {
+        let removed = if is_dir {
             let mut dir = Ext4File::new(path.as_str(), InodeTypes::EXT4_DE_DIR);
             dir.dir_rm(path.as_str()).is_ok()
         } else {
             let mut file = Ext4File::new(path.as_str(), InodeTypes::EXT4_DE_REG_FILE);
             file.file_remove(path.as_str()).is_ok()
+        };
+        if removed {
+            ext4_cache_remove_path(&path);
         }
+        removed
     }
 
     fn truncate(&self) {
@@ -353,6 +456,7 @@ impl VfsInode for Ext4Inode {
             }
         };
         let _ = file.file_close();
+        ext4_cache_touch_write(self.path.as_str(), Some(0));
     }
 
     fn truncate_to(&self, size: usize) {
@@ -373,12 +477,17 @@ impl VfsInode for Ext4Inode {
             self.write_at(size - 1, &[0u8; 1]);
         } else {
             // Shrink: use ext4's ftruncate (works correctly for shrinking).
-            self.with_data_file(true, |file| {
-                file.file_truncate(size as u64).ok().map(|_| ())
-            });
+            let truncated = self
+                .with_data_file(true, |file| {
+                    file.file_truncate(size as u64).ok().map(|_| ())
+                })
+                .is_some();
             // ext4_ftruncate does NOT update file->fsize in the cached ext4_file
             // struct, so close the cached file to force a fresh open on next access.
             self.close_cached_file();
+            if truncated {
+                ext4_cache_touch_write(self.path.as_str(), Some(size as u64));
+            }
         }
     }
 
@@ -401,13 +510,13 @@ impl VfsInode for Ext4Inode {
     }
 
     fn size(&self) -> usize {
-        ext4_raw_metadata(self.path.as_str())
+        ext4_cached_metadata(self.path.as_str())
             .map(|metadata| metadata.size as usize)
             .unwrap_or(0)
     }
 
     fn metadata(&self) -> Option<VfsMetadata> {
-        ext4_raw_metadata(self.path.as_str()).ok()
+        ext4_cached_metadata(self.path.as_str()).ok()
     }
 
     fn chmod(&self, mode: u32) -> Result<(), isize> {
@@ -428,11 +537,17 @@ impl VfsInode for Ext4Inode {
         if rc != EOK as i32 {
             return Err(ext4_errno(rc));
         }
-        ext4_set_time(self.path.as_str(), None, None)
+        ext4_set_time(self.path.as_str(), None, None)?;
+        let now = (crate::timer::get_time_us() / 1_000_000) as i64;
+        ext4_metadata_cache_update(self.path.as_str(), |metadata| {
+            metadata.mode = file_type | (mode & 0o7777);
+            metadata.ctime_sec = now;
+        });
+        Ok(())
     }
 
     fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), isize> {
-        let metadata = ext4_raw_metadata(self.path.as_str())?;
+        let metadata = ext4_cached_metadata(self.path.as_str())?;
         let c_path = path_cstring(self.path.as_str())?;
         let rc = unsafe {
             ext4_owner_set(
@@ -444,11 +559,33 @@ impl VfsInode for Ext4Inode {
         if rc != EOK as i32 {
             return Err(ext4_errno(rc));
         }
-        ext4_set_time(self.path.as_str(), None, None)
+        ext4_set_time(self.path.as_str(), None, None)?;
+        let now = (crate::timer::get_time_us() / 1_000_000) as i64;
+        ext4_metadata_cache_update(self.path.as_str(), |metadata| {
+            if let Some(uid) = uid {
+                metadata.uid = uid;
+            }
+            if let Some(gid) = gid {
+                metadata.gid = gid;
+            }
+            metadata.ctime_sec = now;
+        });
+        Ok(())
     }
 
     fn utimens(&self, atime_sec: Option<i64>, mtime_sec: Option<i64>) -> Result<(), isize> {
-        ext4_set_time(self.path.as_str(), atime_sec, mtime_sec)
+        ext4_set_time(self.path.as_str(), atime_sec, mtime_sec)?;
+        let now = (crate::timer::get_time_us() / 1_000_000) as i64;
+        ext4_metadata_cache_update(self.path.as_str(), |metadata| {
+            if let Some(atime_sec) = atime_sec {
+                metadata.atime_sec = atime_sec;
+            }
+            if let Some(mtime_sec) = mtime_sec {
+                metadata.mtime_sec = mtime_sec;
+            }
+            metadata.ctime_sec = now;
+        });
+        Ok(())
     }
 
     fn link_to(&self, new_path: &str) -> Result<(), isize> {
@@ -458,6 +595,7 @@ impl VfsInode for Ext4Inode {
         if rc != EOK as i32 {
             return Err(ext4_errno(rc));
         }
+        ext4_cache_remove_path(new_path);
         Ok(())
     }
 
@@ -472,6 +610,7 @@ impl VfsInode for Ext4Inode {
         if rc != EOK as i32 {
             return Err(ext4_errno(rc));
         }
+        ext4_cache_remove_path(&path);
         Ok(Arc::new(Ext4Inode::new(path, VfsNodeKind::Symlink)))
     }
 
@@ -506,10 +645,8 @@ impl VfsInode for Ext4Inode {
         if rc != EOK as i32 {
             return Err(ext4_errno(rc));
         }
-        let inode = Arc::new(Ext4Inode::new(
-            path,
-            ext4_mode_to_kind(mode),
-        ));
+        let inode = Arc::new(Ext4Inode::new(path, ext4_mode_to_kind(mode)));
+        ext4_cache_remove_path(inode.path.as_str());
         let _ = inode.chmod(mode & 0o7777);
         Ok(inode)
     }
@@ -529,10 +666,21 @@ impl VfsInode for Ext4Inode {
         if rc != EOK as i32 {
             return Err(ext4_errno(rc));
         }
+        let path = ext4_cache_key(self.path.as_str());
+        EXT4_XATTR_CACHE
+            .exclusive_access()
+            .insert((path.clone(), String::from(name)), Some(value.to_vec()));
+        EXT4_LISTXATTR_CACHE.exclusive_access().remove(&path);
+        ext4_cache_touch_write(self.path.as_str(), None);
         Ok(())
     }
 
     fn getxattr(&self, name: &str) -> Result<Vec<u8>, isize> {
+        let path = ext4_cache_key(self.path.as_str());
+        let key = (path.clone(), String::from(name));
+        if let Some(cached) = EXT4_XATTR_CACHE.exclusive_access().get(&key).cloned() {
+            return cached.ok_or(-61);
+        }
         let c_path = path_cstring(self.path.as_str())?;
         let c_name = path_cstring(name)?;
         let mut size = 0usize;
@@ -547,6 +695,7 @@ impl VfsInode for Ext4Inode {
             )
         };
         if rc != EOK as i32 {
+            EXT4_XATTR_CACHE.exclusive_access().insert(key, None);
             return Err(ext4_errno(rc));
         }
         let mut data = Vec::new();
@@ -565,10 +714,17 @@ impl VfsInode for Ext4Inode {
             return Err(ext4_errno(rc));
         }
         data.truncate(size);
+        EXT4_XATTR_CACHE
+            .exclusive_access()
+            .insert((path, String::from(name)), Some(data.clone()));
         Ok(data)
     }
 
     fn listxattr(&self) -> Result<Vec<u8>, isize> {
+        let path = ext4_cache_key(self.path.as_str());
+        if let Some(cached) = EXT4_LISTXATTR_CACHE.exclusive_access().get(&path).cloned() {
+            return Ok(cached);
+        }
         let c_path = path_cstring(self.path.as_str())?;
         let mut size = 0usize;
         let rc = unsafe { ext4_listxattr(c_path.as_ptr(), core::ptr::null_mut(), 0, &mut size) };
@@ -589,6 +745,9 @@ impl VfsInode for Ext4Inode {
             return Err(ext4_errno(rc));
         }
         list.truncate(size);
+        EXT4_LISTXATTR_CACHE
+            .exclusive_access()
+            .insert(path, list.clone());
         Ok(list)
     }
 
@@ -599,17 +758,26 @@ impl VfsInode for Ext4Inode {
         if rc != EOK as i32 {
             return Err(ext4_errno(rc));
         }
+        let path = ext4_cache_key(self.path.as_str());
+        EXT4_XATTR_CACHE
+            .exclusive_access()
+            .insert((path.clone(), String::from(name)), None);
+        EXT4_LISTXATTR_CACHE.exclusive_access().remove(&path);
+        ext4_cache_touch_write(self.path.as_str(), None);
         Ok(())
     }
 
     fn statfs(&self) -> Option<VfsStatFs> {
+        if let Some(stats) = *EXT4_STATFS_CACHE.exclusive_access() {
+            return Some(stats);
+        }
         let c_mount = path_cstring("/").ok()?;
         let mut stats: ext4_mount_stats = unsafe { core::mem::zeroed() };
         let rc = unsafe { ext4_mount_point_stats(c_mount.as_ptr(), &mut stats) };
         if rc != EOK as i32 {
             return None;
         }
-        Some(VfsStatFs {
+        let vfs = VfsStatFs {
             f_type: 0xEF53,
             f_bsize: stats.block_size as i64,
             f_blocks: stats.blocks_count,
@@ -620,6 +788,8 @@ impl VfsInode for Ext4Inode {
             f_namelen: 255,
             f_frsize: stats.block_size as i64,
             f_flags: 0,
-        })
+        };
+        *EXT4_STATFS_CACHE.exclusive_access() = Some(vfs);
+        Some(vfs)
     }
 }
