@@ -260,7 +260,7 @@ pub use vfs::mount_ext4;
 pub use vfs::mount_ext4_auto;
 pub use vfs::{
     create_dir, list_apps, mount_easyfs, mount_fat32, mount_fat32_auto, mount_procfs, open_file,
-    path_exists, path_is_dir, remove_path, shutdown_filesystems,
+    path_exists, path_is_dir, remove_path, shutdown_filesystems, sync_filesystems,
 };
 pub use memfd::MemFdFile;
 pub use stdio::{DevNull, DevUrandom, DevZero, Stdin, Stdout};

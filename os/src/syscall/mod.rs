@@ -849,7 +849,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
-        SYSCALL_SYNC => 0,
+        SYSCALL_SYNC => {
+            crate::fs::sync_filesystems();
+            0
+        }
         SYSCALL_FSYNC => sys_fsync(args[0]),
         SYSCALL_FDATASYNC => sys_fdatasync(args[0]),
         SYSCALL_TIMERFD_CREATE => sys_timerfd_create(args[0] as i32, args[1] as i32),

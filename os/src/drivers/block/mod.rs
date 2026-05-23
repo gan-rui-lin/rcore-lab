@@ -16,21 +16,28 @@ use easy_fs::BlockDevice;
 use lazy_static::*;
 
 lazy_static! {
+    /// Concrete cached block device, kept so kernel code can flush dirty pages explicitly.
+    pub static ref CACHED_BLOCK_DEVICE: Arc<CachedBlockDevice> = {
+        let raw_device: Arc<dyn BlockDevice> = Arc::new(BlockDeviceImpl::new());
+        CachedBlockDevice::new(raw_device)
+    };
     /// Global block device instance with caching layer.
     /// This wraps the raw VirtIO device with a 64-block LRU cache
     /// to significantly improve file system performance.
     pub static ref BLOCK_DEVICE: Arc<dyn BlockDevice> = {
-        let raw_device: Arc<dyn BlockDevice> = Arc::new(BlockDeviceImpl::new());
-        CachedBlockDevice::new(raw_device)
+        let cached: Arc<CachedBlockDevice> = Arc::clone(&CACHED_BLOCK_DEVICE);
+        cached
     };
+}
+
+/// Flush all dirty cached blocks to the underlying block device.
+pub fn sync_block_cache() {
+    CACHED_BLOCK_DEVICE.sync();
 }
 
 /// Get cache statistics from the global block device
 pub fn get_cache_stats() -> Option<CacheStats> {
-    // Try to downcast to CachedBlockDevice
-    // Note: This requires the actual type, not the trait object
-    // For now, we'll add a global cache stats function
-    None
+    Some(CACHED_BLOCK_DEVICE.stats())
 }
 
 /// Basic read/write test for the block device.

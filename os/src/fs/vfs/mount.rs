@@ -39,13 +39,30 @@ pub fn mount_procfs() {
 }
 
 #[cfg(feature = "ext4")]
-pub fn shutdown_filesystems() {
-    let mut vfs = ROOT_VFS.exclusive_access();
-    vfs.shutdown_ext4();
+pub fn sync_filesystems() {
+    let vfs = ROOT_VFS.exclusive_access();
+    vfs.flush_ext4();
+    drop(vfs);
+    crate::drivers::block::sync_block_cache();
 }
 
 #[cfg(not(feature = "ext4"))]
-pub fn shutdown_filesystems() {}
+pub fn sync_filesystems() {
+    crate::drivers::block::sync_block_cache();
+}
+
+#[cfg(feature = "ext4")]
+pub fn shutdown_filesystems() {
+    let mut vfs = ROOT_VFS.exclusive_access();
+    vfs.shutdown_ext4();
+    drop(vfs);
+    crate::drivers::block::sync_block_cache();
+}
+
+#[cfg(not(feature = "ext4"))]
+pub fn shutdown_filesystems() {
+    crate::drivers::block::sync_block_cache();
+}
 
 #[cfg(feature = "ext4")]
 /// Mount ext4 as root with explicit device size.

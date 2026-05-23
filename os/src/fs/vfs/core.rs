@@ -267,6 +267,15 @@ impl Vfs {
         }
     }
 
+    #[cfg(feature = "ext4")]
+    pub(crate) fn flush_ext4(&self) {
+        for mount in &self.mounts {
+            if let Some(fs) = mount._ext4_guard.as_ref() {
+                fs.flush();
+            }
+        }
+    }
+
     fn resolve_mount<'a>(&'a self, path: &'a str) -> Option<(&'a MountPoint, &'a str)> {
         let mut best: Option<&MountPoint> = None;
         for mount in &self.mounts {

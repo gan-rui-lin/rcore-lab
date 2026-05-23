@@ -48,10 +48,11 @@ const fn cache_page_capacity_from_blocks(blocks: usize) -> usize {
 
 /// Cache capacity in logical 512-byte blocks (compatible with old meaning).
 const CACHE_SIZE_BLOCKS: usize = cache_size_blocks_from_env();
-/// Actual cache entry capacity in 4KiB pages.
+/// Actual cache entry capacity in 16KiB pages.
 const CACHE_PAGE_CAPACITY: usize = cache_page_capacity_from_blocks(CACHE_SIZE_BLOCKS);
 
 const TRACE_BLOCK_CACHE_STATS: bool = option_env!("TRACE_BLOCK_CACHE_STATS").is_some();
+const BLOCK_CACHE_WRITE_THROUGH: bool = option_env!("BLOCK_CACHE_WRITE_THROUGH").is_some();
 const CACHE_STATS_LOG_EVERY_GETS: u64 = 20_000;
 const CACHE_PRESSURE_WARN_BURST: u64 = 1;
 const CACHE_PRESSURE_WARN_EVERY: u64 = 4096;
@@ -148,7 +149,7 @@ const fn page_block_range(block_off: usize) -> (usize, usize) {
     (start, start + BLOCK_SIZE)
 }
 
-/// A cached 4KiB page with per-512B block dirty/load tracking.
+/// A cached 16KiB page with per-512B block dirty/load tracking.
 pub struct CachedPage {
     data: [u8; CACHE_PAGE_SIZE],
     page_id: usize,
@@ -202,10 +203,13 @@ impl CachedPage {
         }
         let mask = block_mask(block_off);
         self.loaded_mask |= mask;
-        self.device
-            .write_block(self.page_id * BLOCKS_PER_PAGE + block_off, &self.data[start..end]);
-        CACHE_BACKEND_WRITES.fetch_add(1, Ordering::Relaxed);
-        self.dirty_mask &= !mask;
+        self.dirty_mask |= mask;
+        if BLOCK_CACHE_WRITE_THROUGH {
+            self.device
+                .write_block(self.page_id * BLOCKS_PER_PAGE + block_off, &self.data[start..end]);
+            CACHE_BACKEND_WRITES.fetch_add(1, Ordering::Relaxed);
+            self.dirty_mask &= !mask;
+        }
     }
 
     pub fn has_dirty(&self) -> bool {

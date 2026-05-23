@@ -5179,7 +5179,6 @@ pub fn sys_timerfd_gettime(fd: usize, curr_value: *mut u8) -> isize {
 // ─── fdatasync / fsync stubs ───────────────────────────────────────────────────
 
 /// fdatasync(2) — flush file data and essential metadata to storage.
-/// Stub: always succeeds (no actual disk sync needed in our memory-backed FS).
 pub fn sys_fdatasync(fd: usize) -> isize {
     let process = current_process();
     let inner = process.inner_exclusive_access();
@@ -5189,11 +5188,13 @@ pub fn sys_fdatasync(fd: usize) -> isize {
     if inner.fd_table[fd].is_none() {
         return errno(EBADF);
     }
+    drop(inner);
+    drop(process);
+    crate::fs::sync_filesystems();
     0
 }
 
 /// fsync(2) — flush file data and all metadata to storage.
-/// Stub: always succeeds.
 pub fn sys_fsync(fd: usize) -> isize {
     sys_fdatasync(fd)
 }
