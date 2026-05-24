@@ -8,4 +8,7 @@ mod up;
 pub use condvar::Condvar;
 pub use mutex::{Mutex, MutexBlocking, MutexSpin};
 pub use semaphore::Semaphore;
-pub use up::{UPIntrFreeCell, UPIntrRefMut, UPSafeCell};
+pub use up::{
+    UPIntrFreeCell, UPIntrMutex, UPIntrMutexGuard, UPIntrRef, UPIntrRefMut, UPIntrRwLock,
+    UPIntrRwLockReadGuard, UPIntrRwLockWriteGuard, UPSafeCell,
+};

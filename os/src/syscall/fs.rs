@@ -4,12 +4,10 @@ use super::process::{get_current_umask, TimeSpec};
 use super::user_mem::{self, UserReadPolicy, UserWritePolicy};
 use crate::fs::{
     create_dir, make_pipe, open_file, path_exists, path_is_dir, remove_path, DevNull, DevUrandom,
-    DevZero, MemFdFile, OpenFlags, PollEvents, Stat, StatMode, TimerFdFile, VfsInode,
-    VfsMetadata, VfsStatFs, TIMERFD_EAGAIN,
+    DevZero, MemFdFile, OpenFlags, PollEvents, Stat, StatMode, TimerFdFile, VfsInode, VfsMetadata,
+    VfsStatFs, TIMERFD_EAGAIN,
 };
-use crate::mm::{
-    translated_ref, translated_refmut, translated_str_checked, UserBuffer,
-};
+use crate::mm::{translated_ref, translated_refmut, translated_str_checked, UserBuffer};
 use crate::net::unix_socket::unix_registry_remove;
 #[allow(unused_imports)] // for debug
 use crate::task::{
@@ -163,7 +161,10 @@ fn readonly_mount_remove(path: &str) {
 
 fn readonly_mount_contains(path: &str) -> bool {
     READONLY_MOUNTS.exclusive_access().iter().any(|mount| {
-        path == mount || path.strip_prefix(mount).is_some_and(|rest| rest.starts_with('/'))
+        path == mount
+            || path
+                .strip_prefix(mount)
+                .is_some_and(|rest| rest.starts_with('/'))
     })
 }
 
@@ -182,7 +183,11 @@ fn resolve_final_symlink(path: &str) -> String {
             normalize_path(&target)
         } else {
             let base = if let Some((parent, _)) = current.rsplit_once('/') {
-                if parent.is_empty() { "/" } else { parent }
+                if parent.is_empty() {
+                    "/"
+                } else {
+                    parent
+                }
             } else {
                 "/"
             };
@@ -206,7 +211,11 @@ fn resolve_final_symlink_checked(path: &str) -> Result<String, isize> {
             normalize_path(&target)
         } else {
             let base = if let Some((parent, _)) = current.rsplit_once('/') {
-                if parent.is_empty() { "/" } else { parent }
+                if parent.is_empty() {
+                    "/"
+                } else {
+                    parent
+                }
             } else {
                 "/"
             };
@@ -226,7 +235,10 @@ fn resolve_final_symlink_checked(path: &str) -> Result<String, isize> {
 
 fn resolve_access_path(full_path: &str) -> Result<String, isize> {
     let mut current = String::from("/");
-    let mut comps = full_path.split('/').filter(|part| !part.is_empty()).peekable();
+    let mut comps = full_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .peekable();
     while let Some(comp) = comps.next() {
         let next = if current == "/" {
             format!("/{}", comp)
@@ -253,7 +265,10 @@ fn resolve_access_path(full_path: &str) -> Result<String, isize> {
 
 fn resolve_access_path_nofollow(full_path: &str) -> Result<String, isize> {
     let mut current = String::from("/");
-    let comps: Vec<&str> = full_path.split('/').filter(|part| !part.is_empty()).collect();
+    let comps: Vec<&str> = full_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
     for (i, comp) in comps.iter().enumerate() {
         let next = if current == "/" {
             format!("/{}", comp)
@@ -329,7 +344,10 @@ fn access_allowed_egid(full_path: &str, mode: u32, uid: u32, egid: u32) -> Resul
     if uid != 0 {
         // Check execute permission on every intermediate directory component
         let mut partial = String::new();
-        let mut comps = full_path.split('/').filter(|part| !part.is_empty()).peekable();
+        let mut comps = full_path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .peekable();
         while let Some(comp) = comps.next() {
             partial.push('/');
             partial.push_str(comp);
@@ -409,7 +427,15 @@ fn apply_mode_side_effects_after_chown(path: &str) {
     }
 }
 
-fn can_unprivileged_chown(path: &str, owner: u32, group: u32, euid: u32, rgid: u32, egid: u32, sgid: u32) -> bool {
+fn can_unprivileged_chown(
+    path: &str,
+    owner: u32,
+    group: u32,
+    euid: u32,
+    rgid: u32,
+    egid: u32,
+    sgid: u32,
+) -> bool {
     if owner != u32::MAX {
         return false;
     }
@@ -565,12 +591,7 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
     if dst.is_null() {
         return Err(errno(EFAULT));
     }
-    user_mem::copy_to_user(
-        token,
-        dst,
-        data,
-        UserWritePolicy::DemandCowWithForkFallback,
-    )
+    user_mem::copy_to_user(token, dst, data, UserWritePolicy::DemandCowWithForkFallback)
 }
 
 fn translated_user_write_buffer(
@@ -598,12 +619,7 @@ fn max_user_write_len(token: usize, ptr: *const u8, len: usize) -> usize {
     if len == 0 || ptr.is_null() {
         return 0;
     }
-    if user_mem::ensure_user_writable(
-        token,
-        ptr,
-        len,
-        UserWritePolicy::DemandCowWithForkFallback,
-    ) {
+    if user_mem::ensure_user_writable(token, ptr, len, UserWritePolicy::DemandCowWithForkFallback) {
         return len;
     }
     let mut lo = 0usize;
@@ -652,131 +668,109 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
     }
     let token = current_user_token();
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
+    let Some(file) = process.get_file(fd) else {
+        return errno(EBADF);
+    };
+    if !file.writable() {
         return errno(EBADF);
     }
-    if let Some(file) = &inner.fd_table[fd] {
-        if !file.writable() {
-            return errno(EBADF);
-        }
-        let file = file.clone();
-        // release current task TCB manually to avoid multi-borrow
-        drop(inner);
-        if len > 0
-            && (file.status_flags() & OpenFlags::DIRECT.bits()) != 0
-            && file.inode().is_some()
+    if len > 0 && (file.status_flags() & OpenFlags::DIRECT.bits()) != 0 && file.inode().is_some() {
+        let off = file.get_offset().unwrap_or(0);
+        if (buf as usize) % DIRECT_IO_ALIGN != 0
+            || len % DIRECT_IO_ALIGN != 0
+            || off % DIRECT_IO_ALIGN != 0
         {
-            let off = file.get_offset().unwrap_or(0);
-            if (buf as usize) % DIRECT_IO_ALIGN != 0
-                || len % DIRECT_IO_ALIGN != 0
-                || off % DIRECT_IO_ALIGN != 0
-            {
-                return errno(EINVAL);
-            }
+            return errno(EINVAL);
         }
-        let Some(buffers) = translated_user_read_buffer(token, buf, len) else {
-            return errno(EFAULT);
-        };
-        let written = match file.write_user_buffer(UserBuffer::new(buffers)) {
-            Ok(written) => {
-                if written == usize::MAX {
-                    return errno(EINTR); // interrupted by signal
-                }
-                written as isize
-            }
-            Err(err) => return err,
-        };
-        // let name = process.inner_exclusive_access().name.clone();
-        // if (name == "busybox" || name == "sh") && fd <= 2 && len > 0 {
-        //     if written == 0 {
-        //         trace!("[sys_write] pid={} name={} fd={} len={} -> 0", pid, name, fd, len);
-        //     } else {
-        //         let count = WRITE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        //         if count < 10 {
-        //             trace!(
-        //                 "[sys_write] pid={} name={} fd={} len={} -> {}",
-        //                 pid,
-        //                 name,
-        //                 fd,
-        //                 len,
-        //                 written
-        //             );
-        //         }
-        //     }
-        // }
-        written
-    } else {
-        errno(EBADF)
     }
+    let Some(buffers) = translated_user_read_buffer(token, buf, len) else {
+        return errno(EFAULT);
+    };
+    let written = match file.write_user_buffer(UserBuffer::new(buffers)) {
+        Ok(written) => {
+            if written == usize::MAX {
+                return errno(EINTR); // interrupted by signal
+            }
+            written as isize
+        }
+        Err(err) => return err,
+    };
+    // let name = process.inner_exclusive_access().name.clone();
+    // if (name == "busybox" || name == "sh") && fd <= 2 && len > 0 {
+    //     if written == 0 {
+    //         trace!("[sys_write] pid={} name={} fd={} len={} -> 0", pid, name, fd, len);
+    //     } else {
+    //         let count = WRITE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    //         if count < 10 {
+    //             trace!(
+    //                 "[sys_write] pid={} name={} fd={} len={} -> {}",
+    //                 pid,
+    //                 name,
+    //                 fd,
+    //                 len,
+    //                 written
+    //             );
+    //         }
+    //     }
+    // }
+    written
 }
 
 pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
     let token = current_user_token();
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
-    }
-    if let Some(file) = &inner.fd_table[fd] {
-        let file = file.clone();
-        let mut wait_readable = false;
-        if !file.readable() {
-            if file.is_unix_socket() {
-                wait_readable = true;
-            } else {
-                return errno(EBADF);
-            }
-        }
-        if file.inode().map(|inode| inode.is_dir()).unwrap_or(false) {
-            return errno(EISDIR);
-        }
-        // release current task TCB manually to avoid multi-borrow
-        drop(inner);
-        if len > 0
-            && (file.status_flags() & OpenFlags::DIRECT.bits()) != 0
-            && file.inode().is_some()
-        {
-            let off = file.get_offset().unwrap_or(0);
-            if (buf as usize) % DIRECT_IO_ALIGN != 0
-                || len % DIRECT_IO_ALIGN != 0
-                || off % DIRECT_IO_ALIGN != 0
-            {
-                return errno(EINVAL);
-            }
-        }
-        if wait_readable {
-            loop {
-                if file.readable() {
-                    break;
-                }
-                suspend_current_and_run_next();
-                if crate::task::has_pending_unmasked_signal(false) {
-                    return errno(EINTR);
-                }
-            }
-        }
-        let raw = if let Some(result) = file.read_user_buffer(token, buf, len) {
-            match result {
-                Ok(raw) => raw,
-                Err(err) => return err,
-            }
+    };
+    let mut wait_readable = false;
+    if !file.readable() {
+        if file.is_unix_socket() {
+            wait_readable = true;
         } else {
-            let Some(buffers) = translated_user_write_buffer(token, buf, len) else {
-                return errno(EFAULT);
-            };
-            file.read(UserBuffer::new(buffers))
-        };
-        if raw == usize::MAX {
-            return errno(EINTR); // interrupted by signal
+            return errno(EBADF);
         }
-        if raw == TIMERFD_EAGAIN {
-            return errno(EAGAIN); // timerfd: timer hasn't fired, O_NONBLOCK set
-        }
-        raw as isize
-    } else {
-        errno(EBADF)
     }
+    if file.inode().map(|inode| inode.is_dir()).unwrap_or(false) {
+        return errno(EISDIR);
+    }
+    if len > 0 && (file.status_flags() & OpenFlags::DIRECT.bits()) != 0 && file.inode().is_some() {
+        let off = file.get_offset().unwrap_or(0);
+        if (buf as usize) % DIRECT_IO_ALIGN != 0
+            || len % DIRECT_IO_ALIGN != 0
+            || off % DIRECT_IO_ALIGN != 0
+        {
+            return errno(EINVAL);
+        }
+    }
+    if wait_readable {
+        loop {
+            if file.readable() {
+                break;
+            }
+            suspend_current_and_run_next();
+            if crate::task::has_pending_unmasked_signal(false) {
+                return errno(EINTR);
+            }
+        }
+    }
+    let raw = if let Some(result) = file.read_user_buffer(token, buf, len) {
+        match result {
+            Ok(raw) => raw,
+            Err(err) => return err,
+        }
+    } else {
+        let Some(buffers) = translated_user_write_buffer(token, buf, len) else {
+            return errno(EFAULT);
+        };
+        file.read(UserBuffer::new(buffers))
+    };
+    if raw == usize::MAX {
+        return errno(EINTR); // interrupted by signal
+    }
+    if raw == TIMERFD_EAGAIN {
+        return errno(EAGAIN); // timerfd: timer hasn't fired, O_NONBLOCK set
+    }
+    raw as isize
 }
 
 pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isize {
@@ -891,7 +885,11 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     let dev_file: Option<Arc<dyn crate::fs::File + Send + Sync>> = match full_path.as_str() {
         "/dev/null" => Some(Arc::new(DevNull::new(readable, writable, "/dev/null"))),
         "/dev/zero" => Some(Arc::new(DevZero::new(readable, writable, "/dev/zero"))),
-        "/dev/urandom" => Some(Arc::new(DevUrandom::new(readable, writable, "/dev/urandom"))),
+        "/dev/urandom" => Some(Arc::new(DevUrandom::new(
+            readable,
+            writable,
+            "/dev/urandom",
+        ))),
         "/dev/random" => Some(Arc::new(DevUrandom::new(readable, writable, "/dev/random"))),
         _ => None,
     };
@@ -1177,10 +1175,8 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, _dev: u32) -> isize
     let gid = inner.effective_gid;
     drop(inner);
     let inode = if node_type == S_IFREG {
-        let Some(file) = open_file(
-            full_path.as_str(),
-            OpenFlags::CREATE | OpenFlags::WRONLY,
-        ) else {
+        let Some(file) = open_file(full_path.as_str(), OpenFlags::CREATE | OpenFlags::WRONLY)
+        else {
             return errno(EIO);
         };
         match file.inode() {
@@ -1191,7 +1187,11 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, _dev: u32) -> isize
         let Some((parent_path, name)) = full_path.rsplit_once('/') else {
             return errno(ENOENT);
         };
-        let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
+        let parent_path = if parent_path.is_empty() {
+            "/"
+        } else {
+            parent_path
+        };
         let Some(parent) = inode_for_path(parent_path) else {
             return errno(ENOENT);
         };
@@ -1211,17 +1211,12 @@ pub fn sys_close(fd: usize) -> isize {
         syscall!("kernel:pid[{}] sys_close", pid);
     }
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
     // if (inner.name == "busybox" || inner.name == "sh") && fd <= 2 {
     //     trace!("[sys_close] pid={} name={} fd={}", pid, inner.name, fd);
     // }
-    if fd >= inner.fd_table.len() {
+    if process.take_fd(fd).is_none() {
         return errno(EBADF);
     }
-    if inner.fd_table[fd].is_none() {
-        return errno(EBADF);
-    }
-    inner.fd_table[fd].take();
     fd_flags_remove(pid, fd);
     flock_unlock_owner(pid, fd);
     0
@@ -1412,7 +1407,11 @@ fn read_times_from_user(token: usize, times: *const TimeSpec) -> Option<(TimeSpe
 }
 
 /// Apply utimensat semantics through the filesystem metadata backend.
-fn apply_utimensat_to_inode(inode: Arc<dyn VfsInode>, times: *const TimeSpec, token: usize) -> isize {
+fn apply_utimensat_to_inode(
+    inode: Arc<dyn VfsInode>,
+    times: *const TimeSpec,
+    token: usize,
+) -> isize {
     let (now_sec, _) = get_current_timespec();
     let metadata = inode.metadata();
     let mut atime = metadata.map(|m| m.atime_sec).unwrap_or(now_sec);
@@ -1558,7 +1557,10 @@ fn fill_regular_stat(stat: &mut Stat, path: &str, inode: &dyn VfsInode) -> Optio
         .filter(|nlink| *nlink > 0)
         .unwrap_or(1);
     stat.size = size as i64;
-    stat.blksize = metadata.map(|m| m.blksize as i32).filter(|v| *v > 0).unwrap_or(512);
+    stat.blksize = metadata
+        .map(|m| m.blksize as i32)
+        .filter(|v| *v > 0)
+        .unwrap_or(512);
     stat.blocks = metadata
         .map(|m| m.blocks as i64)
         .filter(|blocks| *blocks > 0)
@@ -1567,10 +1569,7 @@ fn fill_regular_stat(stat: &mut Stat, path: &str, inode: &dyn VfsInode) -> Optio
     stat.uid = uid;
     stat.gid = gid;
     stat.rdev = metadata.map(|m| m.rdev).unwrap_or(0);
-    stat.dev = metadata
-        .map(|m| m.dev)
-        .filter(|dev| *dev != 0)
-        .unwrap_or(1);
+    stat.dev = metadata.map(|m| m.dev).filter(|dev| *dev != 0).unwrap_or(1);
     stat.ino = metadata
         .map(|m| m.ino)
         .filter(|ino| *ino != 0)
@@ -2015,7 +2014,11 @@ pub fn sys_symlinkat(target: *const u8, new_dirfd: isize, linkpath: *const u8) -
     let Some((parent_path, name)) = new_path.rsplit_once('/') else {
         return errno(ENOENT);
     };
-    let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
+    let parent_path = if parent_path.is_empty() {
+        "/"
+    } else {
+        parent_path
+    };
     let Some(parent) = inode_for_path(parent_path) else {
         return errno(ENOENT);
     };
@@ -2041,11 +2044,7 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
     if raw.is_empty() {
         return errno(ENOENT);
     }
-    if raw.len() > PATH_MAX
-        || raw
-            .split('/')
-            .any(|component| component.len() > NAME_MAX)
-    {
+    if raw.len() > PATH_MAX || raw.split('/').any(|component| component.len() > NAME_MAX) {
         return errno(ENAMETOOLONG);
     }
     let base = match dirfd_base(_dirfd) {
@@ -2744,7 +2743,11 @@ pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
         if user_mem::copy_from_user(token, iov_ptr, &mut iov_data, UserReadPolicy::DemandPaged)
             .is_err()
         {
-            return if total_read > 0 { total_read } else { errno(EFAULT) };
+            return if total_read > 0 {
+                total_read
+            } else {
+                errno(EFAULT)
+            };
         }
 
         let base = usize::from_le_bytes([
@@ -2775,16 +2778,27 @@ pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
             return errno(EINVAL);
         }
         if base == 0 {
-            return if total_read > 0 { total_read } else { errno(EFAULT) };
+            return if total_read > 0 {
+                total_read
+            } else {
+                errno(EFAULT)
+            };
         }
 
-        let Some(buffers) = translated_user_write_buffer(token, base as *const u8, len)
-        else {
-            return if total_read > 0 { total_read } else { errno(EFAULT) };
+        let Some(buffers) = translated_user_write_buffer(token, base as *const u8, len) else {
+            return if total_read > 0 {
+                total_read
+            } else {
+                errno(EFAULT)
+            };
         };
         let read = file.read(UserBuffer::new(buffers));
         if read == usize::MAX {
-            return if total_read > 0 { total_read } else { errno(EINTR) };
+            return if total_read > 0 {
+                total_read
+            } else {
+                errno(EINTR)
+            };
         }
         total_read += read as isize;
         if read < len {
@@ -2851,7 +2865,11 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
         if user_mem::copy_from_user(token, iov_ptr, &mut iov_data, UserReadPolicy::DemandPaged)
             .is_err()
         {
-            return if total_written > 0 { total_written } else { errno(EFAULT) };
+            return if total_written > 0 {
+                total_written
+            } else {
+                errno(EFAULT)
+            };
         }
 
         let base = usize::from_le_bytes([
@@ -2882,17 +2900,28 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
             return errno(EINVAL);
         }
         if base == 0 {
-            return if total_written > 0 { total_written } else { errno(EFAULT) };
+            return if total_written > 0 {
+                total_written
+            } else {
+                errno(EFAULT)
+            };
         }
 
-        let Some(buffers) = translated_user_read_buffer(token, base as *const u8, len)
-        else {
-            return if total_written > 0 { total_written } else { errno(EFAULT) };
+        let Some(buffers) = translated_user_read_buffer(token, base as *const u8, len) else {
+            return if total_written > 0 {
+                total_written
+            } else {
+                errno(EFAULT)
+            };
         };
         let written = match file.write_user_buffer(UserBuffer::new(buffers)) {
             Ok(written) => {
                 if written == usize::MAX {
-                    return if total_written > 0 { total_written } else { errno(EINTR) };
+                    return if total_written > 0 {
+                        total_written
+                    } else {
+                        errno(EINTR)
+                    };
                 }
                 written
             }
@@ -3064,9 +3093,8 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
                 return errno(EINVAL);
             }
             flock.l_type = F_UNLCK;
-            let bytes = unsafe {
-                core::slice::from_raw_parts((&flock as *const Flock) as *const u8, size)
-            };
+            let bytes =
+                unsafe { core::slice::from_raw_parts((&flock as *const Flock) as *const u8, size) };
             if !user_mem::ensure_user_writable(
                 token,
                 ptr as *const u8,
@@ -3154,7 +3182,13 @@ fn xattr_name_from_user(name: *const u8) -> Result<String, isize> {
     Ok(name)
 }
 
-fn sys_setxattr_path(path: String, name: *const u8, value: *const u8, size: usize, flags: u32) -> isize {
+fn sys_setxattr_path(
+    path: String,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: u32,
+) -> isize {
     const XATTR_CREATE: u32 = 1;
     const XATTR_REPLACE: u32 = 2;
     if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 || flags == (XATTR_CREATE | XATTR_REPLACE) {
@@ -3170,12 +3204,7 @@ fn sys_setxattr_path(path: String, name: *const u8, value: *const u8, size: usiz
         if value.is_null() {
             return errno(EFAULT);
         }
-        if !user_mem::ensure_user_readable(
-            token,
-            value,
-            size,
-            UserReadPolicy::DemandPaged,
-        ) {
+        if !user_mem::ensure_user_readable(token, value, size, UserReadPolicy::DemandPaged) {
             return errno(EFAULT);
         }
         let bufs = crate::mm::translated_byte_buffer(token, value, size);
@@ -3283,7 +3312,14 @@ fn xattr_path_from_fd(fd: usize) -> Result<String, isize> {
     }
 }
 
-pub fn sys_setxattr(path: *const u8, name: *const u8, value: *const u8, size: usize, flags: u32, follow: bool) -> isize {
+pub fn sys_setxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: u32,
+    follow: bool,
+) -> isize {
     let path = match xattr_path_from_user(AT_FDCWD, path, follow) {
         Ok(path) => path,
         Err(err) => return err,
@@ -3291,7 +3327,13 @@ pub fn sys_setxattr(path: *const u8, name: *const u8, value: *const u8, size: us
     sys_setxattr_path(path, name, value, size, flags)
 }
 
-pub fn sys_fsetxattr(fd: usize, name: *const u8, value: *const u8, size: usize, flags: u32) -> isize {
+pub fn sys_fsetxattr(
+    fd: usize,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: u32,
+) -> isize {
     let path = match xattr_path_from_fd(fd) {
         Ok(path) => path,
         Err(err) => return err,
@@ -3299,7 +3341,13 @@ pub fn sys_fsetxattr(fd: usize, name: *const u8, value: *const u8, size: usize, 
     sys_setxattr_path(path, name, value, size, flags)
 }
 
-pub fn sys_getxattr(path: *const u8, name: *const u8, value: *mut u8, size: usize, follow: bool) -> isize {
+pub fn sys_getxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *mut u8,
+    size: usize,
+    follow: bool,
+) -> isize {
     let path = match xattr_path_from_user(AT_FDCWD, path, follow) {
         Ok(path) => path,
         Err(err) => return err,
@@ -4112,7 +4160,9 @@ pub fn sys_pselect6(
             );
 
             let mut fd_ready = false;
-            if watch_read && ready.intersects(PollEvents::POLLIN | PollEvents::POLLHUP | PollEvents::POLLERR) {
+            if watch_read
+                && ready.intersects(PollEvents::POLLIN | PollEvents::POLLHUP | PollEvents::POLLERR)
+            {
                 fdset_set(out_read.as_mut_slice(), fd);
                 fd_ready = true;
             }
@@ -4393,19 +4443,37 @@ fn sys_preadv_common(
     for i in 0..iovcnt {
         let (base, len) = match read_user_iovec(token, iov, i) {
             Ok(v) => v,
-            Err(_) => return if total_read > 0 { total_read as isize } else { errno(EFAULT) },
+            Err(_) => {
+                return if total_read > 0 {
+                    total_read as isize
+                } else {
+                    errno(EFAULT)
+                }
+            }
         };
         if len == 0 {
             continue;
         }
         if len > isize::MAX as usize {
-            return if total_read > 0 { total_read as isize } else { errno(EINVAL) };
+            return if total_read > 0 {
+                total_read as isize
+            } else {
+                errno(EINVAL)
+            };
         }
         if base == 0 {
-            return if total_read > 0 { total_read as isize } else { errno(EFAULT) };
+            return if total_read > 0 {
+                total_read as isize
+            } else {
+                errno(EFAULT)
+            };
         }
         let Some(buffers) = translated_user_write_buffer(token, base as *const u8, len) else {
-            return if total_read > 0 { total_read as isize } else { errno(EFAULT) };
+            return if total_read > 0 {
+                total_read as isize
+            } else {
+                errno(EFAULT)
+            };
         };
 
         let mut iov_read = 0usize;
@@ -4415,10 +4483,18 @@ fn sys_preadv_common(
                 break;
             }
             let Some(next_off) = off.checked_add(n) else {
-                return if total_read > 0 { total_read as isize } else { errno(EINVAL) };
+                return if total_read > 0 {
+                    total_read as isize
+                } else {
+                    errno(EINVAL)
+                };
             };
             let Some(next_total) = total_read.checked_add(n) else {
-                return if total_read > 0 { total_read as isize } else { errno(EINVAL) };
+                return if total_read > 0 {
+                    total_read as isize
+                } else {
+                    errno(EINVAL)
+                };
             };
             off = next_off;
             total_read = next_total;
@@ -4532,7 +4608,11 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, count: usize, offset: isize) -> i
                 let step = (off - cur).min(zeros.len());
                 let n = inode.write_at(cur, &zeros[..step]);
                 if n == 0 {
-                    return if total > 0 { total as isize } else { errno(EIO) };
+                    return if total > 0 {
+                        total as isize
+                    } else {
+                        errno(EIO)
+                    };
                 }
                 cur += n;
             }
@@ -4655,7 +4735,10 @@ pub fn sys_pwritev(fd: usize, iov: *const usize, iovcnt: usize, offset: isize) -
             };
         }
         if (file.status_flags() & OpenFlags::DIRECT.bits()) != 0 {
-            if base % DIRECT_IO_ALIGN != 0 || len % DIRECT_IO_ALIGN != 0 || off % DIRECT_IO_ALIGN != 0 {
+            if base % DIRECT_IO_ALIGN != 0
+                || len % DIRECT_IO_ALIGN != 0
+                || off % DIRECT_IO_ALIGN != 0
+            {
                 return if total_written > 0 {
                     total_written as isize
                 } else {
@@ -4664,8 +4747,7 @@ pub fn sys_pwritev(fd: usize, iov: *const usize, iovcnt: usize, offset: isize) -
             }
         }
 
-        let Some(buffers) = translated_user_read_buffer(token, base as *const u8, len)
-        else {
+        let Some(buffers) = translated_user_read_buffer(token, base as *const u8, len) else {
             return if total_written > 0 {
                 total_written as isize
             } else {
@@ -4914,13 +4996,7 @@ pub fn sys_fchmod(fd: usize, mut mode: u32) -> isize {
     }
 }
 
-pub fn sys_fchownat(
-    dirfd: isize,
-    path: *const u8,
-    owner: u32,
-    group: u32,
-    flags: u32,
-) -> isize {
+pub fn sys_fchownat(dirfd: isize, path: *const u8, owner: u32, group: u32, flags: u32) -> isize {
     if path.is_null() {
         return errno(EFAULT);
     }
@@ -5043,8 +5119,7 @@ fn read_itimerspec_from_user(token: usize, ptr: *const u8) -> Option<ITimerSpec>
     }
     let size = core::mem::size_of::<ITimerSpec>();
     let mut raw = [0u8; 32];
-    if user_mem::copy_from_user(token, ptr, &mut raw[..size], UserReadPolicy::DemandPaged)
-        .is_err()
+    if user_mem::copy_from_user(token, ptr, &mut raw[..size], UserReadPolicy::DemandPaged).is_err()
     {
         return None;
     }
@@ -5080,7 +5155,7 @@ fn us_to_timespec(us: u64) -> TimeSpec {
 }
 
 const TFD_CLOEXEC: i32 = 0o2000000; // same as O_CLOEXEC
-const TFD_NONBLOCK: i32 = 0o4000;   // same as O_NONBLOCK
+const TFD_NONBLOCK: i32 = 0o4000; // same as O_NONBLOCK
 const TFD_TIMER_ABSTIME: i32 = 1;
 
 /// timerfd_create(2)
@@ -5093,7 +5168,7 @@ pub fn sys_timerfd_create(clockid: i32, flags: i32) -> isize {
         return errno(EINVAL);
     }
     let nonblock = (flags & TFD_NONBLOCK) != 0;
-    let cloexec  = (flags & TFD_CLOEXEC)  != 0;
+    let cloexec = (flags & TFD_CLOEXEC) != 0;
     let file = Arc::new(TimerFdFile::new(clockid, nonblock, cloexec));
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
@@ -5106,7 +5181,12 @@ pub fn sys_timerfd_create(clockid: i32, flags: i32) -> isize {
 }
 
 /// timerfd_settime(2)
-pub fn sys_timerfd_settime(fd: usize, flags: i32, new_value: *const u8, old_value: *mut u8) -> isize {
+pub fn sys_timerfd_settime(
+    fd: usize,
+    flags: i32,
+    new_value: *const u8,
+    old_value: *mut u8,
+) -> isize {
     if new_value.is_null() {
         return errno(EFAULT);
     }

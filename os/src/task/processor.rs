@@ -93,10 +93,7 @@ pub fn current_user_token() -> usize {
 }
 
 pub fn current_trap_cx() -> &'static mut TrapContext {
-    current_task()
-        .unwrap()
-        .inner_exclusive_access()
-        .get_trap_cx()
+    current_task().unwrap().trap_cx()
 }
 
 pub fn current_trap_cx_user_va() -> usize {

@@ -9,8 +9,8 @@ use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{
     translated_byte_buffer_checked, translated_ref, translated_refmut, translated_str, MemorySet,
 };
-use crate::sync::UPIntrRefMut;
-use crate::sync::{Condvar, Mutex, Semaphore, UPIntrFreeCell};
+use crate::sync::UPIntrMutexGuard;
+use crate::sync::{Condvar, Mutex, Semaphore, UPIntrMutex};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -96,7 +96,7 @@ fn find_global_pointer(elf_data: &[u8]) -> Option<usize> {
 
 pub struct ProcessControlBlock {
     pub pid: PidHandle,
-    inner: UPIntrFreeCell<ProcessControlBlockInner>,
+    inner: UPIntrMutex<ProcessControlBlockInner>,
 }
 
 pub struct ProcessControlBlockInner {
@@ -291,13 +291,15 @@ impl ProcessControlBlock {
     }
 
     #[track_caller]
-    pub fn inner_exclusive_access(&self) -> UPIntrRefMut<'_, ProcessControlBlockInner> {
-        self.inner.exclusive_access()
+    pub fn inner_exclusive_access(&self) -> UPIntrMutexGuard<'_, ProcessControlBlockInner> {
+        self.inner.lock()
     }
 
     /// Try to borrow the process inner state; returns None if already borrowed.
-    pub fn try_inner_exclusive_access(&self) -> Option<UPIntrRefMut<'_, ProcessControlBlockInner>> {
-        self.inner.try_exclusive_access()
+    pub fn try_inner_exclusive_access(
+        &self,
+    ) -> Option<UPIntrMutexGuard<'_, ProcessControlBlockInner>> {
+        self.inner.try_lock()
     }
 
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
@@ -321,7 +323,7 @@ impl ProcessControlBlock {
         let process = Arc::new(Self {
             pid: pid_handle,
             inner: unsafe {
-                UPIntrFreeCell::new(ProcessControlBlockInner {
+                UPIntrMutex::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
                     parent: None,
@@ -382,7 +384,11 @@ impl ProcessControlBlock {
             inner.session_id = 0;
             inner.pgid = 0;
         }
-        let task = Arc::new(TaskControlBlock::new(Arc::clone(&process), ustack_base, false));
+        let task = Arc::new(TaskControlBlock::new(
+            Arc::clone(&process),
+            ustack_base,
+            false,
+        ));
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         let ustack_top = user_stack_top;
@@ -516,9 +522,12 @@ impl ProcessControlBlock {
         if exec_name == "sh" || exec_name == "busybox" {
             let mut bytes = [0u8; 8];
             let debug_entry = main_entry;
-            if let Some(slices) =
-                translated_byte_buffer_checked(new_token, debug_entry as *const u8, bytes.len(), false)
-            {
+            if let Some(slices) = translated_byte_buffer_checked(
+                new_token,
+                debug_entry as *const u8,
+                bytes.len(),
+                false,
+            ) {
                 let mut offset = 0usize;
                 for slice in slices {
                     let len = slice.len().min(bytes.len() - offset);
@@ -800,7 +809,7 @@ impl ProcessControlBlock {
         let child = Arc::new(Self {
             pid,
             inner: unsafe {
-                UPIntrFreeCell::new(ProcessControlBlockInner {
+                UPIntrMutex::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
                     parent: Some(Arc::downgrade(self)),
@@ -886,5 +895,91 @@ impl ProcessControlBlock {
 
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    #[inline]
+    pub fn get_user_token(&self) -> usize {
+        self.inner_exclusive_access().memory_set.token()
+    }
+
+    #[inline]
+    pub fn thread_count(&self) -> usize {
+        self.inner_exclusive_access().thread_count()
+    }
+
+    #[inline]
+    pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
+        self.inner_exclusive_access().get_task(tid)
+    }
+
+    pub fn tasks_snapshot(&self) -> Vec<Arc<TaskControlBlock>> {
+        self.inner_exclusive_access()
+            .tasks
+            .iter()
+            .filter_map(|task| task.as_ref().map(Arc::clone))
+            .collect()
+    }
+
+    #[inline]
+    pub fn alloc_tid(&self) -> usize {
+        self.inner_exclusive_access().alloc_tid()
+    }
+
+    #[inline]
+    pub fn dealloc_tid(&self, tid: usize) {
+        self.inner_exclusive_access().dealloc_tid(tid);
+    }
+
+    #[inline]
+    pub fn name(&self) -> String {
+        self.inner_exclusive_access().name.clone()
+    }
+
+    #[inline]
+    pub fn cwd(&self) -> String {
+        self.inner_exclusive_access().cwd.clone()
+    }
+
+    #[inline]
+    pub fn root_dir(&self) -> String {
+        self.inner_exclusive_access().root_dir.clone()
+    }
+
+    pub fn get_file(&self, fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
+        self.inner_exclusive_access()
+            .fd_table
+            .get(fd)
+            .and_then(|slot| slot.as_ref().map(Arc::clone))
+    }
+
+    pub fn alloc_fd(&self) -> Option<usize> {
+        self.inner_exclusive_access().alloc_fd()
+    }
+
+    pub fn set_fd(&self, fd: usize, file: Option<Arc<dyn File + Send + Sync>>) -> bool {
+        let mut inner = self.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return false;
+        }
+        inner.fd_table[fd] = file;
+        true
+    }
+
+    pub fn take_fd(&self, fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
+        let mut inner = self.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return None;
+        }
+        inner.fd_table[fd].take()
+    }
+
+    pub fn with_memory_set<R>(&self, f: impl FnOnce(&MemorySet) -> R) -> R {
+        let inner = self.inner_exclusive_access();
+        f(&inner.memory_set)
+    }
+
+    pub fn with_memory_set_mut<R>(&self, f: impl FnOnce(&mut MemorySet) -> R) -> R {
+        let mut inner = self.inner_exclusive_access();
+        f(&mut inner.memory_set)
     }
 }

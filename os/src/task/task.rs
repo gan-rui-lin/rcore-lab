@@ -1,7 +1,6 @@
 use super::id::TaskUserRes;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, TaskContext};
-use crate::sync::UPIntrFreeCell;
-use crate::sync::UPIntrRefMut;
+use crate::sync::{UPIntrMutex, UPIntrMutexGuard};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use arch::TrapContext;
@@ -51,23 +50,60 @@ pub fn live_task_pid_summary() -> (usize, usize, usize, usize, usize, usize) {
 pub struct TaskControlBlock {
     pub process: Weak<ProcessControlBlock>,
     pub kstack: KernelStack,
-    inner: UPIntrFreeCell<TaskControlBlockInner>,
+    inner: UPIntrMutex<TaskControlBlockInner>,
 }
 
 impl TaskControlBlock {
-    pub fn inner_exclusive_access(&self) -> UPIntrRefMut<'_, TaskControlBlockInner> {
-        self.inner.exclusive_access()
+    pub fn inner_exclusive_access(&self) -> UPIntrMutexGuard<'_, TaskControlBlockInner> {
+        self.inner.lock()
     }
 
     /// Try to borrow the task inner state; returns None if already borrowed.
-    pub fn try_inner_exclusive_access(&self) -> Option<UPIntrRefMut<'_, TaskControlBlockInner>> {
-        self.inner.try_exclusive_access()
+    pub fn try_inner_exclusive_access(
+        &self,
+    ) -> Option<UPIntrMutexGuard<'_, TaskControlBlockInner>> {
+        self.inner.try_lock()
     }
 
     pub fn get_user_token(&self) -> usize {
         let process = self.process.upgrade().unwrap();
-        let inner = process.inner_exclusive_access();
-        inner.memory_set.token()
+        process.get_user_token()
+    }
+
+    pub fn tid(&self) -> usize {
+        self.inner_exclusive_access()
+            .res
+            .as_ref()
+            .map(|res| res.tid)
+            .unwrap_or(0)
+    }
+
+    pub fn trap_cx(&self) -> &'static mut TrapContext {
+        self.inner_exclusive_access().get_trap_cx()
+    }
+
+    pub fn status(&self) -> TaskStatus {
+        self.inner_exclusive_access().task_status
+    }
+
+    pub fn set_status(&self, status: TaskStatus) {
+        self.inner_exclusive_access().task_status = status;
+    }
+
+    pub fn exit_code(&self) -> Option<i32> {
+        self.inner_exclusive_access().exit_code
+    }
+
+    pub fn set_exit_code(&self, exit_code: Option<i32>) {
+        self.inner_exclusive_access().exit_code = exit_code;
+    }
+
+    pub fn last_syscall(&self) -> usize {
+        self.inner_exclusive_access().last_syscall
+    }
+
+    pub fn set_last_syscall(&self, syscall_id: usize) {
+        self.inner_exclusive_access().last_syscall = syscall_id;
     }
 }
 
@@ -122,7 +158,7 @@ impl TaskControlBlock {
             process: Arc::downgrade(&process),
             kstack,
             inner: unsafe {
-                UPIntrFreeCell::new(TaskControlBlockInner {
+                UPIntrMutex::new(TaskControlBlockInner {
                     res: Some(res),
                     trap_cx_ppn,
                     task_cx: TaskContext::for_user_trap_loop(

@@ -57,9 +57,7 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 }
 
 pub fn wakeup_task(task: Arc<TaskControlBlock>) {
-    let mut task_inner = task.inner_exclusive_access();
-    task_inner.task_status = TaskStatus::Ready;
-    drop(task_inner);
+    task.set_status(TaskStatus::Ready);
     add_task(task);
 }
 
@@ -313,8 +311,7 @@ pub fn print_ready_queue_brief(limit: usize) {
         } else {
             println!(
                 "[kernel] alloc_error ready[{}]: pid={} <task_busy>",
-                idx,
-                pid
+                idx, pid
             );
         }
     }

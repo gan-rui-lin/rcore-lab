@@ -186,7 +186,7 @@ impl TaskUserRes {
         ustack_base: usize,
         alloc_user_res: bool,
     ) -> Self {
-        let tid = process.inner_exclusive_access().alloc_tid();
+        let tid = process.alloc_tid();
         let mut task_user_res = Self {
             tid,
             ustack_base,
@@ -257,8 +257,7 @@ impl TaskUserRes {
 
     pub fn dealloc_tid(&self) {
         let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.inner_exclusive_access();
-        process_inner.dealloc_tid(self.tid);
+        process.dealloc_tid(self.tid);
     }
 
     pub fn trap_cx_user_va(&self) -> usize {
