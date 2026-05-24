@@ -53,7 +53,7 @@ impl Time {
 }
 
 pub fn init_timer() {
-    let ticks = ((*FREQ / 100) + 3) & !3;
+    let ticks = ((*FREQ / 1000) + 3) & !3;
     tcfg::set_periodic(true);
     tcfg::set_init_val(ticks);
     tcfg::set_en(true);
