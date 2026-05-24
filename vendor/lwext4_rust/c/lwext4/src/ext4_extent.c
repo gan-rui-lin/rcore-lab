@@ -493,16 +493,6 @@ static int ext4_allocate_single_block(struct ext4_inode_ref *inode_ref,
 	return ext4_balloc_alloc_block(inode_ref, goal, blockp);
 }
 
-static int ext4_allocate_blocks(struct ext4_inode_ref *inode_ref,
-				ext4_fsblk_t goal, uint32_t *count,
-				ext4_fsblk_t *blockp)
-{
-	if (!count || *count <= 1)
-		return ext4_allocate_single_block(inode_ref, goal, blockp);
-
-	return ext4_balloc_alloc_blocks(inode_ref, goal, count, blockp);
-}
-
 static ext4_fsblk_t ext4_new_meta_blocks(struct ext4_inode_ref *inode_ref,
 					 ext4_fsblk_t goal,
 					 uint32_t flags __unused,
@@ -510,14 +500,8 @@ static ext4_fsblk_t ext4_new_meta_blocks(struct ext4_inode_ref *inode_ref,
 {
 	ext4_fsblk_t block = 0;
 
+	*errp = ext4_allocate_single_block(inode_ref, goal, &block);
 	if (count)
-		*errp = ext4_allocate_blocks(inode_ref, goal, count, &block);
-	else {
-		*errp = ext4_allocate_single_block(inode_ref, goal, &block);
-	}
-	if (!count)
-		return block;
-	if (*errp != EOK)
 		*count = 1;
 	return block;
 }

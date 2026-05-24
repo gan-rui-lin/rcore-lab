@@ -193,10 +193,6 @@ impl Ext4File {
         Err(r)
     }
 
-    pub fn file_pos(&self) -> u64 {
-        self.file_desc.fpos
-    }
-
     pub fn file_read(&mut self, buff: &mut [u8]) -> Result<usize, i32> {
         let mut rw_count = 0;
         let r = unsafe {

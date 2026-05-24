@@ -5094,7 +5094,6 @@ pub fn sys_fdatasync(fd: usize) -> isize {
         return errno(EBADF);
     };
     drop(process);
-    file.flush();
     crate::fs::sync_filesystems();
     0
 }
