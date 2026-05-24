@@ -2,7 +2,10 @@ use super::*;
 
 pub(super) fn handle_user_supervisor_external() {
     let trap_cx = current_trap_cx();
-    warn!("[kernel] trap_handler: unknown trap at sepc={:#x}", trap_cx.sepc);
+    warn!(
+        "[kernel] trap_handler: unknown trap at sepc={:#x}",
+        trap_cx.sepc
+    );
 }
 
 pub(super) fn handle_user_page_fault(addr: usize) {
@@ -48,8 +51,7 @@ pub(super) fn handle_user_illegal_instruction(addr: usize) {
     let args = trap_cx.args();
     error!(
         "[kernel] trap_handler: illegal instruction addr={:#x} sepc={:#x}",
-        addr,
-        trap_cx.sepc
+        addr, trap_cx.sepc
     );
     error!(
         "[kernel] trap_handler: ra={:#x} sp={:#x} tp={:#x} syscall={:#x} args={:x?}",
@@ -64,10 +66,16 @@ pub(super) fn handle_user_illegal_instruction(addr: usize) {
 
 pub(super) fn handle_user_breakpoint() {
     let trap_cx = current_trap_cx();
-    warn!("[kernel] trap_handler: unknown trap at sepc={:#x}", trap_cx.sepc);
+    warn!(
+        "[kernel] trap_handler: unknown trap at sepc={:#x}",
+        trap_cx.sepc
+    );
 }
 
 pub(super) fn handle_user_unknown_trap(_trap_type: arch::TrapType) {
     let trap_cx = current_trap_cx();
-    warn!("[kernel] trap_handler: unknown trap at sepc={:#x}", trap_cx.sepc);
+    warn!(
+        "[kernel] trap_handler: unknown trap at sepc={:#x}",
+        trap_cx.sepc
+    );
 }

@@ -105,7 +105,12 @@ fn check_itimers(current_ms: usize) {
         let expire = inner.itimer_real_expire_ms;
         if expire != 0 && expire <= current_ms {
             // Fire SIGALRM
-            log::warn!("[itimer] pid={} SIGALRM fired, expire={} now={}", _pid, expire, current_ms);
+            log::warn!(
+                "[itimer] pid={} SIGALRM fired, expire={} now={}",
+                _pid,
+                expire,
+                current_ms
+            );
             inner.signal_pending |= SignalFlags::SIGALRM;
             // Reload interval or disarm
             if inner.itimer_real_interval_ms > 0 {
@@ -113,7 +118,7 @@ fn check_itimers(current_ms: usize) {
             } else {
                 inner.itimer_real_expire_ms = 0;
             }
-            
+
             // Wake up any blocked tasks in this process so they can handle the signal
             for task in process.tasks_snapshot() {
                 let mut task_inner = task.inner_exclusive_access();

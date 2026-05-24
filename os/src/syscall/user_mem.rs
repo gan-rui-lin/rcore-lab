@@ -4,8 +4,7 @@ use alloc::vec::Vec;
 use super::errno::{errno, EFAULT};
 use crate::config::{MEMORY_END, PAGE_SIZE};
 use crate::mm::{
-    translated_byte_buffer, translated_byte_buffer_checked, PageTable, PhysAddr, PTEFlags,
-    VirtAddr,
+    translated_byte_buffer, translated_byte_buffer_checked, PTEFlags, PageTable, PhysAddr, VirtAddr,
 };
 use crate::task::current_process;
 
@@ -182,10 +181,7 @@ pub fn write_value_to_user<T: Copy>(
         return Err(errno(EFAULT));
     }
     let data = unsafe {
-        core::slice::from_raw_parts(
-            (&value as *const T) as *const u8,
-            core::mem::size_of::<T>(),
-        )
+        core::slice::from_raw_parts((&value as *const T) as *const u8, core::mem::size_of::<T>())
     };
     copy_to_user_inline(token, dst as *mut u8, data, policy)
 }
@@ -376,10 +372,7 @@ fn user_write_range_mapped(token: usize, ptr: *const u8, len: usize, writable: b
     true
 }
 
-fn run_write_callback<F>(
-    slices: Vec<&'static mut [u8]>,
-    f: &mut F,
-) -> Result<usize, isize>
+fn run_write_callback<F>(slices: Vec<&'static mut [u8]>, f: &mut F) -> Result<usize, isize>
 where
     F: FnMut(&mut [u8]) -> Result<usize, isize>,
 {

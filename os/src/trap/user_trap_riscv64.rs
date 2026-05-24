@@ -11,7 +11,11 @@ fn riscv_insn_len_at(user_token: usize, sepc: usize) -> usize {
         _ => return 2,
     };
     let insn16 = u16::from_le_bytes([b0, b1]);
-    if (insn16 & 0b11) == 0b11 { 4 } else { 2 }
+    if (insn16 & 0b11) == 0b11 {
+        4
+    } else {
+        2
+    }
 }
 
 pub(super) fn handle_user_supervisor_external() {
@@ -141,5 +145,8 @@ pub(super) fn handle_user_breakpoint() {
 
 pub(super) fn handle_user_unknown_trap(trap_type: arch::TrapType) {
     let trap_cx = current_trap_cx();
-    warn!("[kernel] trap_handler: unsupported trap {:?} sepc={:#x}", trap_type, trap_cx.sepc);
+    warn!(
+        "[kernel] trap_handler: unsupported trap {:?} sepc={:#x}",
+        trap_type, trap_cx.sepc
+    );
 }

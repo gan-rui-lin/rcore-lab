@@ -226,7 +226,6 @@ impl ProcessControlBlockInner {
         self.pending_signal_sender_pid[idx] = 0;
         self.pending_signal_si_code[idx] = 0;
     }
-
 }
 
 impl ProcessFs {

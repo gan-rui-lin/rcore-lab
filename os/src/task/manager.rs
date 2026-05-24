@@ -217,8 +217,12 @@ pub fn print_pid2process_top_by_fd(limit: usize) {
         let Some(inner) = process.try_inner_exclusive_access() else {
             continue;
         };
-        let (fd_slots, fd_used) =
-            process.with_fs(|fs| (fs.fd_table.len(), fs.fd_table.iter().filter(|fd| fd.is_some()).count()));
+        let (fd_slots, fd_used) = process.with_fs(|fs| {
+            (
+                fs.fd_table.len(),
+                fs.fd_table.iter().filter(|fd| fd.is_some()).count(),
+            )
+        });
         let tasks_alive = process.thread_count();
         let children = inner.children.len();
         let is_zombie = inner.is_zombie;

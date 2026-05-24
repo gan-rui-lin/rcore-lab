@@ -206,7 +206,9 @@ impl VfsInode for ProcPidDirInode {
             // /proc/self/mounts, /proc/self/mountinfo, /proc/self/mountstats
             "mounts" => Some(ProcFileInode::new(proc_mounts)),
             "mountinfo" => Some(ProcFileInode::new(proc_mountinfo)),
-            "mountstats" => Some(ProcFileInode::new(|| String::from("device rootfs mounted on / with fstype rootfs\n"))),
+            "mountstats" => Some(ProcFileInode::new(|| {
+                String::from("device rootfs mounted on / with fstype rootfs\n")
+            })),
             // /proc/self/cgroup - needed by cgroup tests
             "cgroup" => Some(ProcFileInode::new(|| String::from("0::/\n"))),
             // /proc/self/status - needed by various tests
@@ -271,11 +273,7 @@ impl VfsInode for ProcPidTaskDirInode {
         let tid = name.parse::<usize>().ok()?;
         let process = pid2process(self.pid)?;
         let task_idx = process.with_threads(|threads| {
-            threads
-            .tasks
-            .iter()
-            .enumerate()
-            .find_map(|(idx, t)| {
+            threads.tasks.iter().enumerate().find_map(|(idx, t)| {
                 if t.is_some() && ((if idx == 0 { self.pid } else { self.pid + idx }) == tid) {
                     Some(idx)
                 } else {
@@ -298,18 +296,18 @@ impl VfsInode for ProcPidTaskDirInode {
         };
         let mut out: Vec<String> = process.with_threads(|threads| {
             threads
-            .tasks
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, t)| {
-                if t.is_some() {
-                    Some(if idx == 0 { self.pid } else { self.pid + idx })
-                } else {
-                    None
-                }
-            })
-            .map(|tid| format!("{}", tid))
-            .collect()
+                .tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, t)| {
+                    if t.is_some() {
+                        Some(if idx == 0 { self.pid } else { self.pid + idx })
+                    } else {
+                        None
+                    }
+                })
+                .map(|tid| format!("{}", tid))
+                .collect()
         });
         out.sort();
         out
@@ -383,17 +381,17 @@ impl ProcPidTaskStatInode {
                     .and_then(|task| task.as_ref().cloned())
             }) {
                 if let Some(task_inner) = task.try_inner_exclusive_access() {
-                state = match task_inner.task_status {
-                    TaskStatus::Blocked => 'S',
-                    TaskStatus::Running => 'R',
-                    TaskStatus::Ready => {
-                        if task_inner.last_syscall == SYSCALL_WAITPID {
-                            'S'
-                        } else {
-                            'R'
+                    state = match task_inner.task_status {
+                        TaskStatus::Blocked => 'S',
+                        TaskStatus::Running => 'R',
+                        TaskStatus::Ready => {
+                            if task_inner.last_syscall == SYSCALL_WAITPID {
+                                'S'
+                            } else {
+                                'R'
+                            }
                         }
-                    }
-                };
+                    };
                 }
             }
         }
@@ -927,7 +925,10 @@ fn proc_sysvipc() -> Arc<dyn VfsInode> {
 pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
     let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
     entries.insert(String::from("mounts"), ProcFileInode::new(proc_mounts));
-    entries.insert(String::from("mountinfo"), ProcFileInode::new(proc_mountinfo));
+    entries.insert(
+        String::from("mountinfo"),
+        ProcFileInode::new(proc_mountinfo),
+    );
     entries.insert(String::from("meminfo"), ProcFileInode::new(proc_meminfo));
     entries.insert(String::from("stat"), ProcFileInode::new(proc_stat));
     entries.insert(String::from("uptime"), ProcFileInode::new(proc_uptime));
@@ -940,9 +941,7 @@ pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
     // /proc/cgroups - needed by cgroup tests (empty = no cgroup controllers)
     entries.insert(
         String::from("cgroups"),
-        ProcFileInode::new(|| {
-            String::from("#subsys_name\thierarchy\tnum_cgroups\tenabled\n")
-        }),
+        ProcFileInode::new(|| String::from("#subsys_name\thierarchy\tnum_cgroups\tenabled\n")),
     );
     // /proc/filesystems - needed by various tests
     entries.insert(

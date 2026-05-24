@@ -690,7 +690,7 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
         }
         Err(err) => return err,
     };
-    // let name = process.inner_exclusive_access().name.clone();
+    // let name = process.name();
     // if (name == "busybox" || name == "sh") && fd <= 2 && len > 0 {
     //     if written == 0 {
     //         trace!("[sys_write] pid={} name={} fd={} len={} -> 0", pid, name, fd, len);
@@ -809,7 +809,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
             pid, raw_path, full_path, flags
         );
     }
-    // let proc_name = process.inner_exclusive_access().name.clone();
+    // let proc_name = process.name();
     // if (proc_name == "busybox" || proc_name == "sh")
     //     && (raw_path.starts_with("./") || raw_path.contains("/basic/"))
     // {
@@ -1790,7 +1790,8 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, flags: u32) -> isize {
     let Some(file) = process.get_file(oldfd) else {
         return errno(EBADF);
     };
-    let limit = process.inner_exclusive_access().rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize;
+    let limit =
+        process.inner_exclusive_access().rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize;
     if newfd >= limit {
         return errno(EBADF);
     }
@@ -2221,7 +2222,7 @@ pub fn sys_chdir(_path: *const u8) -> isize {
         return errno(ENAMETOOLONG);
     }
     let process = current_process();
-    // let proc_name = process.inner_exclusive_access().name.clone();
+    // let proc_name = process.name();
     let base = if raw.starts_with('/') {
         String::from("/")
     } else {
@@ -2325,13 +2326,14 @@ pub fn sys_chroot(path: *const u8) -> isize {
     process.with_fs_mut(|fs| {
         fs.root_dir = full_path.clone();
         if !(fs.cwd == full_path
-        || fs
-            .cwd
-            .strip_prefix(&full_path)
-            .is_some_and(|rest| rest.starts_with('/')))
-    {
-        fs.cwd = full_path;
-    }});
+            || fs
+                .cwd
+                .strip_prefix(&full_path)
+                .is_some_and(|rest| rest.starts_with('/')))
+        {
+            fs.cwd = full_path;
+        }
+    });
     0
 }
 
@@ -2854,7 +2856,7 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
         total_written += written as isize;
     }
 
-    // let name = current_process().inner_exclusive_access().name.clone();
+    // let name = current_process().name();
     // if (name == "busybox" || name == "sh") && fd <= 2 && iovcnt > 0 {
     //     if total_written == 0 {
     //         trace!("[sys_writev] pid={} name={} fd={} iovcnt={} -> 0", pid, name, fd, iovcnt);
@@ -2935,7 +2937,8 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             // Duplicate fd to the lowest numbered available fd >= arg
-            let limit = process.inner_exclusive_access().rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize;
+            let limit = process.inner_exclusive_access().rlimits[crate::task::RLIMIT_NOFILE]
+                .rlim_cur as usize;
             if arg >= limit {
                 return errno(EINVAL);
             }

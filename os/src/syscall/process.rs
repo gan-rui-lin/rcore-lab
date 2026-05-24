@@ -9,6 +9,8 @@ use alloc::vec::Vec;
 use bitflags::bitflags;
 use lazy_static::lazy_static;
 
+#[cfg(not(target_arch = "loongarch64"))]
+use crate::task::SA_RESTORER;
 use crate::{
     fs::{open_file, path_exists, path_is_dir, File, OpenFlags},
     mm::{
@@ -20,15 +22,12 @@ use crate::{
         exit_current_and_run_next, flags_to_user_mask, futex_remove_waiter,
         futex_remove_waiter_any, futex_requeue, futex_wait, futex_wait_bitset, futex_wake,
         futex_wake_bitset, pid2process, pid2process_snapshot, remove_from_pid2process,
-        suspend_current_and_run_next,
-        user_mask_to_flags, ChildWaitEvent, FutexKey, IntervalTimerState, RLimit, SignalAction,
-        SignalFlags, TaskControlBlock, TaskStatus, UserContext, MAX_SIG, RLIMIT_NLIMITS, SIGCHLD,
-        SIGCONT, SIGKILL, SIGSEGV, SIGSTOP,
+        suspend_current_and_run_next, user_mask_to_flags, ChildWaitEvent, FutexKey,
+        IntervalTimerState, RLimit, SignalAction, SignalFlags, TaskControlBlock, TaskStatus,
+        UserContext, MAX_SIG, RLIMIT_NLIMITS, SIGCHLD, SIGCONT, SIGKILL, SIGSEGV, SIGSTOP,
     },
     timer::{add_timer, get_time, get_time_ms, get_time_us, remove_timer},
 };
-#[cfg(not(target_arch = "loongarch64"))]
-use crate::task::SA_RESTORER;
 
 use arch::TrapFrameArgs;
 
@@ -41,10 +40,8 @@ use crate::sync::UPIntrFreeCell;
 lazy_static! {
     static ref EXEC_IMAGE_CACHE: UPIntrFreeCell<BTreeMap<String, Arc<[u8]>>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
-    static ref UMASK_STATE: UPIntrFreeCell<usize> =
-        unsafe { UPIntrFreeCell::new(0o022) };
-    static ref REALTIME_OFFSET_US: UPIntrFreeCell<i64> =
-        unsafe { UPIntrFreeCell::new(0) };
+    static ref UMASK_STATE: UPIntrFreeCell<usize> = unsafe { UPIntrFreeCell::new(0o022) };
+    static ref REALTIME_OFFSET_US: UPIntrFreeCell<i64> = unsafe { UPIntrFreeCell::new(0) };
     static ref UTS_STATE: UPIntrFreeCell<(String, String)> =
         unsafe { UPIntrFreeCell::new((String::from("rcore"), String::from("ruos"))) };
     static ref SCHED_POLICIES: UPIntrFreeCell<BTreeMap<usize, i32>> =
@@ -677,7 +674,11 @@ pub fn sys_setsid() -> isize {
 
 pub fn sys_setpgid(pid: isize, pgid: isize) -> isize {
     let process = current_process();
-    let target_pid = if pid == 0 { process.pid.0 } else { pid as usize };
+    let target_pid = if pid == 0 {
+        process.pid.0
+    } else {
+        pid as usize
+    };
     let target_pgid = if pgid == 0 { target_pid } else { pgid as usize };
     if target_pid == process.pid.0 {
         process.set_pgid(target_pgid);
@@ -695,9 +696,7 @@ pub fn sys_getpgid(pid: isize) -> isize {
     } else {
         // Look up target process; return ESRCH if it doesn't exist.
         match pid2process(pid as usize) {
-            Some(target) => {
-                target.pgid() as isize
-            }
+            Some(target) => target.pgid() as isize,
             None => errno(ESRCH),
         }
     }
@@ -712,9 +711,7 @@ pub fn sys_getsid(pid: isize) -> isize {
     } else {
         // Look up target process; return ESRCH if it doesn't exist.
         match pid2process(pid as usize) {
-            Some(target) => {
-                target.session_id() as isize
-            }
+            Some(target) => target.session_id() as isize,
             None => errno(ESRCH),
         }
     }
@@ -769,7 +766,9 @@ pub fn sys_clone3(args_ptr: *const u8, size: usize) -> isize {
     }
 
     let exit_signal = args.exit_signal as i32;
-    if args.exit_signal > 0xff || (exit_signal != 0 && (exit_signal <= 0 || exit_signal > MAX_SIG as i32)) {
+    if args.exit_signal > 0xff
+        || (exit_signal != 0 && (exit_signal <= 0 || exit_signal > MAX_SIG as i32))
+    {
         return errno(EINVAL);
     }
 
@@ -824,20 +823,19 @@ pub fn sys_clone(
     let parent_cx = *current_trap_cx();
 
     if !clone_flags.contains(CloneFlags::THREAD) {
-        let has_extended_clone_semantics =
-            clone_flags.intersects(
-                CloneFlags::PARENT
-                    | CloneFlags::VFORK
-                    | CloneFlags::PARENT_SETTID
-                    | CloneFlags::CHILD_CLEARTID
-                    | CloneFlags::CHILD_SETTID
-                    | CloneFlags::SETTLS
-                    | CloneFlags::VM
-                    | CloneFlags::FS
-                    | CloneFlags::FILES
-                    | CloneFlags::SIGHAND
-                    | CloneFlags::SYSVSEM,
-            ) || !stack.is_null();
+        let has_extended_clone_semantics = clone_flags.intersects(
+            CloneFlags::PARENT
+                | CloneFlags::VFORK
+                | CloneFlags::PARENT_SETTID
+                | CloneFlags::CHILD_CLEARTID
+                | CloneFlags::CHILD_SETTID
+                | CloneFlags::SETTLS
+                | CloneFlags::VM
+                | CloneFlags::FS
+                | CloneFlags::FILES
+                | CloneFlags::SIGHAND
+                | CloneFlags::SYSVSEM,
+        ) || !stack.is_null();
         if !has_extended_clone_semantics {
             return sys_fork();
         }
@@ -1111,8 +1109,7 @@ fn read_exec_image(path: &str, file: &Arc<dyn File>) -> Arc<[u8]> {
         if file_size >= 8 * 1024 * 1024 {
             info!(
                 "[exec-image] large file path={} size={} bytes",
-                path,
-                file_size
+                path, file_size
             );
         }
     }
@@ -1614,8 +1611,10 @@ fn write_waitid_siginfo(info_ptr: *mut u8, info: LinuxSigInfo) -> Result<(), isi
 }
 
 fn waitid_options_valid(options: i32) -> bool {
-    let known = WAITID_WNOHANG | WAITID_WSTOPPED | WAITID_WEXITED | WAITID_WCONTINUED | WAITID_WNOWAIT;
-    (options & !known) == 0 && (options & (WAITID_WSTOPPED | WAITID_WEXITED | WAITID_WCONTINUED)) != 0
+    let known =
+        WAITID_WNOHANG | WAITID_WSTOPPED | WAITID_WEXITED | WAITID_WCONTINUED | WAITID_WNOWAIT;
+    (options & !known) == 0
+        && (options & (WAITID_WSTOPPED | WAITID_WEXITED | WAITID_WCONTINUED)) != 0
 }
 
 fn exit_code_to_waitid(exit_code: i32) -> (i32, i32) {
@@ -1635,7 +1634,8 @@ pub(crate) fn has_unmasked_user_signal_without_restart() -> bool {
     let process_inner = process.inner_exclusive_access();
     let task = current_task().unwrap();
     let task_inner = task.inner_exclusive_access();
-    let unmasked = (process_inner.signal_pending | task_inner.signal_pending) & !task_inner.signal_mask;
+    let unmasked =
+        (process_inner.signal_pending | task_inner.signal_pending) & !task_inner.signal_mask;
     if unmasked.is_empty() {
         return false;
     }
@@ -1692,7 +1692,11 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
     let nohang = (options & WAITID_WNOHANG) != 0;
     let nowait = (options & WAITID_WNOWAIT) != 0;
     let caller_pgid = current_process().pgid();
-    let target_pgid = if idtype == P_PGID && id == 0 { caller_pgid } else { id };
+    let target_pgid = if idtype == P_PGID && id == 0 {
+        caller_pgid
+    } else {
+        id
+    };
 
     loop {
         let process = current_process();
@@ -1716,11 +1720,8 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
             if let Some(event) = child_inner.child_wait_event {
                 match event {
                     ChildWaitEvent::Stopped(sig) if want_stopped => {
-                        let info = LinuxSigInfo::for_sigchld(
-                            child_pid as i32,
-                            sig,
-                            WAITID_CLD_STOPPED,
-                        );
+                        let info =
+                            LinuxSigInfo::for_sigchld(child_pid as i32, sig, WAITID_CLD_STOPPED);
                         if !nowait {
                             child_inner.child_wait_event = None;
                         }
@@ -1732,11 +1733,8 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
                         return 0;
                     }
                     ChildWaitEvent::Continued(sig) if want_continued => {
-                        let info = LinuxSigInfo::for_sigchld(
-                            child_pid as i32,
-                            sig,
-                            WAITID_CLD_CONTINUED,
-                        );
+                        let info =
+                            LinuxSigInfo::for_sigchld(child_pid as i32, sig, WAITID_CLD_CONTINUED);
                         if !nowait {
                             child_inner.child_wait_event = None;
                         }
@@ -1826,31 +1824,31 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
     const SIG_DFL: usize = 0;
     #[allow(dead_code)]
     const SIG_IGN: usize = 1;
-    
+
     // Helper: check if child matches the pid criteria
     let matches_pid = |child_pid: usize, child_pgid: usize| -> bool {
         match pid {
-            -1 => true,  // Any child
-            0 => child_pgid == my_pgid,  // Same process group
-            p if p > 0 => child_pid == p as usize,  // Specific PID
-            p => child_pgid == (-p) as usize,  // Specific process group (pid < -1)
+            -1 => true,                            // Any child
+            0 => child_pgid == my_pgid,            // Same process group
+            p if p > 0 => child_pid == p as usize, // Specific PID
+            p => child_pgid == (-p) as usize,      // Specific process group (pid < -1)
         }
     };
-    
+
     loop {
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-        
+
         // Check if any child matches the criteria
         let has_matching_child = inner
             .children
             .iter()
             .any(|p| matches_pid(p.getpid(), p.pgid()));
-        
+
         if !has_matching_child {
             return errno(ECHILD);
         }
-        
+
         // First, check for ptrace-stopped children (higher priority than zombies)
         let ptrace_pair = inner.children.iter().enumerate().find(|(_, p)| {
             let child_inner = p.inner_exclusive_access();
@@ -1860,7 +1858,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
             let child = &inner.children[idx];
             let found_pid = child.getpid();
             let mut child_inner = child.inner_exclusive_access();
-            
+
             if let Some(signum) = child_inner.ptrace_stop_signal.take() {
                 if !exit_code_ptr.is_null() {
                     // WIFSTOPPED encoding: (signal << 8) | 0x7f
@@ -1869,7 +1867,9 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
                 }
                 trace!(
                     "[sys_waitpid] pid={} reports ptrace-stop of child pid={} signal={}",
-                    my_pid, found_pid, signum
+                    my_pid,
+                    found_pid,
+                    signum
                 );
                 return found_pid as isize;
             }
@@ -1914,7 +1914,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
                 return found_pid as isize;
             }
         }
-        
+
         // Then check for zombie children
         let pair = inner.children.iter().enumerate().find(|(_, p)| {
             let child_inner = p.inner_exclusive_access();
@@ -1931,7 +1931,9 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
             }
             trace!(
                 "[sys_waitpid] pid={} reaped child pid={} exit_code={}",
-                my_pid, found_pid, exit_code
+                my_pid,
+                found_pid,
+                exit_code
             );
             return found_pid as isize;
         }
@@ -2199,7 +2201,11 @@ pub fn sys_getitimer(which: isize, curr_value: *mut ITimerVal) -> isize {
                 0usize
             } else {
                 let now_ms = get_time_ms();
-                if expire_ms > now_ms { (expire_ms - now_ms) * 1000 } else { 0 }
+                if expire_ms > now_ms {
+                    (expire_ms - now_ms) * 1000
+                } else {
+                    0
+                }
             };
             ITimerVal {
                 it_interval: us_to_timeval(inner.itimer_real_interval_ms * 1000),
@@ -2250,7 +2256,11 @@ pub fn sys_setitimer(
                 0usize
             } else {
                 let now_ms = get_time_ms();
-                if expire_ms > now_ms { (expire_ms - now_ms) * 1000 } else { 0 }
+                if expire_ms > now_ms {
+                    (expire_ms - now_ms) * 1000
+                } else {
+                    0
+                }
             };
             // Keep user-visible interval precision from the canonical itimer state,
             // instead of the millisecond scheduling cache field.
@@ -2497,11 +2507,17 @@ fn user_page_resident_bitmap(start: usize, pages: usize) -> Vec<u8> {
     let mut out = Vec::new();
     for i in 0..pages {
         let va = start.saturating_add(i * PAGE_SIZE);
-        out.push(if inner.memory_set.translate(VirtAddr::from(va).floor()).is_some() {
-            1
-        } else {
-            0
-        });
+        out.push(
+            if inner
+                .memory_set
+                .translate(VirtAddr::from(va).floor())
+                .is_some()
+            {
+                1
+            } else {
+                0
+            },
+        );
     }
     out
 }
@@ -2534,12 +2550,13 @@ pub fn sys_mlock(addr: usize, len: usize) -> isize {
         len,
         UserReadPolicy::DemandPaged,
     );
-    let writable = readable || user_mem::ensure_user_writable(
-        current_user_token(),
-        addr as *const u8,
-        len,
-        UserWritePolicy::DemandCowWithForkFallback,
-    );
+    let writable = readable
+        || user_mem::ensure_user_writable(
+            current_user_token(),
+            addr as *const u8,
+            len,
+            UserWritePolicy::DemandCowWithForkFallback,
+        );
     if !writable {
         return errno(ENOMEM);
     }
@@ -2687,15 +2704,12 @@ pub fn sys_msync(start: usize, len: usize, _flags: usize) -> isize {
     let ms_writeback = (_flags & (MS_SYNC | MS_ASYNC)) != 0;
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    match inner
-        .memory_set
-        .msync_file_range(
-            VirtAddr::from(start),
-            VirtAddr::from(end),
-            ms_invalidate,
-            ms_writeback,
-        )
-    {
+    match inner.memory_set.msync_file_range(
+        VirtAddr::from(start),
+        VirtAddr::from(end),
+        ms_invalidate,
+        ms_writeback,
+    ) {
         Ok(_) => 0,
         Err(crate::mm::MsyncError::Busy) => errno(EBUSY),
         Err(crate::mm::MsyncError::Unmapped) => errno(ENOMEM),
@@ -2954,7 +2968,9 @@ pub fn sys_mmap(
     if overlap > 0 {
         if is_fixed {
             // MAP_FIXED: unmap overlapping pages in the target range.
-            inner.memory_set.unmap_range(VirtAddr(start), VirtAddr(start + len));
+            inner
+                .memory_set
+                .unmap_range(VirtAddr(start), VirtAddr(start + len));
         } else {
             // Non-MAP_FIXED mappings must not overlap existing VMAs.
             return errno(ENOMEM);
@@ -3214,9 +3230,8 @@ fn clamp_nice(prio: isize) -> i32 {
 
 fn collect_priority_target_pids(which: isize, who: isize) -> Result<Vec<usize>, isize> {
     let current = current_process();
-    let (self_pid, self_pgid, self_euid) = {
-        (current.getpid(), current.pgid(), current.effective_uid())
-    };
+    let (self_pid, self_pgid, self_euid) =
+        { (current.getpid(), current.pgid(), current.effective_uid()) };
     match which {
         PRIO_PROCESS => {
             if who < 0 {
@@ -3282,9 +3297,8 @@ pub fn sys_set_priority(which: isize, who: isize, prio: isize) -> isize {
         let Some(target) = pid2process(pid) else {
             continue;
         };
-        let target_identity = target.with_identity(|identity| {
-            (identity.effective_uid, identity.nice)
-        });
+        let target_identity =
+            target.with_identity(|identity| (identity.effective_uid, identity.nice));
         if !is_privileged {
             // Unprivileged caller can only modify its own processes.
             if target_identity.0 != caller_euid {
@@ -3418,7 +3432,7 @@ pub fn sys_kill(pid: isize, signum: i32) -> isize {
     if pid > 0 {
         kill_single(pid as usize, signum, flag, pid_now)
     } else if pid == 0 {
-    let caller_pgid = current_process().pgid();
+        let caller_pgid = current_process().pgid();
         kill_group(Some(caller_pgid), signum, flag, pid_now)
     } else if pid == -1 {
         kill_group(None, signum, flag, pid_now)
@@ -3428,12 +3442,7 @@ pub fn sys_kill(pid: isize, signum: i32) -> isize {
     }
 }
 
-fn kill_single(
-    pid: usize,
-    signum: i32,
-    flag: Option<SignalFlags>,
-    sender_pid: usize,
-) -> isize {
+fn kill_single(pid: usize, signum: i32, flag: Option<SignalFlags>, sender_pid: usize) -> isize {
     let process = match pid2process(pid) {
         Some(p) => p,
         None => return errno(ESRCH),
@@ -3472,16 +3481,24 @@ fn kill_group(
 ) -> isize {
     let mut found = false;
     for (p, process) in pid2process_snapshot() {
-        if p == 1 { continue; }
-        if target_pgid.is_none() && p == sender_pid { continue; }
+        if p == 1 {
+            continue;
+        }
+        if target_pgid.is_none() && p == sender_pid {
+            continue;
+        }
         let matches = if let Some(pgid) = target_pgid {
             process.pgid() == pgid
         } else {
             true
         };
-        if !matches { continue; }
+        if !matches {
+            continue;
+        }
         found = true;
-        if signum == 0 { continue; }
+        if signum == 0 {
+            continue;
+        }
         let flag = flag.unwrap();
         let mut inner = process.inner_exclusive_access();
         if flag == SignalFlags::SIGCONT && inner.group_stopped {
@@ -3494,7 +3511,11 @@ fn kill_group(
             wake_task_for_signal(&task, flag);
         }
     }
-    if found { 0 } else { errno(ESRCH) }
+    if found {
+        0
+    } else {
+        errno(ESRCH)
+    }
 }
 
 fn signal_flag_from_signum(signum: i32) -> Result<SignalFlags, isize> {
@@ -3965,23 +3986,23 @@ pub fn sys_getegid() -> isize {
 pub fn sys_setfsuid(uid: u32) -> isize {
     let process = current_process();
     process.with_identity_mut(|inner| {
-    let prev = inner.fs_uid;
-    let neg1 = u32::MAX;
+        let prev = inner.fs_uid;
+        let neg1 = u32::MAX;
 
-    if uid == neg1 {
-        return prev as isize;
-    }
+        if uid == neg1 {
+            return prev as isize;
+        }
 
-    let is_privileged = inner.effective_uid == 0;
-    if is_privileged
-        || uid == inner.real_uid
-        || uid == inner.effective_uid
-        || uid == inner.saved_uid
-        || uid == inner.fs_uid
-    {
-        inner.fs_uid = uid;
-    }
-    prev as isize
+        let is_privileged = inner.effective_uid == 0;
+        if is_privileged
+            || uid == inner.real_uid
+            || uid == inner.effective_uid
+            || uid == inner.saved_uid
+            || uid == inner.fs_uid
+        {
+            inner.fs_uid = uid;
+        }
+        prev as isize
     })
 }
 
@@ -3990,23 +4011,23 @@ pub fn sys_setfsuid(uid: u32) -> isize {
 pub fn sys_setfsgid(gid: u32) -> isize {
     let process = current_process();
     process.with_identity_mut(|inner| {
-    let prev = inner.fs_gid;
-    let neg1 = u32::MAX;
+        let prev = inner.fs_gid;
+        let neg1 = u32::MAX;
 
-    if gid == neg1 {
-        return prev as isize;
-    }
+        if gid == neg1 {
+            return prev as isize;
+        }
 
-    let is_privileged = inner.effective_uid == 0;
-    if is_privileged
-        || gid == inner.real_gid
-        || gid == inner.effective_gid
-        || gid == inner.saved_gid
-        || gid == inner.fs_gid
-    {
-        inner.fs_gid = gid;
-    }
-    prev as isize
+        let is_privileged = inner.effective_uid == 0;
+        if is_privileged
+            || gid == inner.real_gid
+            || gid == inner.effective_gid
+            || gid == inner.saved_gid
+            || gid == inner.fs_gid
+        {
+            inner.fs_gid = gid;
+        }
+        prev as isize
     })
 }
 
@@ -4018,18 +4039,18 @@ pub fn sys_setuid(uid: u32) -> isize {
         syscall!("kernel:pid[{}] sys_setuid uid={}", pid, uid);
     }
     process.with_identity_mut(|inner| {
-    if inner.effective_uid == 0 {
-        inner.real_uid = uid;
-        inner.effective_uid = uid;
-        inner.fs_uid = uid;
-        return 0;
-    }
-    if uid == inner.real_uid || uid == inner.effective_uid {
-        inner.effective_uid = uid;
-        inner.fs_uid = uid;
-        return 0;
-    }
-    errno(EPERM)
+        if inner.effective_uid == 0 {
+            inner.real_uid = uid;
+            inner.effective_uid = uid;
+            inner.fs_uid = uid;
+            return 0;
+        }
+        if uid == inner.real_uid || uid == inner.effective_uid {
+            inner.effective_uid = uid;
+            inner.fs_uid = uid;
+            return 0;
+        }
+        errno(EPERM)
     })
 }
 
@@ -4041,21 +4062,20 @@ pub fn sys_setgid(gid: u32) -> isize {
         syscall!("kernel:pid[{}] sys_setgid gid={}", pid, gid);
     }
     process.with_identity_mut(|inner| {
-    if inner.effective_gid == 0 {
-        inner.real_gid = gid;
-        inner.effective_gid = gid;
-        inner.fs_gid = gid;
-        return 0;
-    }
-    if gid == inner.real_gid || gid == inner.effective_gid {
-        inner.effective_gid = gid;
-        inner.fs_gid = gid;
-        return 0;
-    }
-    errno(EPERM)
+        if inner.effective_gid == 0 {
+            inner.real_gid = gid;
+            inner.effective_gid = gid;
+            inner.fs_gid = gid;
+            return 0;
+        }
+        if gid == inner.real_gid || gid == inner.effective_gid {
+            inner.effective_gid = gid;
+            inner.fs_gid = gid;
+            return 0;
+        }
+        errno(EPERM)
     })
 }
-
 
 /// getgroups(size, list) - syscall 158
 /// Returns the supplementary group IDs of the calling process.
@@ -4063,7 +4083,12 @@ pub fn sys_setgid(gid: u32) -> isize {
 pub fn sys_getgroups(size: i32, list: *mut u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_getgroups size={} list={:p}", pid, size, list);
+        syscall!(
+            "kernel:pid[{}] sys_getgroups size={} list={:p}",
+            pid,
+            size,
+            list
+        );
     }
     // size < 0 is invalid
     if size < 0 {
@@ -4097,7 +4122,12 @@ pub fn sys_getgroups(size: i32, list: *mut u32) -> isize {
 pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_setgroups size={} list={:p}", pid, size, list);
+        syscall!(
+            "kernel:pid[{}] sys_setgroups size={} list={:p}",
+            pid,
+            size,
+            list
+        );
     }
     const NGROUPS_MAX: usize = 65536;
     if size > NGROUPS_MAX {
@@ -4117,35 +4147,43 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
 pub fn sys_setregid(rgid: u32, egid: u32) -> isize {
     let process = current_process();
     process.with_identity_mut(|inner| {
-    let is_root = inner.effective_gid == 0;
-    let neg1 = u32::MAX;
+        let is_root = inner.effective_gid == 0;
+        let neg1 = u32::MAX;
 
-    if !is_root {
-        // unprivileged: can only set to one of real/effective/saved
-        if rgid != neg1 && rgid != inner.real_gid && rgid != inner.effective_gid {
-            return errno(EPERM);
+        if !is_root {
+            // unprivileged: can only set to one of real/effective/saved
+            if rgid != neg1 && rgid != inner.real_gid && rgid != inner.effective_gid {
+                return errno(EPERM);
+            }
+            if egid != neg1
+                && egid != inner.real_gid
+                && egid != inner.effective_gid
+                && egid != inner.saved_gid
+            {
+                return errno(EPERM);
+            }
         }
-        if egid != neg1 && egid != inner.real_gid && egid != inner.effective_gid && egid != inner.saved_gid {
-            return errno(EPERM);
-        }
-    }
 
-    let old_real_gid = inner.real_gid;
-    if rgid != neg1 {
-        inner.real_gid = rgid;
-    }
-    let new_egid = if egid != neg1 { egid } else { inner.effective_gid };
-    if egid != neg1 {
-        inner.effective_gid = new_egid;
-        inner.fs_gid = new_egid;
-    }
-    // Linux setregid: saved_gid is set to new effective GID if:
-    //   1. real GID was changed, OR
-    //   2. new effective GID != old real GID
-    if rgid != neg1 || new_egid != old_real_gid {
-        inner.saved_gid = new_egid;
-    }
-    0
+        let old_real_gid = inner.real_gid;
+        if rgid != neg1 {
+            inner.real_gid = rgid;
+        }
+        let new_egid = if egid != neg1 {
+            egid
+        } else {
+            inner.effective_gid
+        };
+        if egid != neg1 {
+            inner.effective_gid = new_egid;
+            inner.fs_gid = new_egid;
+        }
+        // Linux setregid: saved_gid is set to new effective GID if:
+        //   1. real GID was changed, OR
+        //   2. new effective GID != old real GID
+        if rgid != neg1 || new_egid != old_real_gid {
+            inner.saved_gid = new_egid;
+        }
+        0
     })
 }
 
@@ -4153,34 +4191,42 @@ pub fn sys_setregid(rgid: u32, egid: u32) -> isize {
 pub fn sys_setreuid(ruid: u32, euid: u32) -> isize {
     let process = current_process();
     process.with_identity_mut(|inner| {
-    let is_root = inner.effective_uid == 0;
-    let neg1 = u32::MAX;
+        let is_root = inner.effective_uid == 0;
+        let neg1 = u32::MAX;
 
-    if !is_root {
-        if ruid != neg1 && ruid != inner.real_uid && ruid != inner.effective_uid {
-            return errno(EPERM);
+        if !is_root {
+            if ruid != neg1 && ruid != inner.real_uid && ruid != inner.effective_uid {
+                return errno(EPERM);
+            }
+            if euid != neg1
+                && euid != inner.real_uid
+                && euid != inner.effective_uid
+                && euid != inner.saved_uid
+            {
+                return errno(EPERM);
+            }
         }
-        if euid != neg1 && euid != inner.real_uid && euid != inner.effective_uid && euid != inner.saved_uid {
-            return errno(EPERM);
-        }
-    }
 
-    let old_real_uid = inner.real_uid;
-    if ruid != neg1 {
-        inner.real_uid = ruid;
-    }
-    let new_euid = if euid != neg1 { euid } else { inner.effective_uid };
-    if euid != neg1 {
-        inner.effective_uid = new_euid;
-        inner.fs_uid = new_euid;
-    }
-    // Linux setreuid: saved_uid is set to new effective UID if:
-    //   1. real UID was changed, OR
-    //   2. new effective UID != old real UID
-    if ruid != neg1 || new_euid != old_real_uid {
-        inner.saved_uid = new_euid;
-    }
-    0
+        let old_real_uid = inner.real_uid;
+        if ruid != neg1 {
+            inner.real_uid = ruid;
+        }
+        let new_euid = if euid != neg1 {
+            euid
+        } else {
+            inner.effective_uid
+        };
+        if euid != neg1 {
+            inner.effective_uid = new_euid;
+            inner.fs_uid = new_euid;
+        }
+        // Linux setreuid: saved_uid is set to new effective UID if:
+        //   1. real UID was changed, OR
+        //   2. new effective UID != old real UID
+        if ruid != neg1 || new_euid != old_real_uid {
+            inner.saved_uid = new_euid;
+        }
+        0
     })
 }
 
@@ -4188,52 +4234,61 @@ pub fn sys_setreuid(ruid: u32, euid: u32) -> isize {
 pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> isize {
     let process = current_process();
     process.with_identity_mut(|inner| {
-    let is_root = inner.effective_uid == 0;
-    let neg1 = u32::MAX;
+        let is_root = inner.effective_uid == 0;
+        let neg1 = u32::MAX;
 
-    if !is_root {
-        // Non-root: can only set to one of current real/effective/saved
-        let allowed = [inner.real_uid, inner.effective_uid, inner.saved_uid];
-        if ruid != neg1 && !allowed.contains(&ruid) {
-            return errno(EPERM);
+        if !is_root {
+            // Non-root: can only set to one of current real/effective/saved
+            let allowed = [inner.real_uid, inner.effective_uid, inner.saved_uid];
+            if ruid != neg1 && !allowed.contains(&ruid) {
+                return errno(EPERM);
+            }
+            if euid != neg1 && !allowed.contains(&euid) {
+                return errno(EPERM);
+            }
+            if suid != neg1 && !allowed.contains(&suid) {
+                return errno(EPERM);
+            }
         }
-        if euid != neg1 && !allowed.contains(&euid) {
-            return errno(EPERM);
-        }
-        if suid != neg1 && !allowed.contains(&suid) {
-            return errno(EPERM);
-        }
-    }
 
-    if ruid != neg1 { inner.real_uid = ruid; }
-    if euid != neg1 {
-        inner.effective_uid = euid;
-        inner.fs_uid = euid;
-    }
-    if suid != neg1 { inner.saved_uid = suid; }
-    0
+        if ruid != neg1 {
+            inner.real_uid = ruid;
+        }
+        if euid != neg1 {
+            inner.effective_uid = euid;
+            inner.fs_uid = euid;
+        }
+        if suid != neg1 {
+            inner.saved_uid = suid;
+        }
+        0
     })
 }
 
 /// getresuid(ruid, euid, suid) - syscall 148
 pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
     let process = current_process();
-    let (r, e, s) = process.with_identity(|inner| {
-        (inner.real_uid, inner.effective_uid, inner.saved_uid)
-    });
+    let (r, e, s) =
+        process.with_identity(|inner| (inner.real_uid, inner.effective_uid, inner.saved_uid));
     drop(process);
     let token = current_user_token();
     let r_bytes = r.to_ne_bytes();
     let e_bytes = e.to_ne_bytes();
     let s_bytes = s.to_ne_bytes();
     if !ruid.is_null() {
-        if copy_to_user(token, ruid as *mut u8, &r_bytes).is_err() { return errno(EFAULT); }
+        if copy_to_user(token, ruid as *mut u8, &r_bytes).is_err() {
+            return errno(EFAULT);
+        }
     }
     if !euid.is_null() {
-        if copy_to_user(token, euid as *mut u8, &e_bytes).is_err() { return errno(EFAULT); }
+        if copy_to_user(token, euid as *mut u8, &e_bytes).is_err() {
+            return errno(EFAULT);
+        }
     }
     if !suid.is_null() {
-        if copy_to_user(token, suid as *mut u8, &s_bytes).is_err() { return errno(EFAULT); }
+        if copy_to_user(token, suid as *mut u8, &s_bytes).is_err() {
+            return errno(EFAULT);
+        }
     }
     0
 }
@@ -4242,51 +4297,60 @@ pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
 pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> isize {
     let process = current_process();
     process.with_identity_mut(|inner| {
-    let is_root = inner.effective_gid == 0;
-    let neg1 = u32::MAX;
+        let is_root = inner.effective_gid == 0;
+        let neg1 = u32::MAX;
 
-    if !is_root {
-        let allowed = [inner.real_gid, inner.effective_gid, inner.saved_gid];
-        if rgid != neg1 && !allowed.contains(&rgid) {
-            return errno(EPERM);
+        if !is_root {
+            let allowed = [inner.real_gid, inner.effective_gid, inner.saved_gid];
+            if rgid != neg1 && !allowed.contains(&rgid) {
+                return errno(EPERM);
+            }
+            if egid != neg1 && !allowed.contains(&egid) {
+                return errno(EPERM);
+            }
+            if sgid != neg1 && !allowed.contains(&sgid) {
+                return errno(EPERM);
+            }
         }
-        if egid != neg1 && !allowed.contains(&egid) {
-            return errno(EPERM);
-        }
-        if sgid != neg1 && !allowed.contains(&sgid) {
-            return errno(EPERM);
-        }
-    }
 
-    if rgid != neg1 { inner.real_gid = rgid; }
-    if egid != neg1 {
-        inner.effective_gid = egid;
-        inner.fs_gid = egid;
-    }
-    if sgid != neg1 { inner.saved_gid = sgid; }
-    0
+        if rgid != neg1 {
+            inner.real_gid = rgid;
+        }
+        if egid != neg1 {
+            inner.effective_gid = egid;
+            inner.fs_gid = egid;
+        }
+        if sgid != neg1 {
+            inner.saved_gid = sgid;
+        }
+        0
     })
 }
 
 /// getresgid(rgid, egid, sgid) - syscall 150
 pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> isize {
     let process = current_process();
-    let (r, e, s) = process.with_identity(|inner| {
-        (inner.real_gid, inner.effective_gid, inner.saved_gid)
-    });
+    let (r, e, s) =
+        process.with_identity(|inner| (inner.real_gid, inner.effective_gid, inner.saved_gid));
     drop(process);
     let token = current_user_token();
     let r_bytes = r.to_ne_bytes();
     let e_bytes = e.to_ne_bytes();
     let s_bytes = s.to_ne_bytes();
     if !rgid.is_null() {
-        if copy_to_user(token, rgid as *mut u8, &r_bytes).is_err() { return errno(EFAULT); }
+        if copy_to_user(token, rgid as *mut u8, &r_bytes).is_err() {
+            return errno(EFAULT);
+        }
     }
     if !egid.is_null() {
-        if copy_to_user(token, egid as *mut u8, &e_bytes).is_err() { return errno(EFAULT); }
+        if copy_to_user(token, egid as *mut u8, &e_bytes).is_err() {
+            return errno(EFAULT);
+        }
     }
     if !sgid.is_null() {
-        if copy_to_user(token, sgid as *mut u8, &s_bytes).is_err() { return errno(EFAULT); }
+        if copy_to_user(token, sgid as *mut u8, &s_bytes).is_err() {
+            return errno(EFAULT);
+        }
     }
     0
 }
@@ -4482,7 +4546,11 @@ pub fn sys_capget(header_ptr: *mut u8, data_ptr: *mut u8) -> isize {
     // If data_ptr is provided, fill capability data
     if !data_ptr.is_null() {
         // Determine data count (V2/V3 have 2 sets)
-        let data_count: usize = if hdr.version == _LINUX_CAPABILITY_VERSION_1 { 1 } else { 2 };
+        let data_count: usize = if hdr.version == _LINUX_CAPABILITY_VERSION_1 {
+            1
+        } else {
+            2
+        };
         let data_bytes_len = data_count * core::mem::size_of::<CapData>();
         if !user_mem::ensure_user_writable(
             token,
@@ -4510,7 +4578,11 @@ pub fn sys_capget(header_ptr: *mut u8, data_ptr: *mut u8) -> isize {
         );
         drop(process);
 
-        let data0 = CapData { effective: eff_lo, permitted: perm_lo, inheritable: inh_lo };
+        let data0 = CapData {
+            effective: eff_lo,
+            permitted: perm_lo,
+            inheritable: inh_lo,
+        };
         let data_bytes0 = unsafe {
             core::slice::from_raw_parts(
                 &data0 as *const CapData as *const u8,
@@ -4522,7 +4594,11 @@ pub fn sys_capget(header_ptr: *mut u8, data_ptr: *mut u8) -> isize {
         }
 
         if data_count == 2 {
-            let data1 = CapData { effective: eff_hi, permitted: perm_hi, inheritable: inh_hi };
+            let data1 = CapData {
+                effective: eff_hi,
+                permitted: perm_hi,
+                inheritable: inh_hi,
+            };
             let data_bytes1 = unsafe {
                 core::slice::from_raw_parts(
                     &data1 as *const CapData as *const u8,
@@ -4559,9 +4635,12 @@ pub fn sys_capset(header_ptr: *const u8, data_ptr: *const u8) -> isize {
     if !valid_versions.contains(&hdr.version) {
         // Write preferred version back to header before returning EINVAL
         hdr.version = _LINUX_CAPABILITY_VERSION_3;
-        let _ = copy_to_user(token, header_ptr as *mut u8,
-            unsafe { core::slice::from_raw_parts(&hdr as *const CapHeader as *const u8,
-                core::mem::size_of::<CapHeader>()) });
+        let _ = copy_to_user(token, header_ptr as *mut u8, unsafe {
+            core::slice::from_raw_parts(
+                &hdr as *const CapHeader as *const u8,
+                core::mem::size_of::<CapHeader>(),
+            )
+        });
         return errno(EINVAL);
     }
 
@@ -4579,7 +4658,11 @@ pub fn sys_capset(header_ptr: *const u8, data_ptr: *const u8) -> isize {
         return errno(EFAULT);
     }
 
-    let data_count: usize = if hdr.version == _LINUX_CAPABILITY_VERSION_1 { 1 } else { 2 };
+    let data_count: usize = if hdr.version == _LINUX_CAPABILITY_VERSION_1 {
+        1
+    } else {
+        2
+    };
 
     let data0 = match read_from_user::<CapData>(token, data_ptr as *const CapData) {
         Ok(v) => v,
@@ -4603,33 +4686,32 @@ pub fn sys_capset(header_ptr: *const u8, data_ptr: *const u8) -> isize {
     // Validate and update process capability sets
     let process = current_process();
     process.with_identity_mut(|inner| {
-
-    // new_effective must be subset of new_permitted
-    if (new_effective & !new_permitted) != 0 {
-        return errno(EPERM);
-    }
-    // new_permitted must be subset of old_permitted (can't raise permitted)
-    if (new_permitted & !inner.cap_permitted) != 0 {
-        return errno(EPERM);
-    }
-    // new_inheritable must be subset of (old_inheritable | old_permitted), unless CAP_SETPCAP
-    // With CAP_SETPCAP, still bounded by bounding set
-    // CAP_SETPCAP = bit 8
-    const CAP_SETPCAP: u64 = 1 << 8;
-    if (new_inheritable & !(inner.cap_inheritable | inner.cap_permitted)) != 0 {
-        if (inner.cap_effective & CAP_SETPCAP) == 0 {
+        // new_effective must be subset of new_permitted
+        if (new_effective & !new_permitted) != 0 {
             return errno(EPERM);
         }
-        // Even with CAP_SETPCAP, can't exceed bounding set
-        if (new_inheritable & !inner.cap_bounding) != 0 {
+        // new_permitted must be subset of old_permitted (can't raise permitted)
+        if (new_permitted & !inner.cap_permitted) != 0 {
             return errno(EPERM);
         }
-    }
+        // new_inheritable must be subset of (old_inheritable | old_permitted), unless CAP_SETPCAP
+        // With CAP_SETPCAP, still bounded by bounding set
+        // CAP_SETPCAP = bit 8
+        const CAP_SETPCAP: u64 = 1 << 8;
+        if (new_inheritable & !(inner.cap_inheritable | inner.cap_permitted)) != 0 {
+            if (inner.cap_effective & CAP_SETPCAP) == 0 {
+                return errno(EPERM);
+            }
+            // Even with CAP_SETPCAP, can't exceed bounding set
+            if (new_inheritable & !inner.cap_bounding) != 0 {
+                return errno(EPERM);
+            }
+        }
 
-    inner.cap_effective = new_effective;
-    inner.cap_permitted = new_permitted;
-    inner.cap_inheritable = new_inheritable;
-    0
+        inner.cap_effective = new_effective;
+        inner.cap_permitted = new_permitted;
+        inner.cap_inheritable = new_inheritable;
+        0
     })
 }
 
@@ -4704,7 +4786,11 @@ pub fn sys_prctl(option: usize, arg2: usize, arg3: usize, _arg4: usize, _arg5: u
             }
             let process = current_process();
             process.with_identity(|inner| {
-                if (inner.cap_bounding >> arg2) & 1 == 1 { 1 } else { 0 }
+                if (inner.cap_bounding >> arg2) & 1 == 1 {
+                    1
+                } else {
+                    0
+                }
             })
         }
         PR_CAPBSET_DROP => {
@@ -4714,11 +4800,11 @@ pub fn sys_prctl(option: usize, arg2: usize, arg3: usize, _arg4: usize, _arg5: u
             }
             let process = current_process();
             process.with_identity_mut(|inner| {
-            if (inner.cap_effective & CAP_SETPCAP) == 0 {
-                return errno(EPERM);
-            }
-            inner.cap_bounding &= !(1u64 << arg2);
-            0
+                if (inner.cap_effective & CAP_SETPCAP) == 0 {
+                    return errno(EPERM);
+                }
+                inner.cap_bounding &= !(1u64 << arg2);
+                0
             })
         }
         PR_SET_SECUREBITS => {
@@ -5249,7 +5335,7 @@ pub fn sys_sched_getattr(_pid: usize, attr: *mut u8, size: usize, _flags: usize)
     //   u64 sched_period = 0
     let mut buf = [0u8; 48];
     buf[0..4].copy_from_slice(&48u32.to_le_bytes()); // size = 48
-    // All other fields are 0 (SCHED_OTHER, no priority, etc.)
+                                                     // All other fields are 0 (SCHED_OTHER, no priority, etc.)
     match copy_to_user(token, attr, &buf) {
         Ok(_) => 0,
         Err(e) => e,

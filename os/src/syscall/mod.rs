@@ -375,9 +375,9 @@ mod errno;
 mod fs;
 mod ipc;
 pub(crate) mod process;
-pub(crate) mod user_mem;
 mod sync;
 mod thread;
+pub(crate) mod user_mem;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use errno::ENOSYS;
@@ -706,11 +706,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     let (name_for_trace, cwd_for_exec_trace) = if trace || (pid == 4 && syscall_id == SYSCALL_EXEC)
     {
         let process = current_process();
-        let name = if trace {
-            Some(process.name())
-        } else {
-            None
-        };
+        let name = if trace { Some(process.name()) } else { None };
         let cwd = if pid == 4 && syscall_id == 221 {
             Some((process.name(), process.cwd()))
         } else {
@@ -768,14 +764,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3],
             false,
         ),
-        SYSCALL_FGETXATTR => sys_fgetxattr(
-            args[0],
-            args[1] as *const u8,
-            args[2] as *mut u8,
-            args[3],
-        ),
+        SYSCALL_FGETXATTR => {
+            sys_fgetxattr(args[0], args[1] as *const u8, args[2] as *mut u8, args[3])
+        }
         SYSCALL_LISTXATTR => sys_listxattr(args[0] as *const u8, args[1] as *mut u8, args[2], true),
-        SYSCALL_LLISTXATTR => sys_listxattr(args[0] as *const u8, args[1] as *mut u8, args[2], false),
+        SYSCALL_LLISTXATTR => {
+            sys_listxattr(args[0] as *const u8, args[1] as *mut u8, args[2], false)
+        }
         SYSCALL_FLISTXATTR => sys_flistxattr(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_REMOVEXATTR => sys_removexattr(args[0] as *const u8, args[1] as *const u8, true),
         SYSCALL_LREMOVEXATTR => sys_removexattr(args[0] as *const u8, args[1] as *const u8, false),
@@ -786,7 +781,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1] as i32, args[2]),
         SYSCALL_FLOCK => sys_flock(args[0], args[1] as i32),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
-        SYSCALL_MKNODAT => sys_mknodat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32),
+        SYSCALL_MKNODAT => sys_mknodat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as u32,
+            args[3] as u32,
+        ),
         SYSCALL_TRUNCATE => sys_truncate(args[0] as *const u8, args[1] as isize),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as isize),
         SYSCALL_FALLOCATE => {
@@ -872,8 +872,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FDATASYNC => sys_fdatasync(args[0]),
         SYSCALL_TIMERFD_CREATE => sys_timerfd_create(args[0] as i32, args[1] as i32),
         SYSCALL_TIMERFD_SETTIME => sys_timerfd_settime(
-            args[0], args[1] as i32,
-            args[2] as *const u8, args[3] as *mut u8,
+            args[0],
+            args[1] as i32,
+            args[2] as *const u8,
+            args[3] as *mut u8,
         ),
         SYSCALL_TIMERFD_GETTIME => sys_timerfd_gettime(args[0], args[1] as *mut u8),
         SYSCALL_READV => sys_readv(args[0], args[1] as *const usize, args[2]),
@@ -941,7 +943,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => {
             let name = current_process().name();
-            log::warn!("[exit_group] pid={} name={} code={}", pid, name, args[0] as i32);
+            log::warn!(
+                "[exit_group] pid={} name={} code={}",
+                pid,
+                name,
+                args[0] as i32
+            );
             sys_exit_group(args[0] as i32)
         }
         SYSCALL_WAITID => sys_waitid(
@@ -978,11 +985,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *const TimeSpec,
             args[3] as *mut TimeSpec,
         ),
-        SYSCALL_SCHED_SETSCHEDULER => sys_sched_setscheduler(args[0], args[1] as i32, args[2] as *const u8),
+        SYSCALL_SCHED_SETSCHEDULER => {
+            sys_sched_setscheduler(args[0], args[1] as i32, args[2] as *const u8)
+        }
         SYSCALL_SCHED_GETSCHEDULER => sys_sched_getscheduler(args[0]),
         SYSCALL_SCHED_GETPARAM => sys_sched_getparam(args[0], args[1] as *mut u8),
         SYSCALL_SCHED_SETAFFINITY => sys_sched_setaffinity(args[0], args[1], args[2] as *const u8),
-        SYSCALL_SCHED_GETAFFINITY => sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8),
+        SYSCALL_SCHED_GETAFFINITY => {
+            sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8)
+        }
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_KILL => sys_kill(args[0] as isize, args[1] as i32),
         SYSCALL_TKILL => process::sys_tkill(args[0] as isize, args[1] as i32),
@@ -1033,9 +1044,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SETREUID => process::sys_setreuid(args[0] as u32, args[1] as u32),
         SYSCALL_SETUID => sys_setuid(args[0] as u32),
         SYSCALL_SETRESUID => process::sys_setresuid(args[0] as u32, args[1] as u32, args[2] as u32),
-        SYSCALL_GETRESUID => process::sys_getresuid(args[0] as *mut u32, args[1] as *mut u32, args[2] as *mut u32),
+        SYSCALL_GETRESUID => process::sys_getresuid(
+            args[0] as *mut u32,
+            args[1] as *mut u32,
+            args[2] as *mut u32,
+        ),
         SYSCALL_SETRESGID => process::sys_setresgid(args[0] as u32, args[1] as u32, args[2] as u32),
-        SYSCALL_GETRESGID => process::sys_getresgid(args[0] as *mut u32, args[1] as *mut u32, args[2] as *mut u32),
+        SYSCALL_GETRESGID => process::sys_getresgid(
+            args[0] as *mut u32,
+            args[1] as *mut u32,
+            args[2] as *mut u32,
+        ),
         SYSCALL_SETFSUID => process::sys_setfsuid(args[0] as u32),
         SYSCALL_SETFSGID => process::sys_setfsgid(args[0] as u32),
         SYSCALL_SETPGID => sys_setpgid(args[0] as isize, args[1] as isize),
@@ -1126,21 +1145,28 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MADVISE => 0, // stub: madvise hints are advisory only
         SYSCALL_SBRK => sys_sbrk(args[0] as isize),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
-        SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize, args[1] as isize, args[2] as isize),
+        SYSCALL_SET_PRIORITY => {
+            sys_set_priority(args[0] as isize, args[1] as isize, args[2] as isize)
+        }
         SYSCALL_GET_PRIORITY => sys_get_priority(args[0] as isize, args[1] as isize),
         SYSCALL_POLL => sys_ppoll(args[0] as *mut PollFd, args[1], args[2] as *const TimeSpec),
         SYSCALL_SHUTDOWN => sys_shutdown(),
         // ---- Network syscalls ----
         SYSCALL_SOCKET => crate::net::syscall::sys_socket(args[0], args[1], args[2]),
-        SYSCALL_SOCKETPAIR => crate::net::syscall::sys_socketpair(args[0], args[1], args[2], args[3] as *mut i32),
+        SYSCALL_SOCKETPAIR => {
+            crate::net::syscall::sys_socketpair(args[0], args[1], args[2], args[3] as *mut i32)
+        }
         SYSCALL_BIND => crate::net::syscall::sys_bind(args[0], args[1] as *const u8, args[2]),
         SYSCALL_LISTEN => crate::net::syscall::sys_listen(args[0], args[1]),
         SYSCALL_ACCEPT => {
             crate::net::syscall::sys_accept(args[0], args[1] as *mut u8, args[2] as *mut u32, 0)
         }
-        SYSCALL_ACCEPT4 => {
-            crate::net::syscall::sys_accept(args[0], args[1] as *mut u8, args[2] as *mut u32, args[3])
-        }
+        SYSCALL_ACCEPT4 => crate::net::syscall::sys_accept(
+            args[0],
+            args[1] as *mut u8,
+            args[2] as *mut u32,
+            args[3],
+        ),
         SYSCALL_CONNECT => crate::net::syscall::sys_connect(args[0], args[1] as *const u8, args[2]),
         SYSCALL_GETSOCKNAME => {
             crate::net::syscall::sys_getsockname(args[0], args[1] as *mut u8, args[2] as *mut u32)
@@ -1185,7 +1211,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_RECVMSG => crate::net::syscall::sys_recvmsg(),
         SYSCALL_SCHED_SETATTR => sys_sched_setattr(args[0], args[1], args[2]),
         SYSCALL_SCHED_GETATTR => sys_sched_getattr(args[0], args[1] as *mut u8, args[2], args[3]),
-        SYSCALL_GET_MEMPOLICY => sys_get_mempolicy(args[0] as *mut i32, args[1] as *mut usize, args[2], args[3], args[4]),
+        SYSCALL_GET_MEMPOLICY => sys_get_mempolicy(
+            args[0] as *mut i32,
+            args[1] as *mut usize,
+            args[2],
+            args[3],
+            args[4],
+        ),
         SYSCALL_MEMBARRIER => sys_membarrier(args[0] as isize, args[1] as isize),
         _ => {
             known = false;

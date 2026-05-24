@@ -26,11 +26,9 @@ use crate::config::USER_STACK_TOP as USER_ADDR_MAX;
 mod initproc_embed;
 #[allow(unused_imports)]
 use crate::fs::{open_file, OpenFlags};
-use crate::mm::{
-    translated_byte_buffer_checked, translated_refmut, PageTable, VirtAddr,
-};
 #[cfg(not(target_arch = "loongarch64"))]
 use crate::mm::PTEFlags;
+use crate::mm::{translated_byte_buffer_checked, translated_refmut, PageTable, VirtAddr};
 use crate::timer::remove_timer;
 use alloc::sync::Arc;
 #[allow(unused_imports)]
@@ -41,9 +39,7 @@ use lazy_static::*;
 use manager::fetch_task;
 use process::ProcessControlBlock;
 
-pub use action::{
-    SignalAction, SignalActions, SA_RESETHAND, SA_RESTART, SA_RESTORER, SA_SIGINFO,
-};
+pub use action::{SignalAction, SignalActions, SA_RESETHAND, SA_RESTART, SA_RESTORER, SA_SIGINFO};
 pub use auxv::AuxvInfo;
 pub use context::TaskContext;
 pub use futex::{
@@ -53,16 +49,16 @@ pub use futex::{
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
 pub use manager::{
     add_task, pid2process, pid2process_aggregate, pid2process_fdtable_summary, pid2process_len,
-    pid2process_snapshot, ready_queue_len, ready_queue_snapshot, remove_from_pid2process,
-    remove_task, wakeup_task, print_pid2process_top_by_fd, print_ready_queue_brief,
+    pid2process_snapshot, print_pid2process_top_by_fd, print_ready_queue_brief, ready_queue_len,
+    ready_queue_snapshot, remove_from_pid2process, remove_task, wakeup_task,
 };
 pub use process::{
     ChildWaitEvent, IntervalTimerState, RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK,
     RLIM_INFINITY,
 };
 pub use processor::{
-    current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
-    current_task_context_for_alloc_trace, current_user_token, has_pending_unmasked_signal,
+    current_kstack_top, current_process, current_task, current_task_context_for_alloc_trace,
+    current_trap_cx, current_trap_cx_user_va, current_user_token, has_pending_unmasked_signal,
     print_current_task_brief_for_alloc_error, run_tasks, schedule, take_current_task,
 };
 pub use signal::{
@@ -249,7 +245,11 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             parent_inner.set_pending_signal_siginfo(SIGCHLD, pid as i32, 0);
         }
         let process_inner = process.inner_exclusive_access();
-        if let Some(vfork_parent) = process_inner.vfork_vm_parent.as_ref().and_then(|p| p.upgrade()) {
+        if let Some(vfork_parent) = process_inner
+            .vfork_vm_parent
+            .as_ref()
+            .and_then(|p| p.upgrade())
+        {
             let mut parent_inner = vfork_parent.inner_exclusive_access();
             let copied = parent_inner
                 .memory_set
@@ -488,7 +488,7 @@ fn setup_signal_stack(
         siginfo.si_signo = signum as i32;
         siginfo.si_code = si_code;
         siginfo._pad[0..4].copy_from_slice(&sender_pid.to_ne_bytes()); // si_pid at offset 16
-        // glibc sigcancel_handler expects SI_TKILL for SIG32/SIG33.
+                                                                       // glibc sigcancel_handler expects SI_TKILL for SIG32/SIG33.
         if (signum == 32 || signum == 33) && siginfo.si_code == 0 {
             siginfo.si_code = -6; // SI_TKILL
         }
@@ -742,7 +742,8 @@ pub fn handle_signals() {
             }
             // SIGCONT: 恢复被停止的进程（目前简单忽略）
             signal::SIGCONT => {
-                process_inner.child_wait_event = Some(ChildWaitEvent::Continued(signal::SIGCONT as i32));
+                process_inner.child_wait_event =
+                    Some(ChildWaitEvent::Continued(signal::SIGCONT as i32));
                 process_inner.group_stopped = false;
                 debug!("[signal] pid={} SIGCONT default=continue", pid);
                 return;
@@ -838,11 +839,13 @@ pub fn handle_signals() {
             false
         } else {
             let restorer_va = VirtAddr::from(action.restorer);
-            page_table.translate(restorer_va.floor()).map_or(false, |pte| {
-                pte.is_valid()
-                    && pte.flags().contains(PTEFlags::U)
-                    && (pte.executable() || pte.readable())
-            })
+            page_table
+                .translate(restorer_va.floor())
+                .map_or(false, |pte| {
+                    pte.is_valid()
+                        && pte.flags().contains(PTEFlags::U)
+                        && (pte.executable() || pte.readable())
+                })
         };
         if use_restorer {
             trap_cx[TrapFrameArgs::RA] = action.restorer;

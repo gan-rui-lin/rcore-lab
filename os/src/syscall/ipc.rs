@@ -464,7 +464,12 @@ impl IpcManager {
         self.message_queues.remove(&id).is_some()
     }
 
-    pub fn create_shm(&mut self, key: IpcKey, size: usize, permissions: u32) -> Result<IpcId, isize> {
+    pub fn create_shm(
+        &mut self,
+        key: IpcKey,
+        size: usize,
+        permissions: u32,
+    ) -> Result<IpcId, isize> {
         if self.shm_segments.len() >= SHMMNI {
             return Err(errno(ENOMEM));
         }
@@ -832,7 +837,11 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, _buf: usize) -> isize {
                 return errno(EPERM);
             }
             drop(q);
-            if manager.remove_msgq(msqid) { 0 } else { errno(EINVAL) }
+            if manager.remove_msgq(msqid) {
+                0
+            } else {
+                errno(EINVAL)
+            }
         }
         IPC_STAT => {
             if _buf == 0 {
@@ -1071,10 +1080,7 @@ pub fn sys_shmat(shmid: i32, shmaddr: usize, _shmflg: i32) -> isize {
     let (size, frames) = {
         let shm_locked = shm.lock();
         if shm_locked.marked_for_delete {
-            error!(
-                "[shm] shmat on deleted segment shmid={} pid={}",
-                shmid, pid
-            );
+            error!("[shm] shmat on deleted segment shmid={} pid={}", shmid, pid);
             return errno(EINVAL);
         }
         (shm_locked.size, shm_locked.frames.clone())
@@ -1159,7 +1165,10 @@ pub fn sys_shmat(shmid: i32, shmaddr: usize, _shmflg: i32) -> isize {
     }
     drop(inner);
 
-    if manager.add_attachment(pid, attach_addr, shmid, size).is_err() {
+    if manager
+        .add_attachment(pid, attach_addr, shmid, size)
+        .is_err()
+    {
         let mut inner = process.inner_exclusive_access();
         inner
             .memory_set
