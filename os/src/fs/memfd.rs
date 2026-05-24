@@ -114,13 +114,11 @@ impl File for MemFdFile {
         true
     }
 
-    fn read(&self, buf: UserBuffer) -> usize {
+    fn read(&self, mut buf: UserBuffer) -> usize {
         let mut off = self.offset.lock();
         let mut total = 0;
-        for slice in buf.buffers.iter() {
-            let n = self.inode.read_at(*off, unsafe {
-                core::slice::from_raw_parts_mut(slice.as_ptr() as *mut u8, slice.len())
-            });
+        for slice in buf.buffers.iter_mut() {
+            let n = self.inode.read_at(*off, *slice);
             *off += n;
             total += n;
             if n < slice.len() {

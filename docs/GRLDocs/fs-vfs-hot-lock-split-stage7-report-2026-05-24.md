@@ -220,9 +220,9 @@ ext4 inode 内本来已经有多个 cache（metadata/xattr/listxattr/statfs）�
    - `EAGAIN`/`EINTR` 在 `read()` 中用 `usize::MAX-1/usize::MAX` 作为 sentinel（与现有 File trait 约定相关）。
    - 这部分不是本次提交引入的，但后续如果要更严格对齐 Linux errno 传播，可能需要统一 trait 返回类型或集中转换。
 
-3. **ext4 cache 仍然依赖 UPIntrFreeCell**：
-   - 本次做的是“访问入口收敛”，并未引入更复杂的 cache 过期策略/容量淘汰。
-   - 大量路径归一化后，cache 命中率与一致性会更稳定，但仍需要通过实际回归来确认性能收益与无副作用。
+3. **ext4 cache 切换为 UPIntrRwLock，但未引入过期/淘汰策略**：
+   - 读路径共享读锁、写路径独占写锁，降低热点读访问的串行化。
+   - 仍需通过实际回归确认性能收益与无副作用。
 
 4. **MemFd write 路径的锁组合**：
    - `MemFdFile::write()` 当前会同时持有 offset mutex 与 inode inner write（先锁 offset，再锁 inode）。
@@ -245,6 +245,25 @@ make all
 - MemFd：基本 read/write/seek、seal 行为（F_SEAL_WRITE）与并发读写交错。
 - VfsFile：常见 open/read/write/append/truncate；以及 `exec()` 读 ELF 的 `read_all()` 性能/正确性。
 - ext4：xattr/listxattr/statfs 的一致性与缓存失效；iozone 场景下元数据/写入触摸更新。
+
+## 实现补充：并发安全 / 性能 / 可维护性
+
+### 并发安全
+
+- **锁顺序明确化**：ROOT_VFS 仅用于 mount 表与 resolve 入口，严禁持锁进入 inode ops 或 lwext4；fd offset 锁不跨可能阻塞路径。
+- **pipe 阻塞前释放锁**：read/write/write_user_buffer 在需要 `suspend_current_and_run_next()` 前均确保已释放 pipe buffer 锁，避免持锁跨调度。
+- **cache 锁不跨 lwext4**：ext4 cache helper 保证数据拷贝后再进入 lwext4 调用，避免锁持有覆盖潜在阻塞/IO。
+
+### 性能
+
+- **read_at/write_at 绕过共享 offset lock**：新增 VfsFile `read_at`/`write_at`，`read_all` 使用显式 offset 批量读，降低热点读路径对 offset mutex 的依赖。
+- **ext4 cache 读路径共享读锁**：ext4 metadata/xattr/listxattr/statfs cache 使用 `UPIntrRwLock`，读路径并发共享读锁，写路径独占更新。
+
+### 可维护性
+
+- **pipe guard 化的阻塞规则**：读写路径以“锁域 + 阻塞点分离”形式编码，防止未来改动把 `suspend` 放回持锁区。
+- **cache helper 固化规则**：统一 key 归一化、失效策略与写触摸更新，降低 callsite 漏改风险。
+- **lock-order 文档化**：ROOT_VFS 与 inode/pipe/cache 的锁序规则通过注释固定，后续演进更不易踩坑。
 
 ## 后续建议
 

@@ -350,6 +350,8 @@ impl Vfs {
     }
 }
 
+// Global mount table.
+// Locking rules: keep the scope short and never hold this lock across inode operations.
 lazy_static! {
     pub(crate) static ref ROOT_VFS: UPIntrRwLock<Vfs> = unsafe { UPIntrRwLock::new(Vfs::new()) };
 }

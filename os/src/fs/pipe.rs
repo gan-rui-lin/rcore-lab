@@ -118,29 +118,32 @@ impl File for PipeEnd {
     }
 
     fn read(&self, mut user_buf: UserBuffer) -> usize {
+        let nonblock = self.nonblock.load(Ordering::Relaxed);
         let mut total = 0;
         for slice in user_buf.buffers.iter_mut() {
             loop {
-                let mut pipe = self.pipe.lock();
-                if pipe.len > 0 {
-                    let n = pipe.read_into(*slice);
-                    total += n;
+                let mut should_block = true;
+                {
+                    let mut pipe = self.pipe.lock();
+                    if pipe.len > 0 {
+                        let n = pipe.read_into(*slice);
+                        total += n;
+                        should_block = false;
+                    } else if !pipe.write_open {
+                        return total;
+                    } else if total > 0 {
+                        return total;
+                    } else if nonblock {
+                        return usize::MAX - 1; // EAGAIN sentinel
+                    } else if has_pending_unmasked_signal(true) {
+                        return usize::MAX; // EINTR sentinel
+                    }
+                }
+                if should_block {
+                    suspend_current_and_run_next();
+                } else {
                     break;
                 }
-                if !pipe.write_open {
-                    return total;
-                }
-                if total > 0 {
-                    return total;
-                }
-                if self.nonblock.load(Ordering::Relaxed) {
-                    return usize::MAX - 1; // EAGAIN sentinel
-                }
-                if has_pending_unmasked_signal(true) {
-                    return usize::MAX; // EINTR sentinel
-                }
-                drop(pipe);
-                suspend_current_and_run_next();
             }
         }
         total
@@ -151,25 +154,34 @@ impl File for PipeEnd {
         for slice in user_buf.buffers.iter() {
             let mut offset = 0;
             while offset < slice.len() {
-                let mut pipe = self.pipe.lock();
-                if !pipe.read_open {
-                    return total;
-                }
-                if pipe.len < pipe.capacity() {
-                    let n = pipe.write_from(&slice[offset..]);
-                    total += n;
-                    offset += n;
-                    if n == 0 {
-                        break;
-                    }
-                } else {
-                    if total > 0 {
+                let mut should_block = false;
+                let mut break_loop = false;
+                {
+                    let mut pipe = self.pipe.lock();
+                    if !pipe.read_open {
                         return total;
                     }
-                    if has_pending_unmasked_signal(true) {
-                        return usize::MAX; // EINTR sentinel
+                    if pipe.len < pipe.capacity() {
+                        let n = pipe.write_from(&slice[offset..]);
+                        total += n;
+                        offset += n;
+                        if n == 0 {
+                            break_loop = true;
+                        }
+                    } else {
+                        if total > 0 {
+                            return total;
+                        }
+                        if has_pending_unmasked_signal(true) {
+                            return usize::MAX; // EINTR sentinel
+                        }
+                        should_block = true;
                     }
-                    drop(pipe);
+                }
+                if break_loop {
+                    break;
+                }
+                if should_block {
                     suspend_current_and_run_next();
                 }
             }
@@ -182,28 +194,37 @@ impl File for PipeEnd {
         for slice in user_buf.buffers.iter() {
             let mut offset = 0usize;
             while offset < slice.len() {
-                let mut pipe = self.pipe.lock();
-                if !pipe.read_open {
-                    if total == 0 {
-                        if let Some(task) = current_task() {
-                            task.insert_pending_signal(SignalFlags::SIGPIPE);
+                let mut should_block = false;
+                let mut break_loop = false;
+                {
+                    let mut pipe = self.pipe.lock();
+                    if !pipe.read_open {
+                        if total == 0 {
+                            if let Some(task) = current_task() {
+                                task.insert_pending_signal(SignalFlags::SIGPIPE);
+                            }
+                            return Err(EPIPE_ERRNO);
                         }
-                        return Err(EPIPE_ERRNO);
-                    }
-                    return Ok(total);
-                }
-                if pipe.len < pipe.capacity() {
-                    let n = pipe.write_from(&slice[offset..]);
-                    total += n;
-                    offset += n;
-                    if n == 0 {
-                        break;
-                    }
-                } else {
-                    if total > 0 {
                         return Ok(total);
                     }
-                    drop(pipe);
+                    if pipe.len < pipe.capacity() {
+                        let n = pipe.write_from(&slice[offset..]);
+                        total += n;
+                        offset += n;
+                        if n == 0 {
+                            break_loop = true;
+                        }
+                    } else {
+                        if total > 0 {
+                            return Ok(total);
+                        }
+                        should_block = true;
+                    }
+                }
+                if break_loop {
+                    break;
+                }
+                if should_block {
                     suspend_current_and_run_next();
                 }
             }

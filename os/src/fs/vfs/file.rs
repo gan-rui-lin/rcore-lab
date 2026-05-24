@@ -46,8 +46,15 @@ impl VfsFile {
         }
     }
 
+    pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.inode.read_at(offset, buf)
+    }
+
+    pub fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
+        self.inode.write_at(offset, buf)
+    }
+
     pub fn read_all(&self) -> Vec<u8> {
-        let mut file_offset = self.offset.lock();
         let file_size = self.inode.size();
         let mut offset = 0usize;
         let out = if file_size > 0 {
@@ -58,7 +65,7 @@ impl VfsFile {
             const READ_ALL_CHUNK: usize = 16 * 1024;
             while offset < file_size {
                 let end = core::cmp::min(offset + READ_ALL_CHUNK, file_size);
-                let n = self.inode.read_at(offset, &mut data[offset..end]);
+                let n = self.read_at(offset, &mut data[offset..end]);
                 if n == 0 {
                     break;
                 }
@@ -71,7 +78,7 @@ impl VfsFile {
             let mut data = Vec::new();
             let mut buf = [0u8; READ_ALL_CHUNK];
             loop {
-                let n = self.inode.read_at(offset, &mut buf);
+                let n = self.read_at(offset, &mut buf);
                 if n == 0 {
                     break;
                 }
@@ -80,7 +87,7 @@ impl VfsFile {
             }
             data
         };
-        *file_offset = offset;
+        *self.offset.lock() = offset;
         out
     }
 }

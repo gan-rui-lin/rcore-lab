@@ -1,5 +1,5 @@
 use super::super::core::{normalize_path, VfsInode, VfsMetadata, VfsNodeKind, VfsStatFs};
-use crate::sync::UPIntrFreeCell;
+use crate::sync::{UPIntrFreeCell, UPIntrRwLock};
 use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
 use alloc::format;
@@ -19,14 +19,14 @@ const SEEK_SET: u32 = 0;
 const ZERO_PAD_CHUNK: usize = 1024 * 1024;
 
 lazy_static! {
-    static ref EXT4_METADATA_CACHE: UPIntrFreeCell<BTreeMap<String, VfsMetadata>> =
-        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
-    static ref EXT4_XATTR_CACHE: UPIntrFreeCell<BTreeMap<(String, String), Option<Vec<u8>>>> =
-        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
-    static ref EXT4_LISTXATTR_CACHE: UPIntrFreeCell<BTreeMap<String, Vec<u8>>> =
-        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
-    static ref EXT4_STATFS_CACHE: UPIntrFreeCell<Option<VfsStatFs>> =
-        unsafe { UPIntrFreeCell::new(None) };
+    static ref EXT4_METADATA_CACHE: UPIntrRwLock<BTreeMap<String, VfsMetadata>> =
+        unsafe { UPIntrRwLock::new(BTreeMap::new()) };
+    static ref EXT4_XATTR_CACHE: UPIntrRwLock<BTreeMap<(String, String), Option<Vec<u8>>>> =
+        unsafe { UPIntrRwLock::new(BTreeMap::new()) };
+    static ref EXT4_LISTXATTR_CACHE: UPIntrRwLock<BTreeMap<String, Vec<u8>>> =
+        unsafe { UPIntrRwLock::new(BTreeMap::new()) };
+    static ref EXT4_STATFS_CACHE: UPIntrRwLock<Option<VfsStatFs>> =
+        unsafe { UPIntrRwLock::new(None) };
 }
 
 pub struct Ext4Inode {
@@ -118,21 +118,19 @@ fn ext4_cache_key(path: &str) -> String {
 }
 
 fn ext4_metadata_cache_get(path: &str) -> Option<VfsMetadata> {
-    EXT4_METADATA_CACHE
-        .exclusive_access()
-        .get(&ext4_cache_key(path))
-        .copied()
+    let cache = EXT4_METADATA_CACHE.read();
+    cache.get(&ext4_cache_key(path)).copied()
 }
 
 fn ext4_metadata_cache_set(path: &str, metadata: VfsMetadata) {
     EXT4_METADATA_CACHE
-        .exclusive_access()
+        .write()
         .insert(ext4_cache_key(path), metadata);
 }
 
 fn ext4_metadata_cache_remove(path: &str) {
     EXT4_METADATA_CACHE
-        .exclusive_access()
+        .write()
         .remove(&ext4_cache_key(path));
 }
 
@@ -141,7 +139,7 @@ where
     F: FnMut(&mut VfsMetadata),
 {
     let key = ext4_cache_key(path);
-    let mut cache = EXT4_METADATA_CACHE.exclusive_access();
+    let mut cache = EXT4_METADATA_CACHE.write();
     if let Some(metadata) = cache.get_mut(&key) {
         update(metadata);
     }
@@ -149,50 +147,50 @@ where
 
 fn ext4_xattr_cache_get(path: &str, name: &str) -> Option<Option<Vec<u8>>> {
     let key = (ext4_cache_key(path), String::from(name));
-    EXT4_XATTR_CACHE.exclusive_access().get(&key).cloned()
+    EXT4_XATTR_CACHE.read().get(&key).cloned()
 }
 
 fn ext4_xattr_cache_set(path: &str, name: &str, value: Option<Vec<u8>>) {
     let key = (ext4_cache_key(path), String::from(name));
-    EXT4_XATTR_CACHE.exclusive_access().insert(key, value);
+    EXT4_XATTR_CACHE.write().insert(key, value);
 }
 
 fn ext4_xattr_cache_remove_path(path: &str) {
     let key = ext4_cache_key(path);
     EXT4_XATTR_CACHE
-        .exclusive_access()
+        .write()
         .retain(|(cached_path, _), _| cached_path != &key);
 }
 
 fn ext4_listxattr_cache_get(path: &str) -> Option<Vec<u8>> {
     EXT4_LISTXATTR_CACHE
-        .exclusive_access()
+        .read()
         .get(&ext4_cache_key(path))
         .cloned()
 }
 
 fn ext4_listxattr_cache_set(path: &str, value: Vec<u8>) {
     EXT4_LISTXATTR_CACHE
-        .exclusive_access()
+        .write()
         .insert(ext4_cache_key(path), value);
 }
 
 fn ext4_listxattr_cache_remove(path: &str) {
     EXT4_LISTXATTR_CACHE
-        .exclusive_access()
+        .write()
         .remove(&ext4_cache_key(path));
 }
 
 fn ext4_statfs_cache_get() -> Option<VfsStatFs> {
-    *EXT4_STATFS_CACHE.exclusive_access()
+    *EXT4_STATFS_CACHE.read()
 }
 
 fn ext4_statfs_cache_set(value: VfsStatFs) {
-    *EXT4_STATFS_CACHE.exclusive_access() = Some(value);
+    *EXT4_STATFS_CACHE.write() = Some(value);
 }
 
 fn ext4_statfs_cache_invalidate() {
-    *EXT4_STATFS_CACHE.exclusive_access() = None;
+    *EXT4_STATFS_CACHE.write() = None;
 }
 
 fn ext4_cache_remove_path(path: &str) {
