@@ -39,6 +39,10 @@ pub trait File: Send + Sync {
     fn write_user_buffer(&self, buf: UserBuffer) -> Result<usize, isize> {
         Ok(self.write(buf))
     }
+    /// Flush file-local buffered writes, if any.
+    fn flush(&self) -> usize {
+        0
+    }
     /// read entire file content into a buffer
     fn read_all(&self) -> Vec<u8> {
         Vec::new()

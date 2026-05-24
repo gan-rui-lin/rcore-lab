@@ -324,7 +324,9 @@ impl VfsInode for Ext4Inode {
             if offset >= size {
                 return Some(0);
             }
-            if file.file_seek(offset as i64, SEEK_SET).is_err() {
+            if file.file_pos() != offset as u64
+                && file.file_seek(offset as i64, SEEK_SET).is_err()
+            {
                 return None;
             }
             Some(file.file_read(buf).unwrap_or(0) as usize)
@@ -341,7 +343,9 @@ impl VfsInode for Ext4Inode {
         }
         let written = self
             .with_data_file(true, |file| {
-                if file.file_seek(offset as i64, SEEK_SET).is_err() {
+                if file.file_pos() != offset as u64
+                    && file.file_seek(offset as i64, SEEK_SET).is_err()
+                {
                     // lwext4 rejects SEEK_SET beyond EOF with EINVAL.
                     // Extend from EOF to `offset` by writing zero chunks, then write `buf`.
                     // Use reasonably large chunks so large sparse extensions (e.g. fallocate)

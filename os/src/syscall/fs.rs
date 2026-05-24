@@ -5193,11 +5193,12 @@ pub fn sys_fdatasync(fd: usize) -> isize {
     if fd >= inner.fd_table.len() {
         return errno(EBADF);
     }
-    if inner.fd_table[fd].is_none() {
+    let Some(file) = inner.fd_table[fd].clone() else {
         return errno(EBADF);
-    }
+    };
     drop(inner);
     drop(process);
+    file.flush();
     crate::fs::sync_filesystems();
     0
 }

@@ -9,6 +9,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+const SMALL_WRITE_BUFFER_SIZE: usize = 32 * 1024;
+
 pub struct VfsFile {
     readable: bool,
     writable: bool,
@@ -24,6 +26,8 @@ static NEXT_TS_ID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicU
 struct VfsFileInner {
     offset: usize,
     inode: Arc<dyn VfsInode>,
+    write_buf_start: usize,
+    write_buf: Vec<u8>,
 }
 
 impl VfsFile {
@@ -45,12 +49,76 @@ impl VfsFile {
             status_flags,
             path,
             ts_id: NEXT_TS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-            inner: unsafe { UPIntrFreeCell::new(VfsFileInner { offset: 0, inode }) },
+            inner: unsafe {
+                UPIntrFreeCell::new(VfsFileInner {
+                    offset: 0,
+                    inode,
+                    write_buf_start: 0,
+                    write_buf: Vec::new(),
+                })
+            },
         }
+    }
+
+    fn flush_inner(inner: &mut VfsFileInner) -> usize {
+        if inner.write_buf.is_empty() {
+            return 0;
+        }
+        let start = inner.write_buf_start;
+        let data = core::mem::take(&mut inner.write_buf);
+        let written = inner.inode.write_at(start, data.as_slice());
+        if written < data.len() {
+            inner.write_buf_start = start + written;
+            inner.write_buf.extend_from_slice(&data[written..]);
+        }
+        written
+    }
+
+    fn write_slice(inner: &mut VfsFileInner, slice: &[u8], buffered: bool) -> usize {
+        if !buffered {
+            Self::flush_inner(inner);
+            let n = inner.inode.write_at(inner.offset, slice);
+            inner.offset += n;
+            return n;
+        }
+
+        let mut total = 0usize;
+        while total < slice.len() {
+            if inner.write_buf.is_empty() {
+                inner.write_buf_start = inner.offset;
+            }
+            let expected = inner.write_buf_start + inner.write_buf.len();
+            if inner.offset != expected {
+                Self::flush_inner(inner);
+                inner.write_buf_start = inner.offset;
+            }
+            if inner.write_buf.is_empty() && slice.len() - total >= SMALL_WRITE_BUFFER_SIZE {
+                let n = inner.inode.write_at(inner.offset, &slice[total..]);
+                inner.offset += n;
+                total += n;
+                if n == 0 {
+                    break;
+                }
+                continue;
+            }
+            let space = SMALL_WRITE_BUFFER_SIZE - inner.write_buf.len();
+            let n = core::cmp::min(space, slice.len() - total);
+            inner.write_buf.extend_from_slice(&slice[total..total + n]);
+            inner.offset += n;
+            total += n;
+            if inner.write_buf.len() == SMALL_WRITE_BUFFER_SIZE {
+                Self::flush_inner(inner);
+                if !inner.write_buf.is_empty() {
+                    break;
+                }
+            }
+        }
+        total
     }
 
     pub fn read_all(&self) -> Vec<u8> {
         let mut inner = self.inner.exclusive_access();
+        Self::flush_inner(&mut inner);
         let file_size = inner.inode.size();
         let mut offset = 0usize;
         let out = if file_size > 0 {
@@ -99,6 +167,7 @@ impl File for VfsFile {
 
     fn read(&self, mut buf: UserBuffer) -> usize {
         let mut inner = self.inner.exclusive_access();
+        Self::flush_inner(&mut inner);
         let mut total = 0usize;
         for slice in buf.buffers.iter_mut() {
             let n = inner.inode.read_at(inner.offset, *slice);
@@ -121,6 +190,7 @@ impl File for VfsFile {
         len: usize,
     ) -> Option<Result<usize, isize>> {
         let mut inner = self.inner.exclusive_access();
+        Self::flush_inner(&mut inner);
         let mut total = 0usize;
         let result = user_mem::for_each_user_write_slice(
             token,
@@ -144,15 +214,19 @@ impl File for VfsFile {
         let mut inner = self.inner.exclusive_access();
         if (self.status_flags & OpenFlags::APPEND.bits()) != 0 {
             // O_APPEND: each write starts at current EOF.
-            inner.offset = inner.inode.size();
+            inner.offset = if inner.write_buf.is_empty() {
+                inner.inode.size()
+            } else {
+                inner.write_buf_start + inner.write_buf.len()
+            };
         }
+        let buffered = (self.status_flags & OpenFlags::DIRECT.bits()) == 0;
         let mut total = 0usize;
         for slice in buf.buffers.iter() {
-            let n = inner.inode.write_at(inner.offset, *slice);
+            let n = Self::write_slice(&mut inner, *slice, buffered);
             if n == 0 {
                 break;
             }
-            inner.offset += n;
             total += n;
             if n < slice.len() {
                 break;
@@ -166,7 +240,8 @@ impl File for VfsFile {
     }
 
     fn inode(&self) -> Option<Arc<dyn VfsInode>> {
-        let inner = self.inner.exclusive_access();
+        let mut inner = self.inner.exclusive_access();
+        Self::flush_inner(&mut inner);
         Some(inner.inode.clone())
     }
 
@@ -181,6 +256,7 @@ impl File for VfsFile {
 
     fn set_offset(&self, offset: usize) {
         let mut inner = self.inner.exclusive_access();
+        Self::flush_inner(&mut inner);
         inner.offset = offset;
     }
 
@@ -193,8 +269,22 @@ impl File for VfsFile {
     }
 
     fn read_at_kernel(&self, offset: usize, buf: &mut [u8]) -> usize {
-        let inner = self.inner.exclusive_access();
+        let mut inner = self.inner.exclusive_access();
+        Self::flush_inner(&mut inner);
         inner.inode.read_at(offset, buf)
+    }
+
+    fn flush(&self) -> usize {
+        let mut inner = self.inner.exclusive_access();
+        Self::flush_inner(&mut inner)
+    }
+}
+
+impl Drop for VfsFile {
+    fn drop(&mut self) {
+        if let Some(mut inner) = self.inner.try_exclusive_access() {
+            Self::flush_inner(&mut inner);
+        }
     }
 }
 

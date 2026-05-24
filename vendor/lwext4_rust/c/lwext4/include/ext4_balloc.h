@@ -101,6 +101,17 @@ int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
 			    ext4_fsblk_t goal,
 			    ext4_fsblk_t *baddr);
 
+/**@brief   Allocate contiguous blocks from one block group.
+ * @param   inode_ref inode reference
+ * @param   goal preferred block address
+ * @param   count requested count on input, actual count on output
+ * @param   baddr first allocated block address
+ * @return  standard error code*/
+int ext4_balloc_alloc_blocks(struct ext4_inode_ref *inode_ref,
+			     ext4_fsblk_t goal,
+			     uint32_t *count,
+			     ext4_fsblk_t *baddr);
+
 /**@brief   Try allocate selected block.
  * @param   inode_ref inode reference
  * @param   baddr block address to allocate

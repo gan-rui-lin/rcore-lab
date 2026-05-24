@@ -52,6 +52,7 @@
 #include <ext4_dir_idx.h>
 #include <ext4_xattr.h>
 #include <ext4_journal.h>
+#include <ext4_extent.h>
 
 
 #include <stdlib.h>
@@ -1916,12 +1917,27 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 	while (size >= block_size) {
 
 		while (iblk_idx < iblock_last) {
+			uint32_t block_run = 1;
 			if (iblk_idx < ifile_blocks) {
 				r = ext4_fs_init_inode_dblk_idx(&ref, iblk_idx,
 								&fblk);
 				if (r != EOK)
 					goto Finish;
 			} else {
+#if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
+				if (fblock_count == 0 &&
+				    ext4_sb_feature_incom(&ref.fs->sb, EXT4_FINCOM_EXTENTS) &&
+				    ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_EXTENTS)) {
+					uint32_t wanted = iblock_last - iblk_idx;
+					uint32_t got = 0;
+					rr = ext4_extent_get_blocks(&ref, iblk_idx, wanted,
+								     &fblk, true, &got);
+					if (rr != EOK || got == 0)
+						break;
+					block_run = got;
+				} else
+#endif
+				{
 				rr = ext4_fs_append_inode_dblk(&ref, &fblk,
 							       &iblk_idx);
 				if (rr != EOK) {
@@ -1930,9 +1946,10 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 					 * */
 					break;
 				}
+				}
 			}
 
-			iblk_idx++;
+			iblk_idx += block_run;
 
 			if (!fblock_start) {
 				fblock_start = fblk;
@@ -1941,7 +1958,7 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 			if ((fblock_start + fblock_count) != fblk)
 				break;
 
-			fblock_count++;
+			fblock_count += block_run;
 		}
 
 		r = ext4_blocks_set_direct(file->mp->fs.bdev, u8_buf, fblock_start,

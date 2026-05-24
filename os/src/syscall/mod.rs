@@ -380,6 +380,7 @@ mod sync;
 mod thread;
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::vec::Vec;
 use errno::ENOSYS;
 use fs::*;
 use ipc::*;
@@ -860,6 +861,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_SYNC => {
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            let files: Vec<_> = inner.fd_table.iter().filter_map(Clone::clone).collect();
+            drop(inner);
+            drop(process);
+            for file in files {
+                file.flush();
+            }
             crate::fs::sync_filesystems();
             0
         }
