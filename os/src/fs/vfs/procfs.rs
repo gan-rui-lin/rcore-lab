@@ -270,14 +270,19 @@ impl VfsInode for ProcPidTaskDirInode {
     fn lookup(&self, name: &str) -> Option<Arc<dyn VfsInode>> {
         let tid = name.parse::<usize>().ok()?;
         let process = pid2process(self.pid)?;
-        let inner = process.inner_exclusive_access();
-        let (task_idx, _) = inner
+        let task_idx = process.with_threads(|threads| {
+            threads
             .tasks
             .iter()
             .enumerate()
-            .find(|(idx, t)| {
-                t.is_some() && ((if *idx == 0 { self.pid } else { self.pid + *idx }) == tid)
-            })?;
+            .find_map(|(idx, t)| {
+                if t.is_some() && ((if idx == 0 { self.pid } else { self.pid + idx }) == tid) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+        })?;
         Some(ProcPidTaskTidDirInode::new(self.pid, task_idx))
     }
 
@@ -291,8 +296,8 @@ impl VfsInode for ProcPidTaskDirInode {
         let Some(process) = pid2process(self.pid) else {
             return Vec::new();
         };
-        let inner = process.inner_exclusive_access();
-        let mut out: Vec<String> = inner
+        let mut out: Vec<String> = process.with_threads(|threads| {
+            threads
             .tasks
             .iter()
             .enumerate()
@@ -304,7 +309,8 @@ impl VfsInode for ProcPidTaskDirInode {
                 }
             })
             .map(|tid| format!("{}", tid))
-            .collect();
+            .collect()
+        });
         out.sort();
         out
     }
@@ -367,10 +373,15 @@ impl ProcPidTaskStatInode {
             return String::new();
         };
         let inner = process.inner_exclusive_access();
-        let comm = inner.name.clone();
+        let comm = process.name();
         let mut state = if inner.is_zombie { 'Z' } else { 'R' };
         if !inner.is_zombie {
-            if let Some(Some(task)) = inner.tasks.get(self.task_idx) {
+            if let Some(task) = process.with_threads(|threads| {
+                threads
+                    .tasks
+                    .get(self.task_idx)
+                    .and_then(|task| task.as_ref().cloned())
+            }) {
                 if let Some(task_inner) = task.try_inner_exclusive_access() {
                 state = match task_inner.task_status {
                     TaskStatus::Blocked => 'S',
@@ -451,9 +462,10 @@ impl ProcPidMapsInode {
             return String::new();
         };
         let inner = process.inner_exclusive_access();
+        let name = process.name();
         inner
             .memory_set
-            .render_proc_maps(&inner.name, inner.heap_bottom, inner.program_brk)
+            .render_proc_maps(&name, inner.heap_bottom, inner.program_brk)
     }
 }
 
@@ -510,12 +522,14 @@ impl ProcPidStatInode {
             return String::new();
         };
         let inner = process.inner_exclusive_access();
-        let comm = inner.name.clone();
+        let comm = process.name();
         // /proc/<pid>/stat should reflect the thread-group leader state.
         // LTP's TST_PROCESS_STATE_WAIT() relies on this for parent process sleep detection.
         let mut state = if inner.is_zombie { 'Z' } else { 'R' };
         if !inner.is_zombie {
-            if let Some(Some(leader)) = inner.tasks.get(0) {
+            if let Some(leader) = process.with_threads(|threads| {
+                threads.tasks.get(0).and_then(|task| task.as_ref().cloned())
+            }) {
                 if let Some(task_inner) = leader.try_inner_exclusive_access() {
                     state = match task_inner.task_status {
                         TaskStatus::Blocked => 'S',
@@ -590,11 +604,9 @@ impl ProcPidStatusInode {
         let Some(process) = pid2process(self.pid) else {
             return String::new();
         };
-        let inner = process.inner_exclusive_access();
-        let name = inner.name.clone();
+        let name = process.name();
         let pid = self.pid;
-        let uid = inner.effective_uid;
-        drop(inner);
+        let uid = process.effective_uid();
         format!(
             "Name:\t{name}\n\
              Tgid:\t{pid}\n\

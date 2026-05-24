@@ -247,12 +247,7 @@ impl TaskUserRes {
 
     #[allow(unused)]
     pub fn alloc_tid(&mut self) {
-        self.tid = self
-            .process
-            .upgrade()
-            .unwrap()
-            .inner_exclusive_access()
-            .alloc_tid();
+        self.tid = self.process.upgrade().unwrap().alloc_tid();
     }
 
     pub fn dealloc_tid(&self) {

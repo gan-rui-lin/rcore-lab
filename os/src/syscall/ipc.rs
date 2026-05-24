@@ -128,10 +128,9 @@ struct MsgInfoUser {
 fn current_ipc_identity() -> (u32, u32, usize, bool) {
     let process = current_process();
     let pid = process.pid.0;
-    let inner = process.inner_exclusive_access();
-    let euid = inner.effective_uid;
-    let egid = inner.effective_gid;
-    drop(inner);
+    let creds = process.credentials_snapshot();
+    let euid = creds.effective_uid;
+    let egid = creds.effective_gid;
     (euid, egid, pid, euid == 0)
 }
 

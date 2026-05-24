@@ -135,7 +135,7 @@ pub fn pid2process_aggregate() -> (
             sampled_processes += 1;
             let child_len = inner.children.len();
             total_children += child_len;
-            total_tasks += inner.tasks.iter().filter(|t| t.is_some()).count();
+            total_tasks += process.thread_count();
             if child_len > max_children {
                 max_children = child_len;
                 max_children_pid = *pid;
@@ -166,8 +166,8 @@ pub fn pid2process_fdtable_summary() -> (usize, usize, usize) {
     let mut max_fd_slots = 0usize;
     let mut max_fd_pid = 0usize;
     for (pid, process) in map.iter() {
-        if let Some(inner) = process.try_inner_exclusive_access() {
-            let fd_len = inner.fd_table.len();
+        if process.try_inner_exclusive_access().is_some() {
+            let fd_len = process.with_fs(|fs| fs.fd_table.len());
             total_fd_slots += fd_len;
             if fd_len > max_fd_slots {
                 max_fd_slots = fd_len;
@@ -217,9 +217,9 @@ pub fn print_pid2process_top_by_fd(limit: usize) {
         let Some(inner) = process.try_inner_exclusive_access() else {
             continue;
         };
-        let fd_slots = inner.fd_table.len();
-        let fd_used = inner.fd_table.iter().filter(|fd| fd.is_some()).count();
-        let tasks_alive = inner.tasks.iter().filter(|t| t.is_some()).count();
+        let (fd_slots, fd_used) =
+            process.with_fs(|fs| (fs.fd_table.len(), fs.fd_table.iter().filter(|fd| fd.is_some()).count()));
+        let tasks_alive = process.thread_count();
         let children = inner.children.len();
         let is_zombie = inner.is_zombie;
         let candidate = TopFdEntry {
@@ -250,12 +250,12 @@ pub fn print_pid2process_top_by_fd(limit: usize) {
             break;
         }
         if let Some(process) = pid2process(entry.pid) {
-            if let Some(inner) = process.try_inner_exclusive_access() {
+            if process.try_inner_exclusive_access().is_some() {
                 println!(
                     "[kernel] alloc_error top_fd[{}]: pid={} name={} zombie={} tasks_alive={} children={} fd_used={} fd_slots={} sampled=true",
                     idx,
                     entry.pid,
-                    inner.name.as_str(),
+                    process.name().as_str(),
                     entry.is_zombie,
                     entry.tasks_alive,
                     entry.children,

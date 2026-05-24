@@ -397,7 +397,7 @@ fn access_allowed_egid(full_path: &str, mode: u32, uid: u32, egid: u32) -> Resul
 /// Convenience wrapper that reads egid from the current process.
 /// Do NOT call while holding the process inner lock — use access_allowed_egid instead.
 fn access_allowed(full_path: &str, mode: u32, uid: u32) -> Result<(), isize> {
-    let egid = current_process().inner_exclusive_access().effective_gid;
+    let egid = current_process().effective_gid();
     access_allowed_egid(full_path, mode, uid, egid)
 }
 
@@ -537,8 +537,7 @@ fn resolve_path(base: &str, path: &str) -> String {
 
 fn current_root_dir() -> String {
     let process = current_process();
-    let root = process.inner_exclusive_access().root_dir.clone();
-    root
+    process.root_dir()
 }
 
 fn resolve_user_path(base: &str, path: &str) -> String {
@@ -559,18 +558,14 @@ fn resolve_user_path(base: &str, path: &str) -> String {
 fn dirfd_base(dirfd: isize) -> Result<String, isize> {
     if dirfd == AT_FDCWD {
         let process = current_process();
-        return Ok(process.inner_exclusive_access().cwd.clone());
+        return Ok(process.cwd());
     }
     if dirfd < 0 {
         return Err(errno(EBADF));
     }
     let process = current_process();
-    let inner = process.inner_exclusive_access();
     let fd = dirfd as usize;
-    if fd >= inner.fd_table.len() {
-        return Err(errno(EBADF));
-    }
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return Err(errno(EBADF));
     };
     if let Some(inode) = file.inode() {
@@ -805,7 +800,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         Ok(path) => path,
         Err(err) => return err,
     };
-    let proc_name = process.inner_exclusive_access().name.clone();
+    let proc_name = process.name();
     let trace_so_open =
         proc_name == "entry-dynamic.exe" && (raw_path.contains(".so") || full_path.contains(".so"));
     if trace_so_open {
@@ -830,12 +825,9 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     const O_TMPFILE: u32 = 0x410000;
     if (flags & O_TMPFILE) == O_TMPFILE {
         let memfd: Arc<dyn crate::fs::File + Send + Sync> = Arc::new(MemFdFile::new(false));
-        let mut inner = process.inner_exclusive_access();
-        let fd = match inner.alloc_fd() {
-            Some(fd) => fd,
-            None => return errno(EMFILE),
+        let Some(fd) = process.install_file(memfd) else {
+            return errno(EMFILE);
         };
-        inner.fd_table[fd] = Some(memfd);
         return fd as isize;
     }
     let flags = OpenFlags::from_bits_truncate(flags);
@@ -853,9 +845,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     }
     // Special device files
     let (readable, writable) = flags.read_write();
-    let inner_for_perm = process.inner_exclusive_access();
-    let euid = inner_for_perm.effective_uid;
-    drop(inner_for_perm);
+    let euid = process.effective_uid();
     if flags.contains(OpenFlags::CREATE) && !existed {
         if let Some((parent, _)) = full_path.rsplit_once('/') {
             let parent = if parent.is_empty() { "/" } else { parent };
@@ -894,12 +884,9 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         _ => None,
     };
     if let Some(file) = dev_file {
-        let mut inner = process.inner_exclusive_access();
-        let fd = match inner.alloc_fd() {
-            Some(fd) => fd,
-            None => return errno(EMFILE),
+        let Some(fd) = process.install_file(file) else {
+            return errno(EMFILE);
         };
-        inner.fd_table[fd] = Some(file);
         return fd as isize;
     }
     if let Some(inode) = open_file(full_path.as_str(), flags) {
@@ -909,19 +896,15 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
             }
         }
         if flags.contains(OpenFlags::CREATE) && !existed {
-            let inner = process.inner_exclusive_access();
+            let creds = process.credentials_snapshot();
             if let Some(vfs_inode) = inode.inode() {
                 let _ = vfs_inode.chmod(apply_umask(_mode));
-                let _ = vfs_inode.chown(Some(inner.effective_uid), Some(inner.effective_gid));
+                let _ = vfs_inode.chown(Some(creds.effective_uid), Some(creds.effective_gid));
             }
-            drop(inner);
         }
-        let mut inner = process.inner_exclusive_access();
-        let fd = match inner.alloc_fd() {
-            Some(fd) => fd,
-            None => return errno(EMFILE),
+        let Some(fd) = process.install_file(inode) else {
+            return errno(EMFILE);
         };
-        inner.fd_table[fd] = Some(inode);
         if trace_so_open {
             info!(
                 "[openat-so] pid={} open ok full={} -> fd={}",
@@ -968,7 +951,7 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: u32, _flags: u32) -> i
         Ok(path) => path,
         Err(err) => return err,
     };
-    let uid = current_process().inner_exclusive_access().real_uid;
+    let uid = current_process().real_uid();
     match access_allowed(full_path.as_str(), mode, uid) {
         Ok(()) => 0,
         Err(err) => err,
@@ -1007,7 +990,7 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsize: usiz
     // Minimal procfs compatibility for busybox/glibc probes.
     // If /proc/<pid>/exe (or /proc/self/exe) is requested, return a stable executable path.
     let process = current_process();
-    let process_name = process.inner_exclusive_access().name.clone();
+    let process_name = process.name();
     let self_exe =
         full_path == "/proc/self/exe" || full_path == format!("/proc/{}/exe", process.pid.0);
 
@@ -1108,11 +1091,9 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
         return errno(EEXIST);
     }
     if create_dir(&full_path) {
-        let process = current_process();
-        let inner = process.inner_exclusive_access();
-        let uid = inner.effective_uid;
-        let gid = inner.effective_gid;
-        drop(inner);
+        let creds = current_process().credentials_snapshot();
+        let uid = creds.effective_uid;
+        let gid = creds.effective_gid;
         if let Some(inode) = inode_for_path(&full_path) {
             let _ = inode.chmod(apply_umask(_mode));
             let _ = inode.chown(Some(uid), Some(gid));
@@ -1169,11 +1150,9 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, _dev: u32) -> isize
             return errno(ENOENT);
         }
     }
-    let process = current_process();
-    let inner = process.inner_exclusive_access();
-    let uid = inner.effective_uid;
-    let gid = inner.effective_gid;
-    drop(inner);
+    let creds = current_process().credentials_snapshot();
+    let uid = creds.effective_uid;
+    let gid = creds.effective_gid;
     let inode = if node_type == S_IFREG {
         let Some(file) = open_file(full_path.as_str(), OpenFlags::CREATE | OpenFlags::WRONLY)
         else {
@@ -1235,23 +1214,24 @@ pub fn sys_close_range(first: usize, last: usize, flags: u32) -> isize {
     }
     let process = current_process();
     let pid = process.pid.0;
-    let mut inner = process.inner_exclusive_access();
-    if inner.fd_table.is_empty() || first >= inner.fd_table.len() {
+    let fd_len = process.with_fs(|fs| fs.fd_table.len());
+    if fd_len == 0 || first >= fd_len {
         return 0;
     }
-    let upper = last.min(inner.fd_table.len().saturating_sub(1));
+    let upper = last.min(fd_len.saturating_sub(1));
     if (flags & CLOSE_RANGE_CLOEXEC) != 0 {
         for fd in first..=upper {
-            if inner.fd_table[fd].is_some() {
+            if process.get_file(fd).is_some() {
                 let cur = fd_flags_get(pid, fd);
                 fd_flags_set(pid, fd, cur | FD_CLOEXEC);
             }
         }
     } else {
         for fd in first..=upper {
-            inner.fd_table[fd].take();
-            fd_flags_remove(pid, fd);
-            flock_unlock_owner(pid, fd);
+            if process.take_fd(fd).is_some() {
+                fd_flags_remove(pid, fd);
+                flock_unlock_owner(pid, fd);
+            }
         }
     }
     0
@@ -1446,12 +1426,9 @@ fn apply_utimensat_to_inode(
 /// Apply utimensat semantics to an open file descriptor.
 fn apply_utimensat_to_fd(fd: usize, times: *const TimeSpec, token: usize) -> isize {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
-    }
-    let file = inner.fd_table[fd].as_ref().unwrap().clone();
-    drop(inner);
+    };
     match file.inode() {
         Some(inode) => apply_utimensat_to_inode(inode, times, token),
         None => 0,
@@ -1580,15 +1557,9 @@ fn fill_regular_stat(stat: &mut Stat, path: &str, inode: &dyn VfsInode) -> Optio
 
 fn stat_from_fd(fd: usize) -> Result<Stat, isize> {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return Err(errno(EBADF));
-    }
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return Err(errno(EBADF));
     };
-    let file = file.clone();
-    drop(inner);
 
     let mut stat = Stat::default();
     let path = file.path().unwrap_or("");
@@ -1713,7 +1684,7 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: i32, _mask: u32, buf: *mu
             return errno(ENOENT);
         }
         if dirfd == AT_FDCWD {
-            let cwd = current_process().inner_exclusive_access().cwd.clone();
+            let cwd = current_process().cwd();
             stat_from_path(&cwd)
         } else if dirfd < 0 {
             return errno(EBADF);
@@ -1793,15 +1764,12 @@ pub fn sys_dup(fd: usize) -> isize {
         syscall!("kernel:pid[{}] sys_dup", pid);
     }
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
-    }
-    let new_fd = match inner.alloc_fd() {
-        Some(fd) => fd,
-        None => return errno(EMFILE),
     };
-    inner.fd_table[new_fd] = inner.fd_table[fd].clone();
+    let Some(new_fd) = process.install_file(file) else {
+        return errno(EMFILE);
+    };
     fd_flags_set(pid, new_fd, 0);
     new_fd as isize
 }
@@ -1819,18 +1787,14 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, flags: u32) -> isize {
         return errno(EINVAL);
     }
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    if oldfd >= inner.fd_table.len() || inner.fd_table[oldfd].is_none() {
+    let Some(file) = process.get_file(oldfd) else {
         return errno(EBADF);
-    }
-    let limit = inner.rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize;
+    };
+    let limit = process.inner_exclusive_access().rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize;
     if newfd >= limit {
         return errno(EBADF);
     }
-    if newfd >= inner.fd_table.len() {
-        inner.fd_table.resize_with(newfd + 1, || None);
-    }
-    inner.fd_table[newfd] = inner.fd_table[oldfd].clone();
+    process.install_file_at(newfd, file);
     let new_flags = if (flags & O_CLOEXEC) != 0 { 1 } else { 0 };
     fd_flags_set(pid, newfd, new_flags);
     newfd as isize
@@ -1962,7 +1926,7 @@ pub fn sys_linkat(
         return errno(EROFS);
     }
 
-    let euid = current_process().inner_exclusive_access().effective_uid;
+    let euid = current_process().effective_uid();
     if euid != 0 {
         if let Err(err) = access_allowed(&old_path, 0, euid) {
             return err;
@@ -2062,11 +2026,9 @@ pub fn sys_unlinkat(_dirfd: isize, _name: *const u8, _flags: u32) -> isize {
     };
     if let Some((parent, _)) = path.rsplit_once('/') {
         let parent = if parent.is_empty() { "/" } else { parent };
-        let process = current_process();
-        let inner = process.inner_exclusive_access();
-        let euid = inner.effective_uid;
-        let egid = inner.effective_gid;
-        drop(inner);
+        let creds = current_process().credentials_snapshot();
+        let euid = creds.effective_uid;
+        let egid = creds.effective_gid;
         if let Err(err) = access_allowed_egid(parent, 0o3, euid, egid) {
             return err;
         }
@@ -2216,7 +2178,7 @@ pub fn sys_getcwd(buf: *mut u8, len: usize) -> isize {
     // Get cwd first so we can check the size before validating buf.
     // Linux checks ERANGE (buffer too small) before EFAULT (invalid buf pointer).
     let process = current_process();
-    let cwd = process.inner_exclusive_access().cwd.clone();
+    let cwd = process.cwd();
     let bytes = cwd.as_bytes();
     if len == 0 || len < bytes.len() + 1 {
         return errno(ERANGE);
@@ -2263,7 +2225,7 @@ pub fn sys_chdir(_path: *const u8) -> isize {
     let base = if raw.starts_with('/') {
         String::from("/")
     } else {
-        process.inner_exclusive_access().cwd.clone()
+        process.cwd()
     };
     let path = if raw.starts_with('/') {
         normalize_path(&raw)
@@ -2282,8 +2244,7 @@ pub fn sys_chdir(_path: *const u8) -> isize {
     //     );
     // }
     if is_dir {
-        let mut inner = process.inner_exclusive_access();
-        inner.cwd = path;
+        process.set_cwd(path);
         0
     } else {
         errno(ENOENT)
@@ -2296,11 +2257,7 @@ pub fn sys_fchdir(fd: usize) -> isize {
         syscall!("kernel:pid[{}] sys_fchdir", pid);
     }
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
     let Some(inode) = file.inode() else {
@@ -2312,13 +2269,14 @@ pub fn sys_fchdir(fd: usize) -> isize {
     let Some(path) = file.path() else {
         return errno(ENOTDIR);
     };
-    let uid = inner.effective_uid;
-    let egid = inner.effective_gid;
+    let creds = process.credentials_snapshot();
+    let uid = creds.effective_uid;
+    let egid = creds.effective_gid;
     // Use egid-aware variant since inner is still held
     if let Err(err) = access_allowed_egid(path, 0o1, uid, egid) {
         return err;
     }
-    inner.cwd = String::from(path);
+    process.set_cwd(String::from(path));
     0
 }
 
@@ -2345,7 +2303,7 @@ pub fn sys_chroot(path: *const u8) -> isize {
         return errno(ENAMETOOLONG);
     }
     let process = current_process();
-    let cwd = process.inner_exclusive_access().cwd.clone();
+    let cwd = process.cwd();
     let full_path = resolve_user_path(&cwd, &raw_path);
     let full_path = match resolve_access_path(&full_path) {
         Ok(path) => path,
@@ -2357,23 +2315,23 @@ pub fn sys_chroot(path: *const u8) -> isize {
     if !path_is_dir(&full_path) {
         return errno(ENOTDIR);
     }
-    let euid = process.inner_exclusive_access().effective_uid;
+    let euid = process.effective_uid();
     if euid != 0 {
         if let Err(err) = access_allowed(&full_path, 0o1, euid) {
             return err;
         }
         return errno(EPERM);
     }
-    let mut inner = process.inner_exclusive_access();
-    inner.root_dir = full_path.clone();
-    if !(inner.cwd == full_path
-        || inner
+    process.with_fs_mut(|fs| {
+        fs.root_dir = full_path.clone();
+        if !(fs.cwd == full_path
+        || fs
             .cwd
             .strip_prefix(&full_path)
             .is_some_and(|rest| rest.starts_with('/')))
     {
-        inner.cwd = full_path;
-    }
+        fs.cwd = full_path;
+    }});
     0
 }
 
@@ -2397,18 +2355,12 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> isize {
         return errno(EFAULT);
     }
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
     if !file.readable() {
         return errno(EBADF);
     }
-    let file = file.clone();
-    drop(inner);
     if let Some(path) = file.path() {
         // `getdents02` expects ENOENT when a directory fd points to an unlinked path.
         if !path_exists_for_access(path) {
@@ -2470,21 +2422,17 @@ pub fn sys_pipe2(fds: *mut i32, flags: u32) -> isize {
         write_end.set_status_flags(O_NONBLOCK);
     }
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd0 = match inner.alloc_fd() {
+    let fd0 = match process.install_file(read_end) {
         Some(fd) => fd,
         None => return errno(EMFILE),
     };
-    inner.fd_table[fd0] = Some(read_end);
-    let fd1 = match inner.alloc_fd() {
+    let fd1 = match process.install_file(write_end) {
         Some(fd) => fd,
         None => {
-            inner.fd_table[fd0] = None;
+            process.take_fd(fd0);
             return errno(EMFILE);
         }
     };
-    inner.fd_table[fd1] = Some(write_end);
-    drop(inner);
     if flags & O_CLOEXEC != 0 {
         fd_flags_set(pid, fd0, 1);
         fd_flags_set(pid, fd1, 1);
@@ -2522,12 +2470,10 @@ pub fn sys_memfd_create(name: *const u8, flags: u32) -> isize {
         Arc::new(MemFdFile::new((flags & MFD_ALLOW_SEALING) != 0));
     let process = current_process();
     let pid = process.pid.0;
-    let mut inner = process.inner_exclusive_access();
-    let fd = match inner.alloc_fd() {
+    let fd = match process.install_file(memfd) {
         Some(fd) => fd,
         None => return errno(EMFILE),
     };
-    inner.fd_table[fd] = Some(memfd);
     if (flags & MFD_CLOEXEC) != 0 {
         fd_flags_set(pid, fd, 1);
     }
@@ -2556,7 +2502,7 @@ pub fn sys_mount(
     if raw_target.is_empty() {
         return errno(EINVAL);
     }
-    let cwd = current_process().inner_exclusive_access().cwd.clone();
+    let cwd = current_process().cwd();
     let target = if raw_target.starts_with('/') {
         normalize_path(&raw_target)
     } else {
@@ -2585,7 +2531,7 @@ pub fn sys_umount2(_target: *const u8, _flags: u32) -> isize {
     if raw_target.is_empty() {
         return errno(EINVAL);
     }
-    let cwd = current_process().inner_exclusive_access().cwd.clone();
+    let cwd = current_process().cwd();
     let target = if raw_target.starts_with('/') {
         normalize_path(&raw_target)
     } else {
@@ -2622,13 +2568,7 @@ pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> isize {
     const SEEK_END: usize = 2;
 
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
 
@@ -2662,9 +2602,6 @@ pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> isize {
     if file.inode().is_none() {
         return errno(ESPIPE);
     }
-
-    let file = file.clone();
-    drop(inner);
 
     let current_offset = file.get_offset().unwrap_or(0) as isize;
     let file_size = if let Some(inode) = file.inode() {
@@ -2718,22 +2655,13 @@ pub fn sys_readv(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 
     let token = current_user_token();
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
 
     if !file.readable() {
         return errno(EBADF);
     }
-
-    let file = file.clone();
-    drop(inner);
 
     let mut total_read = 0isize;
 
@@ -2839,22 +2767,13 @@ pub fn sys_writev(fd: usize, iov: *const usize, iovcnt: usize) -> isize {
 
     let token = current_user_token();
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
 
     if !file.writable() {
         return errno(EBADF);
     }
-
-    let file = file.clone();
-    drop(inner);
 
     let mut total_written = 0isize;
 
@@ -3007,39 +2926,40 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     }
 
     let file = {
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return errno(EBADF);
-        }
-        let Some(file) = &inner.fd_table[fd] else {
+        let Some(file) = process.get_file(fd) else {
             return errno(EBADF);
         };
-        file.clone()
+        file
     };
 
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             // Duplicate fd to the lowest numbered available fd >= arg
-            let mut inner = process.inner_exclusive_access();
-            let limit = inner.rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize;
+            let limit = process.inner_exclusive_access().rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize;
             if arg >= limit {
                 return errno(EINVAL);
             }
-            let mut new_fd = None;
-            for i in arg..inner.fd_table.len() {
-                if inner.fd_table[i].is_none() {
-                    new_fd = Some(i);
-                    break;
+            let new_fd = process.with_fs_mut(|fs| {
+                let mut new_fd = None;
+                for i in arg..fs.fd_table.len() {
+                    if fs.fd_table[i].is_none() {
+                        new_fd = Some(i);
+                        break;
+                    }
                 }
-            }
-            let new_fd = new_fd.unwrap_or(arg.max(inner.fd_table.len()));
-            if new_fd >= limit {
+                let new_fd = new_fd.unwrap_or(arg.max(fs.fd_table.len()));
+                if new_fd >= limit {
+                    return None;
+                }
+                if new_fd >= fs.fd_table.len() {
+                    fs.fd_table.resize_with(new_fd + 1, || None);
+                }
+                fs.fd_table[new_fd] = Some(file);
+                Some(new_fd)
+            });
+            let Some(new_fd) = new_fd else {
                 return errno(EMFILE);
-            }
-            if new_fd >= inner.fd_table.len() {
-                inner.fd_table.resize_with(new_fd + 1, || None);
-            }
-            inner.fd_table[new_fd] = Some(file);
+            };
             let cloexec = if cmd == F_DUPFD_CLOEXEC {
                 FD_CLOEXEC
             } else {
@@ -3298,11 +3218,7 @@ fn sys_removexattr_path(path: String, name: *const u8) -> isize {
 
 fn xattr_path_from_fd(fd: usize) -> Result<String, isize> {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return Err(errno(EBADF));
-    }
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return Err(errno(EBADF));
     };
     if let Some(path) = file.path() {
@@ -3403,18 +3319,13 @@ pub fn sys_flock(fd: usize, operation: i32) -> isize {
 
     let pid = current_process().pid.0;
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
     let Some(path) = file.path() else {
         return errno(EBADF);
     };
     let path = String::from(path);
-    drop(inner);
 
     if (operation & LOCK_UN) != 0 {
         let mut locks = FLOCK_LOCKS.exclusive_access();
@@ -3470,15 +3381,8 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
     const FIONBIO: usize = 0x5421; // Set/clear non-blocking I/O
 
     let process = current_process();
-    let file = {
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return errno(EBADF);
-        }
-        let Some(file) = &inner.fd_table[fd] else {
-            return errno(EBADF);
-        };
-        file.clone()
+    let Some(file) = process.get_file(fd) else {
+        return errno(EBADF);
     };
 
     // Handle common ioctl requests
@@ -3586,16 +3490,9 @@ pub fn sys_ftruncate(fd: usize, length: isize) -> isize {
     }
 
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-
-    let Some(file) = inner.fd_table[fd].clone() else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
-    drop(inner);
 
     // POSIX: EINVAL if file is not open for writing (O_RDONLY) or not a regular file
     if !file.writable() {
@@ -3650,7 +3547,7 @@ pub fn sys_truncate(path: *const u8, length: isize) -> isize {
     let full_path = if raw_path.starts_with('/') {
         normalize_path(&raw_path)
     } else {
-        let base = current_process().inner_exclusive_access().cwd.clone();
+        let base = current_process().cwd();
         resolve_path(&base, &raw_path)
     };
 
@@ -3667,11 +3564,10 @@ pub fn sys_truncate(path: *const u8, length: isize) -> isize {
     }
 
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    let euid = inner.effective_uid;
-    let egid = inner.effective_gid;
-    let file_limit = inner.rlimits[1].rlim_cur;
-    drop(inner);
+    let creds = process.credentials_snapshot();
+    let euid = creds.effective_uid;
+    let egid = creds.effective_gid;
+    let file_limit = process.inner_exclusive_access().rlimits[1].rlim_cur;
 
     if (length as u64) > file_limit {
         return errno(EFBIG);
@@ -3711,11 +3607,7 @@ pub fn sys_fallocate(fd: usize, mode: u32, offset: isize, len: isize) -> isize {
         None => return errno(EINVAL),
     };
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
     if !file.writable() {
@@ -3754,7 +3646,7 @@ pub fn sys_statfs(path: *const u8, buf: *mut StatFs) -> isize {
     if raw.is_empty() {
         return errno(EINVAL);
     }
-    let cwd = current_process().inner_exclusive_access().cwd.clone();
+    let cwd = current_process().cwd();
     let full_path = if raw.starts_with('/') {
         normalize_path(&raw)
     } else {
@@ -3787,12 +3679,9 @@ pub fn sys_fstatfs(fd: usize, buf: *mut StatFs) -> isize {
         return errno(EFAULT);
     }
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
-    }
-    let file = inner.fd_table[fd].as_ref().unwrap().clone();
-    drop(inner);
+    };
     let Some(inode) = file.inode() else {
         return errno(ENOTSUP);
     };
@@ -3837,20 +3726,16 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset: *mut isize, count: usiz
 
     let process = current_process();
     let (in_file, out_file) = {
-        let inner = process.inner_exclusive_access();
-        if in_fd >= inner.fd_table.len() || out_fd >= inner.fd_table.len() {
-            return errno(EBADF);
-        }
-        let Some(in_file) = &inner.fd_table[in_fd] else {
+        let Some(in_file) = process.get_file(in_fd) else {
             return errno(EBADF);
         };
-        let Some(out_file) = &inner.fd_table[out_fd] else {
+        let Some(out_file) = process.get_file(out_fd) else {
             return errno(EBADF);
         };
         if !in_file.readable() || !out_file.writable() {
             return errno(EBADF);
         }
-        (in_file.clone(), out_file.clone())
+        (in_file, out_file)
     };
 
     let in_inode = in_file.inode();
@@ -3957,14 +3842,10 @@ pub fn sys_splice(
     }
 
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd_in >= inner.fd_table.len() || fd_out >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file_in) = &inner.fd_table[fd_in] else {
+    let Some(file_in) = process.get_file(fd_in) else {
         return errno(EBADF);
     };
-    let Some(file_out) = &inner.fd_table[fd_out] else {
+    let Some(file_out) = process.get_file(fd_out) else {
         return errno(EBADF);
     };
     if !file_in.readable() || !file_out.writable() {
@@ -4141,14 +4022,10 @@ pub fn sys_pselect6(
 
             let file = {
                 let process = current_process();
-                let inner = process.inner_exclusive_access();
-                if fd >= inner.fd_table.len() {
-                    return errno(EBADF);
-                }
-                let Some(file) = &inner.fd_table[fd] else {
+                let Some(file) = process.get_file(fd) else {
                     return errno(EBADF);
                 };
-                file.clone()
+                file
             };
 
             let ready = file.poll(
@@ -4268,18 +4145,12 @@ pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: *const TimeSpec) -> isi
 
             let file = {
                 let process = current_process();
-                let inner = process.inner_exclusive_access();
-                if (fd.fd as usize) >= inner.fd_table.len() {
+                let Some(file) = process.get_file(fd.fd as usize) else {
                     fd.revents |= PollEvents::POLLINVAL;
                     ret += 1;
                     continue;
                 };
-                let Some(file) = &inner.fd_table[fd.fd as usize] else {
-                    fd.revents |= PollEvents::POLLINVAL;
-                    ret += 1;
-                    continue;
-                };
-                file.clone()
+                file
             };
             let request = fd.events | PollEvents::POLLERR | PollEvents::POLLHUP;
             let ready = file.poll(request);
@@ -4317,15 +4188,9 @@ pub fn sys_pread64(fd: usize, buf: *const u8, count: usize, offset: isize) -> is
     }
     let token = current_user_token();
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
-    let file = file.clone();
-    drop(inner);
     if !file.readable() {
         return errno(EBADF);
     }
@@ -4413,15 +4278,9 @@ fn sys_preadv_common(
 
     let token = current_user_token();
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
-    let file = file.clone();
-    drop(inner);
 
     if !file.readable() {
         return errno(EBADF);
@@ -4565,15 +4424,9 @@ pub fn sys_pwrite64(fd: usize, buf: *const u8, count: usize, offset: isize) -> i
     }
     let token = current_user_token();
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
-    let file = file.clone();
-    drop(inner);
     if offset < 0 {
         return errno(EINVAL);
     }
@@ -4661,15 +4514,9 @@ pub fn sys_pwritev(fd: usize, iov: *const usize, iovcnt: usize, offset: isize) -
 
     let token = current_user_token();
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
-    let file = file.clone();
-    drop(inner);
     if !file.writable() {
         return errno(EBADF);
     }
@@ -4813,15 +4660,9 @@ pub fn sys_posix_fadvise(fd: usize, offset: isize, len: isize, advice: i32) -> i
     }
 
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
-    let file = file.clone();
-    drop(inner);
 
     if file.inode().is_none() {
         return errno(ESPIPE);
@@ -4871,10 +4712,7 @@ pub fn sys_get_robust_list(pid: usize, head: *mut u8, len: *mut u8) -> isize {
     };
     // Check permissions: non-root can only query their own process
     {
-        let cur = current_process();
-        let inner = cur.inner_exclusive_access();
-        let effective_uid = inner.effective_uid;
-        drop(inner);
+        let effective_uid = current_process().effective_uid();
         if pid != 0 && effective_uid != 0 {
             // Check if this is our own thread group
             let target_pid = process.pid.0;
@@ -4936,7 +4774,8 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mut mode: u32, _flags: u32) -
         return errno(EROFS);
     }
     let process = current_process();
-    let euid = process.inner_exclusive_access().effective_uid;
+    let creds = process.credentials_snapshot();
+    let euid = creds.effective_uid;
     if euid != 0 {
         if let Err(err) = access_allowed(&full_path, 0, euid) {
             return err;
@@ -4947,7 +4786,7 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mut mode: u32, _flags: u32) -
         }
         // POSIX: if caller's effective GID doesn't match the file's GID,
         // the S_ISGID bit must be silently cleared (non-root can't set it).
-        let egid = process.inner_exclusive_access().effective_gid;
+        let egid = creds.effective_gid;
         if egid != file_gid {
             mode &= !0o2000u32; // clear S_ISGID
         }
@@ -4964,11 +4803,7 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mut mode: u32, _flags: u32) -
 /// sys_fchmod (syscall 52)
 pub fn sys_fchmod(fd: usize, mut mode: u32) -> isize {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
     let Some(path) = file.path() else {
@@ -4977,13 +4812,14 @@ pub fn sys_fchmod(fd: usize, mut mode: u32) -> isize {
     if readonly_mount_contains(path) {
         return errno(EROFS);
     }
-    if inner.effective_uid != 0 {
+    let creds = process.credentials_snapshot();
+    if creds.effective_uid != 0 {
         let (uid, file_gid) = effective_path_owner(path);
-        if uid != inner.effective_uid {
+        if uid != creds.effective_uid {
             return errno(EPERM);
         }
         // POSIX: clear S_ISGID if caller's egid doesn't match the file's GID
-        if inner.effective_gid != file_gid {
+        if creds.effective_gid != file_gid {
             mode &= !0o2000u32;
         }
     }
@@ -5051,13 +4887,11 @@ pub fn sys_fchownat(dirfd: isize, path: *const u8, owner: u32, group: u32, flags
     if readonly_mount_contains(&full_path) {
         return errno(EROFS);
     }
-    let process = current_process();
-    let inner = process.inner_exclusive_access();
-    let euid = inner.effective_uid;
-    let egid = inner.effective_gid;
-    let rgid = inner.real_gid;
-    let sgid = inner.saved_gid;
-    drop(inner);
+    let creds = current_process().credentials_snapshot();
+    let euid = creds.effective_uid;
+    let egid = creds.effective_gid;
+    let rgid = creds.real_gid;
+    let sgid = creds.saved_gid;
     if euid != 0 {
         if let Err(err) = access_allowed(&full_path, 0, euid) {
             return err;
@@ -5073,22 +4907,18 @@ pub fn sys_fchownat(dirfd: isize, path: *const u8, owner: u32, group: u32, flags
 
 pub fn sys_fchown(fd: usize, owner: u32, group: u32) -> isize {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = &inner.fd_table[fd] else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
     let Some(path) = file.path() else {
         return errno(EBADF);
     };
     let path = String::from(path);
-    let euid = inner.effective_uid;
-    let egid = inner.effective_gid;
-    let rgid = inner.real_gid;
-    let sgid = inner.saved_gid;
-    drop(inner);
+    let creds = process.credentials_snapshot();
+    let euid = creds.effective_uid;
+    let egid = creds.effective_gid;
+    let rgid = creds.real_gid;
+    let sgid = creds.saved_gid;
 
     if readonly_mount_contains(&path) {
         return errno(EROFS);
@@ -5171,12 +5001,10 @@ pub fn sys_timerfd_create(clockid: i32, flags: i32) -> isize {
     let cloexec = (flags & TFD_CLOEXEC) != 0;
     let file = Arc::new(TimerFdFile::new(clockid, nonblock, cloexec));
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd = match inner.alloc_fd() {
+    let fd = match process.install_file(file) {
         Some(fd) => fd,
         None => return errno(EMFILE),
     };
-    inner.fd_table[fd] = Some(file);
     fd as isize
 }
 
@@ -5196,14 +5024,9 @@ pub fn sys_timerfd_settime(
         None => return errno(EFAULT),
     };
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = inner.fd_table[fd].clone() else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
-    drop(inner);
     if !file.is_timerfd() {
         return errno(EINVAL);
     }
@@ -5242,14 +5065,9 @@ pub fn sys_timerfd_gettime(fd: usize, curr_value: *mut u8) -> isize {
     }
     let token = current_user_token();
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = inner.fd_table[fd].clone() else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
-    drop(inner);
     if !file.is_timerfd() {
         return errno(EINVAL);
     }
@@ -5269,14 +5087,9 @@ pub fn sys_timerfd_gettime(fd: usize, curr_value: *mut u8) -> isize {
 /// fdatasync(2) — flush file data and essential metadata to storage.
 pub fn sys_fdatasync(fd: usize) -> isize {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return errno(EBADF);
-    }
-    let Some(file) = inner.fd_table[fd].clone() else {
+    let Some(file) = process.get_file(fd) else {
         return errno(EBADF);
     };
-    drop(inner);
     drop(process);
     file.flush();
     crate::fs::sync_filesystems();

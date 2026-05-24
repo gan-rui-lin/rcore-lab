@@ -58,7 +58,7 @@ pub fn kernel_interrupt_dispatch(trap_type: arch::TrapType) {
                 if let Some(task) = current_task() {
                     if let Some(process) = task.process.upgrade() {
                         let pid = process.pid.0;
-                        let name = process.inner_exclusive_access().name.clone();
+                        let name = process.name();
                         let (sepc, sp, ra) = {
                             let task_inner = task.inner_exclusive_access();
                             let trap_cx = task_inner.get_trap_cx();

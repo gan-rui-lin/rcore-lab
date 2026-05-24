@@ -151,7 +151,7 @@ pub fn print_current_task_brief_for_alloc_error() {
                 "[kernel] alloc_error current: pid={} tid={} name={} zombie={} status={:?} last_syscall={} sepc={:#x} sp={:#x} ra={:#x} sampled=true",
                 pid,
                 tid,
-                proc_inner.name.as_str(),
+                process.name().as_str(),
                 proc_inner.is_zombie,
                 task_inner.task_status,
                 task_inner.last_syscall,
@@ -175,7 +175,7 @@ pub fn print_current_task_brief_for_alloc_error() {
         println!(
             "[kernel] alloc_error current: pid={} name={} zombie={} <task_busy> sampled=true",
             pid,
-            proc_inner.name.as_str(),
+            process.name().as_str(),
             proc_inner.is_zombie
         );
     } else {

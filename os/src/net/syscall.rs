@@ -193,11 +193,7 @@ fn write_sockaddr(
 /// Helper: get socket handle and type from fd.
 fn get_socket_info(fd: usize) -> Result<(SocketHandle, SocketType), isize> {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return Err(EBADF);
-    }
-    match inner.fd_table[fd].as_ref() {
+    match process.get_file(fd) {
         Some(file) => {
             if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
                 return Err(EBADF);
@@ -214,11 +210,7 @@ fn get_socket_info(fd: usize) -> Result<(SocketHandle, SocketType), isize> {
 /// Helper: get socket file's bound_port and listening state.
 fn get_socket_extra(fd: usize) -> Result<(SocketHandle, SocketType, u16, bool), isize> {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return Err(EBADF);
-    }
-    match inner.fd_table[fd].as_ref() {
+    match process.get_file(fd) {
         Some(file) => {
             if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
                 return Err(EBADF);
@@ -279,7 +271,7 @@ fn resolve_unix_bind_path(path: &str) -> alloc::string::String {
     if path.starts_with('/') {
         return normalize_abs_path(path);
     }
-    let cwd = current_process().inner_exclusive_access().cwd.clone();
+    let cwd = current_process().cwd();
     if cwd == "/" {
         normalize_abs_path(&alloc::format!("/{}", path))
     } else {
@@ -305,12 +297,10 @@ pub fn sys_socket(domain: usize, sock_type: usize, _protocol: usize) -> isize {
         };
         let sock = UnixSocketFile::new(unix_type, nonblock, cloexec);
         let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-        let fd = match inner.alloc_fd() {
+        let fd = match process.install_file(sock) {
             Some(fd) => fd,
             None => return EMFILE,
         };
-        inner.fd_table[fd] = Some(sock);
         return fd as isize;
     }
 
@@ -353,12 +343,10 @@ pub fn sys_socket(domain: usize, sock_type: usize, _protocol: usize) -> isize {
     socket_file.cloexec = cloexec;
 
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd = match inner.alloc_fd() {
+    let fd = match process.install_file(Arc::new(socket_file)) {
         Some(fd) => fd,
         None => return EMFILE,
     };
-    inner.fd_table[fd] = Some(Arc::new(socket_file));
     fd as isize
 }
 
@@ -481,15 +469,10 @@ pub fn sys_bind(fd: usize, addr: *const u8, addr_len: usize) -> isize {
     // Check if fd is valid and get file
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return EBADF;
-        }
-        let file = match inner.fd_table[fd].as_ref() {
-            Some(f) => f.clone(),
+        let file = match process.get_file(fd) {
+            Some(f) => f,
             None => return EBADF,
         };
-        drop(inner);
 
         // Handle AF_UNIX sockets
         if file.is_unix_socket() {
@@ -569,8 +552,7 @@ pub fn sys_bind(fd: usize, addr: *const u8, addr_len: usize) -> isize {
     // Check privileged port access (ports < 1024 require root)
     if listen_ep.port > 0 && listen_ep.port < 1024 {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if inner.effective_uid != 0 {
+        if process.effective_uid() != 0 {
             return EACCES;
         }
     }
@@ -592,8 +574,7 @@ pub fn sys_bind(fd: usize, addr: *const u8, addr_len: usize) -> isize {
             // Store via File trait's set_bound_port
             drop(net);
             let process = current_process();
-            let inner = process.inner_exclusive_access();
-            if let Some(file) = &inner.fd_table[fd] {
+            if let Some(file) = process.get_file(fd) {
                 file.set_bound_port(port);
             }
             0
@@ -625,13 +606,10 @@ pub fn sys_listen(fd: usize, _backlog: usize) -> isize {
     // Handle AF_UNIX sockets first (not tracked via smoltcp).
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd < inner.fd_table.len() {
-            if let Some(ref file) = inner.fd_table[fd] {
-                if file.is_unix_socket() {
-                    let ret = file.unix_do_listen(_backlog);
-                    return ret;
-                }
+        if let Some(file) = process.get_file(fd) {
+            if file.is_unix_socket() {
+                let ret = file.unix_do_listen(_backlog);
+                return ret;
             }
         }
     }
@@ -667,8 +645,7 @@ pub fn sys_listen(fd: usize, _backlog: usize) -> isize {
 
     // Update the socket file's state
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if let Some(file) = &inner.fd_table[fd] {
+    if let Some(file) = process.get_file(fd) {
         file.set_bound_port(port);
         file.set_listening(true);
     }
@@ -683,13 +660,10 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32, flags: us
     // Handle AF_UNIX sockets (not tracked via smoltcp).
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if listen_fd < inner.fd_table.len() {
-            if let Some(ref file) = inner.fd_table[listen_fd] {
+        if let Some(file) = process.get_file(listen_fd) {
                 if file.is_unix_socket() {
                     let listen_file = file.clone();
                     let state = listen_file.unix_get_state_u8();
-                    drop(inner);
                     if state != 2 {
                         // Not in listening state
                         return EINVAL;
@@ -705,12 +679,10 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32, flags: us
                             }
                             // Allocate a new fd for the accepted socket.
                             let proc = current_process();
-                            let mut inner2 = proc.inner_exclusive_access();
-                            let new_fd = match inner2.alloc_fd() {
+                            let new_fd = match proc.install_file(accepted_sock) {
                                 Some(fd) => fd,
                                 None => return EMFILE,
                             };
-                            inner2.fd_table[new_fd] = Some(accepted_sock);
                             return new_fd as isize;
                         }
                         crate::task::suspend_current_and_run_next();
@@ -720,7 +692,6 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32, flags: us
                         }
                     }
                 }
-            }
         }
     }
 
@@ -795,9 +766,8 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32, flags: us
 
             // Update listen fd to new listen socket
             let process = current_process();
-            let mut inner = process.inner_exclusive_access();
             // Mark old SocketFile as transferred so Drop doesn't destroy the socket
-            if let Some(old_file) = &inner.fd_table[listen_fd] {
+            if let Some(old_file) = process.get_file(listen_fd) {
                 old_file.mark_transferred();
             }
             // Replace the listen socket with the new one
@@ -808,14 +778,13 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32, flags: us
                 sf.listening = AtomicBool::new(true);
                 Arc::new(sf)
             };
-            inner.fd_table[listen_fd] = Some(new_listen_file);
+            process.install_file_at(listen_fd, new_listen_file);
 
             // Allocate fd for the accepted connection
-            let new_fd = match inner.alloc_fd() {
+            let new_fd = match process.install_file(accepted_file) {
                 Some(fd) => fd,
                 None => return EMFILE,
             };
-            inner.fd_table[new_fd] = Some(accepted_file);
             return new_fd as isize;
         }
 
@@ -835,18 +804,13 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
     // AF_UNIX connect path.
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return EBADF;
-        }
-        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+        let Some(file) = process.get_file(fd) else {
             return EBADF;
         };
         if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
             return EBADF;
         }
         if file.is_unix_socket() {
-            drop(inner);
             let family = match read_sockaddr_family(addr, addr_len, token) {
                 Some(f) => f,
                 None => return EINVAL,
@@ -882,10 +846,9 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
                 let server_side = UnixSocketFile::new(sock_type, nonblock, false);
                 let server_side_arc: Arc<dyn crate::fs::File> = server_side;
                 // Record connecting process credentials (for SO_PEERCRED on accepted socket).
-                let (cred_pid, cred_uid, cred_gid) = {
-                    let inner2 = process.inner_exclusive_access();
-                    (process.pid.0 as u32, inner2.real_uid, inner2.real_gid)
-                };
+                let creds = process.credentials_snapshot();
+                let (cred_pid, cred_uid, cred_gid) =
+                    (process.pid.0 as u32, creds.real_uid, creds.real_gid);
                 server_side_arc.unix_set_peer_cred(cred_pid, cred_uid, cred_gid);
                 // Link peers: client ↔ server_side
                 file.unix_set_peer_dyn(Arc::downgrade(&server_side_arc));
@@ -996,11 +959,8 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
         SocketType::Udp => {
             // UDP connect stores the default destination for write()/send()
             let process = current_process();
-            let inner = process.inner_exclusive_access();
-            if fd < inner.fd_table.len() {
-                if let Some(ref file) = inner.fd_table[fd] {
-                    file.set_connected_remote(remote);
-                }
+            if let Some(file) = process.get_file(fd) {
+                file.set_connected_remote(remote);
             }
             // Also set smoltcp-level remote filter so that this connected
             // socket won't steal packets destined for other sockets on the
@@ -1024,11 +984,7 @@ pub fn sys_getsockname(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
     // AF_UNIX sockets are stored as generic File objects (not smoltcp sockets).
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return EBADF;
-        }
-        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+        let Some(file) = process.get_file(fd) else {
             return EBADF;
         };
         if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
@@ -1036,7 +992,6 @@ pub fn sys_getsockname(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
         }
         if file.is_unix_socket() {
             let path = file.unix_bound_path().unwrap_or_else(alloc::string::String::new);
-            drop(inner);
             return match write_unix_sockaddr(&path, addr, addr_len, token) {
                 Ok(()) => 0,
                 Err(e) => e,
@@ -1087,11 +1042,7 @@ pub fn sys_getpeername(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
     // Handle AF_UNIX sockets (not tracked via smoltcp).
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return EBADF;
-        }
-        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+        let Some(file) = process.get_file(fd) else {
             return EBADF;
         };
         if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
@@ -1099,7 +1050,6 @@ pub fn sys_getpeername(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
         }
         if file.is_unix_socket() {
             let state = file.unix_get_state_u8();
-            drop(inner);
             if state != 3 {
                 // Not Connected
                 return ENOTCONN;
@@ -1139,16 +1089,12 @@ pub fn sys_getpeername(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
         SocketType::Udp => {
             // Return the connected remote endpoint if set
             let process = current_process();
-            let inner = process.inner_exclusive_access();
-            if fd < inner.fd_table.len() {
-                if let Some(ref file) = inner.fd_table[fd] {
-                    if let Some(ep) = file.get_connected_remote() {
-                        drop(inner);
-                        return match write_sockaddr(&ep, addr, addr_len, token) {
-                            Ok(()) => 0,
-                            Err(e) => e,
-                        };
-                    }
+            if let Some(file) = process.get_file(fd) {
+                if let Some(ep) = file.get_connected_remote() {
+                    return match write_sockaddr(&ep, addr, addr_len, token) {
+                        Ok(()) => 0,
+                        Err(e) => e,
+                    };
                 }
             }
             ENOTCONN
@@ -1188,18 +1134,13 @@ pub fn sys_sendto(
     // AF_UNIX sendto path.
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return EBADF;
-        }
-        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+        let Some(file) = process.get_file(fd) else {
             return EBADF;
         };
         if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
             return EBADF;
         }
         if file.is_unix_socket() {
-            drop(inner);
             // If destination is provided, try direct pathname/abstract delivery first.
             if !dest_addr.is_null() {
                 if let Some((path, is_abstract)) = read_unix_sockaddr(dest_addr, addr_len, token) {
@@ -1353,18 +1294,13 @@ pub fn sys_recvfrom(
     // AF_UNIX recvfrom path.
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return EBADF;
-        }
-        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+        let Some(file) = process.get_file(fd) else {
             return EBADF;
         };
         if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
             return EBADF;
         }
         if file.is_unix_socket() {
-            drop(inner);
             loop {
                 let mut tmp = vec![0u8; len];
                 let n = file.unix_read(&mut tmp);
@@ -1561,13 +1497,10 @@ pub fn sys_getsockopt(
     // Handle AF_UNIX sockets: limited support for SOL_SOCKET options.
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd < inner.fd_table.len() {
-            if let Some(file_cloned) = inner.fd_table[fd].as_ref().cloned() {
+        if let Some(file_cloned) = process.get_file(fd) {
                 let file = &file_cloned;
                 if file.is_unix_socket() {
                     let unix_type = file.unix_socket_type() as u32;
-                    drop(inner);
                     let write_u32 = |val: u32| -> isize {
                         if copy_to_user(token, optval, &val.to_ne_bytes()).is_err() {
                             return EFAULT;
@@ -1617,7 +1550,6 @@ pub fn sys_getsockopt(
                     }
                     return EOPNOTSUPP;
                 }
-            }
         }
     }
 
@@ -1780,21 +1712,17 @@ pub fn sys_socketpair(domain: usize, sock_type: usize, protocol: usize, sv: *mut
     right_file.unix_set_peer_dyn(Arc::downgrade(&left_file));
 
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd0 = match inner.alloc_fd() {
+    let fd0 = match process.install_file(left_file) {
         Some(fd) => fd,
         None => return EMFILE,
     };
-    inner.fd_table[fd0] = Some(left_file);
-    let fd1 = match inner.alloc_fd() {
+    let fd1 = match process.install_file(right_file) {
         Some(fd) => fd,
         None => {
-            inner.fd_table[fd0] = None;
+            process.take_fd(fd0);
             return EMFILE;
         }
     };
-    inner.fd_table[fd1] = Some(right_file);
-    drop(inner);
 
     *translated_refmut(token, sv) = fd0 as i32;
     *translated_refmut(token, unsafe { sv.add(1) }) = fd1 as i32;

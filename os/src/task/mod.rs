@@ -183,7 +183,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     let tid = task_inner.res.as_ref().unwrap().tid;
     // for debug
     let pid = process.getpid();
-    let name = process.inner_exclusive_access().name.clone();
+    let name = process.name();
     info!(
         "[exit] pid={} tid={} name={} code={}",
         pid, tid, name, exit_code
@@ -231,14 +231,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     drop(task_inner);
     drop(task);
     let pid = process.getpid();
-    let all_threads_exited = {
-        let process_inner = process.inner_exclusive_access();
-        process_inner
-            .tasks
-            .iter()
-            .filter_map(|t| t.as_ref())
-            .all(|t| t.inner_exclusive_access().exit_code.is_some())
-    };
+    let all_threads_exited = process.all_tasks_exited();
     if tid == 0 || all_threads_exited {
         if pid == IDLE_PID {
             shutdown();
@@ -287,8 +280,8 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             }
         }
         let mut recycle_res = alloc::vec::Vec::new();
-        for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
-            let task = task.as_ref().unwrap();
+        let tasks = process.tasks_snapshot();
+        for task in tasks {
             remove_inactive_task(Arc::clone(&task));
             let mut task_inner = task.inner_exclusive_access();
             if let Some(res) = task_inner.res.take() {
@@ -300,10 +293,13 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         let mut process_inner = process.inner_exclusive_access();
         process_inner.children.clear();
         process_inner.memory_set.recycle_data_pages();
-        process_inner.fd_table.clear();
-        while process_inner.tasks.len() > 1 {
-            process_inner.tasks.pop();
-        }
+        drop(process_inner);
+        process.with_fs_mut(|fs| fs.fd_table.clear());
+        process.with_threads_mut(|threads| {
+            while threads.tasks.len() > 1 {
+                threads.tasks.pop();
+            }
+        });
     }
     drop(process);
     let mut _unused = TaskContext::zero_init();
@@ -340,11 +336,10 @@ pub fn current_add_signal(signal: SignalFlags) {
 }
 
 fn wake_process_for_signal(process: &Arc<ProcessControlBlock>) {
-    let inner = process.inner_exclusive_access();
-    for task in inner.tasks.iter().filter_map(|t| t.as_ref()) {
+    for task in process.tasks_snapshot() {
         let mut task_inner = task.inner_exclusive_access();
         if task_inner.task_status == TaskStatus::Blocked {
-            futex_remove_waiter_any(task);
+            futex_remove_waiter_any(&task);
             task_inner.interrupted_by_signal = true;
             task_inner.task_status = TaskStatus::Ready;
             drop(task_inner);
@@ -661,16 +656,17 @@ pub fn handle_signals() {
     if signum == signal::SIGKILL {
         warn!(
             "[signal] pid={} name={} killed by SIGKILL",
-            pid, process_inner.name
+            pid,
+            process.name()
         );
         // SIGKILL 必须终止进程内所有线程，不仅仅是当前线程
         // 向其他线程也注入 SIGKILL，确保它们在下次调度时退出
-        for other_task in process_inner.tasks.iter().filter_map(|t| t.as_ref()) {
-            if !Arc::ptr_eq(other_task, &task) {
+        for other_task in process.tasks_snapshot() {
+            if !Arc::ptr_eq(&other_task, &task) {
                 let mut other_inner = other_task.inner_exclusive_access();
                 other_inner.signal_pending.insert(SignalFlags::SIGKILL);
                 if other_inner.task_status == TaskStatus::Blocked {
-                    futex_remove_waiter_any(other_task);
+                    futex_remove_waiter_any(&other_task);
                     other_inner.interrupted_by_signal = true;
                     other_inner.task_status = TaskStatus::Ready;
                     drop(other_inner);
@@ -765,18 +761,20 @@ pub fn handle_signals() {
             _ => {
                 warn!(
                     "[signal] pid={} name={} default handler for signal {} -> terminate",
-                    pid, process_inner.name, signum
+                    pid,
+                    process.name(),
+                    signum
                 );
                 // Fatal default signals should terminate the whole thread group.
                 // Otherwise one thread can die while siblings keep waiting (e.g. futex join),
                 // and the process hangs instead of exiting by signal.
-                for other_task in process_inner.tasks.iter().filter_map(|t| t.as_ref()) {
-                    if !Arc::ptr_eq(other_task, &task) {
+                for other_task in process.tasks_snapshot() {
+                    if !Arc::ptr_eq(&other_task, &task) {
                         let mut other_inner = other_task.inner_exclusive_access();
                         other_inner.signal_pending.insert(flag);
                         other_inner.signal_mask.remove(flag);
                         if other_inner.task_status == TaskStatus::Blocked {
-                            futex_remove_waiter_any(other_task);
+                            futex_remove_waiter_any(&other_task);
                             other_inner.interrupted_by_signal = true;
                             other_inner.task_status = TaskStatus::Ready;
                             drop(other_inner);
@@ -934,12 +932,14 @@ pub fn debug_dump_tasks() {
     }
     for (pid, process) in processes {
         let inner = process.inner_exclusive_access();
+        let name = process.name();
+        let tasks = process.tasks_snapshot();
         info!(
             "[debug] pid={} name={} zombie={} tasks={} pending={:?}",
             pid,
-            inner.name,
+            name,
             inner.is_zombie,
-            inner.tasks.len(),
+            tasks.len(),
             inner.signal_pending
         );
         for (child_idx, child) in inner.children.iter().enumerate() {
@@ -948,15 +948,11 @@ pub fn debug_dump_tasks() {
                 "[debug]   child[{}] pid={} name={} zombie={}",
                 child_idx,
                 child.getpid(),
-                child_inner.name,
+                child.name(),
                 child_inner.is_zombie
             );
         }
-        for (tid, task) in inner.tasks.iter().enumerate() {
-            let Some(task) = task else {
-                info!("[debug]   tid={} <none>", tid);
-                continue;
-            };
+        for (tid, task) in tasks.iter().enumerate() {
             if let Some(task_inner) = task.try_inner_exclusive_access() {
                 let trap_cx = task_inner.get_trap_cx();
                 info!(

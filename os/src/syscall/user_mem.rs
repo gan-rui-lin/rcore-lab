@@ -511,7 +511,7 @@ fn legacy_fork_write_fallback(
     len: usize,
 ) -> Option<Vec<&'static mut [u8]>> {
     let process = current_process();
-    let proc_name = process.inner_exclusive_access().name.clone();
+    let proc_name = process.name();
     if !proc_name.starts_with("fork") {
         return None;
     }

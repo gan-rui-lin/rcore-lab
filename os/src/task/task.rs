@@ -8,19 +8,16 @@ use arch::TrapContext;
 pub fn live_task_count() -> usize {
     super::pid2process_snapshot()
         .iter()
-        .filter_map(|(_, process)| process.try_inner_exclusive_access())
-        .map(|inner| inner.tasks.iter().filter(|t| t.is_some()).count())
+        .map(|(_, process)| process.thread_count())
         .sum()
 }
 
 pub fn live_task_pid_summary() -> (usize, usize, usize, usize, usize, usize) {
     let mut pid_counts: BTreeMap<usize, usize> = BTreeMap::new();
     for (pid, process) in super::pid2process_snapshot() {
-        if let Some(inner) = process.try_inner_exclusive_access() {
-            let count = inner.tasks.iter().filter(|t| t.is_some()).count();
-            if count > 0 {
-                pid_counts.insert(pid, count);
-            }
+        let count = process.thread_count();
+        if count > 0 {
+            pid_counts.insert(pid, count);
         }
     }
     if pid_counts.is_empty() {

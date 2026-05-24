@@ -115,16 +115,14 @@ fn check_itimers(current_ms: usize) {
             }
             
             // Wake up any blocked tasks in this process so they can handle the signal
-            for task_opt in inner.tasks.iter() {
-                if let Some(task) = task_opt {
-                    let mut task_inner = task.inner_exclusive_access();
-                    if task_inner.task_status == TaskStatus::Blocked {
-                        task_inner.interrupted_by_signal = true;
-                        task_inner.task_status = TaskStatus::Ready;
-                        drop(task_inner);
-                        wakeup_task(task.clone());
-                        log::info!("[itimer] pid={} woke blocked task", _pid);
-                    }
+            for task in process.tasks_snapshot() {
+                let mut task_inner = task.inner_exclusive_access();
+                if task_inner.task_status == TaskStatus::Blocked {
+                    task_inner.interrupted_by_signal = true;
+                    task_inner.task_status = TaskStatus::Ready;
+                    drop(task_inner);
+                    wakeup_task(task.clone());
+                    log::info!("[itimer] pid={} woke blocked task", _pid);
                 }
             }
         }

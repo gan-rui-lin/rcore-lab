@@ -10,7 +10,7 @@ use crate::mm::{
     translated_byte_buffer_checked, translated_ref, translated_refmut, translated_str, MemorySet,
 };
 use crate::sync::UPIntrMutexGuard;
-use crate::sync::{Condvar, Mutex, Semaphore, UPIntrMutex};
+use crate::sync::{Condvar, Mutex, Semaphore, UPIntrMutex, UPIntrRwLock};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -97,6 +97,9 @@ fn find_global_pointer(elf_data: &[u8]) -> Option<usize> {
 pub struct ProcessControlBlock {
     pub pid: PidHandle,
     inner: UPIntrMutex<ProcessControlBlockInner>,
+    fs: UPIntrRwLock<ProcessFs>,
+    identity: UPIntrRwLock<ProcessIdentity>,
+    threads: UPIntrMutex<ProcessThreads>,
 }
 
 pub struct ProcessControlBlockInner {
@@ -105,7 +108,6 @@ pub struct ProcessControlBlockInner {
     pub parent: Option<Weak<ProcessControlBlock>>,
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub exit_code: i32,
-    pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     pub signals: SignalFlags,
     pub signal_pending: SignalFlags,
     /// Lightweight siginfo metadata for process-level pending signals.
@@ -113,37 +115,15 @@ pub struct ProcessControlBlockInner {
     pub pending_signal_sender_pid: [i32; MAX_SIG],
     pub pending_signal_si_code: [i32; MAX_SIG],
     pub signal_actions: SignalActions,
-    pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
-    pub task_res_allocator: RecycleAllocator,
     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
-    pub name: String,
-    pub cwd: String,
-    pub root_dir: String,
-    pub real_uid: u32,
-    pub effective_uid: u32,
-    pub saved_uid: u32,
-    pub fs_uid: u32,
-    pub real_gid: u32,
-    pub effective_gid: u32,
-    pub saved_gid: u32,
-    pub fs_gid: u32,
-    /// Nice value in Linux range [-20, 19], default 0.
-    pub nice: i32,
-    /// Capability sets (bit mask, Linux kernel format)
-    pub cap_permitted: u64,
-    pub cap_effective: u64,
-    pub cap_inheritable: u64,
-    pub cap_bounding: u64,
     pub heap_bottom: usize,
     pub program_brk: usize,
     pub mmap_base: usize,
     pub tls_area: Option<TlsArea>,
     pub rlimits: [RLimit; RLIMIT_NLIMITS],
     pub itimers: [IntervalTimerState; 3],
-    pub session_id: usize,
-    pub pgid: usize,
     /// Set by ptrace(PTRACE_TRACEME).
     pub ptrace_traceme: bool,
     /// Pending ptrace stop signal to be reported by waitpid.
@@ -158,6 +138,56 @@ pub struct ProcessControlBlockInner {
     pub itimer_real_interval_ms: usize,
     /// Parent process waiting on clone(CLONE_VM|CLONE_VFORK) synchronization.
     pub vfork_vm_parent: Option<Weak<ProcessControlBlock>>,
+}
+
+#[derive(Clone)]
+pub struct ProcessFs {
+    pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
+    pub cwd: String,
+    pub root_dir: String,
+}
+
+#[derive(Clone)]
+pub struct ProcessIdentity {
+    pub name: String,
+    pub real_uid: u32,
+    pub effective_uid: u32,
+    pub saved_uid: u32,
+    pub fs_uid: u32,
+    pub real_gid: u32,
+    pub effective_gid: u32,
+    pub saved_gid: u32,
+    pub fs_gid: u32,
+    /// Nice value in Linux range [-20, 19], default 0.
+    pub nice: i32,
+    /// Capability sets (bit mask, Linux kernel format).
+    pub cap_permitted: u64,
+    pub cap_effective: u64,
+    pub cap_inheritable: u64,
+    pub cap_bounding: u64,
+    pub session_id: usize,
+    pub pgid: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessCredentials {
+    pub real_uid: u32,
+    pub effective_uid: u32,
+    pub saved_uid: u32,
+    pub fs_uid: u32,
+    pub real_gid: u32,
+    pub effective_gid: u32,
+    pub saved_gid: u32,
+    pub fs_gid: u32,
+    pub cap_permitted: u64,
+    pub cap_effective: u64,
+    pub cap_inheritable: u64,
+    pub cap_bounding: u64,
+}
+
+pub struct ProcessThreads {
+    pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
+    pub task_res_allocator: RecycleAllocator,
 }
 
 impl ProcessControlBlockInner {
@@ -197,9 +227,11 @@ impl ProcessControlBlockInner {
         self.pending_signal_si_code[idx] = 0;
     }
 
+}
+
+impl ProcessFs {
     /// Allocate a new file descriptor. Returns None if RLIMIT_NOFILE is reached.
-    pub fn alloc_fd(&mut self) -> Option<usize> {
-        let limit = self.rlimits[RLIMIT_NOFILE].rlim_cur as usize;
+    pub fn alloc_fd(&mut self, limit: usize) -> Option<usize> {
         if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
             if fd < limit {
                 Some(fd)
@@ -215,7 +247,28 @@ impl ProcessControlBlockInner {
             Some(new_fd)
         }
     }
+}
 
+impl ProcessIdentity {
+    pub fn credentials_snapshot(&self) -> ProcessCredentials {
+        ProcessCredentials {
+            real_uid: self.real_uid,
+            effective_uid: self.effective_uid,
+            saved_uid: self.saved_uid,
+            fs_uid: self.fs_uid,
+            real_gid: self.real_gid,
+            effective_gid: self.effective_gid,
+            saved_gid: self.saved_gid,
+            fs_gid: self.fs_gid,
+            cap_permitted: self.cap_permitted,
+            cap_effective: self.cap_effective,
+            cap_inheritable: self.cap_inheritable,
+            cap_bounding: self.cap_bounding,
+        }
+    }
+}
+
+impl ProcessThreads {
     pub fn alloc_tid(&mut self) -> usize {
         self.task_res_allocator.alloc()
     }
@@ -230,6 +283,31 @@ impl ProcessControlBlockInner {
 
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
+    }
+
+    pub fn tasks_snapshot(&self) -> Vec<Arc<TaskControlBlock>> {
+        self.tasks
+            .iter()
+            .filter_map(|task| task.as_ref().map(Arc::clone))
+            .collect()
+    }
+
+    pub fn insert_task(&mut self, tid: usize, task: Arc<TaskControlBlock>) {
+        while self.tasks.len() < tid + 1 {
+            self.tasks.push(None);
+        }
+        self.tasks[tid] = Some(task);
+    }
+
+    pub fn remove_task(&mut self, tid: usize) -> Option<Arc<TaskControlBlock>> {
+        self.tasks.get_mut(tid).and_then(Option::take)
+    }
+
+    pub fn all_tasks_exited(&self) -> bool {
+        self.tasks
+            .iter()
+            .filter_map(|task| task.as_ref())
+            .all(|task| task.exit_code().is_some())
     }
 }
 
@@ -329,24 +407,43 @@ impl ProcessControlBlock {
                     parent: None,
                     children: Vec::new(),
                     exit_code: 0,
-                    fd_table: vec![
-                        Some(Arc::new(Stdin)),
-                        Some(Arc::new(Stdout)),
-                        Some(Arc::new(Stdout)),
-                    ],
                     signals: SignalFlags::empty(),
                     signal_pending: SignalFlags::empty(),
                     pending_signal_sender_pid: [0; MAX_SIG],
                     pending_signal_si_code: [0; MAX_SIG],
                     signal_actions: SignalActions::default(),
-                    tasks: Vec::new(),
-                    task_res_allocator: RecycleAllocator::new(),
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
-                    name: String::from("initproc"),
+                    heap_bottom,
+                    program_brk: heap_bottom,
+                    mmap_base: USER_MMAP_TOP,
+                    tls_area: tls_area.clone(),
+                    rlimits: default_rlimits(),
+                    itimers: [IntervalTimerState::default(); 3],
+                    ptrace_traceme: false,
+                    ptrace_stop_signal: None,
+                    child_wait_event: None,
+                    group_stopped: false,
+                    itimer_real_expire_ms: 0,
+                    itimer_real_interval_ms: 0,
+                    vfork_vm_parent: None,
+                })
+            },
+            fs: unsafe {
+                UPIntrRwLock::new(ProcessFs {
+                    fd_table: vec![
+                        Some(Arc::new(Stdin)),
+                        Some(Arc::new(Stdout)),
+                        Some(Arc::new(Stdout)),
+                    ],
                     cwd: String::from("/"),
                     root_dir: String::from("/"),
+                })
+            },
+            identity: unsafe {
+                UPIntrRwLock::new(ProcessIdentity {
+                    name: String::from("initproc"),
                     real_uid: 0,
                     effective_uid: 0,
                     saved_uid: 0,
@@ -360,29 +457,22 @@ impl ProcessControlBlock {
                     cap_effective: u64::MAX,
                     cap_inheritable: 0,
                     cap_bounding: u64::MAX,
-                    heap_bottom,
-                    program_brk: heap_bottom,
-                    mmap_base: USER_MMAP_TOP,
-                    tls_area: tls_area.clone(),
-                    rlimits: default_rlimits(),
-                    itimers: [IntervalTimerState::default(); 3],
                     session_id: 0,
                     pgid: 0,
-                    ptrace_traceme: false,
-                    ptrace_stop_signal: None,
-                    child_wait_event: None,
-                    group_stopped: false,
-                    itimer_real_expire_ms: 0,
-                    itimer_real_interval_ms: 0,
-                    vfork_vm_parent: None,
+                })
+            },
+            threads: unsafe {
+                UPIntrMutex::new(ProcessThreads {
+                    tasks: Vec::new(),
+                    task_res_allocator: RecycleAllocator::new(),
                 })
             },
         });
         // Init process: session_id=0, pgid=0 (matches Linux /proc/1/stat behavior)
         {
-            let mut inner = process.inner_exclusive_access();
-            inner.session_id = 0;
-            inner.pgid = 0;
+            let mut identity = process.identity.write();
+            identity.session_id = 0;
+            identity.pgid = 0;
         }
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&process),
@@ -414,9 +504,7 @@ impl ProcessControlBlock {
         }
 
         *trap_cx = trap_cx_value;
-        let mut process_inner = process.inner_exclusive_access();
-        process_inner.tasks.push(Some(Arc::clone(&task)));
-        drop(process_inner);
+        process.insert_task(0, Arc::clone(&task));
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
         add_task(task);
         process
@@ -433,8 +521,8 @@ impl ProcessControlBlock {
         args: Vec<String>,
         envs: Vec<String>,
     ) {
-        assert_eq!(self.inner_exclusive_access().thread_count(), 1);
-        let exec_name = self.inner_exclusive_access().name.clone();
+        assert_eq!(self.thread_count(), 1);
+        let exec_name = self.name();
         debug!(
             "[kernel] exec: process name={} argc={}",
             exec_name,
@@ -562,7 +650,7 @@ impl ProcessControlBlock {
             inner.tls_area = tls_area.clone();
             inner.itimers = [IntervalTimerState::default(); 3];
         }
-        let task = self.inner_exclusive_access().get_task(0);
+        let task = self.get_task(0);
         let mut task_inner = task.inner_exclusive_access();
         if let Some(res) = task_inner.res.as_mut() {
             res.ustack_base = ustack_base;
@@ -768,12 +856,12 @@ impl ProcessControlBlock {
     }
 
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
-        let mut parent = self.inner_exclusive_access();
-        if parent.thread_count() != 1 {
+        let thread_count = self.thread_count();
+        if thread_count != 1 {
             warn!(
                 "[fork-stage] pid={} fork from multi-thread process (thread_count={}), continuing with single-thread child",
                 self.pid.0,
-                parent.thread_count()
+                thread_count
             );
         }
         // info!(
@@ -784,6 +872,7 @@ impl ProcessControlBlock {
         //     parent.fd_table.len()
         // );
         // info!("[fork-stage] pid={} before memory_set clone", self.pid.0);
+        let mut parent = self.inner_exclusive_access();
         let memory_set = MemorySet::from_existed_user(&mut parent.memory_set);
         // info!("[fork-stage] pid={} after memory_set clone", self.pid.0);
 
@@ -792,14 +881,9 @@ impl ProcessControlBlock {
 
         let pid = pid_alloc();
         info!("[fork-stage] pid={} before fd_table clone", self.pid.0);
-        let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
-        for fd in parent.fd_table.iter() {
-            if let Some(file) = fd {
-                new_fd_table.push(Some(file.clone()));
-            } else {
-                new_fd_table.push(None);
-            }
-        }
+        let parent_fs = self.fs.read().clone();
+        let parent_identity = self.identity.read().clone();
+        let new_fd_table = parent_fs.fd_table.clone();
         info!(
             "[fork-stage] pid={} after fd_table clone new_len={}",
             self.pid.0,
@@ -815,41 +899,20 @@ impl ProcessControlBlock {
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
                     exit_code: 0,
-                    fd_table: new_fd_table,
                     signals: SignalFlags::empty(),
                     signal_pending: SignalFlags::empty(),
                     pending_signal_sender_pid: [0; MAX_SIG],
                     pending_signal_si_code: [0; MAX_SIG],
                     signal_actions: parent.signal_actions.clone(),
-                    tasks: Vec::new(),
-                    task_res_allocator: RecycleAllocator::new(),
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
-                    name: parent.name.clone(),
-                    cwd: parent.cwd.clone(),
-                    root_dir: parent.root_dir.clone(),
-                    real_uid: parent.real_uid,
-                    effective_uid: parent.effective_uid,
-                    saved_uid: parent.saved_uid,
-                    fs_uid: parent.fs_uid,
-                    real_gid: parent.real_gid,
-                    effective_gid: parent.effective_gid,
-                    saved_gid: parent.saved_gid,
-                    fs_gid: parent.fs_gid,
-                    nice: parent.nice,
-                    cap_permitted: parent.cap_permitted,
-                    cap_effective: parent.cap_effective,
-                    cap_inheritable: parent.cap_inheritable,
-                    cap_bounding: parent.cap_bounding,
                     heap_bottom: parent.heap_bottom,
                     program_brk: parent.program_brk,
                     mmap_base: parent.mmap_base,
                     tls_area,
                     rlimits: parent.rlimits,
                     itimers: [IntervalTimerState::default(); 3],
-                    session_id: parent.session_id,
-                    pgid: parent.pgid,
                     ptrace_traceme: false,
                     ptrace_stop_signal: None,
                     child_wait_event: None,
@@ -859,11 +922,26 @@ impl ProcessControlBlock {
                     vfork_vm_parent: None,
                 })
             },
+            fs: unsafe {
+                UPIntrRwLock::new(ProcessFs {
+                    fd_table: new_fd_table,
+                    cwd: parent_fs.cwd,
+                    root_dir: parent_fs.root_dir,
+                })
+            },
+            identity: unsafe { UPIntrRwLock::new(parent_identity) },
+            threads: unsafe {
+                UPIntrMutex::new(ProcessThreads {
+                    tasks: Vec::new(),
+                    task_res_allocator: RecycleAllocator::new(),
+                })
+            },
         });
         // info!("[fork-stage] pid={} child pcb allocated new_pid={}", self.pid.0, new_pid_value);
         parent.children.push(Arc::clone(&child));
         info!("[fork-stage] pid={} child linked to parent", self.pid.0);
-        let ustack_base = parent
+        drop(parent);
+        let ustack_base = self
             .get_task(0)
             .inner_exclusive_access()
             .res
@@ -871,17 +949,15 @@ impl ProcessControlBlock {
             .unwrap()
             .ustack_base;
         // 获取父线程的 signal_mask，用于子进程继承
-        let parent_signal_mask = parent.get_task(0).inner_exclusive_access().signal_mask;
+        let parent_signal_mask = self.get_task(0).inner_exclusive_access().signal_mask;
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&child),
             ustack_base,
             false,
         ));
         // info!("[fork-stage] pid={} child task allocated", self.pid.0);
-        let mut child_inner = child.inner_exclusive_access();
-        child_inner.tasks.push(Some(Arc::clone(&task)));
+        child.insert_task(0, Arc::clone(&task));
         // info!("[fork-stage] pid={} child task linked", self.pid.0);
-        drop(child_inner);
         let mut task_inner = task.inner_exclusive_access();
         // 子进程继承父进程的信号掩码（Linux 语义：fork 继承 signal_mask）
         task_inner.signal_mask = parent_signal_mask;
@@ -904,73 +980,207 @@ impl ProcessControlBlock {
 
     #[inline]
     pub fn thread_count(&self) -> usize {
-        self.inner_exclusive_access().thread_count()
+        self.threads.lock().thread_count()
     }
 
     #[inline]
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
-        self.inner_exclusive_access().get_task(tid)
+        self.threads.lock().get_task(tid)
     }
 
     pub fn tasks_snapshot(&self) -> Vec<Arc<TaskControlBlock>> {
-        self.inner_exclusive_access()
-            .tasks
-            .iter()
-            .filter_map(|task| task.as_ref().map(Arc::clone))
-            .collect()
+        self.threads.lock().tasks_snapshot()
     }
 
     #[inline]
     pub fn alloc_tid(&self) -> usize {
-        self.inner_exclusive_access().alloc_tid()
+        self.threads.lock().alloc_tid()
     }
 
     #[inline]
     pub fn dealloc_tid(&self, tid: usize) {
-        self.inner_exclusive_access().dealloc_tid(tid);
+        self.threads.lock().dealloc_tid(tid);
+    }
+
+    pub fn insert_task(&self, tid: usize, task: Arc<TaskControlBlock>) {
+        self.threads.lock().insert_task(tid, task);
+    }
+
+    pub fn remove_task(&self, tid: usize) -> Option<Arc<TaskControlBlock>> {
+        self.threads.lock().remove_task(tid)
+    }
+
+    pub fn all_tasks_exited(&self) -> bool {
+        self.threads.lock().all_tasks_exited()
     }
 
     #[inline]
     pub fn name(&self) -> String {
-        self.inner_exclusive_access().name.clone()
+        self.identity.read().name.clone()
+    }
+
+    pub fn set_name(&self, name: String) {
+        self.identity.write().name = name;
     }
 
     #[inline]
     pub fn cwd(&self) -> String {
-        self.inner_exclusive_access().cwd.clone()
+        self.fs.read().cwd.clone()
+    }
+
+    pub fn set_cwd(&self, cwd: String) {
+        self.fs.write().cwd = cwd;
     }
 
     #[inline]
     pub fn root_dir(&self) -> String {
-        self.inner_exclusive_access().root_dir.clone()
+        self.fs.read().root_dir.clone()
+    }
+
+    pub fn set_root_dir(&self, root_dir: String) {
+        self.fs.write().root_dir = root_dir;
+    }
+
+    pub fn credentials_snapshot(&self) -> ProcessCredentials {
+        self.identity.read().credentials_snapshot()
+    }
+
+    pub fn effective_uid(&self) -> u32 {
+        self.identity.read().effective_uid
+    }
+
+    pub fn effective_gid(&self) -> u32 {
+        self.identity.read().effective_gid
+    }
+
+    pub fn real_uid(&self) -> u32 {
+        self.identity.read().real_uid
+    }
+
+    pub fn real_gid(&self) -> u32 {
+        self.identity.read().real_gid
+    }
+
+    pub fn pgid(&self) -> usize {
+        self.identity.read().pgid
+    }
+
+    pub fn set_pgid(&self, pgid: usize) {
+        self.identity.write().pgid = pgid;
+    }
+
+    pub fn session_id(&self) -> usize {
+        self.identity.read().session_id
+    }
+
+    pub fn set_session_id(&self, session_id: usize) {
+        self.identity.write().session_id = session_id;
     }
 
     pub fn get_file(&self, fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
-        self.inner_exclusive_access()
+        self.fs
+            .read()
             .fd_table
             .get(fd)
             .and_then(|slot| slot.as_ref().map(Arc::clone))
     }
 
     pub fn alloc_fd(&self) -> Option<usize> {
-        self.inner_exclusive_access().alloc_fd()
+        let limit = self.inner_exclusive_access().rlimits[RLIMIT_NOFILE].rlim_cur as usize;
+        self.fs.write().alloc_fd(limit)
+    }
+
+    pub fn install_file(&self, file: Arc<dyn File + Send + Sync>) -> Option<usize> {
+        let limit = self.inner_exclusive_access().rlimits[RLIMIT_NOFILE].rlim_cur as usize;
+        let mut fs = self.fs.write();
+        let fd = fs.alloc_fd(limit)?;
+        fs.fd_table[fd] = Some(file);
+        Some(fd)
+    }
+
+    pub fn install_file_at(&self, fd: usize, file: Arc<dyn File + Send + Sync>) -> bool {
+        let limit = self.inner_exclusive_access().rlimits[RLIMIT_NOFILE].rlim_cur as usize;
+        if fd >= limit {
+            return false;
+        }
+        let mut fs = self.fs.write();
+        if fd >= fs.fd_table.len() {
+            fs.fd_table.resize_with(fd + 1, || None);
+        }
+        fs.fd_table[fd] = Some(file);
+        true
+    }
+
+    pub fn replace_file(
+        &self,
+        fd: usize,
+        file: Option<Arc<dyn File + Send + Sync>>,
+    ) -> Option<Arc<dyn File + Send + Sync>> {
+        let mut fs = self.fs.write();
+        if fd >= fs.fd_table.len() {
+            return None;
+        }
+        core::mem::replace(&mut fs.fd_table[fd], file)
     }
 
     pub fn set_fd(&self, fd: usize, file: Option<Arc<dyn File + Send + Sync>>) -> bool {
-        let mut inner = self.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
+        let mut fs = self.fs.write();
+        if fd >= fs.fd_table.len() {
             return false;
         }
-        inner.fd_table[fd] = file;
+        fs.fd_table[fd] = file;
         true
     }
 
     pub fn take_fd(&self, fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
-        let mut inner = self.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
+        let mut fs = self.fs.write();
+        if fd >= fs.fd_table.len() {
             return None;
         }
-        inner.fd_table[fd].take()
+        fs.fd_table[fd].take()
+    }
+
+    pub fn fd_snapshot(&self) -> Vec<Option<Arc<dyn File + Send + Sync>>> {
+        self.fs.read().fd_table.clone()
+    }
+
+    pub fn fd_files_snapshot(&self) -> Vec<Arc<dyn File + Send + Sync>> {
+        self.fs
+            .read()
+            .fd_table
+            .iter()
+            .filter_map(|file| file.as_ref().map(Arc::clone))
+            .collect()
+    }
+
+    pub fn with_fs<R>(&self, f: impl FnOnce(&ProcessFs) -> R) -> R {
+        let fs = self.fs.read();
+        f(&fs)
+    }
+
+    pub fn with_fs_mut<R>(&self, f: impl FnOnce(&mut ProcessFs) -> R) -> R {
+        let mut fs = self.fs.write();
+        f(&mut fs)
+    }
+
+    pub fn with_identity<R>(&self, f: impl FnOnce(&ProcessIdentity) -> R) -> R {
+        let identity = self.identity.read();
+        f(&identity)
+    }
+
+    pub fn with_identity_mut<R>(&self, f: impl FnOnce(&mut ProcessIdentity) -> R) -> R {
+        let mut identity = self.identity.write();
+        f(&mut identity)
+    }
+
+    pub fn with_threads<R>(&self, f: impl FnOnce(&ProcessThreads) -> R) -> R {
+        let threads = self.threads.lock();
+        f(&threads)
+    }
+
+    pub fn with_threads_mut<R>(&self, f: impl FnOnce(&mut ProcessThreads) -> R) -> R {
+        let mut threads = self.threads.lock();
+        f(&mut threads)
     }
 
     pub fn with_memory_set<R>(&self, f: impl FnOnce(&MemorySet) -> R) -> R {

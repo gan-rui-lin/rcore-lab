@@ -21,13 +21,8 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     let new_task_inner = new_task.inner_exclusive_access();
     let new_task_res = new_task_inner.res.as_ref().unwrap();
     let new_task_tid = new_task_res.tid;
-    let mut process_inner = process.inner_exclusive_access();
     // add new thread to current process
-    let tasks = &mut process_inner.tasks;
-    while tasks.len() < new_task_tid + 1 {
-        tasks.push(None);
-    }
-    tasks[new_task_tid] = Some(Arc::clone(&new_task));
+    process.insert_task(new_task_tid, Arc::clone(&new_task));
     let new_task_trap_cx = new_task_inner.get_trap_cx();
     *new_task_trap_cx = TrapContext::app_init_context(entry, new_task_res.ustack_top());
     new_task_trap_cx[TrapFrameArgs::ARG0] = arg;
@@ -94,16 +89,17 @@ pub fn sys_waittid(tid: usize) -> isize {
         );
     }
 
-    let mut process_inner = process.inner_exclusive_access();
     // a thread cannot wait for itself
     if task_inner.res.as_ref().unwrap().tid == tid {
         return errno(ECHILD);
     }
     let mut exit_code: Option<i32> = None;
-    if tid >= process_inner.tasks.len() {
-        return errno(ECHILD);
-    }
-    let waited_task = process_inner.tasks[tid].as_ref();
+    let waited_task = process.with_threads(|threads| {
+        threads
+            .tasks
+            .get(tid)
+            .and_then(|slot| slot.as_ref().map(Arc::clone))
+    });
     if let Some(waited_task) = waited_task {
         if let Some(waited_exit_code) = waited_task.inner_exclusive_access().exit_code {
             exit_code = Some(waited_exit_code);
@@ -114,7 +110,7 @@ pub fn sys_waittid(tid: usize) -> isize {
     }
     if let Some(exit_code) = exit_code {
         // dealloc the exited thread
-        process_inner.tasks[tid] = None;
+        process.remove_task(tid);
         if pid == 34 || pid == 36 {
             info!(
                 "[sys_waittid] pid={} tid={} -> exit_code={}",

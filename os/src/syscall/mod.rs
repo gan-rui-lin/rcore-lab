@@ -380,7 +380,6 @@ mod sync;
 mod thread;
 
 use core::sync::atomic::{AtomicBool, Ordering};
-use alloc::vec::Vec;
 use errno::ENOSYS;
 use fs::*;
 use ipc::*;
@@ -687,7 +686,7 @@ pub fn should_trace_syscall(pid: usize) -> bool {
     }
     if let Some(target) = TRACE_NAME {
         let process = current_process();
-        let name = process.inner_exclusive_access().name.clone();
+        let name = process.name();
         return name == target;
     }
     true
@@ -707,14 +706,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     let (name_for_trace, cwd_for_exec_trace) = if trace || (pid == 4 && syscall_id == SYSCALL_EXEC)
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
         let name = if trace {
-            Some(inner.name.clone())
+            Some(process.name())
         } else {
             None
         };
         let cwd = if pid == 4 && syscall_id == 221 {
-            Some((inner.name.clone(), inner.cwd.clone()))
+            Some((process.name(), process.cwd()))
         } else {
             None
         };
@@ -862,9 +860,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_SYNC => {
             let process = current_process();
-            let inner = process.inner_exclusive_access();
-            let files: Vec<_> = inner.fd_table.iter().filter_map(Clone::clone).collect();
-            drop(inner);
+            let files = process.fd_files_snapshot();
             drop(process);
             for file in files {
                 file.flush();
@@ -944,7 +940,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => {
-            let name = current_process().inner_exclusive_access().name.clone();
+            let name = current_process().name();
             log::warn!("[exit_group] pid={} name={} code={}", pid, name, args[0] as i32);
             sys_exit_group(args[0] as i32)
         }
@@ -1193,7 +1189,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MEMBARRIER => sys_membarrier(args[0] as isize, args[1] as isize),
         _ => {
             known = false;
-            let name = current_process().inner_exclusive_access().name.clone();
+            let name = current_process().name();
             error!(
                 "{} {}: unimplemented syscall {} ({})",
                 pid,
