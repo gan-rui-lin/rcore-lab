@@ -4,10 +4,11 @@
 
 pub use arch::{get_time, get_time_ms, get_time_us, set_next_trigger};
 
-use crate::sync::UPIntrFreeCell;
+use crate::sync::UPIntrRwLock;
 use crate::task::{wakeup_task, TaskControlBlock};
 use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use lazy_static::lazy_static;
@@ -43,25 +44,37 @@ impl Ord for TimerCondVar {
 }
 
 lazy_static! {
-    static ref TIMERS: UPIntrFreeCell<BinaryHeap<TimerCondVar>> =
-        unsafe { UPIntrFreeCell::new(BinaryHeap::<TimerCondVar>::new()) };
+    static ref TIMERS: UPIntrRwLock<BinaryHeap<TimerCondVar>> =
+        unsafe { UPIntrRwLock::new(BinaryHeap::<TimerCondVar>::new()) };
+}
+
+fn with_timers_read<R>(f: impl FnOnce(&BinaryHeap<TimerCondVar>) -> R) -> R {
+    let timers = TIMERS.read();
+    f(&timers)
+}
+
+fn with_timers_write<R>(f: impl FnOnce(&mut BinaryHeap<TimerCondVar>) -> R) -> R {
+    let mut timers = TIMERS.write();
+    f(&mut timers)
 }
 
 pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
-    let mut timers = TIMERS.exclusive_access();
-    timers.push(TimerCondVar { expire_ms, task });
+    with_timers_write(|timers| {
+        timers.push(TimerCondVar { expire_ms, task });
+    });
 }
 
 pub fn remove_timer(task: Arc<TaskControlBlock>) {
-    let mut timers = TIMERS.exclusive_access();
-    let mut temp = BinaryHeap::<TimerCondVar>::new();
-    for condvar in timers.drain() {
-        if Arc::as_ptr(&task) != Arc::as_ptr(&condvar.task) {
-            temp.push(condvar);
+    with_timers_write(|timers| {
+        let mut temp = BinaryHeap::<TimerCondVar>::new();
+        for condvar in timers.drain() {
+            if Arc::as_ptr(&task) != Arc::as_ptr(&condvar.task) {
+                temp.push(condvar);
+            }
         }
-    }
-    timers.clear();
-    timers.append(&mut temp);
+        timers.clear();
+        timers.append(&mut temp);
+    });
 }
 
 pub fn check_timer() {
@@ -74,16 +87,20 @@ pub fn check_timer() {
         );
     }
     let current_ms = get_time_ms();
-    let mut timers = TIMERS.exclusive_access();
-    while let Some(timer) = timers.peek() {
-        if timer.expire_ms <= current_ms {
-            wakeup_task(Arc::clone(&timer.task));
-            timers.pop();
-        } else {
-            break;
+    let mut expired = Vec::new();
+    with_timers_write(|timers| {
+        while let Some(timer) = timers.peek() {
+            if timer.expire_ms <= current_ms {
+                expired.push(Arc::clone(&timer.task));
+                timers.pop();
+            } else {
+                break;
+            }
         }
+    });
+    for task in expired {
+        wakeup_task(task);
     }
-    drop(timers);
     // Poll network stack from timer interrupt so loopback TCP packets
     // get delivered even when all user processes are blocked in recv().
     crate::net::poll_net_if_available();
@@ -134,5 +151,5 @@ fn check_itimers(current_ms: usize) {
 }
 
 pub fn timer_len() -> usize {
-    TIMERS.exclusive_access().len()
+    with_timers_read(|timers| timers.len())
 }
