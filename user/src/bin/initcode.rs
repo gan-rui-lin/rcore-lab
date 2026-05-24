@@ -821,7 +821,8 @@ fn run_ltp_suite(root: &str) -> i32 {
     );
     // Run standalone LTP cases while skipping obvious helper/library entries
     // that are not meant to be launched directly (e.g. cgroup_fj_proc).
-    // TODO: data 不是测试；不应该加入；以及其它 /ltp/testcases/bin 目录下的非测试文件；
+    // NOTE: /ltp/testcases/bin 下混有 helper/support 条目（如 data/create_file 等）。
+    // 这些会在下面生成的 wrapper 脚本里通过 is_skip_case() 的 never_run 分组提前过滤。
     let script = if root == "/glibc" {
         "\
 #!/bin/sh
@@ -832,15 +833,21 @@ case_limit=\"${LTP_CASE_LIMIT:-}\"
 case_count=0
 
 is_skip_case() {
-  case \"$1\" in
-    *.sh|*_helper|*_helper.sh|*_child|busy_poll_lib.sh|tst_*|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|cpuctl_fj_*|cpuhotplug_do_*|cpuhotplug_report_*|cpuset*|crash*|dio_read|dio_sparse|doio|epoll*|eventfd*|event_generator|execveat*|fanotify*|fanout*|f00f|faccessat201|faccessat202|fallocate02|fallocate04|fallocate05|fallocate06|fchmod02|fchmod05|fchown01_16|fchown02_16|fchown03_16|fchown04|fchown04_16|fchown05_16|fchownat02|fcntl01|fcntl01_64|fcntl07|fcntl07_64|fcntl09|fcntl09_64|fcntl10|fcntl10_64|fcntl11|fcntl11_64|fcntl12|fcntl12_64|fcntl14|fcntl14_64|fcntl15|fcntl15_64|fcntl16|fcntl16_64|fcntl17|fcntl17_64|fcntl19|fcntl19_64|fcntl20|fcntl20_64|fcntl21|fcntl21_64|fcntl2[2-7]*|fcntl30|fcntl30_64|fcntl31|fcntl31_64|fcntl32|fcntl32_64|fcntl33|fcntl33_64|fcntl34|fcntl34_64|fcntl35|fcntl35_64|fcntl36|fcntl36_64|fcntl37|fcntl37_64|fcntl38|fcntl38_64|fcntl39|fcntl39_64|fdatasync02|fdatasync03|fgetxattr*|flistxattr*|find_portbundle|finit_module*|float_*|flock01|flock02|flock03|flock04|fork05|fork07|fork09|fork13|fork14|fork_exec_loop|fptest*|frag|fremovexattr*|fs_di|fs_fill|fs_inod|fs_perms|fsconfig*|fsetxattr*|fsmount*|fsopen*|fspick*|fsstress|fstatfs01|fstatfs01_64|fsx-linux|fsync*|ftest01|ftest02|ftest03|ftest04|ftest05|ftest06|ftest07|ftest08|ftruncate01|ftruncate01_64|ftruncate04|ftruncate04_64|futex_cmp_requeue*|futex_wait03|futex_wait05|futex_wait_bitset*|futex_waitv*|futex_wake02|futex_wake04|futimesat01|fw_load|gen*|\
-    creat04|creat05|creat07|creat08|creat09|copy_file_range*|crypto_user*|cve-*|delete_module*|diotest2|dio_append|dio_truncate|dirtyc0w*|dirtypipe|dma_thread_diotest|dup05|ebizzy|eject_check_tray|endian_switch01|exec_with_inh|exec_without_inh|execve02|execve04|execve05|getxattr0[2-4]|hackbench|inode01|inode02|kill08|kill10|kill11|leapsec01|lftest|mallocstress|memcg*|mmap1|mmap3|mmapstress*|mmstress|mremap*|mtest*|nanosleep01|nanosleep04|nftw01|nftw6401|nptl01|pause*|pids_task*|pidns05|pipe13|ppoll*|poll02|prot_hsymlinks|pselect01|pselect01_64|pselect02*|ptrace02|ptrace06|pthcli|pthserv|readlink03|recvmsg01|select02|select04*|sem_comm|semtest_2ns|sendfile07*|setfsgid03*|setpgid03|setrlimit06|shm_test*|shmat1|signal01*|starvation*|stat03|stat03_64|tgkill*|thp01|timed_forkbomb*|timerfd01|timerfd_settime02|waitpid08*|chdir01|clock_nanosleep*|close_range01|gettimeofday02|link05|link08|lstat02|lstat02_64|madvise01|madvise02|mincore04|mkdir03|mkdirat02|msgrcv05|msgrcv06|msgsnd05|msgsnd06|open04|open_tree01|open_tree02|openat04|sched_datafile*|capset04|io_control*|clone04|cpuctl_*|cpu_controller*|memctl_*|memory_controller*|tcp4-*|tcp6-*|udp4-*|udp6-*)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+    case \"$1\" in
+        # never_run: not a standalone testcase / never-score
+        # Source: analysis/rv_ltp/rv_ltp_analysis_report.md -> \"不应该加入测试的条目\".
+        check_icmpv4_connectivity|check_icmpv6_connectivity|cpuacct_task|create_datafile|create_file|data|dirty|growfiles|kernbench|libcgroup_freezer|locktests|ltpServer|mc_member_test|mc_recv|mc_send|mc_verify_opts|mc_verify_opts_error|mmap-corruption01|mmap2|mmstress_dummy|nfs01_open_files|nfs04_create_file|nfs_flock|nfs_flock_dgen|ns-echoclient|ns-tcpclient|openfile|pm_cpu_consolidation.py|pm_ilb_test.py|pm_sched_domain.py|pm_sched_mc.py|print_caps|rwtest|sched_tc2|sched_tc3|sched_tc4|sched_tc5|stress|test_ioctl|testsf_c)
+            return 0
+            ;;
+        # skip_hang_case: existing hang/problematic cases
+        *.sh|*_helper|*_helper.sh|*_child|busy_poll_lib.sh|tst_*|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|cpuctl_fj_*|cpuhotplug_do_*|cpuhotplug_report_*|cpuset*|crash*|dio_read|dio_sparse|doio|epoll*|eventfd*|event_generator|execveat*|fanotify*|fanout*|f00f|faccessat201|faccessat202|fallocate02|fallocate04|fallocate05|fallocate06|fchmod02|fchmod05|fchown01_16|fchown02_16|fchown03_16|fchown04|fchown04_16|fchown05_16|fchownat02|fcntl01|fcntl01_64|fcntl07|fcntl07_64|fcntl09|fcntl09_64|fcntl10|fcntl10_64|fcntl11|fcntl11_64|fcntl12|fcntl12_64|fcntl14|fcntl14_64|fcntl15|fcntl15_64|fcntl16|fcntl16_64|fcntl17|fcntl17_64|fcntl19|fcntl19_64|fcntl20|fcntl20_64|fcntl21|fcntl21_64|fcntl2[2-7]*|fcntl30|fcntl30_64|fcntl31|fcntl31_64|fcntl32|fcntl32_64|fcntl33|fcntl33_64|fcntl34|fcntl34_64|fcntl35|fcntl35_64|fcntl36|fcntl36_64|fcntl37|fcntl37_64|fcntl38|fcntl38_64|fcntl39|fcntl39_64|fdatasync02|fdatasync03|fgetxattr*|flistxattr*|find_portbundle|finit_module*|float_*|flock01|flock02|flock03|flock04|fork05|fork07|fork09|fork13|fork14|fork_exec_loop|fptest*|frag|fremovexattr*|fs_di|fs_fill|fs_inod|fs_perms|fsconfig*|fsetxattr*|fsmount*|fsopen*|fspick*|fsstress|fstatfs01|fstatfs01_64|fsx-linux|fsync*|ftest01|ftest02|ftest03|ftest04|ftest05|ftest06|ftest07|ftest08|ftruncate01|ftruncate01_64|ftruncate04|ftruncate04_64|futex_cmp_requeue*|futex_wait03|futex_wait05|futex_wait_bitset*|futex_waitv*|futex_wake02|futex_wake04|futimesat01|fw_load|gen*|\
+        creat04|creat05|creat07|creat08|creat09|copy_file_range*|crypto_user*|cve-*|delete_module*|diotest2|dio_append|dio_truncate|dirtyc0w*|dirtypipe|dma_thread_diotest|dup05|ebizzy|eject_check_tray|endian_switch01|exec_with_inh|exec_without_inh|execve02|execve04|execve05|getxattr0[2-4]|hackbench|inode01|inode02|kill08|kill10|kill11|leapsec01|lftest|mallocstress|memcg*|mmap1|mmap3|mmapstress*|mmstress|mremap*|mtest*|nanosleep01|nanosleep04|nftw01|nftw6401|nptl01|pause*|pids_task*|pidns05|pipe13|ppoll*|poll02|prot_hsymlinks|pselect01|pselect01_64|pselect02*|ptrace02|ptrace06|pthcli|pthserv|readlink03|recvmsg01|select02|select04*|sem_comm|semtest_2ns|sendfile07*|setfsgid03*|setpgid03|setrlimit06|shm_test*|shmat1|signal01*|starvation*|stat03|stat03_64|tgkill*|thp01|timed_forkbomb*|timerfd01|timerfd_settime02|waitpid08*|chdir01|clock_nanosleep*|close_range01|gettimeofday02|link05|link08|lstat02|lstat02_64|madvise01|madvise02|mincore04|mkdir03|mkdirat02|msgrcv05|msgrcv06|msgsnd05|msgsnd06|open04|open_tree01|open_tree02|openat04|sched_datafile*|capset04|io_control*|clone04|cpuctl_*|cpu_controller*|memctl_*|memory_controller*|tcp4-*|tcp6-*|udp4-*|udp6-*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 for file in \"$target_dir\"/*; do
@@ -881,6 +888,12 @@ case_count=0
 
 is_skip_case() {
     case \"$1\" in
+        # never_run: not a standalone testcase / never-score
+        # Source: analysis/rv_ltp/rv_ltp_analysis_report.md -> \"不应该加入测试的条目\".
+        check_icmpv4_connectivity|check_icmpv6_connectivity|cpuacct_task|create_datafile|create_file|data|dirty|growfiles|kernbench|libcgroup_freezer|locktests|ltpServer|mc_member_test|mc_recv|mc_send|mc_verify_opts|mc_verify_opts_error|mmap-corruption01|mmap2|mmstress_dummy|nfs01_open_files|nfs04_create_file|nfs_flock|nfs_flock_dgen|ns-echoclient|ns-tcpclient|openfile|pm_cpu_consolidation.py|pm_ilb_test.py|pm_sched_domain.py|pm_sched_mc.py|print_caps|rwtest|sched_tc2|sched_tc3|sched_tc4|sched_tc5|stress|test_ioctl|testsf_c)
+            return 0
+            ;;
+        # skip_hang_case: existing hang/problematic cases
         *.sh|*_helper|*_helper.sh|*_child|busy_poll_lib.sh|tst_*|tst_*.sh|cgroup_fj_proc|cgroup_fj_*|cgroup_regression_*|cpuctl_fj_*|cpuhotplug_do_*|cpuhotplug_report_*|cpuset*|crash*|dio_read|dio_sparse|doio|epoll*|eventfd*|event_generator|execveat*|fanotify*|fanout*|f00f|faccessat201|faccessat202|fallocate02|fallocate04|fallocate05|fallocate06|fchmod02|fchmod05|fchown01_16|fchown02_16|fchown03_16|fchown04|fchown04_16|fchown05_16|fchownat02|fcntl01|fcntl01_64|fcntl07|fcntl07_64|fcntl09|fcntl09_64|fcntl10|fcntl10_64|fcntl11|fcntl11_64|fcntl12|fcntl12_64|fcntl14|fcntl14_64|fcntl15|fcntl15_64|fcntl16|fcntl16_64|fcntl17|fcntl17_64|fcntl19|fcntl19_64|fcntl20|fcntl20_64|fcntl21|fcntl21_64|fcntl2[2-7]*|fcntl30|fcntl30_64|fcntl31|fcntl31_64|fcntl32|fcntl32_64|fcntl33|fcntl33_64|fcntl34|fcntl34_64|fcntl35|fcntl35_64|fcntl36|fcntl36_64|fcntl37|fcntl37_64|fcntl38|fcntl38_64|fcntl39|fcntl39_64|fdatasync02|fdatasync03|fgetxattr*|flistxattr*|find_portbundle|finit_module*|float_*|flock01|flock02|flock03|flock04|fork05|fork07|fork09|fork13|fork14|fork_exec_loop|fptest*|frag|fremovexattr*|fs_di|fs_fill|fs_inod|fs_perms|fsconfig*|fsetxattr*|fsmount*|fsopen*|fspick*|fsstress|fstatfs01|fstatfs01_64|fsx-linux|fsync*|ftest01|ftest02|ftest03|ftest04|ftest05|ftest06|ftest07|ftest08|ftruncate01|ftruncate01_64|ftruncate04|ftruncate04_64|futex_cmp_requeue*|futex_wait03|futex_wait05|futex_wait_bitset*|futex_waitv*|futex_wake02|futex_wake04|futimesat01|fw_load|gen*|\
         creat04|creat05|creat07|creat08|creat09|copy_file_range*|crypto_user*|cve-*|delete_module*|diotest2|dio_append|dio_truncate|dirtyc0w*|dirtypipe|dma_thread_diotest|dup05|ebizzy|eject_check_tray|endian_switch01|exec_with_inh|exec_without_inh|execve02|execve04|execve05|getxattr0[2-4]|hackbench|inode01|inode02|kill08|kill10|kill11|leapsec01|lftest|mallocstress|memcg*|mmap1|mmap3|mmapstress*|mmstress|mremap*|mtest*|nanosleep01|nanosleep04|nftw01|nftw6401|nptl01|pause*|pids_task*|pidns05|pipe13|ppoll*|poll02|prot_hsymlinks|pselect01|pselect01_64|pselect02*|ptrace02|ptrace06|pthcli|pthserv|readlink03|recvmsg01|select02|select04*|sem_comm|semtest_2ns|sendfile07*|setfsgid03*|setpgid03|setrlimit06|shm_test*|shmat1|signal01*|starvation*|stat03|stat03_64|tgkill*|thp01|timed_forkbomb*|timerfd01|timerfd_settime02|waitpid08*|chdir01|clock_nanosleep*|close_range01|gettimeofday02|link05|link08|lstat02|lstat02_64|madvise01|madvise02|mincore04|mkdir03|mkdirat02|msgrcv05|msgrcv06|msgsnd05|msgsnd06|open04|open_tree01|open_tree02|openat04|sched_datafile*|capset04|io_control*|clone04|cpuctl_*|cpu_controller*|memctl_*|memory_controller*|tcp4-*|tcp6-*|udp4-*|udp6-*)
             return 0
