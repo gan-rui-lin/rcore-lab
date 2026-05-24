@@ -382,7 +382,7 @@ pub fn sys_futex(
             }
             if ret == errno(EINTR) {
                 let process = current_process();
-                let process_pending = process.inner_exclusive_access().signal_pending;
+                let process_pending = process.pending_signal();
                 let (tid, mask, task_pending, handling_sig, interrupted_by_signal, sepc, ra, tp) =
                     match current_task() {
                         Some(task) => {
@@ -565,7 +565,7 @@ pub fn sys_futex(
             }
             if ret == errno(EINTR) {
                 let process = current_process();
-                let process_pending = process.inner_exclusive_access().signal_pending;
+                let process_pending = process.pending_signal();
                 let (tid, mask, task_pending, handling_sig, interrupted_by_signal, sepc, ra, tp) =
                     match current_task() {
                         Some(task) => {
@@ -680,8 +680,7 @@ pub fn sys_getpid() -> isize {
 
 pub fn sys_getppid() -> isize {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if let Some(parent) = inner.parent.as_ref().and_then(|p| p.upgrade()) {
+    if let Some(parent) = process.parent() {
         parent.pid.0 as isize
     } else {
         0
@@ -870,7 +869,7 @@ pub fn sys_clone(
         let new_process = current.fork();
         let new_pid = new_process.pid.0;
         if clone_flags.contains(CloneFlags::VM) && clone_flags.contains(CloneFlags::VFORK) {
-            new_process.inner_exclusive_access().vfork_vm_parent = Some(Arc::downgrade(&current));
+            new_process.set_vfork_parent(Some(Arc::downgrade(&current)));
         }
 
         let new_task = new_process.get_task(0);
@@ -899,26 +898,17 @@ pub fn sys_clone(
         }
 
         if clone_flags.contains(CloneFlags::PARENT) {
-            let parent_weak = current.inner_exclusive_access().parent.clone();
-            {
-                let mut cur_inner = current.inner_exclusive_access();
-                cur_inner.children.retain(|c| c.pid.0 != new_pid);
-            }
-            {
-                let mut child_inner = new_process.inner_exclusive_access();
-                child_inner.parent = parent_weak.clone();
-            }
+            let parent_weak = current.parent_weak();
+            current.remove_child_by_pid(new_pid);
+            new_process.set_parent(parent_weak.clone());
             if let Some(parent) = parent_weak.and_then(|p| p.upgrade()) {
-                parent
-                    .inner_exclusive_access()
-                    .children
-                    .push(Arc::clone(&new_process));
+                parent.push_child(Arc::clone(&new_process));
             }
         }
 
         if clone_flags.contains(CloneFlags::VFORK) {
             loop {
-                if new_process.inner_exclusive_access().is_zombie {
+                if new_process.is_zombie() {
                     break;
                 }
                 suspend_current_and_run_next();
@@ -1646,26 +1636,24 @@ fn exit_code_to_waitid(exit_code: i32) -> (i32, i32) {
 
 pub(crate) fn has_unmasked_user_signal_without_restart() -> bool {
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
     let task = current_task().unwrap();
     let (task_pending, signal_mask) =
         task.with_signals(|signals| (signals.signal_pending, signals.signal_mask));
-    let unmasked = (process_inner.signal_pending | task_pending) & !signal_mask;
+    let unmasked = (process.pending_signal() | task_pending) & !signal_mask;
     if unmasked.is_empty() {
         return false;
     }
     use crate::task::SA_RESTART;
-    let actions = &process_inner.signal_actions;
     let raw = unmasked.bits();
     for bit in 0..64u32 {
         if raw & (1u64 << bit) == 0 {
             continue;
         }
         let signum = bit as usize + 1;
-        if signum >= actions.table.len() {
+        if signum >= MAX_SIG {
             continue;
         }
-        let action = &actions.table[signum];
+        let action = process.with_signal_action(signum, |action| action);
         if action.handler == 1 {
             continue; // SIG_IGN
         }
@@ -1715,13 +1703,12 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
 
     loop {
         let process = current_process();
-        let mut inner = process.inner_exclusive_access();
+        let children = process.children_snapshot();
         let mut has_matching_child = false;
 
         // 1) report non-exit events first (WSTOPPED/WCONTINUED)
-        for child in inner.children.iter() {
+        for child in children.iter() {
             let child_pid = child.getpid();
-            let mut child_inner = child.inner_exclusive_access();
             let matched = match idtype {
                 P_ALL => true,
                 P_PID => child_pid == id,
@@ -1732,16 +1719,14 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
                 continue;
             }
             has_matching_child = true;
-            if let Some(event) = child_inner.child_wait_event {
+            if let Some(event) = child.child_wait_event() {
                 match event {
                     ChildWaitEvent::Stopped(sig) if want_stopped => {
                         let info =
                             LinuxSigInfo::for_sigchld(child_pid as i32, sig, WAITID_CLD_STOPPED);
                         if !nowait {
-                            child_inner.child_wait_event = None;
+                            child.take_child_wait_event();
                         }
-                        drop(child_inner);
-                        drop(inner);
                         if write_waitid_siginfo(infop, info).is_err() {
                             return errno(EFAULT);
                         }
@@ -1751,10 +1736,8 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
                         let info =
                             LinuxSigInfo::for_sigchld(child_pid as i32, sig, WAITID_CLD_CONTINUED);
                         if !nowait {
-                            child_inner.child_wait_event = None;
+                            child.take_child_wait_event();
                         }
-                        drop(child_inner);
-                        drop(inner);
                         if write_waitid_siginfo(infop, info).is_err() {
                             return errno(EFAULT);
                         }
@@ -1767,9 +1750,8 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
 
         // 2) report exit events
         if want_exited {
-            let pair = inner.children.iter().enumerate().find(|(_, child)| {
+            let pair = children.iter().find(|child| {
                 let child_pid = child.getpid();
-                let child_inner = child.inner_exclusive_access();
                 let matched = match idtype {
                     P_ALL => true,
                     P_PID => child_pid == id,
@@ -1779,18 +1761,17 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
                 if matched {
                     has_matching_child = true;
                 }
-                matched && child_inner.is_zombie
+                matched && child.is_zombie()
             });
-            if let Some((idx, _)) = pair {
+            if let Some(child) = pair {
                 let (found_pid, exit_code, reaped) = if nowait {
-                    let child = inner.children[idx].clone();
                     let found_pid = child.getpid();
-                    let exit_code = child.inner_exclusive_access().exit_code;
+                    let exit_code = child.exit_code();
                     (found_pid, exit_code, false)
                 } else {
-                    let child = inner.children.remove(idx);
                     let found_pid = child.getpid();
-                    let exit_code = child.inner_exclusive_access().exit_code;
+                    let exit_code = child.exit_code();
+                    process.remove_child_by_pid(found_pid);
                     (found_pid, exit_code, true)
                 };
                 if reaped {
@@ -1798,7 +1779,6 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
                 }
                 let (status, code) = exit_code_to_waitid(exit_code);
                 let info = LinuxSigInfo::for_sigchld(found_pid as i32, status, code);
-                drop(inner);
                 if write_waitid_siginfo(infop, info).is_err() {
                     return errno(EFAULT);
                 }
@@ -1813,13 +1793,11 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
         // No reportable event.
         if nohang {
             let info = LinuxSigInfo::zeroed();
-            drop(inner);
             if write_waitid_siginfo(infop, info).is_err() {
                 return errno(EFAULT);
             }
             return 0;
         }
-        drop(inner);
         suspend_current_and_run_next();
         if has_unmasked_user_signal_without_restart() {
             return errno(EINTR);
@@ -1852,33 +1830,27 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
 
     loop {
         let process = current_process();
-        let mut inner = process.inner_exclusive_access();
+        let children = process.children_snapshot();
 
         // Check if any child matches the criteria
-        let has_matching_child = inner
-            .children
-            .iter()
-            .any(|p| matches_pid(p.getpid(), p.pgid()));
+        let has_matching_child = children.iter().any(|p| matches_pid(p.getpid(), p.pgid()));
 
         if !has_matching_child {
             return errno(ECHILD);
         }
 
         // First, check for ptrace-stopped children (higher priority than zombies)
-        let ptrace_pair = inner.children.iter().enumerate().find(|(_, p)| {
-            let child_inner = p.inner_exclusive_access();
-            child_inner.ptrace_stop_signal.is_some() && matches_pid(p.getpid(), p.pgid())
-        });
-        if let Some((idx, _)) = ptrace_pair {
-            let child = &inner.children[idx];
+        let ptrace_child = children
+            .iter()
+            .find(|p| p.ptrace_stop_signal().is_some() && matches_pid(p.getpid(), p.pgid()));
+        if let Some(child) = ptrace_child {
             let found_pid = child.getpid();
-            let mut child_inner = child.inner_exclusive_access();
 
-            if let Some(signum) = child_inner.ptrace_stop_signal.take() {
+            if let Some(signum) = child.take_ptrace_stop_signal() {
                 if !exit_code_ptr.is_null() {
                     // WIFSTOPPED encoding: (signal << 8) | 0x7f
                     let status = ((signum & 0xff) << 8) | 0x7f;
-                    *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
+                    *translated_refmut(current_user_token(), exit_code_ptr) = status;
                 }
                 trace!(
                     "[sys_waitpid] pid={} reports ptrace-stop of child pid={} signal={}",
@@ -1892,24 +1864,23 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
 
         // Then, if caller requests WUNTRACED, report group-stopped children.
         if (options & WUNTRACED) != 0 {
-            let stopped_pair = inner.children.iter().enumerate().find_map(|(idx, p)| {
-                let mut child_inner = p.inner_exclusive_access();
+            let stopped_pair = children.iter().find_map(|p| {
                 if !matches_pid(p.getpid(), p.pgid()) {
                     return None;
                 }
-                let stop_sig = match child_inner.child_wait_event.take() {
+                let stop_sig = match p.take_child_wait_event() {
                     Some(ChildWaitEvent::Stopped(sig)) => Some(sig),
                     Some(other) => {
                         // Keep non-stopped event for waitid()/other wait semantics.
-                        child_inner.child_wait_event = Some(other);
+                        p.set_child_wait_event(Some(other));
                         None
                     }
                     None => None,
                 };
-                stop_sig.map(|sig| (idx, sig))
+                stop_sig.map(|sig| (p.clone(), sig))
             });
-            if let Some((idx, signum)) = stopped_pair {
-                let found_pid = inner.children[idx].getpid();
+            if let Some((child, signum)) = stopped_pair {
+                let found_pid = child.getpid();
                 if !exit_code_ptr.is_null() {
                     let stop_sig = if (1..=(MAX_SIG as i32)).contains(&signum) {
                         signum
@@ -1918,7 +1889,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
                     };
                     // WIFSTOPPED encoding.
                     let status = ((stop_sig & 0xff) << 8) | 0x7f;
-                    *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
+                    *translated_refmut(current_user_token(), exit_code_ptr) = status;
                 }
                 trace!(
                     "[sys_waitpid] pid={} reports group-stop of child pid={} signal={}",
@@ -1931,18 +1902,17 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
         }
 
         // Then check for zombie children
-        let pair = inner.children.iter().enumerate().find(|(_, p)| {
-            let child_inner = p.inner_exclusive_access();
-            child_inner.is_zombie && matches_pid(p.getpid(), p.pgid())
-        });
-        if let Some((idx, _)) = pair {
-            let child = inner.children.remove(idx);
+        let pair = children
+            .iter()
+            .find(|p| p.is_zombie() && matches_pid(p.getpid(), p.pgid()));
+        if let Some(child) = pair {
             let found_pid = child.getpid();
-            let exit_code = child.inner_exclusive_access().exit_code;
+            let exit_code = child.exit_code();
+            process.remove_child_by_pid(found_pid);
             remove_from_pid2process(found_pid);
             if !exit_code_ptr.is_null() {
                 let status = encode_wait_status(exit_code);
-                *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
+                *translated_refmut(current_user_token(), exit_code_ptr) = status;
             }
             trace!(
                 "[sys_waitpid] pid={} reaped child pid={} exit_code={}",
@@ -1952,7 +1922,6 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
             );
             return found_pid as isize;
         }
-        drop(inner);
 
         // WNOHANG: return 0 immediately if no zombie child
         if (options & WNOHANG) != 0 {
@@ -2124,12 +2093,11 @@ pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
 
     let unmasked_pending_signal = || -> Option<(SignalFlags, SignalFlags, SignalFlags)> {
         let process = current_process();
-        let process_inner = process.inner_exclusive_access();
         let task = match current_task() {
             Some(task) => task,
             None => return None,
         };
-        let process_pending = process_inner.signal_pending;
+        let process_pending = process.pending_signal();
         let (task_pending, signal_mask) =
             task.with_signals(|signals| (signals.signal_pending, signals.signal_mask));
         let pending = (process_pending | task_pending) & !signal_mask;
@@ -3372,12 +3340,11 @@ pub fn sys_ptrace(request: usize, pid: isize, _addr: usize, _data: usize) -> isi
     match request {
         PTRACE_TRACEME => {
             let process = current_process();
-            let mut inner = process.inner_exclusive_access();
-            if inner.ptrace_traceme {
+            if process.ptrace_traceme() {
                 return errno(EPERM);
             }
-            inner.ptrace_traceme = true;
-            inner.ptrace_stop_signal = None;
+            process.set_ptrace_traceme(true);
+            process.set_ptrace_stop_signal(None);
             0
         }
         PTRACE_CONT | PTRACE_KILL => {
@@ -3390,11 +3357,10 @@ pub fn sys_ptrace(request: usize, pid: isize, _addr: usize, _data: usize) -> isi
             };
             let current_pid = current_process().getpid();
             let traced_by_me = {
-                let inner = target.inner_exclusive_access();
-                if !inner.ptrace_traceme {
+                if !target.ptrace_traceme() {
                     false
                 } else {
-                    match inner.parent.as_ref().and_then(|p| p.upgrade()) {
+                    match target.parent() {
                         Some(parent) => parent.getpid() == current_pid,
                         None => false,
                     }
@@ -3404,7 +3370,7 @@ pub fn sys_ptrace(request: usize, pid: isize, _addr: usize, _data: usize) -> isi
                 return errno(EPERM);
             }
             if request == PTRACE_CONT {
-                target.inner_exclusive_access().ptrace_stop_signal = None;
+                target.set_ptrace_stop_signal(None);
                 let tasks = target.tasks_snapshot();
                 for task in tasks {
                     if task.status() == TaskStatus::Blocked {
@@ -3466,19 +3432,16 @@ fn kill_single(pid: usize, signum: i32, flag: Option<SignalFlags>, sender_pid: u
         return 0;
     }
     let flag = flag.unwrap();
-    let mut inner = process.inner_exclusive_access();
     let mut yielded_after_continue = false;
-    if flag == SignalFlags::SIGCONT && inner.group_stopped {
-        inner.child_wait_event = Some(ChildWaitEvent::Continued(SIGCONT as i32));
-        inner.group_stopped = false;
+    if flag == SignalFlags::SIGCONT && process.group_stopped() {
+        process.set_child_wait_event(Some(ChildWaitEvent::Continued(SIGCONT as i32)));
+        process.set_group_stopped(false);
         yielded_after_continue = true;
     }
-    inner.set_pending_signal_siginfo(signum as usize, sender_pid as i32, 0);
-    inner.signal_pending |= flag;
+    process.insert_process_signal(flag, sender_pid as i32, 0);
     for task in process.tasks_snapshot() {
         wake_task_for_signal(&task, flag);
     }
-    drop(inner);
     if yielded_after_continue {
         suspend_current_and_run_next();
     }
@@ -3512,13 +3475,11 @@ fn kill_group(
             continue;
         }
         let flag = flag.unwrap();
-        let mut inner = process.inner_exclusive_access();
-        if flag == SignalFlags::SIGCONT && inner.group_stopped {
-            inner.child_wait_event = Some(ChildWaitEvent::Continued(SIGCONT as i32));
-            inner.group_stopped = false;
+        if flag == SignalFlags::SIGCONT && process.group_stopped() {
+            process.set_child_wait_event(Some(ChildWaitEvent::Continued(SIGCONT as i32)));
+            process.set_group_stopped(false);
         }
-        inner.set_pending_signal_siginfo(signum as usize, sender_pid as i32, 0);
-        inner.signal_pending |= flag;
+        process.insert_process_signal(flag, sender_pid as i32, 0);
         for task in process.tasks_snapshot() {
             wake_task_for_signal(&task, flag);
         }
@@ -3659,11 +3620,10 @@ pub fn sys_sigaction(
         return errno(EINVAL);
     }
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
     let idx = signum as usize;
-    let token = inner.memory_set.token();
+    let token = current_user_token();
     if !old_action.is_null() {
-        let old = inner.signal_actions.table[idx];
+        let old = process.with_signal_action(idx, |action| action);
         let bytes = unsafe {
             core::slice::from_raw_parts(
                 (&old as *const SignalAction) as *const u8,
@@ -3718,7 +3678,7 @@ pub fn sys_sigaction(
                 );
             }
         }
-        inner.signal_actions.table[idx] = new_action;
+        process.update_signal_action(idx, |slot| *slot = new_action);
     }
     0
 }
@@ -3916,15 +3876,15 @@ pub fn sys_sigreturn() -> isize {
 
     if current_sig >= 0 && (current_sig as usize) <= crate::task::MAX_SIG {
         let process = current_process();
-        let mut process_inner = process.inner_exclusive_access();
-        process_pending_snapshot = process_inner.signal_pending;
-        let action = process_inner.signal_actions.table[current_sig as usize];
+        process_pending_snapshot = process.pending_signal();
+        let action = process.with_signal_action(current_sig as usize, |action| action);
         if (action.flags & crate::task::SA_RESETHAND) != 0 {
             info!(
                 "[sigreturn] SA_RESETHAND set for signal {}, resetting handler to SIG_DFL",
                 current_sig
             );
-            process_inner.signal_actions.table[current_sig as usize] = SignalAction::default();
+            process
+                .update_signal_action(current_sig as usize, |slot| *slot = SignalAction::default());
         }
     }
 
@@ -4401,10 +4361,9 @@ pub fn sys_rt_sigsuspend(mask_ptr: *const usize, sigsetsize: usize) -> isize {
     loop {
         let has_signal = {
             let process = current_process();
-            let inner = process.inner_exclusive_access();
             let (task_pending, mask) =
                 task.with_signals(|signals| (signals.signal_pending, signals.signal_mask));
-            let pending = inner.signal_pending | task_pending;
+            let pending = process.pending_signal() | task_pending;
             !(pending & !mask).is_empty()
         };
         if has_signal {
@@ -5137,9 +5096,8 @@ pub fn sys_rt_sigtimedwait(
         let mut interrupted_by_other = false;
         {
             let process = current_process();
-            let process_inner = process.inner_exclusive_access();
             let task = current_task().unwrap();
-            let process_pending = process_inner.signal_pending;
+            let process_pending = process.pending_signal();
             let (task_pending, signal_mask) =
                 task.with_signals(|signals| (signals.signal_pending, signals.signal_mask));
             let pending_any = process_pending | task_pending;
@@ -5164,8 +5122,7 @@ pub fn sys_rt_sigtimedwait(
                 }
                 if (sigset & (1usize << (signum - 1))) != 0 {
                     if process_pending.contains(flag) {
-                        let (sender_pid, si_code) =
-                            process_inner.get_pending_signal_siginfo(signum);
+                        let (sender_pid, si_code) = process.process_signal_siginfo(signum);
                         found = Some((signum, true, sender_pid, si_code));
                     } else {
                         found = Some((signum, false, 0, 0));
@@ -5174,7 +5131,7 @@ pub fn sys_rt_sigtimedwait(
                 }
                 // Non-waited unmasked signal interrupts with EINTR.
                 if !signal_mask.contains(flag) {
-                    let action = process_inner.signal_actions.table[signum];
+                    let action = process.with_signal_action(signum, |action| action);
                     if action.handler == SIG_IGN_HANDLER
                         || (action.handler == 0 && signal_default_ignored(signum))
                     {
@@ -5194,12 +5151,10 @@ pub fn sys_rt_sigtimedwait(
                 }
             }
             let process = current_process();
-            let mut process_inner = process.inner_exclusive_access();
             let task = current_task().unwrap();
             let flag = SignalFlags::from_bits_truncate(1u64 << (signum - 1));
             if from_process {
-                process_inner.signal_pending.remove(flag);
-                process_inner.clear_pending_signal_siginfo(signum);
+                process.take_process_signal(signum);
             } else {
                 task.remove_pending_signal(flag);
             }

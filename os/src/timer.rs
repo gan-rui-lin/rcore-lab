@@ -111,13 +111,14 @@ fn check_itimers(current_ms: usize) {
                 expire,
                 current_ms
             );
-            inner.signal_pending |= SignalFlags::SIGALRM;
             // Reload interval or disarm
             if inner.itimer_real_interval_ms > 0 {
                 inner.itimer_real_expire_ms = current_ms + inner.itimer_real_interval_ms;
             } else {
                 inner.itimer_real_expire_ms = 0;
             }
+            drop(inner);
+            process.insert_process_signal(SignalFlags::SIGALRM, 0, 0);
 
             // Wake up any blocked tasks in this process so they can handle the signal
             for task in process.tasks_snapshot() {

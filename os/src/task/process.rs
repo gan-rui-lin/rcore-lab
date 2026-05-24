@@ -100,21 +100,12 @@ pub struct ProcessControlBlock {
     fs: UPIntrRwLock<ProcessFs>,
     identity: UPIntrRwLock<ProcessIdentity>,
     threads: UPIntrMutex<ProcessThreads>,
+    signals: UPIntrMutex<ProcessSignals>,
+    family: UPIntrMutex<ProcessFamily>,
 }
 
 pub struct ProcessControlBlockInner {
-    pub is_zombie: bool,
     pub memory_set: MemorySet,
-    pub parent: Option<Weak<ProcessControlBlock>>,
-    pub children: Vec<Arc<ProcessControlBlock>>,
-    pub exit_code: i32,
-    pub signals: SignalFlags,
-    pub signal_pending: SignalFlags,
-    /// Lightweight siginfo metadata for process-level pending signals.
-    /// Index `i` corresponds to signal number `i + 1`.
-    pub pending_signal_sender_pid: [i32; MAX_SIG],
-    pub pending_signal_si_code: [i32; MAX_SIG],
-    pub signal_actions: SignalActions,
     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
@@ -124,6 +115,27 @@ pub struct ProcessControlBlockInner {
     pub tls_area: Option<TlsArea>,
     pub rlimits: [RLimit; RLIMIT_NLIMITS],
     pub itimers: [IntervalTimerState; 3],
+    /// ITIMER_REAL: absolute expire time in ms, 0 = inactive.
+    pub itimer_real_expire_ms: usize,
+    /// ITIMER_REAL: interval for repeating timer in ms, 0 = one-shot.
+    pub itimer_real_interval_ms: usize,
+}
+
+pub struct ProcessSignals {
+    pub signals: SignalFlags,
+    pub signal_pending: SignalFlags,
+    /// Lightweight siginfo metadata for process-level pending signals.
+    /// Index `i` corresponds to signal number `i + 1`.
+    pub pending_signal_sender_pid: [i32; MAX_SIG],
+    pub pending_signal_si_code: [i32; MAX_SIG],
+    pub signal_actions: SignalActions,
+}
+
+pub struct ProcessFamily {
+    pub is_zombie: bool,
+    pub parent: Option<Weak<ProcessControlBlock>>,
+    pub children: Vec<Arc<ProcessControlBlock>>,
+    pub exit_code: i32,
     /// Set by ptrace(PTRACE_TRACEME).
     pub ptrace_traceme: bool,
     /// Pending ptrace stop signal to be reported by waitpid.
@@ -132,10 +144,6 @@ pub struct ProcessControlBlockInner {
     pub child_wait_event: Option<ChildWaitEvent>,
     /// True when the process is currently in a job-control stopped state.
     pub group_stopped: bool,
-    /// ITIMER_REAL: absolute expire time in ms, 0 = inactive.
-    pub itimer_real_expire_ms: usize,
-    /// ITIMER_REAL: interval for repeating timer in ms, 0 = one-shot.
-    pub itimer_real_interval_ms: usize,
     /// Parent process waiting on clone(CLONE_VM|CLONE_VFORK) synchronization.
     pub vfork_vm_parent: Option<Weak<ProcessControlBlock>>,
 }
@@ -190,11 +198,7 @@ pub struct ProcessThreads {
     pub task_res_allocator: RecycleAllocator,
 }
 
-impl ProcessControlBlockInner {
-    pub fn get_user_token(&self) -> usize {
-        self.memory_set.token()
-    }
-
+impl ProcessSignals {
     #[inline]
     pub fn set_pending_signal_siginfo(&mut self, signum: usize, sender_pid: i32, si_code: i32) {
         if signum == 0 || signum > MAX_SIG {
@@ -225,6 +229,12 @@ impl ProcessControlBlockInner {
         let idx = signum - 1;
         self.pending_signal_sender_pid[idx] = 0;
         self.pending_signal_si_code[idx] = 0;
+    }
+}
+
+impl ProcessControlBlockInner {
+    pub fn get_user_token(&self) -> usize {
+        self.memory_set.token()
     }
 }
 
@@ -401,16 +411,7 @@ impl ProcessControlBlock {
             pid: pid_handle,
             inner: unsafe {
                 UPIntrMutex::new(ProcessControlBlockInner {
-                    is_zombie: false,
                     memory_set,
-                    parent: None,
-                    children: Vec::new(),
-                    exit_code: 0,
-                    signals: SignalFlags::empty(),
-                    signal_pending: SignalFlags::empty(),
-                    pending_signal_sender_pid: [0; MAX_SIG],
-                    pending_signal_si_code: [0; MAX_SIG],
-                    signal_actions: SignalActions::default(),
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
@@ -420,13 +421,8 @@ impl ProcessControlBlock {
                     tls_area: tls_area.clone(),
                     rlimits: default_rlimits(),
                     itimers: [IntervalTimerState::default(); 3],
-                    ptrace_traceme: false,
-                    ptrace_stop_signal: None,
-                    child_wait_event: None,
-                    group_stopped: false,
                     itimer_real_expire_ms: 0,
                     itimer_real_interval_ms: 0,
-                    vfork_vm_parent: None,
                 })
             },
             fs: unsafe {
@@ -464,6 +460,28 @@ impl ProcessControlBlock {
                 UPIntrMutex::new(ProcessThreads {
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
+                })
+            },
+            signals: unsafe {
+                UPIntrMutex::new(ProcessSignals {
+                    signals: SignalFlags::empty(),
+                    signal_pending: SignalFlags::empty(),
+                    pending_signal_sender_pid: [0; MAX_SIG],
+                    pending_signal_si_code: [0; MAX_SIG],
+                    signal_actions: SignalActions::default(),
+                })
+            },
+            family: unsafe {
+                UPIntrMutex::new(ProcessFamily {
+                    is_zombie: false,
+                    parent: None,
+                    children: Vec::new(),
+                    exit_code: 0,
+                    ptrace_traceme: false,
+                    ptrace_stop_signal: None,
+                    child_wait_event: None,
+                    group_stopped: false,
+                    vfork_vm_parent: None,
                 })
             },
         });
@@ -636,15 +654,18 @@ impl ProcessControlBlock {
             inner.memory_set = memory_set;
             inner.heap_bottom = heap_bottom;
             inner.program_brk = heap_bottom;
+            inner.mmap_base = USER_MMAP_TOP;
+            inner.tls_area = tls_area.clone();
+            inner.itimers = [IntervalTimerState::default(); 3];
+        }
+        {
+            let mut signals = self.signals.lock();
             // Exec resets signal dispositions to default, except SIG_IGN.
-            for action in inner.signal_actions.table.iter_mut().skip(1) {
+            for action in signals.signal_actions.table.iter_mut().skip(1) {
                 if action.handler != 1 {
                     *action = SignalAction::default();
                 }
             }
-            inner.mmap_base = USER_MMAP_TOP;
-            inner.tls_area = tls_area.clone();
-            inner.itimers = [IntervalTimerState::default(); 3];
         }
         let task = self.get_task(0);
         task.set_ustack_base_and_refresh_trap_cx_ppn(ustack_base);
@@ -864,6 +885,8 @@ impl ProcessControlBlock {
         //     parent.fd_table.len()
         // );
         // info!("[fork-stage] pid={} before memory_set clone", self.pid.0);
+        let parent_signal_actions =
+            self.with_process_signals(|signals| signals.signal_actions.clone());
         let mut parent = self.inner_exclusive_access();
         let memory_set = MemorySet::from_existed_user(&mut parent.memory_set);
         // info!("[fork-stage] pid={} after memory_set clone", self.pid.0);
@@ -886,16 +909,7 @@ impl ProcessControlBlock {
             pid,
             inner: unsafe {
                 UPIntrMutex::new(ProcessControlBlockInner {
-                    is_zombie: false,
                     memory_set,
-                    parent: Some(Arc::downgrade(self)),
-                    children: Vec::new(),
-                    exit_code: 0,
-                    signals: SignalFlags::empty(),
-                    signal_pending: SignalFlags::empty(),
-                    pending_signal_sender_pid: [0; MAX_SIG],
-                    pending_signal_si_code: [0; MAX_SIG],
-                    signal_actions: parent.signal_actions.clone(),
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
@@ -905,13 +919,8 @@ impl ProcessControlBlock {
                     tls_area,
                     rlimits: parent.rlimits,
                     itimers: [IntervalTimerState::default(); 3],
-                    ptrace_traceme: false,
-                    ptrace_stop_signal: None,
-                    child_wait_event: None,
-                    group_stopped: false,
                     itimer_real_expire_ms: 0,
                     itimer_real_interval_ms: 0,
-                    vfork_vm_parent: None,
                 })
             },
             fs: unsafe {
@@ -928,11 +937,33 @@ impl ProcessControlBlock {
                     task_res_allocator: RecycleAllocator::new(),
                 })
             },
+            signals: unsafe {
+                UPIntrMutex::new(ProcessSignals {
+                    signals: SignalFlags::empty(),
+                    signal_pending: SignalFlags::empty(),
+                    pending_signal_sender_pid: [0; MAX_SIG],
+                    pending_signal_si_code: [0; MAX_SIG],
+                    signal_actions: parent_signal_actions,
+                })
+            },
+            family: unsafe {
+                UPIntrMutex::new(ProcessFamily {
+                    is_zombie: false,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    ptrace_traceme: false,
+                    ptrace_stop_signal: None,
+                    child_wait_event: None,
+                    group_stopped: false,
+                    vfork_vm_parent: None,
+                })
+            },
         });
         // info!("[fork-stage] pid={} child pcb allocated new_pid={}", self.pid.0, new_pid_value);
-        parent.children.push(Arc::clone(&child));
-        info!("[fork-stage] pid={} child linked to parent", self.pid.0);
         drop(parent);
+        self.push_child(Arc::clone(&child));
+        info!("[fork-stage] pid={} child linked to parent", self.pid.0);
         let parent_task = self.get_task(0);
         let ustack_base = parent_task.ustack_base();
         // 获取父线程的 signal_mask，用于子进程继承
@@ -1166,6 +1197,185 @@ impl ProcessControlBlock {
     pub fn with_threads_mut<R>(&self, f: impl FnOnce(&mut ProcessThreads) -> R) -> R {
         let mut threads = self.threads.lock();
         f(&mut threads)
+    }
+
+    pub fn with_process_signals<R>(&self, f: impl FnOnce(&ProcessSignals) -> R) -> R {
+        let signals = self.signals.lock();
+        f(&signals)
+    }
+
+    pub fn with_process_signals_mut<R>(&self, f: impl FnOnce(&mut ProcessSignals) -> R) -> R {
+        let mut signals = self.signals.lock();
+        f(&mut signals)
+    }
+
+    pub fn pending_signal(&self) -> SignalFlags {
+        self.signals.lock().signal_pending
+    }
+
+    pub fn signal_pending_snapshot(&self) -> SignalFlags {
+        self.pending_signal()
+    }
+
+    pub fn insert_process_signal(&self, flag: SignalFlags, sender_pid: i32, si_code: i32) {
+        let mut signals = self.signals.lock();
+        signals.signal_pending |= flag;
+        let mut bits = flag.bits();
+        while bits != 0 {
+            let idx = bits.trailing_zeros() as usize;
+            signals.set_pending_signal_siginfo(idx + 1, sender_pid, si_code);
+            bits &= bits - 1;
+        }
+    }
+
+    pub fn remove_process_signal(&self, flag: SignalFlags) {
+        self.signals.lock().signal_pending.remove(flag);
+    }
+
+    pub fn take_process_signal(&self, signum: usize) -> Option<(SignalFlags, i32, i32)> {
+        if signum == 0 || signum > MAX_SIG {
+            return None;
+        }
+        let flag = SignalFlags::from_bits_truncate(1u64 << (signum - 1));
+        let mut signals = self.signals.lock();
+        if !signals.signal_pending.contains(flag) {
+            return None;
+        }
+        let (sender_pid, si_code) = signals.get_pending_signal_siginfo(signum);
+        signals.signal_pending.remove(flag);
+        signals.clear_pending_signal_siginfo(signum);
+        Some((flag, sender_pid, si_code))
+    }
+
+    pub fn process_signal_siginfo(&self, signum: usize) -> (i32, i32) {
+        self.signals.lock().get_pending_signal_siginfo(signum)
+    }
+
+    pub fn with_signal_action<R>(&self, signum: usize, f: impl FnOnce(SignalAction) -> R) -> R {
+        let signals = self.signals.lock();
+        f(signals.signal_actions.table[signum])
+    }
+
+    pub fn update_signal_action<R>(
+        &self,
+        signum: usize,
+        f: impl FnOnce(&mut SignalAction) -> R,
+    ) -> R {
+        let mut signals = self.signals.lock();
+        f(&mut signals.signal_actions.table[signum])
+    }
+
+    pub fn with_family<R>(&self, f: impl FnOnce(&ProcessFamily) -> R) -> R {
+        let family = self.family.lock();
+        f(&family)
+    }
+
+    pub fn with_family_mut<R>(&self, f: impl FnOnce(&mut ProcessFamily) -> R) -> R {
+        let mut family = self.family.lock();
+        f(&mut family)
+    }
+
+    pub fn parent(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.family
+            .lock()
+            .parent
+            .as_ref()
+            .and_then(|parent| parent.upgrade())
+    }
+
+    pub fn parent_weak(&self) -> Option<Weak<ProcessControlBlock>> {
+        self.family.lock().parent.clone()
+    }
+
+    pub fn set_parent(&self, parent: Option<Weak<ProcessControlBlock>>) {
+        self.family.lock().parent = parent;
+    }
+
+    pub fn children_snapshot(&self) -> Vec<Arc<ProcessControlBlock>> {
+        self.family.lock().children.clone()
+    }
+
+    pub fn child_count(&self) -> usize {
+        self.family.lock().children.len()
+    }
+
+    pub fn push_child(&self, child: Arc<ProcessControlBlock>) {
+        self.family.lock().children.push(child);
+    }
+
+    pub fn remove_child_by_pid(&self, pid: usize) -> Option<Arc<ProcessControlBlock>> {
+        let mut family = self.family.lock();
+        let idx = family
+            .children
+            .iter()
+            .position(|child| child.getpid() == pid)?;
+        Some(family.children.remove(idx))
+    }
+
+    pub fn is_zombie(&self) -> bool {
+        self.family.lock().is_zombie
+    }
+
+    pub fn set_zombie(&self, exit_code: i32) {
+        let mut family = self.family.lock();
+        family.is_zombie = true;
+        family.exit_code = exit_code;
+    }
+
+    pub fn exit_code(&self) -> i32 {
+        self.family.lock().exit_code
+    }
+
+    pub fn child_wait_event(&self) -> Option<ChildWaitEvent> {
+        self.family.lock().child_wait_event
+    }
+
+    pub fn set_child_wait_event(&self, event: Option<ChildWaitEvent>) {
+        self.family.lock().child_wait_event = event;
+    }
+
+    pub fn take_child_wait_event(&self) -> Option<ChildWaitEvent> {
+        self.family.lock().child_wait_event.take()
+    }
+
+    pub fn group_stopped(&self) -> bool {
+        self.family.lock().group_stopped
+    }
+
+    pub fn set_group_stopped(&self, stopped: bool) {
+        self.family.lock().group_stopped = stopped;
+    }
+
+    pub fn ptrace_traceme(&self) -> bool {
+        self.family.lock().ptrace_traceme
+    }
+
+    pub fn set_ptrace_traceme(&self, traceme: bool) {
+        self.family.lock().ptrace_traceme = traceme;
+    }
+
+    pub fn ptrace_stop_signal(&self) -> Option<i32> {
+        self.family.lock().ptrace_stop_signal
+    }
+
+    pub fn set_ptrace_stop_signal(&self, signum: Option<i32>) {
+        self.family.lock().ptrace_stop_signal = signum;
+    }
+
+    pub fn take_ptrace_stop_signal(&self) -> Option<i32> {
+        self.family.lock().ptrace_stop_signal.take()
+    }
+
+    pub fn vfork_parent(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.family
+            .lock()
+            .vfork_vm_parent
+            .as_ref()
+            .and_then(|parent| parent.upgrade())
+    }
+
+    pub fn set_vfork_parent(&self, parent: Option<Weak<ProcessControlBlock>>) {
+        self.family.lock().vfork_vm_parent = parent;
     }
 
     pub fn with_memory_set<R>(&self, f: impl FnOnce(&MemorySet) -> R) -> R {

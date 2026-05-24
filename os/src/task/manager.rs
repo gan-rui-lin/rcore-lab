@@ -120,7 +120,7 @@ pub fn pid2process_aggregate() -> (
     let map = PID2PCB.exclusive_access();
     let total_processes = map.len();
     let mut sampled_processes = 0usize;
-    let mut skipped_processes = 0usize;
+    let skipped_processes = 0usize;
     let mut total_children = 0usize;
     let mut total_tasks = 0usize;
     let total_exited_threads = 0usize;
@@ -130,17 +130,13 @@ pub fn pid2process_aggregate() -> (
     let total_sem_waiters = 0usize;
     let total_cond_waiters = 0usize;
     for (pid, process) in map.iter() {
-        if let Some(inner) = process.try_inner_exclusive_access() {
-            sampled_processes += 1;
-            let child_len = inner.children.len();
-            total_children += child_len;
-            total_tasks += process.thread_count();
-            if child_len > max_children {
-                max_children = child_len;
-                max_children_pid = *pid;
-            }
-        } else {
-            skipped_processes += 1;
+        sampled_processes += 1;
+        let child_len = process.child_count();
+        total_children += child_len;
+        total_tasks += process.thread_count();
+        if child_len > max_children {
+            max_children = child_len;
+            max_children_pid = *pid;
         }
     }
     (
@@ -165,13 +161,11 @@ pub fn pid2process_fdtable_summary() -> (usize, usize, usize) {
     let mut max_fd_slots = 0usize;
     let mut max_fd_pid = 0usize;
     for (pid, process) in map.iter() {
-        if process.try_inner_exclusive_access().is_some() {
-            let fd_len = process.with_fs(|fs| fs.fd_table.len());
-            total_fd_slots += fd_len;
-            if fd_len > max_fd_slots {
-                max_fd_slots = fd_len;
-                max_fd_pid = *pid;
-            }
+        let fd_len = process.with_fs(|fs| fs.fd_table.len());
+        total_fd_slots += fd_len;
+        if fd_len > max_fd_slots {
+            max_fd_slots = fd_len;
+            max_fd_pid = *pid;
         }
     }
     (total_fd_slots, max_fd_slots, max_fd_pid)
@@ -213,9 +207,6 @@ pub fn print_pid2process_top_by_fd(limit: usize) {
     let mut top = [TopFdEntry::empty(); MAX_TOP];
     let map = PID2PCB.exclusive_access();
     for (pid, process) in map.iter() {
-        let Some(inner) = process.try_inner_exclusive_access() else {
-            continue;
-        };
         let (fd_slots, fd_used) = process.with_fs(|fs| {
             (
                 fs.fd_table.len(),
@@ -223,8 +214,8 @@ pub fn print_pid2process_top_by_fd(limit: usize) {
             )
         });
         let tasks_alive = process.thread_count();
-        let children = inner.children.len();
-        let is_zombie = inner.is_zombie;
+        let children = process.child_count();
+        let is_zombie = process.is_zombie();
         let candidate = TopFdEntry {
             valid: true,
             pid: *pid,

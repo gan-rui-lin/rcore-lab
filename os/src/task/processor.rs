@@ -134,42 +134,24 @@ pub fn print_current_task_brief_for_alloc_error() {
     };
     let pid = process.getpid();
     if let Some(snapshot) = task.try_debug_snapshot() {
-        if let Some(proc_inner) = process.try_inner_exclusive_access() {
-            println!(
-                "[kernel] alloc_error current: pid={} tid={} name={} zombie={} status={:?} last_syscall={} sepc={:#x} sp={:#x} ra={:#x} sampled=true",
-                pid,
-                snapshot.tid,
-                process.name().as_str(),
-                proc_inner.is_zombie,
-                snapshot.status,
-                snapshot.last_syscall,
-                snapshot.sepc,
-                snapshot.sp,
-                snapshot.ra
-            );
-        } else {
-            println!(
-                "[kernel] alloc_error current: pid={} tid={} name=<proc_busy> status={:?} last_syscall={} sepc={:#x} sp={:#x} ra={:#x} sampled=false",
-                pid,
-                snapshot.tid,
-                snapshot.status,
-                snapshot.last_syscall,
-                snapshot.sepc,
-                snapshot.sp,
-                snapshot.ra
-            );
-        }
-    } else if let Some(proc_inner) = process.try_inner_exclusive_access() {
+        println!(
+            "[kernel] alloc_error current: pid={} tid={} name={} zombie={} status={:?} last_syscall={} sepc={:#x} sp={:#x} ra={:#x} sampled=true",
+            pid,
+            snapshot.tid,
+            process.name().as_str(),
+            process.is_zombie(),
+            snapshot.status,
+            snapshot.last_syscall,
+            snapshot.sepc,
+            snapshot.sp,
+            snapshot.ra
+        );
+    } else {
         println!(
             "[kernel] alloc_error current: pid={} name={} zombie={} <task_busy> sampled=true",
             pid,
             process.name().as_str(),
-            proc_inner.is_zombie
-        );
-    } else {
-        println!(
-            "[kernel] alloc_error current: pid={} name=<proc_busy> <task_busy> sampled=false",
-            pid
+            process.is_zombie()
         );
     };
 }
@@ -188,10 +170,9 @@ pub fn has_pending_unmasked_signal(ignore_sigchld: bool) -> bool {
         Some(p) => p,
         None => return false,
     };
-    let process_inner = process.inner_exclusive_access();
     let signal_snapshot =
         task.with_signals(|signals| (signals.signal_pending, signals.signal_mask));
-    let mut pending = (process_inner.signal_pending | signal_snapshot.0) & !signal_snapshot.1;
+    let mut pending = (process.pending_signal() | signal_snapshot.0) & !signal_snapshot.1;
     if ignore_sigchld {
         pending &= !super::SignalFlags::SIGCHLD;
     }

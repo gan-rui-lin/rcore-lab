@@ -370,10 +370,9 @@ impl ProcPidTaskStatInode {
         let Some(process) = pid2process(self.pid) else {
             return String::new();
         };
-        let inner = process.inner_exclusive_access();
         let comm = process.name();
-        let mut state = if inner.is_zombie { 'Z' } else { 'R' };
-        if !inner.is_zombie {
+        let mut state = if process.is_zombie() { 'Z' } else { 'R' };
+        if !process.is_zombie() {
             if let Some(task) = process.with_threads(|threads| {
                 threads
                     .tasks
@@ -519,12 +518,11 @@ impl ProcPidStatInode {
         let Some(process) = pid2process(self.pid) else {
             return String::new();
         };
-        let inner = process.inner_exclusive_access();
         let comm = process.name();
         // /proc/<pid>/stat should reflect the thread-group leader state.
         // LTP's TST_PROCESS_STATE_WAIT() relies on this for parent process sleep detection.
-        let mut state = if inner.is_zombie { 'Z' } else { 'R' };
-        if !inner.is_zombie {
+        let mut state = if process.is_zombie() { 'Z' } else { 'R' };
+        if !process.is_zombie() {
             if let Some(leader) = process.with_threads(|threads| {
                 threads.tasks.get(0).and_then(|task| task.as_ref().cloned())
             }) {

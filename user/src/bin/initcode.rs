@@ -821,6 +821,7 @@ fn run_ltp_suite(root: &str) -> i32 {
     );
     // Run standalone LTP cases while skipping obvious helper/library entries
     // that are not meant to be launched directly (e.g. cgroup_fj_proc).
+    // TODO: data 不是测试；不应该加入；以及其它 /ltp/testcases/bin 目录下的非测试文件；
     let script = if root == "/glibc" {
         "\
 #!/bin/sh
