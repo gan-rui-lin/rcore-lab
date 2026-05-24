@@ -4,7 +4,7 @@ use super::{
     add_task, pid_alloc, PidHandle, SignalAction, SignalActions, SignalFlags, TaskControlBlock,
     TlsArea, MAX_SIG,
 };
-use crate::config::{USER_MMAP_TOP, USER_STACK_SIZE};
+use crate::config::{PAGE_SIZE, USER_MMAP_TOP, USER_STACK_SIZE};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{
     translated_byte_buffer_checked, translated_ref, translated_refmut, translated_str, MemorySet,
@@ -19,6 +19,10 @@ use arch::{TrapContext, TrapFrameArgs};
 use xmas_elf::sections::{SectionData, ShType};
 use xmas_elf::symbol_table::Entry;
 use xmas_elf::ElfFile;
+
+fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
 
 #[cfg(target_arch = "loongarch64")]
 const LOONGARCH_MIN_TCB_ADDR: usize = 0x7000_1000;
@@ -97,6 +101,7 @@ fn find_global_pointer(elf_data: &[u8]) -> Option<usize> {
 pub struct ProcessControlBlock {
     pub pid: PidHandle,
     inner: UPIntrMutex<ProcessControlBlockInner>,
+    memory: UPIntrRwLock<ProcessMemory>,
     fs: UPIntrRwLock<ProcessFs>,
     identity: UPIntrRwLock<ProcessIdentity>,
     threads: UPIntrMutex<ProcessThreads>,
@@ -105,20 +110,23 @@ pub struct ProcessControlBlock {
 }
 
 pub struct ProcessControlBlockInner {
-    pub memory_set: MemorySet,
     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
-    pub heap_bottom: usize,
-    pub program_brk: usize,
-    pub mmap_base: usize,
-    pub tls_area: Option<TlsArea>,
     pub rlimits: [RLimit; RLIMIT_NLIMITS],
     pub itimers: [IntervalTimerState; 3],
     /// ITIMER_REAL: absolute expire time in ms, 0 = inactive.
     pub itimer_real_expire_ms: usize,
     /// ITIMER_REAL: interval for repeating timer in ms, 0 = one-shot.
     pub itimer_real_interval_ms: usize,
+}
+
+pub struct ProcessMemory {
+    pub memory_set: MemorySet,
+    pub heap_bottom: usize,
+    pub program_brk: usize,
+    pub mmap_base: usize,
+    pub tls_area: Option<TlsArea>,
 }
 
 pub struct ProcessSignals {
@@ -229,12 +237,6 @@ impl ProcessSignals {
         let idx = signum - 1;
         self.pending_signal_sender_pid[idx] = 0;
         self.pending_signal_si_code[idx] = 0;
-    }
-}
-
-impl ProcessControlBlockInner {
-    pub fn get_user_token(&self) -> usize {
-        self.memory_set.token()
     }
 }
 
@@ -411,18 +413,22 @@ impl ProcessControlBlock {
             pid: pid_handle,
             inner: unsafe {
                 UPIntrMutex::new(ProcessControlBlockInner {
-                    memory_set,
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
-                    heap_bottom,
-                    program_brk: heap_bottom,
-                    mmap_base: USER_MMAP_TOP,
-                    tls_area: tls_area.clone(),
                     rlimits: default_rlimits(),
                     itimers: [IntervalTimerState::default(); 3],
                     itimer_real_expire_ms: 0,
                     itimer_real_interval_ms: 0,
+                })
+            },
+            memory: unsafe {
+                UPIntrRwLock::new(ProcessMemory {
+                    memory_set,
+                    heap_bottom,
+                    program_brk: heap_bottom,
+                    mmap_base: USER_MMAP_TOP,
+                    tls_area: tls_area.clone(),
                 })
             },
             fs: unsafe {
@@ -507,7 +513,7 @@ impl ProcessControlBlock {
             trap_cx_value[TrapFrameArgs::TLS] = tls.tp_value;
             info!("[kernel] TLS initialized: tp = {:#x}", tls.tp_value);
         } else {
-            let token = process.inner_exclusive_access().memory_set.token();
+            let token = process.get_user_token();
             let tcb_addr =
                 Self::fallback_tcb_addr_if_no_tls(token, ustack_top, minimal_tcb).unwrap_or(0);
             trap_cx_value[TrapFrameArgs::TLS] = tcb_addr;
@@ -649,15 +655,8 @@ impl ProcessControlBlock {
             ustack_base,
             tls_area.is_some()
         );
-        {
-            let mut inner = self.inner_exclusive_access();
-            inner.memory_set = memory_set;
-            inner.heap_bottom = heap_bottom;
-            inner.program_brk = heap_bottom;
-            inner.mmap_base = USER_MMAP_TOP;
-            inner.tls_area = tls_area.clone();
-            inner.itimers = [IntervalTimerState::default(); 3];
-        }
+        self.reset_memory_after_exec(memory_set, heap_bottom, tls_area.clone());
+        self.inner_exclusive_access().itimers = [IntervalTimerState::default(); 3];
         {
             let mut signals = self.signals.lock();
             // Exec resets signal dispositions to default, except SIG_IGN.
@@ -887,12 +886,10 @@ impl ProcessControlBlock {
         // info!("[fork-stage] pid={} before memory_set clone", self.pid.0);
         let parent_signal_actions =
             self.with_process_signals(|signals| signals.signal_actions.clone());
-        let mut parent = self.inner_exclusive_access();
-        let memory_set = MemorySet::from_existed_user(&mut parent.memory_set);
+        let (memory_set, heap_bottom, program_brk, mmap_base, tls_area) =
+            self.clone_memory_for_fork();
+        let rlimits = self.inner_exclusive_access().rlimits;
         // info!("[fork-stage] pid={} after memory_set clone", self.pid.0);
-
-        // TLS pages are already cloned via MemorySet::from_existed_user.
-        let tls_area = parent.tls_area.clone();
 
         let pid = pid_alloc();
         info!("[fork-stage] pid={} before fd_table clone", self.pid.0);
@@ -909,18 +906,22 @@ impl ProcessControlBlock {
             pid,
             inner: unsafe {
                 UPIntrMutex::new(ProcessControlBlockInner {
-                    memory_set,
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
-                    heap_bottom: parent.heap_bottom,
-                    program_brk: parent.program_brk,
-                    mmap_base: parent.mmap_base,
-                    tls_area,
-                    rlimits: parent.rlimits,
+                    rlimits,
                     itimers: [IntervalTimerState::default(); 3],
                     itimer_real_expire_ms: 0,
                     itimer_real_interval_ms: 0,
+                })
+            },
+            memory: unsafe {
+                UPIntrRwLock::new(ProcessMemory {
+                    memory_set,
+                    heap_bottom,
+                    program_brk,
+                    mmap_base,
+                    tls_area,
                 })
             },
             fs: unsafe {
@@ -961,7 +962,6 @@ impl ProcessControlBlock {
             },
         });
         // info!("[fork-stage] pid={} child pcb allocated new_pid={}", self.pid.0, new_pid_value);
-        drop(parent);
         self.push_child(Arc::clone(&child));
         info!("[fork-stage] pid={} child linked to parent", self.pid.0);
         let parent_task = self.get_task(0);
@@ -991,7 +991,7 @@ impl ProcessControlBlock {
 
     #[inline]
     pub fn get_user_token(&self) -> usize {
-        self.inner_exclusive_access().memory_set.token()
+        self.memory.read().memory_set.token()
     }
 
     #[inline]
@@ -1378,13 +1378,106 @@ impl ProcessControlBlock {
         self.family.lock().vfork_vm_parent = parent;
     }
 
+    pub fn with_memory<R>(&self, f: impl FnOnce(&ProcessMemory) -> R) -> R {
+        let memory = self.memory.read();
+        f(&memory)
+    }
+
+    pub fn with_memory_mut<R>(&self, f: impl FnOnce(&mut ProcessMemory) -> R) -> R {
+        let mut memory = self.memory.write();
+        f(&mut memory)
+    }
+
     pub fn with_memory_set<R>(&self, f: impl FnOnce(&MemorySet) -> R) -> R {
-        let inner = self.inner_exclusive_access();
-        f(&inner.memory_set)
+        self.with_memory(|memory| f(&memory.memory_set))
     }
 
     pub fn with_memory_set_mut<R>(&self, f: impl FnOnce(&mut MemorySet) -> R) -> R {
-        let mut inner = self.inner_exclusive_access();
-        f(&mut inner.memory_set)
+        self.with_memory_mut(|memory| f(&mut memory.memory_set))
+    }
+
+    pub fn memory_snapshot_for_proc_maps(&self, name: &str) -> String {
+        self.with_memory(|memory| {
+            memory
+                .memory_set
+                .render_proc_maps(name, memory.heap_bottom, memory.program_brk)
+        })
+    }
+
+    pub fn brk(&self) -> usize {
+        self.memory.read().program_brk
+    }
+
+    pub fn set_brk(&self, program_brk: usize) {
+        self.memory.write().program_brk = program_brk;
+    }
+
+    pub fn heap_bottom(&self) -> usize {
+        self.memory.read().heap_bottom
+    }
+
+    pub fn mmap_base(&self) -> usize {
+        self.memory.read().mmap_base
+    }
+
+    pub fn alloc_mmap_base(&self, len: usize) -> Result<usize, isize> {
+        let mut memory = self.memory.write();
+        let base = align_up(memory.mmap_base, PAGE_SIZE);
+        let Some(next_base) = base.checked_add(len) else {
+            return Err(-12);
+        };
+        memory.mmap_base = next_base;
+        Ok(base)
+    }
+
+    pub fn reset_memory_after_exec(
+        &self,
+        memory_set: MemorySet,
+        heap_bottom: usize,
+        tls_area: Option<TlsArea>,
+    ) {
+        let mut memory = self.memory.write();
+        memory.memory_set = memory_set;
+        memory.heap_bottom = heap_bottom;
+        memory.program_brk = heap_bottom;
+        memory.mmap_base = USER_MMAP_TOP;
+        memory.tls_area = tls_area;
+    }
+
+    pub fn clone_memory_for_fork(&self) -> (MemorySet, usize, usize, usize, Option<TlsArea>) {
+        let mut parent = self.memory.write();
+        let memory_set = MemorySet::from_existed_user(&mut parent.memory_set);
+        (
+            memory_set,
+            parent.heap_bottom,
+            parent.program_brk,
+            parent.mmap_base,
+            parent.tls_area.clone(),
+        )
+    }
+
+    pub fn handle_cow_or_demand_fault(&self, addr: usize) -> bool {
+        let mut memory = self.memory.write();
+        memory.memory_set.handle_cow_fault(addr) || memory.memory_set.handle_demand_fault(addr)
+    }
+
+    pub fn recycle_user_memory(&self) {
+        self.memory.write().memory_set.recycle_data_pages();
+    }
+
+    pub fn sync_vfork_memory_to_parent(&self, parent: &Arc<ProcessControlBlock>) -> usize {
+        if self.pid.0 < parent.pid.0 {
+            let child_memory = self.memory.read();
+            let mut parent_memory = parent.memory.write();
+            parent_memory
+                .memory_set
+                .sync_user_writable_from(&child_memory.memory_set)
+        } else {
+            let mut parent_memory = parent.memory.write();
+            let child_memory = self.memory.read();
+            parent_memory
+                .memory_set
+                .sync_user_writable_from(&child_memory.memory_set)
+        }
     }
 }

@@ -458,11 +458,8 @@ impl ProcPidMapsInode {
         let Some(process) = pid2process(self.pid) else {
             return String::new();
         };
-        let inner = process.inner_exclusive_access();
         let name = process.name();
-        inner
-            .memory_set
-            .render_proc_maps(&name, inner.heap_bottom, inner.program_brk)
+        process.memory_snapshot_for_proc_maps(&name)
     }
 }
 

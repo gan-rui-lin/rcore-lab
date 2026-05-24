@@ -889,11 +889,11 @@ pub fn sys_clone(
             let parent_token = current_user_token();
             *translated_refmut(parent_token, ptid) = new_pid as i32;
             // Make sure child can observe the same value as Linux clone semantics.
-            let child_token = new_process.inner_exclusive_access().memory_set.token();
+            let child_token = new_process.get_user_token();
             *translated_refmut(child_token, ptid) = new_pid as i32;
         }
         if clone_flags.contains(CloneFlags::CHILD_SETTID) && !ctid.is_null() {
-            let child_token = new_process.inner_exclusive_access().memory_set.token();
+            let child_token = new_process.get_user_token();
             *translated_refmut(child_token, ctid) = new_pid as i32;
         }
 
@@ -2479,29 +2479,25 @@ fn user_range_in_area(start: usize, len: usize) -> bool {
         return true;
     }
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    inner.memory_set.is_user_range_mapped_area(start, len)
+    process.with_memory_set(|memory_set| memory_set.is_user_range_mapped_area(start, len))
 }
 
 fn user_page_resident_bitmap(start: usize, pages: usize) -> Vec<u8> {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    let mut out = Vec::new();
-    for i in 0..pages {
-        let va = start.saturating_add(i * PAGE_SIZE);
-        out.push(
-            if inner
-                .memory_set
-                .translate(VirtAddr::from(va).floor())
-                .is_some()
-            {
-                1
-            } else {
-                0
-            },
-        );
-    }
-    out
+    process.with_memory_set(|memory_set| {
+        let mut out = Vec::new();
+        for i in 0..pages {
+            let va = start.saturating_add(i * PAGE_SIZE);
+            out.push(
+                if memory_set.translate(VirtAddr::from(va).floor()).is_some() {
+                    1
+                } else {
+                    0
+                },
+            );
+        }
+        out
+    })
 }
 
 pub fn sys_mlock(addr: usize, len: usize) -> isize {
@@ -2685,13 +2681,14 @@ pub fn sys_msync(start: usize, len: usize, _flags: usize) -> isize {
     let ms_invalidate = (_flags & MS_INVALIDATE) != 0;
     let ms_writeback = (_flags & (MS_SYNC | MS_ASYNC)) != 0;
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    match inner.memory_set.msync_file_range(
-        VirtAddr::from(start),
-        VirtAddr::from(end),
-        ms_invalidate,
-        ms_writeback,
-    ) {
+    match process.with_memory_set_mut(|memory_set| {
+        memory_set.msync_file_range(
+            VirtAddr::from(start),
+            VirtAddr::from(end),
+            ms_invalidate,
+            ms_writeback,
+        )
+    }) {
         Ok(_) => 0,
         Err(crate::mm::MsyncError::Busy) => errno(EBUSY),
         Err(crate::mm::MsyncError::Unmapped) => errno(ENOMEM),
@@ -2741,12 +2738,9 @@ pub fn sys_mmap(
         // let ra = cx[TrapFrameArgs::RA];
         // let gp = cx.gp();
         // let process = current_process();
-        // let inner = process.inner_exclusive_access();
-        // let name = inner.name.clone();
-        // let heap_bottom = inner.heap_bottom;
-        // let program_brk = inner.program_brk;
-        // let mmap_base = inner.mmap_base;
-        // drop(inner);
+        // let name = process.name();
+        // let (heap_bottom, program_brk, mmap_base) =
+        //     process.with_memory(|memory| (memory.heap_bottom, memory.program_brk, memory.mmap_base));
         // let token = current_user_token();
         // let heap_struct = gp.wrapping_add(0x688);
         // let heap_align = *translated_ref(token, (heap_struct + 0x38) as *const usize);
@@ -2827,7 +2821,7 @@ pub fn sys_mmap(
     let is_anon = (flags & MAP_ANON) != 0;
     let process = current_process();
 
-    let file_info = if !is_anon {
+    let file_for_mapping = if !is_anon {
         if offset % PAGE_SIZE != 0 {
             return errno(EINVAL);
         }
@@ -2846,184 +2840,187 @@ pub fn sys_mmap(
         {
             return errno(EPERM);
         }
-        let writable = file.writable();
-        let inode = file.inode();
-        Some((inode, writable))
+        Some(file)
     } else {
         None
     };
+    let file_writable = file_for_mapping
+        .as_ref()
+        .map(|file| file.writable())
+        .unwrap_or(true);
 
     // 计算 mmap 起始地址：
     // - MAP_FIXED: 使用调用方给定地址
     // - 非 MAP_FIXED: 从 hint/mmap_base 出发，向上跳过所有重叠区间后再放置
-    let mut inner = process.inner_exclusive_access();
     let req_start = start;
     let is_fixed = (flags & MAP_FIXED) != 0 && req_start != 0;
-    let mut start = if is_fixed {
-        req_start
-    } else if req_start != 0 {
-        (req_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
-    } else {
-        (inner.mmap_base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
-    };
+    let mmap_result = process.with_memory_mut(|memory| -> Result<usize, isize> {
+        let mut start = if is_fixed {
+            req_start
+        } else if req_start != 0 {
+            (req_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+        } else {
+            (memory.mmap_base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+        };
 
-    if !is_fixed {
-        loop {
+        if !is_fixed {
+            loop {
+                let end = match start.checked_add(len) {
+                    Some(v) => v,
+                    None => return Err(errno(ENOMEM)),
+                };
+                let overlaps = memory
+                    .memory_set
+                    .overlap_ranges(VirtAddr(start), VirtAddr(end));
+                if overlaps.is_empty() {
+                    break;
+                }
+                let jump_to = overlaps
+                    .iter()
+                    .map(|(_, r_end)| r_end.0)
+                    .max()
+                    .unwrap_or(start);
+                let next = (jump_to + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                if next <= start {
+                    return Err(errno(ENOMEM));
+                }
+                start = next;
+            }
             let end = match start.checked_add(len) {
                 Some(v) => v,
-                None => return errno(ENOMEM),
+                None => return Err(errno(ENOMEM)),
             };
-            let overlaps = inner
-                .memory_set
-                .overlap_ranges(VirtAddr(start), VirtAddr(end));
-            if overlaps.is_empty() {
-                break;
-            }
-            let jump_to = overlaps
-                .iter()
-                .map(|(_, r_end)| r_end.0)
-                .max()
-                .unwrap_or(start);
-            let next = (jump_to + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-            if next <= start {
-                return errno(ENOMEM);
-            }
-            start = next;
-        }
-        let end = match start.checked_add(len) {
-            Some(v) => v,
-            None => return errno(ENOMEM),
-        };
-        if end > inner.mmap_base {
-            inner.mmap_base = end;
-        }
-    }
-    // TODO(grl): harden mmap end-range validation in one place for both MAP_FIXED
-    // and non-fixed paths:
-    // 1) compute/check `end = start.checked_add(len)` once;
-    // 2) enforce `end <= USER_ADDR_MAX`;
-    // 3) stop using raw `start + len` in overlap/unmap/insert calls.
-    let mmap_proc_name = process.name();
-    if mmap_proc_name == "busybox" || mmap_proc_name == "ld-linux-riscv64-lp64d.so.1" {
-        let overlap = inner
-            .memory_set
-            .overlap_count(VirtAddr(start), VirtAddr(start + len));
-        trace!(
-            "[sys_mmap] pid={} name={} req={:#x} len={:#x} prot={:#x} flags={:#x} -> start={:#x} overlap={} fixed={}",
-            pid,
-            mmap_proc_name,
-            req_start,
-            len,
-            prot,
-            flags,
-            start,
-            overlap,
-            is_fixed
-        );
-        if is_fixed && overlap > 0 {
-            let ranges = inner
-                .memory_set
-                .overlap_ranges(VirtAddr(start), VirtAddr(start + len));
-            for (idx, (r_start, r_end)) in ranges.into_iter().enumerate() {
-                trace!(
-                    "[sys_mmap] pid={} fixed overlap[{}]=[{:#x},{:#x})",
-                    pid,
-                    idx,
-                    r_start.0,
-                    r_end.0
-                );
+            if end > memory.mmap_base {
+                memory.mmap_base = end;
             }
         }
-    }
-    trace!(
-        "[sys_mmap] pid={} req={:#x} len={:#x} flags={:#x} -> start={:#x}",
-        pid,
-        req_start,
-        len,
-        flags,
-        start
-    );
 
-    let overlap = inner
-        .memory_set
-        .overlap_count(VirtAddr(start), VirtAddr(start + len));
-    if overlap > 0 {
-        if is_fixed {
-            // MAP_FIXED: unmap overlapping pages in the target range.
-            inner
+        // TODO(grl): harden mmap end-range validation in one place for both MAP_FIXED
+        // and non-fixed paths:
+        // 1) compute/check `end = start.checked_add(len)` once;
+        // 2) enforce `end <= USER_ADDR_MAX`;
+        // 3) stop using raw `start + len` in overlap/unmap/insert calls.
+        let mmap_proc_name = proc_name.as_str();
+        if mmap_proc_name == "busybox" || mmap_proc_name == "ld-linux-riscv64-lp64d.so.1" {
+            let overlap = memory
                 .memory_set
-                .unmap_range(VirtAddr(start), VirtAddr(start + len));
-        } else {
-            // Non-MAP_FIXED mappings must not overlap existing VMAs.
-            return errno(ENOMEM);
-        }
-    }
-
-    // Lazy VMA insertion: register VMA, allocate pages on fault.
-    // Preserve MapAreaType tracking from dev for bookkeeping.
-    let meta = MmapMeta {
-        shared: is_shared,
-        file_backed: !is_anon && fd != usize::MAX,
-        file_writable: file_info
-            .as_ref()
-            .map(|(_, writable)| *writable)
-            .unwrap_or(true),
-        map_locked: (flags & MAP_LOCKED) != 0,
-    };
-    if is_anon || fd == usize::MAX {
-        if is_shared {
-            // MAP_SHARED anonymous: eagerly allocate so that all forked processes
-            // share the same physical frames. Lazy allocation creates per-process
-            // pages on fault, breaking MAP_SHARED semantics (e.g. getpid02 test).
-            inner.memory_set.insert_mmap_area(
-                VirtAddr(start),
-                VirtAddr(start + len),
-                map_perm,
-                meta,
-                MapAreaType::MmapAnon,
+                .overlap_count(VirtAddr(start), VirtAddr(start + len));
+            trace!(
+                "[sys_mmap] pid={} name={} req={:#x} len={:#x} prot={:#x} flags={:#x} -> start={:#x} overlap={} fixed={}",
+                pid,
+                mmap_proc_name,
+                req_start,
+                len,
+                prot,
+                flags,
+                start,
+                overlap,
+                is_fixed
             );
-        } else {
-            inner.memory_set.insert_lazy_anon_area(
-                VirtAddr(start),
-                VirtAddr(start + len),
-                map_perm,
-                meta,
-            );
-        }
-    } else {
-        let file = process.get_file(fd);
-        match file {
-            Some(file) => {
-                if is_shared {
-                    // MAP_SHARED file-backed mappings must materialize shared
-                    // frames before fork(). Keeping them lazy can cause parent
-                    // and child to fault different private pages, corrupting
-                    // shared userspace state (e.g. LTP summary counters).
-                    inner.memory_set.insert_shared_file_mmap_area(
-                        VirtAddr(start),
-                        VirtAddr(start + len),
-                        map_perm,
-                        file,
-                        offset as u64,
-                        meta,
-                    );
-                } else {
-                    inner.memory_set.insert_lazy_file_area(
-                        VirtAddr(start),
-                        VirtAddr(start + len),
-                        map_perm,
-                        file,
-                        offset as u64,
-                        meta,
+            if is_fixed && overlap > 0 {
+                let ranges = memory
+                    .memory_set
+                    .overlap_ranges(VirtAddr(start), VirtAddr(start + len));
+                for (idx, (r_start, r_end)) in ranges.into_iter().enumerate() {
+                    trace!(
+                        "[sys_mmap] pid={} fixed overlap[{}]=[{:#x},{:#x})",
+                        pid,
+                        idx,
+                        r_start.0,
+                        r_end.0
                     );
                 }
             }
-            None => return errno(EBADF),
         }
-    }
-    drop(inner);
+        trace!(
+            "[sys_mmap] pid={} req={:#x} len={:#x} flags={:#x} -> start={:#x}",
+            pid,
+            req_start,
+            len,
+            flags,
+            start
+        );
 
-    start as isize
+        let overlap = memory
+            .memory_set
+            .overlap_count(VirtAddr(start), VirtAddr(start + len));
+        if overlap > 0 {
+            if is_fixed {
+                // MAP_FIXED: unmap overlapping pages in the target range.
+                memory
+                    .memory_set
+                    .unmap_range(VirtAddr(start), VirtAddr(start + len));
+            } else {
+                // Non-MAP_FIXED mappings must not overlap existing VMAs.
+                return Err(errno(ENOMEM));
+            }
+        }
+
+        // Lazy VMA insertion: register VMA, allocate pages on fault.
+        // Preserve MapAreaType tracking from dev for bookkeeping.
+        let meta = MmapMeta {
+            shared: is_shared,
+            file_backed: !is_anon && fd != usize::MAX,
+            file_writable,
+            map_locked: (flags & MAP_LOCKED) != 0,
+        };
+        if is_anon || fd == usize::MAX {
+            if is_shared {
+                // MAP_SHARED anonymous: eagerly allocate so that all forked processes
+                // share the same physical frames. Lazy allocation creates per-process
+                // pages on fault, breaking MAP_SHARED semantics (e.g. getpid02 test).
+                memory.memory_set.insert_mmap_area(
+                    VirtAddr(start),
+                    VirtAddr(start + len),
+                    map_perm,
+                    meta,
+                    MapAreaType::MmapAnon,
+                );
+            } else {
+                memory.memory_set.insert_lazy_anon_area(
+                    VirtAddr(start),
+                    VirtAddr(start + len),
+                    map_perm,
+                    meta,
+                );
+            }
+        } else {
+            match file_for_mapping.clone() {
+                Some(file) => {
+                    if is_shared {
+                        // MAP_SHARED file-backed mappings must materialize shared
+                        // frames before fork(). Keeping them lazy can cause parent
+                        // and child to fault different private pages, corrupting
+                        // shared userspace state (e.g. LTP summary counters).
+                        memory.memory_set.insert_shared_file_mmap_area(
+                            VirtAddr(start),
+                            VirtAddr(start + len),
+                            map_perm,
+                            file,
+                            offset as u64,
+                            meta,
+                        );
+                    } else {
+                        memory.memory_set.insert_lazy_file_area(
+                            VirtAddr(start),
+                            VirtAddr(start + len),
+                            map_perm,
+                            file,
+                            offset as u64,
+                            meta,
+                        );
+                    }
+                }
+                None => return Err(errno(EBADF)),
+            }
+        }
+        Ok(start)
+    });
+
+    match mmap_result {
+        Ok(start) => start as isize,
+        Err(err) => err,
+    }
 }
 
 /// YOUR JOB: Implement munmap.
@@ -3037,7 +3034,6 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     }
     let len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
     // if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
     //     let before = inner
     //         .memory_set
@@ -3066,9 +3062,9 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     //     }
     // }
     let aligned_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    inner
-        .memory_set
-        .unmap_range(VirtAddr(start), VirtAddr(start + aligned_len));
+    process.with_memory_set_mut(|memory_set| {
+        memory_set.unmap_range(VirtAddr(start), VirtAddr(start + aligned_len));
+    });
     0
 }
 
@@ -3081,9 +3077,8 @@ pub fn sys_sbrk(arg: isize) -> isize {
     let sepc = current_trap_cx().sepc;
     let name = current_process().name();
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let current_brk = inner.program_brk;
-    let heap_bottom = inner.heap_bottom;
+    let (current_brk, heap_bottom) =
+        process.with_memory(|memory| (memory.program_brk, memory.heap_bottom));
     if arg == 0 {
         // if name == "busybox" {
         //     trace!(
@@ -3146,19 +3141,21 @@ pub fn sys_sbrk(arg: isize) -> isize {
         return errno(ENOMEM);
     }
     // delta == 0 is a no-op (brk query or same address)
-    let result = if delta == 0 {
-        true
-    } else if delta < 0 {
-        // Shrink heap using type-based lookup
-        inner.memory_set.shrink_heap_to(VirtAddr(new_brk))
-    } else {
-        // Expand heap using type-based lookup
-        inner
-            .memory_set
-            .append_heap_to(VirtAddr(new_brk), VirtAddr(heap_bottom))
-    };
+    let result = process.with_memory_mut(|memory| {
+        if delta == 0 {
+            true
+        } else if delta < 0 {
+            // Shrink heap using type-based lookup
+            memory.memory_set.shrink_heap_to(VirtAddr(new_brk))
+        } else {
+            // Expand heap using type-based lookup
+            memory
+                .memory_set
+                .append_heap_to(VirtAddr(new_brk), VirtAddr(heap_bottom))
+        }
+    });
     if result {
-        inner.program_brk = new_brk;
+        process.set_brk(new_brk);
         trace!(
             "[sys_sbrk] pid={} name={} sepc={:#x} arg={} cur={:#x} heap_bottom={:#x} new={:#x} ok",
             pid,
@@ -5012,9 +5009,6 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
         map_perm |= MapPermission::X;
     }
 
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-
     // Round up length to page boundary
     let page_count = (len + PAGE_SIZE - 1) / PAGE_SIZE;
     let Some(end_addr) = addr.checked_add(page_count * PAGE_SIZE) else {
@@ -5022,9 +5016,10 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     };
 
     // Change protection for the memory region
-    let result = inner
-        .memory_set
-        .change_protection(VirtAddr(addr), VirtAddr(end_addr), map_perm);
+    let process = current_process();
+    let result = process.with_memory_set_mut(|memory_set| {
+        memory_set.change_protection(VirtAddr(addr), VirtAddr(end_addr), map_perm)
+    });
 
     match result {
         Ok(()) => 0,

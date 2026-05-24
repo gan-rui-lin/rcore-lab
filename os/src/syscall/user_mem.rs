@@ -400,42 +400,42 @@ fn try_resolve_user_cow_writable(token: usize, ptr: *const u8, len: usize) -> bo
     };
     let page_table = PageTable::from_token(token);
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let mut va = start;
-    while va < end {
-        let vpn = VirtAddr::from(va).floor();
-        let mut pte = page_table.translate(vpn);
-        // `translate()` may return a present leaf entry that is invalid (V=0).
-        // Treat that the same as "missing" for demand-paged VMAs.
-        if pte.map_or(true, |entry| !entry.is_valid()) && !inner.memory_set.handle_demand_fault(va)
-        {
-            return false;
+    process.with_memory_set_mut(|memory_set| {
+        let mut va = start;
+        while va < end {
+            let vpn = VirtAddr::from(va).floor();
+            let mut pte = page_table.translate(vpn);
+            // `translate()` may return a present leaf entry that is invalid (V=0).
+            // Treat that the same as "missing" for demand-paged VMAs.
+            if pte.map_or(true, |entry| !entry.is_valid()) && !memory_set.handle_demand_fault(va) {
+                return false;
+            }
+            pte = page_table.translate(vpn);
+            let Some(pte) = pte else {
+                return false;
+            };
+            let flags = pte.flags();
+            if !pte.is_valid() || !flags.contains(PTEFlags::U) {
+                return false;
+            }
+            if !flags.contains(PTEFlags::W) && !memory_set.handle_cow_fault(va) {
+                return false;
+            }
+            let Some(pte_after) = page_table.translate(vpn) else {
+                return false;
+            };
+            let flags_after = pte_after.flags();
+            if !pte_after.is_valid()
+                || !flags_after.contains(PTEFlags::U)
+                || !flags_after.contains(PTEFlags::W)
+            {
+                return false;
+            }
+            let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
+            va = next_page.max(va + 1);
         }
-        pte = page_table.translate(vpn);
-        let Some(pte) = pte else {
-            return false;
-        };
-        let flags = pte.flags();
-        if !pte.is_valid() || !flags.contains(PTEFlags::U) {
-            return false;
-        }
-        if !flags.contains(PTEFlags::W) && !inner.memory_set.handle_cow_fault(va) {
-            return false;
-        }
-        let Some(pte_after) = page_table.translate(vpn) else {
-            return false;
-        };
-        let flags_after = pte_after.flags();
-        if !pte_after.is_valid()
-            || !flags_after.contains(PTEFlags::U)
-            || !flags_after.contains(PTEFlags::W)
-        {
-            return false;
-        }
-        let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
-        va = next_page.max(va + 1);
-    }
-    true
+        true
+    })
 }
 
 fn try_resolve_user_readable(token: usize, ptr: *const u8, len: usize) -> bool {
@@ -448,29 +448,29 @@ fn try_resolve_user_readable(token: usize, ptr: *const u8, len: usize) -> bool {
     };
     let page_table = PageTable::from_token(token);
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let mut va = start;
-    while va < end {
-        let vpn = VirtAddr::from(va).floor();
-        let mut pte = page_table.translate(vpn);
-        // `translate()` may return an invalid leaf entry (V=0) when the page
-        // table page exists but the specific user page has not been materialized.
-        if pte.map_or(true, |entry| !entry.is_valid()) && !inner.memory_set.handle_demand_fault(va)
-        {
-            return false;
+    process.with_memory_set_mut(|memory_set| {
+        let mut va = start;
+        while va < end {
+            let vpn = VirtAddr::from(va).floor();
+            let mut pte = page_table.translate(vpn);
+            // `translate()` may return an invalid leaf entry (V=0) when the page
+            // table page exists but the specific user page has not been materialized.
+            if pte.map_or(true, |entry| !entry.is_valid()) && !memory_set.handle_demand_fault(va) {
+                return false;
+            }
+            pte = page_table.translate(vpn);
+            let Some(pte) = pte else {
+                return false;
+            };
+            let flags = pte.flags();
+            if !pte.is_valid() || !flags.contains(PTEFlags::U) || !flags.contains(PTEFlags::R) {
+                return false;
+            }
+            let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
+            va = next_page.max(va + 1);
         }
-        pte = page_table.translate(vpn);
-        let Some(pte) = pte else {
-            return false;
-        };
-        let flags = pte.flags();
-        if !pte.is_valid() || !flags.contains(PTEFlags::U) || !flags.contains(PTEFlags::R) {
-            return false;
-        }
-        let next_page = ((va / PAGE_SIZE) + 1) * PAGE_SIZE;
-        va = next_page.max(va + 1);
-    }
-    true
+        true
+    })
 }
 
 fn is_user_read_mapped(token: usize, ptr: *const u8, len: usize) -> bool {

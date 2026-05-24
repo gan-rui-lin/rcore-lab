@@ -184,7 +184,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             "[exit] pid={} tid={} clear_child_tid={:#x}",
             pid, tid, clear_child_tid
         );
-        let token = process.inner_exclusive_access().memory_set.token();
+        let token = process.get_user_token();
         let page_table = PageTable::from_token(token);
         if let Some(pa) = page_table.translate_va(VirtAddr::from(clear_child_tid)) {
             *translated_refmut(token, clear_child_tid as *mut i32) = 0;
@@ -231,13 +231,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             parent.insert_process_signal(SignalFlags::SIGCHLD, pid as i32, 0);
         }
         if let Some(vfork_parent) = process.vfork_parent() {
-            let process_inner = process.inner_exclusive_access();
-            let mut parent_inner = vfork_parent.inner_exclusive_access();
-            let copied = parent_inner
-                .memory_set
-                .sync_user_writable_from(&process_inner.memory_set);
-            drop(parent_inner);
-            drop(process_inner);
+            let copied = process.sync_vfork_memory_to_parent(&vfork_parent);
             trace!(
                 "[vfork] sync child pid={} -> parent pid={} copied_pages={}",
                 pid,
@@ -273,9 +267,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         }
         recycle_res.clear();
         process.with_family_mut(|family| family.children.clear());
-        let mut process_inner = process.inner_exclusive_access();
-        process_inner.memory_set.recycle_data_pages();
-        drop(process_inner);
+        process.recycle_user_memory();
         process.with_fs_mut(|fs| fs.fd_table.clear());
         process.with_threads_mut(|threads| {
             while threads.tasks.len() > 1 {
@@ -647,7 +639,7 @@ pub fn handle_signals() {
     // 10. 获取信号处理动作
     let mut action = process.with_signal_action(signum, |action| action);
     if signum == SIGCHLD && action.handler != 0 {
-        let token = process.inner_exclusive_access().memory_set.token();
+        let token = process.get_user_token();
         let page_table = PageTable::from_token(token);
         let handler_va = VirtAddr::from(action.handler);
         let invalid = match page_table.translate(handler_va.floor()) {
@@ -769,7 +761,7 @@ pub fn handle_signals() {
     });
 
     // 13. 设置 trap context 调用用户态 handler
-    let token = process.inner_exclusive_access().memory_set.token();
+    let token = process.get_user_token();
     let need_siginfo = (action.flags & SA_SIGINFO) != 0 || signum == 32 || signum == 33;
     #[cfg(target_arch = "loongarch64")]
     let ustack_base = task.ustack_base();

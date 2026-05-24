@@ -207,18 +207,17 @@ impl TaskUserRes {
 
     fn alloc_ustack(&self) {
         let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.inner_exclusive_access();
         let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
         let ustack_top = ustack_bottom + USER_STACK_SIZE;
-        process_inner.memory_set.insert_framed_area(
-            ustack_bottom.into(),
-            ustack_top.into(),
-            MapPermission::R | MapPermission::W | MapPermission::U,
-        );
-        if let Some(pte) = process_inner
-            .memory_set
-            .translate(VirtAddr::from(ustack_bottom).floor())
-        {
+        let pte = process.with_memory_set_mut(|memory_set| {
+            memory_set.insert_framed_area(
+                ustack_bottom.into(),
+                ustack_top.into(),
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            );
+            memory_set.translate(VirtAddr::from(ustack_bottom).floor())
+        });
+        if let Some(pte) = pte {
             trace!(
                 "[ustack_alloc] tid={} bottom={:#x} top={:#x} pte_bits={:#x}",
                 self.tid,
@@ -238,11 +237,10 @@ impl TaskUserRes {
 
     fn dealloc_user_res(&self) {
         let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.inner_exclusive_access();
         let ustack_bottom_va: VirtAddr = ustack_bottom_from_tid(self.ustack_base, self.tid).into();
-        process_inner
-            .memory_set
-            .remove_area_with_start_vpn(ustack_bottom_va.into());
+        process.with_memory_set_mut(|memory_set| {
+            memory_set.remove_area_with_start_vpn(ustack_bottom_va.into());
+        });
     }
 
     #[allow(unused)]
