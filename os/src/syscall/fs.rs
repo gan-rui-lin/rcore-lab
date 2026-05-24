@@ -5090,7 +5090,7 @@ pub fn sys_timerfd_gettime(fd: usize, curr_value: *mut u8) -> isize {
 /// fdatasync(2) — flush file data and essential metadata to storage.
 pub fn sys_fdatasync(fd: usize) -> isize {
     let process = current_process();
-    let Some(file) = process.get_file(fd) else {
+    let Some(_) = process.get_file(fd) else {
         return errno(EBADF);
     };
     drop(process);
