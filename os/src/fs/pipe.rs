@@ -2,7 +2,9 @@
 use super::{File, PollEvents};
 use crate::mm::UserBuffer;
 use crate::sync::UPIntrFreeCell;
-use crate::task::{current_task, has_pending_unmasked_signal, suspend_current_and_run_next, SignalFlags};
+use crate::task::{
+    current_task, has_pending_unmasked_signal, suspend_current_and_run_next, SignalFlags,
+};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -103,7 +105,11 @@ impl File for PipeEnd {
     }
 
     fn status_flags(&self) -> u32 {
-        if *self.nonblock.exclusive_access() { 0x800 } else { 0 }
+        if *self.nonblock.exclusive_access() {
+            0x800
+        } else {
+            0
+        }
     }
 
     fn set_status_flags(&self, flags: u32) {
@@ -180,8 +186,7 @@ impl File for PipeEnd {
                 if !pipe.read_open {
                     if total == 0 {
                         if let Some(task) = current_task() {
-                            let mut task_inner = task.inner_exclusive_access();
-                            task_inner.signal_pending |= SignalFlags::SIGPIPE;
+                            task.insert_pending_signal(SignalFlags::SIGPIPE);
                         }
                         return Err(EPIPE_ERRNO);
                     }

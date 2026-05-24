@@ -59,15 +59,13 @@ pub fn kernel_interrupt_dispatch(trap_type: arch::TrapType) {
                     if let Some(process) = task.process.upgrade() {
                         let pid = process.pid.0;
                         let name = process.name();
-                        let (sepc, sp, ra) = {
-                            let task_inner = task.inner_exclusive_access();
-                            let trap_cx = task_inner.get_trap_cx();
+                        let (sepc, sp, ra) = task.with_trap_cx_mut(|trap_cx| {
                             (
                                 trap_cx.sepc,
                                 trap_cx[TrapFrameArgs::SP],
                                 trap_cx[TrapFrameArgs::RA],
                             )
-                        };
+                        });
                         info!(
                             "[sample-k] pid={} name={} sepc={:#x} sp={:#x} ra={:#x}",
                             pid, name, sepc, sp, ra

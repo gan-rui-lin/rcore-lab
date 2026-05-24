@@ -478,10 +478,7 @@ impl ProcessControlBlock {
             ustack_base,
             false,
         ));
-        let task_inner = task.inner_exclusive_access();
-        let trap_cx = task_inner.get_trap_cx();
         let ustack_top = user_stack_top;
-        drop(task_inner);
         let mut trap_cx_value = TrapContext::app_init_context(entry_point, ustack_top);
 
         if gp != 0 {
@@ -502,7 +499,7 @@ impl ProcessControlBlock {
             );
         }
 
-        *trap_cx = trap_cx_value;
+        task.with_trap_cx_mut(|trap_cx| *trap_cx = trap_cx_value);
         process.insert_task(0, Arc::clone(&task));
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
         add_task(task);
@@ -650,11 +647,7 @@ impl ProcessControlBlock {
             inner.itimers = [IntervalTimerState::default(); 3];
         }
         let task = self.get_task(0);
-        let mut task_inner = task.inner_exclusive_access();
-        if let Some(res) = task_inner.res.as_mut() {
-            res.ustack_base = ustack_base;
-        }
-        task_inner.trap_cx_ppn = task_inner.res.as_ref().unwrap().trap_cx_ppn();
+        task.set_ustack_base_and_refresh_trap_cx_ppn(ustack_base);
         let mut user_sp = user_stack_top;
         // End marker (NULL) at the top of stack region.
         user_sp -= 1;
@@ -851,7 +844,7 @@ impl ProcessControlBlock {
             );
         }
 
-        *task_inner.get_trap_cx() = trap_cx;
+        task.with_trap_cx_mut(|task_trap_cx| *task_trap_cx = trap_cx);
     }
 
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
@@ -940,15 +933,10 @@ impl ProcessControlBlock {
         parent.children.push(Arc::clone(&child));
         info!("[fork-stage] pid={} child linked to parent", self.pid.0);
         drop(parent);
-        let ustack_base = self
-            .get_task(0)
-            .inner_exclusive_access()
-            .res
-            .as_ref()
-            .unwrap()
-            .ustack_base;
+        let parent_task = self.get_task(0);
+        let ustack_base = parent_task.ustack_base();
         // 获取父线程的 signal_mask，用于子进程继承
-        let parent_signal_mask = self.get_task(0).inner_exclusive_access().signal_mask;
+        let parent_signal_mask = parent_task.signal_mask();
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&child),
             ustack_base,
@@ -957,10 +945,8 @@ impl ProcessControlBlock {
         // info!("[fork-stage] pid={} child task allocated", self.pid.0);
         child.insert_task(0, Arc::clone(&task));
         // info!("[fork-stage] pid={} child task linked", self.pid.0);
-        let mut task_inner = task.inner_exclusive_access();
         // 子进程继承父进程的信号掩码（Linux 语义：fork 继承 signal_mask）
-        task_inner.signal_mask = parent_signal_mask;
-        drop(task_inner);
+        task.set_signal_mask(parent_signal_mask);
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // info!("[fork-stage] pid={} child inserted pid2process", self.pid.0);
         add_task(task);

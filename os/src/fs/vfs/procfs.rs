@@ -380,12 +380,12 @@ impl ProcPidTaskStatInode {
                     .get(self.task_idx)
                     .and_then(|task| task.as_ref().cloned())
             }) {
-                if let Some(task_inner) = task.try_inner_exclusive_access() {
-                    state = match task_inner.task_status {
+                if let Some(snapshot) = task.try_debug_snapshot() {
+                    state = match snapshot.status {
                         TaskStatus::Blocked => 'S',
                         TaskStatus::Running => 'R',
                         TaskStatus::Ready => {
-                            if task_inner.last_syscall == SYSCALL_WAITPID {
+                            if snapshot.last_syscall == SYSCALL_WAITPID {
                                 'S'
                             } else {
                                 'R'
@@ -528,12 +528,12 @@ impl ProcPidStatInode {
             if let Some(leader) = process.with_threads(|threads| {
                 threads.tasks.get(0).and_then(|task| task.as_ref().cloned())
             }) {
-                if let Some(task_inner) = leader.try_inner_exclusive_access() {
-                    state = match task_inner.task_status {
+                if let Some(snapshot) = leader.try_debug_snapshot() {
+                    state = match snapshot.status {
                         TaskStatus::Blocked => 'S',
                         TaskStatus::Running => 'R',
                         TaskStatus::Ready => {
-                            if task_inner.last_syscall == SYSCALL_WAITPID {
+                            if snapshot.last_syscall == SYSCALL_WAITPID {
                                 'S'
                             } else {
                                 'R'

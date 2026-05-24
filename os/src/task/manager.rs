@@ -6,7 +6,6 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 #[allow(unused_imports)]
 use alloc::vec::Vec;
-use arch::TrapFrameArgs;
 use lazy_static::*;
 
 pub struct TaskManager {
@@ -298,19 +297,17 @@ pub fn print_ready_queue_brief(limit: usize) {
     let mgr = TASK_MANAGER.exclusive_access();
     for (idx, task) in mgr.ready_queue.iter().take(limit).enumerate() {
         let pid = task.process.upgrade().map(|p| p.getpid()).unwrap_or(0);
-        if let Some(task_inner) = task.try_inner_exclusive_access() {
-            let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-            let trap_cx = task_inner.get_trap_cx();
+        if let Some(snapshot) = task.try_debug_snapshot() {
             println!(
                 "[kernel] alloc_error ready[{}]: pid={} tid={} status={:?} last_syscall={} sepc={:#x} sp={:#x} ra={:#x}",
                 idx,
                 pid,
-                tid,
-                task_inner.task_status,
-                task_inner.last_syscall,
-                trap_cx.sepc,
-                trap_cx[TrapFrameArgs::SP],
-                trap_cx[TrapFrameArgs::RA]
+                snapshot.tid,
+                snapshot.status,
+                snapshot.last_syscall,
+                snapshot.sepc,
+                snapshot.sp,
+                snapshot.ra
             );
         } else {
             println!(

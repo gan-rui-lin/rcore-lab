@@ -11,21 +11,17 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     // create a new thread
     let new_task = Arc::new(TaskControlBlock::new(
         Arc::clone(&process),
-        task.inner_exclusive_access()
-            .res
-            .as_ref()
-            .unwrap()
-            .ustack_base,
+        task.ustack_base(),
         true,
     ));
-    let new_task_inner = new_task.inner_exclusive_access();
-    let new_task_res = new_task_inner.res.as_ref().unwrap();
+    let new_task_res = new_task.user_res_snapshot().unwrap();
     let new_task_tid = new_task_res.tid;
     // add new thread to current process
     process.insert_task(new_task_tid, Arc::clone(&new_task));
-    let new_task_trap_cx = new_task_inner.get_trap_cx();
-    *new_task_trap_cx = TrapContext::app_init_context(entry, new_task_res.ustack_top());
-    new_task_trap_cx[TrapFrameArgs::ARG0] = arg;
+    new_task.with_trap_cx_mut(|new_task_trap_cx| {
+        *new_task_trap_cx = TrapContext::app_init_context(entry, new_task_res.ustack_top);
+        new_task_trap_cx[TrapFrameArgs::ARG0] = arg;
+    });
     // Queue the thread after its initial trap context is ready.
     add_task(Arc::clone(&new_task));
     new_task_tid as isize
@@ -51,18 +47,16 @@ pub fn match_user_tid(process_pid: usize, internal_tid: usize, target_tid: usize
 pub fn sys_gettid() -> isize {
     let task = current_task().unwrap();
     let process = current_process();
-    let tid = task.inner_exclusive_access().res.as_ref().unwrap().tid;
+    let tid = task.tid();
     to_user_tid(process.pid.0, tid) as isize
 }
 
 pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
     let task = current_task().unwrap();
     let process = current_process();
-    let mut task_inner = task.inner_exclusive_access();
-    let internal_tid = task_inner.res.as_ref().unwrap().tid;
+    let internal_tid = task.tid();
     let tid = to_user_tid(process.pid.0, internal_tid);
-    task_inner.clear_child_tid = tidptr as usize;
-    drop(task_inner);
+    task.set_clear_child_tid(tidptr as usize);
     info!(
         "[sys_set_tid_address] pid={} tid={} tidptr={:#x}",
         process.pid.0, tid, tidptr as usize
@@ -78,8 +72,7 @@ pub fn sys_waittid(tid: usize) -> isize {
     let process = task.process.upgrade().unwrap();
     let pid = process.pid.0;
 
-    let task_inner = task.inner_exclusive_access();
-    let calling_tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
+    let calling_tid = task.tid();
 
     // Log to verify if pthread_join uses sys_waittid
     if pid == 34 || pid == 36 {
@@ -90,7 +83,7 @@ pub fn sys_waittid(tid: usize) -> isize {
     }
 
     // a thread cannot wait for itself
-    if task_inner.res.as_ref().unwrap().tid == tid {
+    if calling_tid == tid {
         return errno(ECHILD);
     }
     let mut exit_code: Option<i32> = None;
@@ -101,7 +94,7 @@ pub fn sys_waittid(tid: usize) -> isize {
             .and_then(|slot| slot.as_ref().map(Arc::clone))
     });
     if let Some(waited_task) = waited_task {
-        if let Some(waited_exit_code) = waited_task.inner_exclusive_access().exit_code {
+        if let Some(waited_exit_code) = waited_task.exit_code() {
             exit_code = Some(waited_exit_code);
         }
     } else {

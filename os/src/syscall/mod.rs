@@ -721,9 +721,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     }
     // for debug
     if let Some(task) = current_task() {
-        if let Some(mut task_inner) = task.try_inner_exclusive_access() {
-            task_inner.last_syscall = syscall_id;
-        }
+        task.set_last_syscall(syscall_id);
     }
     let mut known = true;
     let ret = match syscall_id {

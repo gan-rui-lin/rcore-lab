@@ -50,8 +50,7 @@ pub fn futex_wait_bitset(futex_key: FutexKey, bitset: i32) -> isize {
         // (e.g. SIGCONT used to resume SIGSTOP) may have set this flag while
         // the task was not in a futex wait. If we keep it, a normal FUTEX_WAKE
         // on this wait can be misreported as EINTR.
-        let mut task_inner = task.inner_exclusive_access();
-        task_inner.interrupted_by_signal = false;
+        task.set_interrupted(false);
     }
     let mut futex_q = FUTEX_Q.lock();
     let queue = futex_q
@@ -68,16 +67,7 @@ pub fn futex_wait_bitset(futex_key: FutexKey, bitset: i32) -> isize {
         let (pid, tid) = task
             .process
             .upgrade()
-            .map(|p| {
-                (
-                    p.pid.0,
-                    task.inner_exclusive_access()
-                        .res
-                        .as_ref()
-                        .map(|r| r.tid)
-                        .unwrap_or(0),
-                )
-            })
+            .map(|p| (p.pid.0, task.tid()))
             .unwrap_or((0, 0));
         info!(
             "[futex] wait pid={} tid={} key=({:#x},{}) bitset={:#x} qlen={}",
@@ -89,25 +79,23 @@ pub fn futex_wait_bitset(futex_key: FutexKey, bitset: i32) -> isize {
 
     // Check if woken by signal (EINTR)
     let task = current_task().unwrap();
-    let mut task_inner = task.inner_exclusive_access();
-    let interrupted = task_inner.interrupted_by_signal;
-    if interrupted {
-        task_inner.interrupted_by_signal = false; // Clear flag
-    }
+    let interrupted = task.take_interrupted();
     let (pid, tid) = task
         .process
         .upgrade()
-        .map(|p| (p.pid.0, task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0)))
+        .map(|p| (p.pid.0, task.tid()))
         .unwrap_or((0, 0));
 
     // Log for pthread tests
     if pid == 34 || pid == 36 {
         info!(
             "[futex] wait_resume pid={} tid={} interrupted={} status={:?}",
-            pid, tid, interrupted, task_inner.task_status
+            pid,
+            tid,
+            interrupted,
+            task.status()
         );
     }
-    drop(task_inner);
     drop(task);
 
     if interrupted {
@@ -150,17 +138,7 @@ pub fn futex_wake_bitset(futex_key: FutexKey, max_size: usize, bitset: i32) -> u
     let count = FUTEX_WAKE_COUNTER.fetch_add(1, Ordering::Relaxed);
     if count % FUTEX_TRACE_INTERVAL == 0 {
         let (pid, tid) = current_task()
-            .and_then(|task| {
-                task.process.upgrade().map(|p| {
-                    let tid = task
-                        .inner_exclusive_access()
-                        .res
-                        .as_ref()
-                        .map(|r| r.tid)
-                        .unwrap_or(0);
-                    (p.pid.0, tid)
-                })
-            })
+            .and_then(|task| task.process.upgrade().map(|p| (p.pid.0, task.tid())))
             .unwrap_or((0, 0));
         info!(
             "[futex] wake pid={} tid={} key=({:#x},{}) max={} bitset={:#x} woke={} qlen_before={}",
@@ -210,17 +188,7 @@ pub fn futex_requeue(
     let count = FUTEX_REQUEUE_COUNTER.fetch_add(1, Ordering::Relaxed);
     if count % FUTEX_TRACE_INTERVAL == 0 {
         let (pid, tid) = current_task()
-            .and_then(|task| {
-                task.process.upgrade().map(|p| {
-                    let tid = task
-                        .inner_exclusive_access()
-                        .res
-                        .as_ref()
-                        .map(|r| r.tid)
-                        .unwrap_or(0);
-                    (p.pid.0, tid)
-                })
-            })
+            .and_then(|task| task.process.upgrade().map(|p| (p.pid.0, task.tid())))
             .unwrap_or((0, 0));
         info!(
             "[futex] requeue pid={} tid={} old=({:#x},{}) new=({:#x},{}) max_wake={} max_requeue={} woke={} moved={}",

@@ -67,9 +67,7 @@ pub use signal::{
     SIGPWR, SIGQUIT, SIGSEGV, SIGSTKFLT, SIGSTOP, SIGSYS, SIGTERM, SIGTRAP, SIGTSTP, SIGTTIN,
     SIGTTOU, SIGURG, SIGUSR1, SIGUSR2, SIGVTALRM, SIGWINCH, SIGXCPU, SIGXFSZ,
 };
-pub use task::{
-    live_task_count, live_task_pid_summary, TaskControlBlock, TaskControlBlockInner, TaskStatus,
-};
+pub use task::{live_task_count, live_task_pid_summary, TaskControlBlock, TaskStatus};
 pub use tls::{TlsArea, TlsInfo};
 
 const DEBUG_DUMP_INTERVAL: u64 = 200;
@@ -149,10 +147,7 @@ fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), ()> {
 pub fn suspend_current_and_run_next() {
     let task = take_current_task().unwrap();
     task.kstack.check_guard();
-    let mut task_inner = task.inner_exclusive_access();
-    let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-    task_inner.task_status = TaskStatus::Ready;
-    drop(task_inner);
+    let task_cx_ptr = task.task_cx_ptr_mut_for_switch(TaskStatus::Ready);
     add_task(task);
     schedule(task_cx_ptr);
 }
@@ -161,9 +156,7 @@ pub fn suspend_current_and_run_next() {
 pub fn block_current_task() -> *mut TaskContext {
     let task = take_current_task().unwrap();
     task.kstack.check_guard();
-    let mut task_inner = task.inner_exclusive_access();
-    task_inner.task_status = TaskStatus::Blocked;
-    &mut task_inner.task_cx as *mut TaskContext
+    task.task_cx_ptr_mut_for_switch(TaskStatus::Blocked)
 }
 
 pub fn block_current_and_run_next() {
@@ -174,9 +167,8 @@ pub fn block_current_and_run_next() {
 pub fn exit_current_and_run_next(exit_code: i32) {
     let task = take_current_task().unwrap();
     task.kstack.check_guard();
-    let mut task_inner = task.inner_exclusive_access();
     let process = task.process.upgrade().unwrap();
-    let tid = task_inner.res.as_ref().unwrap().tid;
+    let tid = task.tid();
     // for debug
     let pid = process.getpid();
     let name = process.name();
@@ -184,7 +176,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         "[exit] pid={} tid={} name={} code={}",
         pid, tid, name, exit_code
     );
-    let clear_child_tid = task_inner.clear_child_tid;
+    let clear_child_tid = task.clear_child_tid();
     // Linux processes clear_child_tid for ALL threads, including the main thread (tid=0).
     // musl's __init_tls calls set_tid_address for the main thread.
     if clear_child_tid != 0 {
@@ -222,9 +214,8 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             );
         }
     }
-    task_inner.exit_code = Some(exit_code);
-    task_inner.res = None;
-    drop(task_inner);
+    task.set_exit_code(Some(exit_code));
+    task.take_user_res();
     drop(task);
     let pid = process.getpid();
     let all_threads_exited = process.all_tasks_exited();
@@ -283,8 +274,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         let tasks = process.tasks_snapshot();
         for task in tasks {
             remove_inactive_task(Arc::clone(&task));
-            let mut task_inner = task.inner_exclusive_access();
-            if let Some(res) = task_inner.res.take() {
+            if let Some(res) = task.take_user_res() {
                 recycle_res.push(res);
             }
         }
@@ -337,12 +327,10 @@ pub fn current_add_signal(signal: SignalFlags) {
 
 fn wake_process_for_signal(process: &Arc<ProcessControlBlock>) {
     for task in process.tasks_snapshot() {
-        let mut task_inner = task.inner_exclusive_access();
-        if task_inner.task_status == TaskStatus::Blocked {
+        if task.status() == TaskStatus::Blocked {
             futex_remove_waiter_any(&task);
-            task_inner.interrupted_by_signal = true;
-            task_inner.task_status = TaskStatus::Ready;
-            drop(task_inner);
+            task.mark_interrupted();
+            task.set_status(TaskStatus::Ready);
             add_task(task.clone());
         }
     }
@@ -536,22 +524,29 @@ pub fn handle_signals() {
     };
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
-    let mut task_inner = task.inner_exclusive_access();
+    let (handling_sig, signal_mask, signal_pending, saved_ctx_present) = task.with_signals(|s| {
+        (
+            s.handling_sig,
+            s.signal_mask,
+            s.signal_pending,
+            s.signal_trap_cx.is_some(),
+        )
+    });
+    let pid = process.pid.0;
+    let _tid = task.tid();
 
     // 2. 检查信号重入
-    if task_inner.handling_sig != -1 {
+    if handling_sig != -1 {
         debug!(
             "[handle_signals] pid={} tid={} already handling signal {}, deferring",
-            process.pid.0,
-            task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
-            task_inner.handling_sig
+            process.pid.0, _tid, handling_sig
         );
         return;
     }
 
     // 3. 计算待处理信号（signal_mask 是 per-thread 的）
-    let process_pending = process_inner.signal_pending & !task_inner.signal_mask;
-    let task_pending = task_inner.signal_pending & !task_inner.signal_mask;
+    let process_pending = process_inner.signal_pending & !signal_mask;
+    let task_pending = signal_pending & !signal_mask;
 
     if (process_pending | task_pending).is_empty() {
         return;
@@ -563,57 +558,61 @@ pub fn handle_signals() {
         None => return,
     };
 
-    let pid = process.pid.0;
-    let _tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
     if signum == 32 || signum == 33 {
-        let tp = task_inner.get_trap_cx()[TrapFrameArgs::TLS];
+        let tp = task.with_trap_cx_mut(|trap_cx| trap_cx[TrapFrameArgs::TLS]);
         info!(
             "[handle_signals] pid={} tid={} sig{} tp={:#x} mask={:?} task_pending={:?} proc_pending={:?}",
             pid,
             _tid,
             signum,
             tp,
-            task_inner.signal_mask,
+            signal_mask,
             task_pending,
             process_pending
         );
     }
     // 5. 如果任务被阻塞，唤醒它
-    if task_inner.task_status == TaskStatus::Blocked {
+    if task.status() == TaskStatus::Blocked {
         if signum == 32 || signum == 33 {
-            let trap_cx = task_inner.get_trap_cx();
+            let (sepc, sp, ra) = task.with_trap_cx_mut(|trap_cx| {
+                (
+                    trap_cx.sepc,
+                    trap_cx[TrapFrameArgs::SP],
+                    trap_cx[TrapFrameArgs::RA],
+                )
+            });
             info!(
                 "[signal-flow] route=blocked_wakeup pid={} tid={} sig{} from_process={} handling_sig={} sepc={:#x} sp={:#x} ra={:#x} mask={:?} task_pending={:?} proc_pending={:?}",
                 pid,
                 _tid,
                 signum,
                 from_process,
-                task_inner.handling_sig,
-                trap_cx.sepc,
-                trap_cx[TrapFrameArgs::SP],
-                trap_cx[TrapFrameArgs::RA],
-                task_inner.signal_mask,
+                handling_sig,
+                sepc,
+                sp,
+                ra,
+                signal_mask,
                 task_pending,
                 process_pending
             );
         }
         futex_remove_waiter_any(&task);
-        task_inner.task_status = TaskStatus::Ready;
-        task_inner.interrupted_by_signal = true;
-        drop(task_inner);
+        task.mark_interrupted();
+        task.set_status(TaskStatus::Ready);
+        drop(process_inner);
         add_task(task);
         return;
     }
 
     // 7. 如果已经在处理其他信号，跳过（除了 SIGKILL）
-    if task_inner.signal_trap_cx.is_some() && signum != signal::SIGKILL {
+    if saved_ctx_present && signum != signal::SIGKILL {
         if signum == 32 || signum == 33 {
             info!(
                 "[signal-flow] route=defer_nested pid={} tid={} sig{} handling_sig={} saved_ctx_present=true",
                 pid,
                 _tid,
                 signum,
-                task_inner.handling_sig
+                handling_sig
             );
         }
         return;
@@ -630,14 +629,13 @@ pub fn handle_signals() {
         process_inner.signal_pending.remove(flag);
         process_inner.clear_pending_signal_siginfo(signum);
     } else {
-        task_inner.signal_pending.remove(flag);
+        task.remove_pending_signal(flag);
     }
 
     // For ptrace(PTRACE_TRACEME), signal delivery stops the tracee and
     // reports WIFSTOPPED to parent waitpid(), except for SIGKILL.
     if process_inner.ptrace_traceme && signum != signal::SIGKILL {
         process_inner.ptrace_stop_signal = Some(signum as i32);
-        drop(task_inner);
         drop(process_inner);
         block_current_and_run_next();
         return;
@@ -647,7 +645,6 @@ pub fn handle_signals() {
     if signum == signal::SIGSTOP {
         process_inner.child_wait_event = Some(ChildWaitEvent::Stopped(signal::SIGSTOP as i32));
         process_inner.group_stopped = true;
-        drop(task_inner);
         drop(process_inner);
         block_current_and_run_next();
         return;
@@ -663,18 +660,15 @@ pub fn handle_signals() {
         // 向其他线程也注入 SIGKILL，确保它们在下次调度时退出
         for other_task in process.tasks_snapshot() {
             if !Arc::ptr_eq(&other_task, &task) {
-                let mut other_inner = other_task.inner_exclusive_access();
-                other_inner.signal_pending.insert(SignalFlags::SIGKILL);
-                if other_inner.task_status == TaskStatus::Blocked {
+                other_task.insert_pending_signal(SignalFlags::SIGKILL);
+                if other_task.status() == TaskStatus::Blocked {
                     futex_remove_waiter_any(&other_task);
-                    other_inner.interrupted_by_signal = true;
-                    other_inner.task_status = TaskStatus::Ready;
-                    drop(other_inner);
+                    other_task.mark_interrupted();
+                    other_task.set_status(TaskStatus::Ready);
                     add_task(other_task.clone());
                 }
             }
         }
-        drop(task_inner);
         drop(process_inner);
         exit_current_and_run_next(-(signal::SIGKILL as i32));
         return;
@@ -728,7 +722,7 @@ pub fn handle_signals() {
             action.handler,
             action.flags,
             action.restorer(),
-            task_inner.signal_mask
+            signal_mask
         );
     }
 
@@ -753,7 +747,6 @@ pub fn handle_signals() {
                 process_inner.child_wait_event = Some(ChildWaitEvent::Stopped(signum as i32));
                 process_inner.group_stopped = true;
                 debug!("[signal] pid={} signum={} default=stop", pid, signum);
-                drop(task_inner);
                 drop(process_inner);
                 block_current_and_run_next();
                 return;
@@ -771,19 +764,18 @@ pub fn handle_signals() {
                 // and the process hangs instead of exiting by signal.
                 for other_task in process.tasks_snapshot() {
                     if !Arc::ptr_eq(&other_task, &task) {
-                        let mut other_inner = other_task.inner_exclusive_access();
-                        other_inner.signal_pending.insert(flag);
-                        other_inner.signal_mask.remove(flag);
-                        if other_inner.task_status == TaskStatus::Blocked {
+                        other_task.with_signals_mut(|signals| {
+                            signals.signal_pending.insert(flag);
+                            signals.signal_mask.remove(flag);
+                        });
+                        if other_task.status() == TaskStatus::Blocked {
                             futex_remove_waiter_any(&other_task);
-                            other_inner.interrupted_by_signal = true;
-                            other_inner.task_status = TaskStatus::Ready;
-                            drop(other_inner);
+                            other_task.mark_interrupted();
+                            other_task.set_status(TaskStatus::Ready);
                             add_task(other_task.clone());
                         }
                     }
                 }
-                drop(task_inner);
                 drop(process_inner);
                 exit_current_and_run_next(-(signum as i32));
                 return;
@@ -792,94 +784,113 @@ pub fn handle_signals() {
     }
 
     // 12. 保存 trap context（如果尚未保存）
-    if task_inner.signal_trap_cx.is_none() {
-        task_inner.signal_trap_cx = Some(*task_inner.get_trap_cx());
-        task_inner.signal_mask_backup = task_inner.signal_mask;
-        task_inner.signal_mask |= action.mask | flag;
-        task_inner.handling_sig = signum as isize;
-    }
+    let saved_now = *task.trap_cx();
+    let (saved_cx, signal_mask_backup, signal_mask_now) = task.with_signals_mut(|signals| {
+        if signals.signal_trap_cx.is_none() {
+            signals.signal_trap_cx = Some(saved_now);
+            signals.signal_mask_backup = signals.signal_mask;
+            signals.signal_mask |= action.mask | flag;
+            signals.handling_sig = signum as isize;
+        }
+        (
+            signals.signal_trap_cx.unwrap(),
+            signals.signal_mask_backup,
+            signals.signal_mask,
+        )
+    });
 
     // 13. 设置 trap context 调用用户态 handler
-    let old_pc = task_inner.get_trap_cx().sepc;
-    let old_sp = task_inner.get_trap_cx()[TrapFrameArgs::SP];
-    let old_ra = task_inner.get_trap_cx()[TrapFrameArgs::RA];
-    let trap_cx = task_inner.get_trap_cx();
-    trap_cx.sepc = action.handler;
     let token = process_inner.memory_set.token();
-    // LoongArch: no SA_RESTORER, always use kernel trampoline for sigreturn
+    let need_siginfo = (action.flags & SA_SIGINFO) != 0 || signum == 32 || signum == 33;
     #[cfg(target_arch = "loongarch64")]
-    {
-        if let Some(res) = task_inner.res.as_ref() {
-            let tramp_base = res.ustack_base().saturating_sub(crate::config::PAGE_SIZE);
-            let tramp_offset = arch::sigtrx::sigreturn_trampoline_offset();
-            let tramp = tramp_base + tramp_offset;
-            trap_cx[TrapFrameArgs::RA] = tramp;
-            trace!(
-                "[signal] pid={} signum={} tramp_base={:#x} tramp={:#x} offset={:#x} sp={:#x}",
-                pid,
-                signum,
-                tramp_base,
-                tramp,
-                tramp_offset,
-                trap_cx[TrapFrameArgs::SP]
-            );
-        }
-    }
-    // RISC-V: use sa_restorer if valid and looks like a real mapped address;
-    // otherwise fallback to fixed SIG_RETURN_ADDR stub.
-    // glibc dynamic binaries may have unrelocated sa_restorer values
-    // (e.g., raw libc offset 0x2000 instead of libc_base + 0x2000).
-    // Our kernel trampoline does the same thing (calls rt_sigreturn).
-    #[cfg(not(target_arch = "loongarch64"))]
-    {
-        let page_table = PageTable::from_token(token);
-        let use_restorer = if (action.flags & SA_RESTORER) == 0 {
-            false
-        } else if action.restorer == 0 || action.restorer >= USER_ADDR_MAX {
-            false
-        } else {
-            let restorer_va = VirtAddr::from(action.restorer);
-            page_table
-                .translate(restorer_va.floor())
-                .map_or(false, |pte| {
-                    pte.is_valid()
-                        && pte.flags().contains(PTEFlags::U)
-                        && (pte.executable() || pte.readable())
-                })
-        };
-        if use_restorer {
-            trap_cx[TrapFrameArgs::RA] = action.restorer;
-        } else {
-            if action.restorer != 0 {
-                warn!(
-                    "[signal] pid={} signum={} ignore restorer={:#x} flags={:#x}, using kernel trampoline",
-                    pid, signum, action.restorer, action.flags
+    let ustack_base = task.ustack_base();
+    let (old_pc, old_sp, old_ra, new_pc, new_sp, new_ra, ucontext_ptr, canary_ptr) =
+        task.with_trap_cx_mut(|trap_cx| {
+            let old_pc = trap_cx.sepc;
+            let old_sp = trap_cx[TrapFrameArgs::SP];
+            let old_ra = trap_cx[TrapFrameArgs::RA];
+            trap_cx.sepc = action.handler;
+
+            // LoongArch: no SA_RESTORER, always use kernel trampoline for sigreturn
+            #[cfg(target_arch = "loongarch64")]
+            {
+                let tramp_base = ustack_base.saturating_sub(crate::config::PAGE_SIZE);
+                let tramp_offset = arch::sigtrx::sigreturn_trampoline_offset();
+                let tramp = tramp_base + tramp_offset;
+                trap_cx[TrapFrameArgs::RA] = tramp;
+                trace!(
+                    "[signal] pid={} signum={} tramp_base={:#x} tramp={:#x} offset={:#x} sp={:#x}",
+                    pid,
+                    signum,
+                    tramp_base,
+                    tramp,
+                    tramp_offset,
+                    trap_cx[TrapFrameArgs::SP]
                 );
             }
-            trap_cx[TrapFrameArgs::RA] =
-                arch::SIG_RETURN_ADDR + arch::sigtrx::sigreturn_trampoline_offset();
-        }
-    }
+            // RISC-V: use sa_restorer if valid and looks like a real mapped address;
+            // otherwise fallback to fixed SIG_RETURN_ADDR stub.
+            // glibc dynamic binaries may have unrelocated sa_restorer values
+            // (e.g., raw libc offset 0x2000 instead of libc_base + 0x2000).
+            // Our kernel trampoline does the same thing (calls rt_sigreturn).
+            #[cfg(not(target_arch = "loongarch64"))]
+            {
+                let page_table = PageTable::from_token(token);
+                let use_restorer = if (action.flags & SA_RESTORER) == 0 {
+                    false
+                } else if action.restorer == 0 || action.restorer >= USER_ADDR_MAX {
+                    false
+                } else {
+                    let restorer_va = VirtAddr::from(action.restorer);
+                    page_table
+                        .translate(restorer_va.floor())
+                        .map_or(false, |pte| {
+                            pte.is_valid()
+                                && pte.flags().contains(PTEFlags::U)
+                                && (pte.executable() || pte.readable())
+                        })
+                };
+                if use_restorer {
+                    trap_cx[TrapFrameArgs::RA] = action.restorer;
+                } else {
+                    if action.restorer != 0 {
+                        warn!(
+                            "[signal] pid={} signum={} ignore restorer={:#x} flags={:#x}, using kernel trampoline",
+                            pid, signum, action.restorer, action.flags
+                        );
+                    }
+                    trap_cx[TrapFrameArgs::RA] =
+                        arch::SIG_RETURN_ADDR + arch::sigtrx::sigreturn_trampoline_offset();
+                }
+            }
 
-    // 14. 设置信号栈
-    let saved_cx = task_inner.signal_trap_cx.as_ref().unwrap();
-    let need_siginfo = (action.flags & SA_SIGINFO) != 0 || signum == 32 || signum == 33;
-
-    let (ucontext_ptr, canary_ptr) = setup_signal_stack(
-        signum,
-        sender_pid,
-        si_code,
-        trap_cx,
-        saved_cx,
-        task_inner.signal_mask_backup,
-        token,
-        need_siginfo,
-    );
-
-    task_inner.signal_ucontext_ptr = ucontext_ptr;
-    task_inner.signal_canary_ptr = canary_ptr;
+            // 14. 设置信号栈
+            let (ucontext_ptr, canary_ptr) = setup_signal_stack(
+                signum,
+                sender_pid,
+                si_code,
+                trap_cx,
+                &saved_cx,
+                signal_mask_backup,
+                token,
+                need_siginfo,
+            );
+            (
+                old_pc,
+                old_sp,
+                old_ra,
+                trap_cx.sepc,
+                trap_cx[TrapFrameArgs::SP],
+                trap_cx[TrapFrameArgs::RA],
+                ucontext_ptr,
+                canary_ptr,
+            )
+        });
+    task.with_signals_mut(|signals| {
+        signals.signal_ucontext_ptr = ucontext_ptr;
+        signals.signal_canary_ptr = canary_ptr;
+    });
     if signum == 32 || signum == 33 {
-        let trap_cx = task_inner.get_trap_cx();
         info!(
             "[signal-flow] route=deliver pid={} tid={} sig{} from_process={} handler={:#x} old_pc={:#x} new_pc={:#x} old_sp={:#x} new_sp={:#x} old_ra={:#x} new_ra={:#x} ucontext_ptr={:#x} need_siginfo={} mask_backup={:?} mask_now={:?}",
             pid,
@@ -888,15 +899,15 @@ pub fn handle_signals() {
             from_process,
             action.handler,
             old_pc,
-            trap_cx.sepc,
+            new_pc,
             old_sp,
-            trap_cx[TrapFrameArgs::SP],
+            new_sp,
             old_ra,
-            trap_cx[TrapFrameArgs::RA],
+            new_ra,
             ucontext_ptr,
             need_siginfo,
-            task_inner.signal_mask_backup,
-            task_inner.signal_mask
+            signal_mask_backup,
+            signal_mask_now
         );
     }
 }
@@ -915,19 +926,17 @@ pub fn debug_dump_tasks() {
     );
     for (idx, task) in ready.iter().enumerate() {
         let pid = task.process.upgrade().map(|p| p.getpid()).unwrap_or(0);
-        if let Some(task_inner) = task.try_inner_exclusive_access() {
-            let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-            let trap_cx = task_inner.get_trap_cx();
+        if let Some(snapshot) = task.try_debug_snapshot() {
             info!(
                 "[debug] ready[{}] pid={} tid={} status={:?} last_syscall={} sepc={:#x} sp={:#x} ra={:#x}",
                 idx,
                 pid,
-                tid,
-                task_inner.task_status,
-                task_inner.last_syscall,
-                trap_cx.sepc,
-                trap_cx[TrapFrameArgs::SP],
-                trap_cx[TrapFrameArgs::RA]
+                snapshot.tid,
+                snapshot.status,
+                snapshot.last_syscall,
+                snapshot.sepc,
+                snapshot.sp,
+                snapshot.ra
             );
         } else {
             info!("[debug] ready[{}] pid={} <busy>", idx, pid);
@@ -956,17 +965,16 @@ pub fn debug_dump_tasks() {
             );
         }
         for (tid, task) in tasks.iter().enumerate() {
-            if let Some(task_inner) = task.try_inner_exclusive_access() {
-                let trap_cx = task_inner.get_trap_cx();
+            if let Some(snapshot) = task.try_debug_snapshot() {
                 info!(
                     "[debug]   tid={} status={:?} exit={:?} last_syscall={} sepc={:#x} sp={:#x} ra={:#x}",
                     tid,
-                    task_inner.task_status,
-                    task_inner.exit_code,
-                    task_inner.last_syscall,
-                    trap_cx.sepc,
-                    trap_cx[TrapFrameArgs::SP],
-                    trap_cx[TrapFrameArgs::RA]
+                    snapshot.status,
+                    snapshot.exit_code,
+                    snapshot.last_syscall,
+                    snapshot.sepc,
+                    snapshot.sp,
+                    snapshot.ra
                 );
             } else {
                 info!("[debug]   tid={} <busy>", tid);

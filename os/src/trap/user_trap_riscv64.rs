@@ -48,10 +48,11 @@ pub(super) fn handle_user_page_fault(addr: usize) {
     if let Some(task) = current_task() {
         // Synchronous faults should be delivered to the faulting thread.
         // If SIGSEGV stays masked, user mode can loop on the same fault forever.
-        let mut task_inner = task.inner_exclusive_access();
-        task_inner.signal_mask.remove(SignalFlags::SIGSEGV);
-        task_inner.signal_pending.insert(SignalFlags::SIGSEGV);
-        task_inner.interrupted_by_signal = true;
+        task.with_signals_mut(|signals| {
+            signals.signal_mask.remove(SignalFlags::SIGSEGV);
+            signals.signal_pending.insert(SignalFlags::SIGSEGV);
+            signals.interrupted_by_signal = true;
+        });
     } else {
         current_add_signal(SignalFlags::SIGSEGV);
     }
@@ -68,24 +69,18 @@ pub(super) fn handle_user_illegal_instruction(addr: usize) {
 
     if let Some(task) = current_task() {
         let pid = current_process().pid.0;
-        let mut task_inner = task.inner_exclusive_access();
-        let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-        let handling_sig = task_inner.handling_sig;
-        if task_inner.illegal_last_sepc == sepc {
-            task_inner.illegal_repeat_count = task_inner.illegal_repeat_count.saturating_add(1);
-        } else {
-            task_inner.illegal_last_sepc = sepc;
-            task_inner.illegal_repeat_count = 1;
-        }
-        let repeat = task_inner.illegal_repeat_count;
+        let tid = task.tid();
+        let handling_sig = task.handling_sig();
+        let repeat = task.record_illegal_instruction(sepc);
 
         // Synchronous illegal-instruction trap should be delivered to the faulting task.
-        task_inner.signal_mask.remove(SignalFlags::SIGILL);
-        task_inner.signal_pending.insert(SignalFlags::SIGILL);
-        task_inner.interrupted_by_signal = true;
+        task.with_signals_mut(|signals| {
+            signals.signal_mask.remove(SignalFlags::SIGILL);
+            signals.signal_pending.insert(SignalFlags::SIGILL);
+            signals.interrupted_by_signal = true;
+        });
 
         let fatal_sigreturn_loop = in_sigreturn_trampoline && handling_sig != -1;
-        drop(task_inner);
 
         if fatal_sigreturn_loop {
             warn!(
