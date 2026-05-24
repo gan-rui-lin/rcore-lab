@@ -1,18 +1,19 @@
 //! Simple in-memory pipe implementation.
 use super::{File, PollEvents};
 use crate::mm::UserBuffer;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::UPIntrMutex;
 use crate::task::{
     current_task, has_pending_unmasked_signal, suspend_current_and_run_next, SignalFlags,
 };
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 const DEFAULT_PIPE_CAPACITY: usize = 4096;
 const EPIPE_ERRNO: isize = -32;
 
-struct Pipe {
+struct PipeBuffer {
     buf: Vec<u8>,
     head: usize,
     tail: usize,
@@ -21,7 +22,7 @@ struct Pipe {
     write_open: bool,
 }
 
-impl Pipe {
+impl PipeBuffer {
     fn new(capacity: usize) -> Self {
         Self {
             buf: vec![0; capacity.max(1)],
@@ -68,24 +69,24 @@ impl Pipe {
 pub struct PipeEnd {
     readable: bool,
     writable: bool,
-    pipe: Arc<UPIntrFreeCell<Pipe>>,
-    nonblock: UPIntrFreeCell<bool>,
+    pipe: Arc<UPIntrMutex<PipeBuffer>>,
+    nonblock: AtomicBool,
 }
 
 impl PipeEnd {
-    fn new(pipe: Arc<UPIntrFreeCell<Pipe>>, readable: bool, writable: bool) -> Self {
+    fn new(pipe: Arc<UPIntrMutex<PipeBuffer>>, readable: bool, writable: bool) -> Self {
         Self {
             readable,
             writable,
             pipe,
-            nonblock: unsafe { UPIntrFreeCell::new(false) },
+            nonblock: AtomicBool::new(false),
         }
     }
 }
 
 impl Drop for PipeEnd {
     fn drop(&mut self) {
-        let mut pipe = self.pipe.exclusive_access();
+        let mut pipe = self.pipe.lock();
         if self.readable {
             pipe.read_open = false;
         }
@@ -105,7 +106,7 @@ impl File for PipeEnd {
     }
 
     fn status_flags(&self) -> u32 {
-        if *self.nonblock.exclusive_access() {
+        if self.nonblock.load(Ordering::Relaxed) {
             0x800
         } else {
             0
@@ -113,15 +114,14 @@ impl File for PipeEnd {
     }
 
     fn set_status_flags(&self, flags: u32) {
-        *self.nonblock.exclusive_access() = (flags & 0x800) != 0;
+        self.nonblock.store((flags & 0x800) != 0, Ordering::Relaxed);
     }
 
     fn read(&self, mut user_buf: UserBuffer) -> usize {
-        let is_nonblock = *self.nonblock.exclusive_access();
         let mut total = 0;
         for slice in user_buf.buffers.iter_mut() {
             loop {
-                let mut pipe = self.pipe.exclusive_access();
+                let mut pipe = self.pipe.lock();
                 if pipe.len > 0 {
                     let n = pipe.read_into(*slice);
                     total += n;
@@ -133,7 +133,7 @@ impl File for PipeEnd {
                 if total > 0 {
                     return total;
                 }
-                if is_nonblock {
+                if self.nonblock.load(Ordering::Relaxed) {
                     return usize::MAX - 1; // EAGAIN sentinel
                 }
                 if has_pending_unmasked_signal(true) {
@@ -151,7 +151,7 @@ impl File for PipeEnd {
         for slice in user_buf.buffers.iter() {
             let mut offset = 0;
             while offset < slice.len() {
-                let mut pipe = self.pipe.exclusive_access();
+                let mut pipe = self.pipe.lock();
                 if !pipe.read_open {
                     return total;
                 }
@@ -182,7 +182,7 @@ impl File for PipeEnd {
         for slice in user_buf.buffers.iter() {
             let mut offset = 0usize;
             while offset < slice.len() {
-                let mut pipe = self.pipe.exclusive_access();
+                let mut pipe = self.pipe.lock();
                 if !pipe.read_open {
                     if total == 0 {
                         if let Some(task) = current_task() {
@@ -212,7 +212,7 @@ impl File for PipeEnd {
     }
 
     fn poll(&self, events: PollEvents) -> PollEvents {
-        let pipe = self.pipe.exclusive_access();
+        let pipe = self.pipe.lock();
         let mut revents = PollEvents::empty();
         if events.contains(PollEvents::POLLIN)
             && self.readable
@@ -233,7 +233,7 @@ impl File for PipeEnd {
 /// Create a pipe and return (read_end, write_end).
 pub fn make_pipe(capacity: usize) -> (Arc<dyn File + Send + Sync>, Arc<dyn File + Send + Sync>) {
     let pipe =
-        Arc::new(unsafe { UPIntrFreeCell::new(Pipe::new(capacity.max(DEFAULT_PIPE_CAPACITY))) });
+        Arc::new(unsafe { UPIntrMutex::new(PipeBuffer::new(capacity.max(DEFAULT_PIPE_CAPACITY))) });
     let read_end = Arc::new(PipeEnd::new(pipe.clone(), true, false));
     let write_end = Arc::new(PipeEnd::new(pipe, false, true));
     (read_end, write_end)

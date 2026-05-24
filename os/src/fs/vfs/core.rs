@@ -1,4 +1,4 @@
-use crate::sync::UPIntrFreeCell;
+use crate::sync::UPIntrRwLock;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
@@ -351,8 +351,17 @@ impl Vfs {
 }
 
 lazy_static! {
-    pub(crate) static ref ROOT_VFS: UPIntrFreeCell<Vfs> =
-        unsafe { UPIntrFreeCell::new(Vfs::new()) };
+    pub(crate) static ref ROOT_VFS: UPIntrRwLock<Vfs> = unsafe { UPIntrRwLock::new(Vfs::new()) };
+}
+
+pub(crate) fn with_root_vfs_read<R>(f: impl FnOnce(&Vfs) -> R) -> R {
+    let vfs = ROOT_VFS.read();
+    f(&vfs)
+}
+
+pub(crate) fn with_root_vfs_write<R>(f: impl FnOnce(&mut Vfs) -> R) -> R {
+    let mut vfs = ROOT_VFS.write();
+    f(&mut vfs)
 }
 
 struct NullInode;

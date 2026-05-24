@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use super::core::ROOT_VFS;
+use super::core::{with_root_vfs_read, with_root_vfs_write};
 use super::easyfs::easyfs_root;
 use super::fat32::fat32_root;
 use super::procfs::procfs_root;
@@ -14,15 +14,13 @@ use alloc::sync::Arc;
 
 pub fn mount_easyfs() {
     let root = easyfs_root();
-    let mut vfs = ROOT_VFS.exclusive_access();
-    vfs.mount_root(root);
+    with_root_vfs_write(|vfs| vfs.mount_root(root));
     trace!("vfs: mounted easy-fs as root");
 }
 
 pub fn mount_fat32() -> Result<(), i32> {
     let root = fat32_root().map_err(|_| -1)?;
-    let mut vfs = ROOT_VFS.exclusive_access();
-    vfs.mount_root(root);
+    with_root_vfs_write(|vfs| vfs.mount_root(root));
     trace!("vfs: mounted fat32 as root");
     Ok(())
 }
@@ -33,16 +31,13 @@ pub fn mount_fat32_auto() -> bool {
 
 pub fn mount_procfs() {
     let root = procfs_root();
-    let mut vfs = ROOT_VFS.exclusive_access();
-    vfs.mount_at("/proc", root);
+    with_root_vfs_write(|vfs| vfs.mount_at("/proc", root));
     trace!("vfs: mounted procfs at /proc");
 }
 
 #[cfg(feature = "ext4")]
 pub fn sync_filesystems() {
-    let vfs = ROOT_VFS.exclusive_access();
-    vfs.flush_ext4();
-    drop(vfs);
+    with_root_vfs_read(|vfs| vfs.flush_ext4());
     crate::drivers::block::sync_block_cache();
 }
 
@@ -53,9 +48,7 @@ pub fn sync_filesystems() {
 
 #[cfg(feature = "ext4")]
 pub fn shutdown_filesystems() {
-    let mut vfs = ROOT_VFS.exclusive_access();
-    vfs.shutdown_ext4();
-    drop(vfs);
+    with_root_vfs_write(|vfs| vfs.shutdown_ext4());
     crate::drivers::block::sync_block_cache();
 }
 
@@ -69,8 +62,7 @@ pub fn shutdown_filesystems() {
 pub fn mount_ext4(total_bytes: i64) -> Result<(), i32> {
     let fs = Arc::new(Ext4Fs::new(BLOCK_DEVICE.clone(), total_bytes)?);
     let root = fs.root_inode();
-    let mut vfs = ROOT_VFS.exclusive_access();
-    vfs.mount_root_ext4(root, fs);
+    with_root_vfs_write(|vfs| vfs.mount_root_ext4(root, fs));
     trace!("vfs: mounted ext4 as root");
     Ok(())
 }

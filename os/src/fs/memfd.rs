@@ -2,12 +2,12 @@
 use super::vfs::{VfsInode, VfsNodeKind};
 use super::{File, PollEvents};
 use crate::mm::UserBuffer;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::{UPIntrMutex, UPIntrRwLock};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-struct MemFdInner {
+struct MemFdData {
     buf: Vec<u8>,
     size: usize,
     seals: u32,
@@ -16,7 +16,7 @@ struct MemFdInner {
 
 /// VfsInode backed by an in-memory buffer (anonymous file).
 pub struct MemFdInode {
-    inner: UPIntrFreeCell<MemFdInner>,
+    inner: UPIntrRwLock<MemFdData>,
 }
 
 impl MemFdInode {
@@ -24,7 +24,7 @@ impl MemFdInode {
     pub fn new(allow_sealing: bool) -> Self {
         Self {
             inner: unsafe {
-                UPIntrFreeCell::new(MemFdInner {
+                UPIntrRwLock::new(MemFdData {
                     buf: Vec::new(),
                     size: 0,
                     seals: if allow_sealing { 0 } else { 0x0001 },
@@ -32,6 +32,21 @@ impl MemFdInode {
                 })
             },
         }
+    }
+
+    fn write_data_at(data: &mut MemFdData, offset: usize, buf: &[u8]) -> usize {
+        if (data.seals & 0x0008) != 0 {
+            return 0;
+        }
+        let end = offset + buf.len();
+        if end > data.buf.len() {
+            data.buf.resize(end, 0);
+        }
+        data.buf[offset..end].copy_from_slice(buf);
+        if end > data.size {
+            data.size = end;
+        }
+        buf.len()
     }
 }
 
@@ -41,7 +56,7 @@ impl VfsInode for MemFdInode {
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
-        let inner = self.inner.exclusive_access();
+        let inner = self.inner.read();
         if offset >= inner.size {
             return 0;
         }
@@ -52,16 +67,8 @@ impl VfsInode for MemFdInode {
     }
 
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
-        let mut inner = self.inner.exclusive_access();
-        let end = offset + buf.len();
-        if end > inner.buf.len() {
-            inner.buf.resize(end, 0);
-        }
-        inner.buf[offset..end].copy_from_slice(buf);
-        if end > inner.size {
-            inner.size = end;
-        }
-        buf.len()
+        let mut inner = self.inner.write();
+        Self::write_data_at(&mut inner, offset, buf)
     }
 
     fn lookup(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
@@ -71,7 +78,7 @@ impl VfsInode for MemFdInode {
         None
     }
     fn truncate(&self) {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.write();
         inner.buf.clear();
         inner.size = 0;
     }
@@ -79,14 +86,14 @@ impl VfsInode for MemFdInode {
         Vec::new()
     }
     fn size(&self) -> usize {
-        self.inner.exclusive_access().size
+        self.inner.read().size
     }
 }
 
 /// Seekable in-memory file descriptor returned by memfd_create(2).
 pub struct MemFdFile {
     inode: Arc<MemFdInode>,
-    offset: UPIntrFreeCell<usize>,
+    offset: UPIntrMutex<usize>,
 }
 
 impl MemFdFile {
@@ -94,7 +101,7 @@ impl MemFdFile {
     pub fn new(allow_sealing: bool) -> Self {
         Self {
             inode: Arc::new(MemFdInode::new(allow_sealing)),
-            offset: unsafe { UPIntrFreeCell::new(0) },
+            offset: unsafe { UPIntrMutex::new(0) },
         }
     }
 }
@@ -108,7 +115,7 @@ impl File for MemFdFile {
     }
 
     fn read(&self, buf: UserBuffer) -> usize {
-        let mut off = self.offset.exclusive_access();
+        let mut off = self.offset.lock();
         let mut total = 0;
         for slice in buf.buffers.iter() {
             let n = self.inode.read_at(*off, unsafe {
@@ -124,13 +131,14 @@ impl File for MemFdFile {
     }
 
     fn write(&self, buf: UserBuffer) -> usize {
-        if (self.inode.inner.exclusive_access().seals & 0x0008) != 0 {
+        let mut off = self.offset.lock();
+        let mut inner = self.inode.inner.write();
+        if (inner.seals & 0x0008) != 0 {
             return 0;
         }
-        let mut off = self.offset.exclusive_access();
         let mut total = 0;
         for slice in buf.buffers.iter() {
-            let n = self.inode.write_at(*off, slice);
+            let n = MemFdInode::write_data_at(&mut inner, *off, slice);
             *off += n;
             total += n;
         }
@@ -138,7 +146,7 @@ impl File for MemFdFile {
     }
 
     fn write_user_buffer(&self, buf: UserBuffer) -> Result<usize, isize> {
-        if (self.inode.inner.exclusive_access().seals & 0x0008) != 0 {
+        if (self.inode.inner.read().seals & 0x0008) != 0 {
             return Err(-1);
         }
         Ok(self.write(buf))
@@ -149,19 +157,19 @@ impl File for MemFdFile {
     }
 
     fn get_offset(&self) -> Option<usize> {
-        Some(*self.offset.exclusive_access())
+        Some(*self.offset.lock())
     }
 
     fn set_offset(&self, offset: usize) {
-        *self.offset.exclusive_access() = offset;
+        *self.offset.lock() = offset;
     }
 
     fn get_seals(&self) -> Option<u32> {
-        Some(self.inode.inner.exclusive_access().seals)
+        Some(self.inode.inner.read().seals)
     }
 
     fn add_seals(&self, seals: u32) -> isize {
-        let mut inner = self.inode.inner.exclusive_access();
+        let mut inner = self.inode.inner.write();
         if !inner.allow_sealing || (inner.seals & 0x0001) != 0 {
             return -1; // EPERM
         }

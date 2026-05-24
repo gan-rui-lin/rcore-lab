@@ -147,14 +147,59 @@ where
     }
 }
 
-fn ext4_cache_remove_path(path: &str) {
+fn ext4_xattr_cache_get(path: &str, name: &str) -> Option<Option<Vec<u8>>> {
+    let key = (ext4_cache_key(path), String::from(name));
+    EXT4_XATTR_CACHE.exclusive_access().get(&key).cloned()
+}
+
+fn ext4_xattr_cache_set(path: &str, name: &str, value: Option<Vec<u8>>) {
+    let key = (ext4_cache_key(path), String::from(name));
+    EXT4_XATTR_CACHE.exclusive_access().insert(key, value);
+}
+
+fn ext4_xattr_cache_remove_path(path: &str) {
     let key = ext4_cache_key(path);
-    ext4_metadata_cache_remove(&key);
     EXT4_XATTR_CACHE
         .exclusive_access()
         .retain(|(cached_path, _), _| cached_path != &key);
-    EXT4_LISTXATTR_CACHE.exclusive_access().remove(&key);
+}
+
+fn ext4_listxattr_cache_get(path: &str) -> Option<Vec<u8>> {
+    EXT4_LISTXATTR_CACHE
+        .exclusive_access()
+        .get(&ext4_cache_key(path))
+        .cloned()
+}
+
+fn ext4_listxattr_cache_set(path: &str, value: Vec<u8>) {
+    EXT4_LISTXATTR_CACHE
+        .exclusive_access()
+        .insert(ext4_cache_key(path), value);
+}
+
+fn ext4_listxattr_cache_remove(path: &str) {
+    EXT4_LISTXATTR_CACHE
+        .exclusive_access()
+        .remove(&ext4_cache_key(path));
+}
+
+fn ext4_statfs_cache_get() -> Option<VfsStatFs> {
+    *EXT4_STATFS_CACHE.exclusive_access()
+}
+
+fn ext4_statfs_cache_set(value: VfsStatFs) {
+    *EXT4_STATFS_CACHE.exclusive_access() = Some(value);
+}
+
+fn ext4_statfs_cache_invalidate() {
     *EXT4_STATFS_CACHE.exclusive_access() = None;
+}
+
+fn ext4_cache_remove_path(path: &str) {
+    ext4_metadata_cache_remove(path);
+    ext4_xattr_cache_remove_path(path);
+    ext4_listxattr_cache_remove(path);
+    ext4_statfs_cache_invalidate();
 }
 
 fn ext4_cache_touch_write(path: &str, size: Option<u64>) {
@@ -167,7 +212,7 @@ fn ext4_cache_touch_write(path: &str, size: Option<u64>) {
         metadata.mtime_sec = now;
         metadata.ctime_sec = now;
     });
-    *EXT4_STATFS_CACHE.exclusive_access() = None;
+    ext4_statfs_cache_invalidate();
 }
 
 fn ext4_cache_touch_write_extend(path: &str, end: u64) {
@@ -180,7 +225,7 @@ fn ext4_cache_touch_write_extend(path: &str, end: u64) {
         metadata.mtime_sec = now;
         metadata.ctime_sec = now;
     });
-    *EXT4_STATFS_CACHE.exclusive_access() = None;
+    ext4_statfs_cache_invalidate();
 }
 
 fn ext4_inode_exists(path: &str, kind: InodeTypes) -> bool {
@@ -666,19 +711,14 @@ impl VfsInode for Ext4Inode {
         if rc != EOK as i32 {
             return Err(ext4_errno(rc));
         }
-        let path = ext4_cache_key(self.path.as_str());
-        EXT4_XATTR_CACHE
-            .exclusive_access()
-            .insert((path.clone(), String::from(name)), Some(value.to_vec()));
-        EXT4_LISTXATTR_CACHE.exclusive_access().remove(&path);
+        ext4_xattr_cache_set(self.path.as_str(), name, Some(value.to_vec()));
+        ext4_listxattr_cache_remove(self.path.as_str());
         ext4_cache_touch_write(self.path.as_str(), None);
         Ok(())
     }
 
     fn getxattr(&self, name: &str) -> Result<Vec<u8>, isize> {
-        let path = ext4_cache_key(self.path.as_str());
-        let key = (path.clone(), String::from(name));
-        if let Some(cached) = EXT4_XATTR_CACHE.exclusive_access().get(&key).cloned() {
+        if let Some(cached) = ext4_xattr_cache_get(self.path.as_str(), name) {
             return cached.ok_or(-61);
         }
         let c_path = path_cstring(self.path.as_str())?;
@@ -695,7 +735,7 @@ impl VfsInode for Ext4Inode {
             )
         };
         if rc != EOK as i32 {
-            EXT4_XATTR_CACHE.exclusive_access().insert(key, None);
+            ext4_xattr_cache_set(self.path.as_str(), name, None);
             return Err(ext4_errno(rc));
         }
         let mut data = Vec::new();
@@ -714,15 +754,12 @@ impl VfsInode for Ext4Inode {
             return Err(ext4_errno(rc));
         }
         data.truncate(size);
-        EXT4_XATTR_CACHE
-            .exclusive_access()
-            .insert((path, String::from(name)), Some(data.clone()));
+        ext4_xattr_cache_set(self.path.as_str(), name, Some(data.clone()));
         Ok(data)
     }
 
     fn listxattr(&self) -> Result<Vec<u8>, isize> {
-        let path = ext4_cache_key(self.path.as_str());
-        if let Some(cached) = EXT4_LISTXATTR_CACHE.exclusive_access().get(&path).cloned() {
+        if let Some(cached) = ext4_listxattr_cache_get(self.path.as_str()) {
             return Ok(cached);
         }
         let c_path = path_cstring(self.path.as_str())?;
@@ -745,9 +782,7 @@ impl VfsInode for Ext4Inode {
             return Err(ext4_errno(rc));
         }
         list.truncate(size);
-        EXT4_LISTXATTR_CACHE
-            .exclusive_access()
-            .insert(path, list.clone());
+        ext4_listxattr_cache_set(self.path.as_str(), list.clone());
         Ok(list)
     }
 
@@ -758,17 +793,14 @@ impl VfsInode for Ext4Inode {
         if rc != EOK as i32 {
             return Err(ext4_errno(rc));
         }
-        let path = ext4_cache_key(self.path.as_str());
-        EXT4_XATTR_CACHE
-            .exclusive_access()
-            .insert((path.clone(), String::from(name)), None);
-        EXT4_LISTXATTR_CACHE.exclusive_access().remove(&path);
+        ext4_xattr_cache_set(self.path.as_str(), name, None);
+        ext4_listxattr_cache_remove(self.path.as_str());
         ext4_cache_touch_write(self.path.as_str(), None);
         Ok(())
     }
 
     fn statfs(&self) -> Option<VfsStatFs> {
-        if let Some(stats) = *EXT4_STATFS_CACHE.exclusive_access() {
+        if let Some(stats) = ext4_statfs_cache_get() {
             return Some(stats);
         }
         let c_mount = path_cstring("/").ok()?;
@@ -789,7 +821,7 @@ impl VfsInode for Ext4Inode {
             f_frsize: stats.block_size as i64,
             f_flags: 0,
         };
-        *EXT4_STATFS_CACHE.exclusive_access() = Some(vfs);
+        ext4_statfs_cache_set(vfs);
         Some(vfs)
     }
 }
