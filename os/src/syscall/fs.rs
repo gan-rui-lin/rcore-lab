@@ -1790,8 +1790,8 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, flags: u32) -> isize {
     let Some(file) = process.get_file(oldfd) else {
         return errno(EBADF);
     };
-    let limit =
-        process.inner_exclusive_access().rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize;
+    let limit = process
+        .with_limits(|limits| limits.rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize);
     if newfd >= limit {
         return errno(EBADF);
     }
@@ -2937,8 +2937,8 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             // Duplicate fd to the lowest numbered available fd >= arg
-            let limit = process.inner_exclusive_access().rlimits[crate::task::RLIMIT_NOFILE]
-                .rlim_cur as usize;
+            let limit = process
+                .with_limits(|limits| limits.rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize);
             if arg >= limit {
                 return errno(EINVAL);
             }
@@ -3570,7 +3570,7 @@ pub fn sys_truncate(path: *const u8, length: isize) -> isize {
     let creds = process.credentials_snapshot();
     let euid = creds.effective_uid;
     let egid = creds.effective_gid;
-    let file_limit = process.inner_exclusive_access().rlimits[1].rlim_cur;
+    let file_limit = process.with_limits(|limits| limits.rlimits[1].rlim_cur);
 
     if (length as u64) > file_limit {
         return errno(EFBIG);
@@ -3939,11 +3939,8 @@ pub fn sys_pselect6(
     timeout: *const TimeSpec,
     _sigmask: usize,
 ) -> isize {
-    let nofile_limit = {
-        let process = current_process();
-        let inner = process.inner_exclusive_access();
-        inner.rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize
-    };
+    let nofile_limit = current_process()
+        .with_limits(|limits| limits.rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize);
     if nfds > nofile_limit {
         return errno(EINVAL);
     }
@@ -4103,11 +4100,8 @@ pub fn sys_pselect6(
 }
 
 pub fn sys_ppoll(fds: *mut PollFd, nfds: usize, timeout: *const TimeSpec) -> isize {
-    let nofile_limit = {
-        let process = current_process();
-        let inner = process.inner_exclusive_access();
-        inner.rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize
-    };
+    let nofile_limit = current_process()
+        .with_limits(|limits| limits.rlimits[crate::task::RLIMIT_NOFILE].rlim_cur as usize);
     if nfds > nofile_limit {
         return errno(EINVAL);
     }

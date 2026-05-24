@@ -342,10 +342,8 @@ pub fn process_interval_timers(on_user_tick: bool) {
     const TIMER_TICK_US: usize = 10_000;
 
     for (_pid, process) in pid2process_snapshot() {
-        let should_signal = {
-            let mut inner = process.inner_exclusive_access();
-            tick_timer_state(&mut inner.itimers[0], TIMER_TICK_US)
-        };
+        let should_signal = process
+            .with_timers_mut(|timers| tick_timer_state(&mut timers.itimers[0], TIMER_TICK_US));
         if should_signal {
             process.insert_process_signal(SignalFlags::SIGALRM, 0, 0);
             wake_process_for_signal(&process);
@@ -361,12 +359,13 @@ pub fn process_interval_timers(on_user_tick: bool) {
     };
     let mut pending = SignalFlags::empty();
     {
-        let mut inner = process.inner_exclusive_access();
-        for which in [1usize, 2usize] {
-            if tick_timer_state(&mut inner.itimers[which], TIMER_TICK_US) {
-                pending |= itimer_signal(which);
+        process.with_timers_mut(|timers| {
+            for which in [1usize, 2usize] {
+                if tick_timer_state(&mut timers.itimers[which], TIMER_TICK_US) {
+                    pending |= itimer_signal(which);
+                }
             }
-        }
+        });
     }
     if !pending.is_empty() {
         process.insert_process_signal(pending, 0, 0);

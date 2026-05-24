@@ -265,7 +265,7 @@ pub fn print_pid2process_top_by_fd(limit: usize) {
             break;
         }
         if let Some(process) = pid2process(entry.pid) {
-            if process.try_inner_exclusive_access().is_some() {
+            if process.try_with_sync_objects_mut(|_| ()).is_some() {
                 println!(
                     "[kernel] alloc_error top_fd[{}]: pid={} name={} zombie={} tasks_alive={} children={} fd_used={} fd_slots={} sampled=true",
                     idx,

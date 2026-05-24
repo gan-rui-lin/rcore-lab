@@ -113,38 +113,41 @@ fn check_itimers(current_ms: usize) {
     use crate::task::{pid2process_snapshot, wakeup_task, SignalFlags, TaskStatus};
     let procs = pid2process_snapshot();
     for (_pid, process) in procs {
-        // Use try_inner_exclusive_access to avoid deadlocking if the timer
+        // Use try_with_inner_mut to avoid deadlocking if the timer
         // interrupt fires while someone holds this process's inner lock.
-        let mut inner = match process.try_inner_exclusive_access() {
-            Some(inner) => inner,
-            None => continue,
-        };
-        let expire = inner.itimer_real_expire_ms;
-        if expire != 0 && expire <= current_ms {
-            // Fire SIGALRM
-            log::warn!(
-                "[itimer] pid={} SIGALRM fired, expire={} now={}",
-                _pid,
-                expire,
-                current_ms
-            );
-            // Reload interval or disarm
-            if inner.itimer_real_interval_ms > 0 {
-                inner.itimer_real_expire_ms = current_ms + inner.itimer_real_interval_ms;
-            } else {
-                inner.itimer_real_expire_ms = 0;
-            }
-            drop(inner);
-            process.insert_process_signal(SignalFlags::SIGALRM, 0, 0);
-
-            // Wake up any blocked tasks in this process so they can handle the signal
-            for task in process.tasks_snapshot() {
-                if task.status() == TaskStatus::Blocked {
-                    task.mark_interrupted();
-                    task.set_status(TaskStatus::Ready);
-                    wakeup_task(task.clone());
-                    log::info!("[itimer] pid={} woke blocked task", _pid);
+        let expire = match process.try_with_timers_mut(|timers| {
+            let expire = timers.itimer_real_expire_ms;
+            if expire != 0 && expire <= current_ms {
+                // Reload interval or disarm
+                if timers.itimer_real_interval_ms > 0 {
+                    timers.itimer_real_expire_ms = current_ms + timers.itimer_real_interval_ms;
+                } else {
+                    timers.itimer_real_expire_ms = 0;
                 }
+                Some(expire)
+            } else {
+                None
+            }
+        }) {
+            Some(Some(expire)) => expire,
+            _ => continue,
+        };
+        // Fire SIGALRM
+        log::warn!(
+            "[itimer] pid={} SIGALRM fired, expire={} now={}",
+            _pid,
+            expire,
+            current_ms
+        );
+        process.insert_process_signal(SignalFlags::SIGALRM, 0, 0);
+
+        // Wake up any blocked tasks in this process so they can handle the signal
+        for task in process.tasks_snapshot() {
+            if task.status() == TaskStatus::Blocked {
+                task.mark_interrupted();
+                task.set_status(TaskStatus::Ready);
+                wakeup_task(task.clone());
+                log::info!("[itimer] pid={} woke blocked task", _pid);
             }
         }
     }

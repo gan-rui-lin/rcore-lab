@@ -9,7 +9,6 @@ use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{
     translated_byte_buffer_checked, translated_ref, translated_refmut, translated_str, MemorySet,
 };
-use crate::sync::UPIntrMutexGuard;
 use crate::sync::{Condvar, Mutex, Semaphore, UPIntrMutex, UPIntrRwLock};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -100,20 +99,28 @@ fn find_global_pointer(elf_data: &[u8]) -> Option<usize> {
 
 pub struct ProcessControlBlock {
     pub pid: PidHandle,
-    inner: UPIntrMutex<ProcessControlBlockInner>,
     memory: UPIntrRwLock<ProcessMemory>,
     fs: UPIntrRwLock<ProcessFs>,
     identity: UPIntrRwLock<ProcessIdentity>,
+    sync_objects: UPIntrMutex<ProcessSyncObjects>,
+    limits: UPIntrRwLock<ProcessLimits>,
+    timers: UPIntrRwLock<ProcessTimers>,
     threads: UPIntrMutex<ProcessThreads>,
     signals: UPIntrMutex<ProcessSignals>,
     family: UPIntrMutex<ProcessFamily>,
 }
 
-pub struct ProcessControlBlockInner {
+pub struct ProcessSyncObjects {
     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+}
+
+pub struct ProcessLimits {
     pub rlimits: [RLimit; RLIMIT_NLIMITS],
+}
+
+pub struct ProcessTimers {
     pub itimers: [IntervalTimerState; 3],
     /// ITIMER_REAL: absolute expire time in ms, 0 = inactive.
     pub itimer_real_expire_ms: usize,
@@ -379,16 +386,50 @@ impl ProcessControlBlock {
         Some(tcb_addr)
     }
 
-    #[track_caller]
-    pub fn inner_exclusive_access(&self) -> UPIntrMutexGuard<'_, ProcessControlBlockInner> {
-        self.inner.lock()
+    pub fn with_sync_objects<R>(&self, f: impl FnOnce(&ProcessSyncObjects) -> R) -> R {
+        let sync_objects = self.sync_objects.lock();
+        f(&sync_objects)
     }
 
-    /// Try to borrow the process inner state; returns None if already borrowed.
-    pub fn try_inner_exclusive_access(
+    pub fn with_sync_objects_mut<R>(&self, f: impl FnOnce(&mut ProcessSyncObjects) -> R) -> R {
+        let mut sync_objects = self.sync_objects.lock();
+        f(&mut sync_objects)
+    }
+
+    pub fn try_with_sync_objects_mut<R>(
         &self,
-    ) -> Option<UPIntrMutexGuard<'_, ProcessControlBlockInner>> {
-        self.inner.try_lock()
+        f: impl FnOnce(&mut ProcessSyncObjects) -> R,
+    ) -> Option<R> {
+        let mut sync_objects = self.sync_objects.try_lock()?;
+        Some(f(&mut sync_objects))
+    }
+
+    pub fn with_limits<R>(&self, f: impl FnOnce(&ProcessLimits) -> R) -> R {
+        let limits = self.limits.read();
+        f(&limits)
+    }
+
+    pub fn with_limits_mut<R>(&self, f: impl FnOnce(&mut ProcessLimits) -> R) -> R {
+        let mut limits = self.limits.write();
+        f(&mut limits)
+    }
+
+    pub fn with_timers<R>(&self, f: impl FnOnce(&ProcessTimers) -> R) -> R {
+        let timers = self.timers.read();
+        f(&timers)
+    }
+
+    pub fn with_timers_mut<R>(&self, f: impl FnOnce(&mut ProcessTimers) -> R) -> R {
+        let mut timers = self.timers.write();
+        f(&mut timers)
+    }
+
+    pub fn try_with_timers_mut<R>(
+        &self,
+        f: impl FnOnce(&mut ProcessTimers) -> R,
+    ) -> Option<R> {
+        let mut timers = self.timers.try_write()?;
+        Some(f(&mut timers))
     }
 
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
@@ -411,17 +452,6 @@ impl ProcessControlBlock {
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
             pid: pid_handle,
-            inner: unsafe {
-                UPIntrMutex::new(ProcessControlBlockInner {
-                    mutex_list: Vec::new(),
-                    semaphore_list: Vec::new(),
-                    condvar_list: Vec::new(),
-                    rlimits: default_rlimits(),
-                    itimers: [IntervalTimerState::default(); 3],
-                    itimer_real_expire_ms: 0,
-                    itimer_real_interval_ms: 0,
-                })
-            },
             memory: unsafe {
                 UPIntrRwLock::new(ProcessMemory {
                     memory_set,
@@ -460,6 +490,25 @@ impl ProcessControlBlock {
                     cap_bounding: u64::MAX,
                     session_id: 0,
                     pgid: 0,
+                })
+            },
+            sync_objects: unsafe {
+                UPIntrMutex::new(ProcessSyncObjects {
+                    mutex_list: Vec::new(),
+                    semaphore_list: Vec::new(),
+                    condvar_list: Vec::new(),
+                })
+            },
+            limits: unsafe {
+                UPIntrRwLock::new(ProcessLimits {
+                    rlimits: default_rlimits(),
+                })
+            },
+            timers: unsafe {
+                UPIntrRwLock::new(ProcessTimers {
+                    itimers: [IntervalTimerState::default(); 3],
+                    itimer_real_expire_ms: 0,
+                    itimer_real_interval_ms: 0,
                 })
             },
             threads: unsafe {
@@ -656,7 +705,7 @@ impl ProcessControlBlock {
             tls_area.is_some()
         );
         self.reset_memory_after_exec(memory_set, heap_bottom, tls_area.clone());
-        self.inner_exclusive_access().itimers = [IntervalTimerState::default(); 3];
+        self.with_timers_mut(|timers| timers.itimers = [IntervalTimerState::default(); 3]);
         {
             let mut signals = self.signals.lock();
             // Exec resets signal dispositions to default, except SIG_IGN.
@@ -888,7 +937,7 @@ impl ProcessControlBlock {
             self.with_process_signals(|signals| signals.signal_actions.clone());
         let (memory_set, heap_bottom, program_brk, mmap_base, tls_area) =
             self.clone_memory_for_fork();
-        let rlimits = self.inner_exclusive_access().rlimits;
+        let rlimits = self.with_limits(|limits| limits.rlimits);
         // info!("[fork-stage] pid={} after memory_set clone", self.pid.0);
 
         let pid = pid_alloc();
@@ -904,17 +953,6 @@ impl ProcessControlBlock {
         let _new_pid_value = pid.0;
         let child = Arc::new(Self {
             pid,
-            inner: unsafe {
-                UPIntrMutex::new(ProcessControlBlockInner {
-                    mutex_list: Vec::new(),
-                    semaphore_list: Vec::new(),
-                    condvar_list: Vec::new(),
-                    rlimits,
-                    itimers: [IntervalTimerState::default(); 3],
-                    itimer_real_expire_ms: 0,
-                    itimer_real_interval_ms: 0,
-                })
-            },
             memory: unsafe {
                 UPIntrRwLock::new(ProcessMemory {
                     memory_set,
@@ -932,6 +970,21 @@ impl ProcessControlBlock {
                 })
             },
             identity: unsafe { UPIntrRwLock::new(parent_identity) },
+            sync_objects: unsafe {
+                UPIntrMutex::new(ProcessSyncObjects {
+                    mutex_list: Vec::new(),
+                    semaphore_list: Vec::new(),
+                    condvar_list: Vec::new(),
+                })
+            },
+            limits: unsafe { UPIntrRwLock::new(ProcessLimits { rlimits }) },
+            timers: unsafe {
+                UPIntrRwLock::new(ProcessTimers {
+                    itimers: [IntervalTimerState::default(); 3],
+                    itimer_real_expire_ms: 0,
+                    itimer_real_interval_ms: 0,
+                })
+            },
             threads: unsafe {
                 UPIntrMutex::new(ProcessThreads {
                     tasks: Vec::new(),
@@ -1102,12 +1155,12 @@ impl ProcessControlBlock {
     }
 
     pub fn alloc_fd(&self) -> Option<usize> {
-        let limit = self.inner_exclusive_access().rlimits[RLIMIT_NOFILE].rlim_cur as usize;
+        let limit = self.with_limits(|limits| limits.rlimits[RLIMIT_NOFILE].rlim_cur as usize);
         self.fs.write().alloc_fd(limit)
     }
 
     pub fn install_file(&self, file: Arc<dyn File + Send + Sync>) -> Option<usize> {
-        let limit = self.inner_exclusive_access().rlimits[RLIMIT_NOFILE].rlim_cur as usize;
+        let limit = self.with_limits(|limits| limits.rlimits[RLIMIT_NOFILE].rlim_cur as usize);
         let mut fs = self.fs.write();
         let fd = fs.alloc_fd(limit)?;
         fs.fd_table[fd] = Some(file);
@@ -1115,7 +1168,7 @@ impl ProcessControlBlock {
     }
 
     pub fn install_file_at(&self, fd: usize, file: Arc<dyn File + Send + Sync>) -> bool {
-        let limit = self.inner_exclusive_access().rlimits[RLIMIT_NOFILE].rlim_cur as usize;
+        let limit = self.with_limits(|limits| limits.rlimits[RLIMIT_NOFILE].rlim_cur as usize);
         if fd >= limit {
             return false;
         }

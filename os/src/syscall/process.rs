@@ -2175,27 +2175,28 @@ pub fn sys_getitimer(which: isize, curr_value: *mut ITimerVal) -> isize {
     }
     let timer = {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if which == 0 {
-            // ITIMER_REAL: compute actual remaining time from expire deadline
-            let expire_ms = inner.itimer_real_expire_ms;
-            let remaining_us = if expire_ms == 0 {
-                0usize
-            } else {
-                let now_ms = get_time_ms();
-                if expire_ms > now_ms {
-                    (expire_ms - now_ms) * 1000
+        process.with_timers(|timers| {
+            if which == 0 {
+                // ITIMER_REAL: compute actual remaining time from expire deadline
+                let expire_ms = timers.itimer_real_expire_ms;
+                let remaining_us = if expire_ms == 0 {
+                    0usize
                 } else {
-                    0
+                    let now_ms = get_time_ms();
+                    if expire_ms > now_ms {
+                        (expire_ms - now_ms) * 1000
+                    } else {
+                        0
+                    }
+                };
+                ITimerVal {
+                    it_interval: us_to_timeval(timers.itimer_real_interval_ms * 1000),
+                    it_value: us_to_timeval(remaining_us),
                 }
-            };
-            ITimerVal {
-                it_interval: us_to_timeval(inner.itimer_real_interval_ms * 1000),
-                it_value: us_to_timeval(remaining_us),
+            } else {
+                itimer_state_to_user(timers.itimers[which as usize])
             }
-        } else {
-            itimer_state_to_user(inner.itimers[which as usize])
-        }
+        })
     };
     let bytes = unsafe {
         core::slice::from_raw_parts(
@@ -2230,43 +2231,44 @@ pub fn sys_setitimer(
     let new_state = itimer_state_from_user(new_timer);
     let old_timer = {
         let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-        let old_timer = if which == 0 {
-            // ITIMER_REAL: compute actual remaining time
-            let expire_ms = inner.itimer_real_expire_ms;
-            let remaining_us = if expire_ms == 0 {
-                0usize
-            } else {
-                let now_ms = get_time_ms();
-                if expire_ms > now_ms {
-                    (expire_ms - now_ms) * 1000
+        process.with_timers_mut(|timers| {
+            let old_timer = if which == 0 {
+                // ITIMER_REAL: compute actual remaining time
+                let expire_ms = timers.itimer_real_expire_ms;
+                let remaining_us = if expire_ms == 0 {
+                    0usize
                 } else {
-                    0
+                    let now_ms = get_time_ms();
+                    if expire_ms > now_ms {
+                        (expire_ms - now_ms) * 1000
+                    } else {
+                        0
+                    }
+                };
+                // Keep user-visible interval precision from the canonical itimer state,
+                // instead of the millisecond scheduling cache field.
+                let interval_us = timers.itimers[0].interval_us;
+                ITimerVal {
+                    it_interval: us_to_timeval(interval_us),
+                    it_value: us_to_timeval(remaining_us),
                 }
-            };
-            // Keep user-visible interval precision from the canonical itimer state,
-            // instead of the millisecond scheduling cache field.
-            let interval_us = inner.itimers[0].interval_us;
-            ITimerVal {
-                it_interval: us_to_timeval(interval_us),
-                it_value: us_to_timeval(remaining_us),
-            }
-        } else {
-            itimer_state_to_user(inner.itimers[which as usize])
-        };
-        inner.itimers[which as usize] = new_state;
-        // Update itimer_real_expire_ms for ITIMER_REAL
-        if which == 0 {
-            let now_ms = get_time_ms();
-            let remaining_us = new_state.remaining_us;
-            if remaining_us == 0 {
-                inner.itimer_real_expire_ms = 0;
             } else {
-                inner.itimer_real_expire_ms = now_ms + remaining_us / 1000;
+                itimer_state_to_user(timers.itimers[which as usize])
+            };
+            timers.itimers[which as usize] = new_state;
+            // Update itimer_real_expire_ms for ITIMER_REAL
+            if which == 0 {
+                let now_ms = get_time_ms();
+                let remaining_us = new_state.remaining_us;
+                if remaining_us == 0 {
+                    timers.itimer_real_expire_ms = 0;
+                } else {
+                    timers.itimer_real_expire_ms = now_ms + remaining_us / 1000;
+                }
+                timers.itimer_real_interval_ms = new_state.interval_us / 1000;
             }
-            inner.itimer_real_interval_ms = new_state.interval_us / 1000;
-        }
-        old_timer
+            old_timer
+        })
     };
     if !old_value.is_null() {
         let bytes = unsafe {
@@ -2510,7 +2512,7 @@ pub fn sys_mlock(addr: usize, len: usize) -> isize {
     };
     let process = current_process();
     let euid = process.effective_uid();
-    let limit = process.inner_exclusive_access().rlimits[RLIMIT_MEMLOCK].rlim_cur as usize;
+    let limit = process.with_limits(|limits| limits.rlimits[RLIMIT_MEMLOCK].rlim_cur as usize);
     if euid != 0 {
         if limit == 0 {
             return errno(EPERM);
@@ -4845,15 +4847,13 @@ pub fn sys_getrlimit(resource: usize, rlim: *mut RLimit) -> isize {
         return errno(EINVAL);
     }
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    let limit = inner.rlimits[resource];
+    let limit = process.with_limits(|limits| limits.rlimits[resource]);
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&limit as *const RLimit) as *const u8,
             core::mem::size_of::<RLimit>(),
         )
     };
-    drop(inner);
     drop(process);
     let token = current_user_token();
     match copy_to_user(token, rlim as *mut u8, bytes) {
@@ -4886,8 +4886,7 @@ pub fn sys_prlimit64(
 
     let token = current_user_token();
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let old = inner.rlimits[resource];
+    let old = process.with_limits(|limits| limits.rlimits[resource]);
     if !old_limit.is_null() {
         let bytes = unsafe {
             core::slice::from_raw_parts(
@@ -4907,7 +4906,7 @@ pub fn sys_prlimit64(
         if new_val.rlim_cur > new_val.rlim_max {
             return errno(EINVAL);
         }
-        inner.rlimits[resource] = new_val;
+        process.with_limits_mut(|limits| limits.rlimits[resource] = new_val);
     }
     0
 }
