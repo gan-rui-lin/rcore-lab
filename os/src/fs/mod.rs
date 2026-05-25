@@ -27,6 +27,8 @@ pub trait File: Send + Sync {
     fn write(&self, buf: UserBuffer) -> usize;
     /// Optional fast path for reading directly into user memory without first
     /// collecting page slices into a Vec. Return None to use the generic path.
+    /// 先读到内核的 bounce buffer 再拷回用户页（涉及 inode 读写），并不是零拷贝，不过将内核拷贝移出了临界区。
+    /// 快路径那快在那些直接在用户页上逐片写入的实现，如 DevZero;对普通盘上文件的加速很有限
     fn read_user_buffer(
         &self,
         _token: usize,

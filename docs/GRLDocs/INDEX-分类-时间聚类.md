@@ -100,6 +100,17 @@
 - [docs/GRLDocs/by-category/perf/2026-01-03/lmbench-glibc-alloc_error调试-2026-03-26.md](docs/GRLDocs/by-category/perf/2026-01-03/lmbench-glibc-alloc_error调试-2026-03-26.md) (date: 2026-03-26, source: filename)
 - [docs/GRLDocs/by-category/perf/2026-01-03/all-bylm-lmbench-alloc_error综合分析-2026-03-28.md](docs/GRLDocs/by-category/perf/2026-01-03/all-bylm-lmbench-alloc_error综合分析-2026-03-28.md) (date: 2026-03-28, source: filename)
 
+## 锁/并发
+
+### 2026-05
+- [docs/GRLDocs/by-category/lock/2026-05/tcb-lock-split-stage3-report-2026-05-24.md](docs/GRLDocs/by-category/lock/2026-05/tcb-lock-split-stage3-report-2026-05-24.md) (date: 2026-05-24, source: filename)
+- [docs/GRLDocs/by-category/lock/2026-05/pcb-tcb-lock-refactor-2026-05-24.md](docs/GRLDocs/by-category/lock/2026-05/pcb-tcb-lock-refactor-2026-05-24.md) (date: 2026-05-24, source: filename)
+- [docs/GRLDocs/by-category/lock/2026-05/fs-vfs-hot-lock-split-stage7-report-2026-05-24.md](docs/GRLDocs/by-category/lock/2026-05/fs-vfs-hot-lock-split-stage7-report-2026-05-24.md) (date: 2026-05-24, source: filename)
+- [docs/GRLDocs/by-category/lock/2026-05/sched-pid2pcb-timer-futex-net-lock-split-stage8-report-2026-05-24.md](docs/GRLDocs/by-category/lock/2026-05/sched-pid2pcb-timer-futex-net-lock-split-stage8-report-2026-05-24.md) (date: 2026-05-24, source: filename)
+- [docs/GRLDocs/by-category/lock/2026-05/vfs-short-lock-stage9-report-2026-05-25.md](docs/GRLDocs/by-category/lock/2026-05/vfs-short-lock-stage9-report-2026-05-25.md) (date: 2026-05-25, source: filename)
+- [docs/GRLDocs/by-category/lock/2026-05/block-cache-lock-split-stage10-report-2026-05-25.md](docs/GRLDocs/by-category/lock/2026-05/block-cache-lock-split-stage10-report-2026-05-25.md) (date: 2026-05-25, source: filename)
+- [docs/GRLDocs/by-category/lock/2026-05/lock-optimization-overview-2026-05-25.md](docs/GRLDocs/by-category/lock/2026-05/lock-optimization-overview-2026-05-25.md) (date: 2026-05-25, source: filename)
+
 ## 测试/LTP与用例
 
 ### 2026-04

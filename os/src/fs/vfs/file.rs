@@ -105,6 +105,7 @@ impl File for VfsFile {
         self.writable
     }
 
+    // 锁绑定到局部变量 offset，一直保持到函数返回，整个读取循环（执行多次 inode.read_at 并更新 offset）都在锁内执行——所以临界区较长
     fn read(&self, mut buf: UserBuffer) -> usize {
         let mut offset = self.offset.lock();
         let mut total = 0usize;
