@@ -1,11 +1,7 @@
 use super::*;
 
 pub(super) fn handle_user_supervisor_external() {
-    let trap_cx = current_trap_cx();
-    warn!(
-        "[kernel] trap_handler: unknown trap at sepc={:#x}",
-        trap_cx.sepc
-    );
+    crate::platform::handle_external_irq();
 }
 
 pub(super) fn handle_user_page_fault(addr: usize) {
@@ -63,10 +59,14 @@ pub(super) fn handle_user_illegal_instruction(addr: usize) {
 
 pub(super) fn handle_user_breakpoint() {
     let trap_cx = current_trap_cx();
-    warn!(
-        "[kernel] trap_handler: unknown trap at sepc={:#x}",
-        trap_cx.sepc
-    );
+    if let Some(next_pc) = arch::breakpoint_next_pc(current_user_token(), trap_cx.sepc) {
+        trap_cx.sepc = next_pc;
+    } else {
+        warn!(
+            "[kernel] trap_handler: unknown trap at sepc={:#x}",
+            trap_cx.sepc
+        );
+    }
 }
 
 pub(super) fn handle_user_unknown_trap(_trap_type: arch::TrapType) {

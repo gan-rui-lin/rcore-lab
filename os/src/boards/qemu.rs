@@ -29,38 +29,74 @@ use crate::drivers::block::BLOCK_DEVICE;
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::drivers::plic::{IntrTargetPriority, PLIC};
 use crate::drivers::{KEYBOARD_DEVICE, MOUSE_DEVICE};
+use crate::platform::{BoardDevices, IrqController};
+
+/// IRQ controller implementation for RISC-V QEMU virt.
+pub struct QemuIrqController;
+
+/// Device dispatch implementation for RISC-V QEMU virt.
+pub struct QemuBoardDevices;
+
+/// Active platform IRQ controller.
+pub type PlatformIrqController = QemuIrqController;
+
+/// Active platform device dispatcher.
+pub type PlatformBoardDevices = QemuBoardDevices;
+
+impl IrqController for QemuIrqController {
+    fn init() {
+        let mut plic = unsafe { PLIC::new(VIRT_PLIC) };
+        let hart_id: usize = 0;
+        let supervisor = IntrTargetPriority::Supervisor;
+        let machine = IntrTargetPriority::Machine;
+        plic.set_threshold(hart_id, supervisor, 0);
+        plic.set_threshold(hart_id, machine, 1);
+        for intr_src_id in [VIRTIO_BLK_IRQ, VIRTIO_NET_IRQ, VIRT_UART_IRQ] {
+            plic.enable(hart_id, supervisor, intr_src_id as usize);
+            plic.set_priority(intr_src_id as usize, 1);
+        }
+        arch::enable_supervisor_external();
+    }
+
+    fn claim() -> Option<u32> {
+        let mut plic = unsafe { PLIC::new(VIRT_PLIC) };
+        let irq = plic.claim(0, IntrTargetPriority::Supervisor);
+        if irq == 0 {
+            None
+        } else {
+            Some(irq)
+        }
+    }
+
+    fn complete(irq: u32) {
+        let mut plic = unsafe { PLIC::new(VIRT_PLIC) };
+        plic.complete(0, IntrTargetPriority::Supervisor, irq);
+    }
+}
+
+impl BoardDevices for QemuBoardDevices {
+    fn init_devices() {}
+
+    fn dispatch_irq(irq: u32) {
+        match irq {
+            5 => KEYBOARD_DEVICE.handle_irq(),
+            6 => MOUSE_DEVICE.handle_irq(),
+            VIRTIO_BLK_IRQ => BLOCK_DEVICE.handle_irq(),
+            VIRT_UART_IRQ => UART.handle_irq(),
+            VIRTIO_NET_IRQ => crate::net::poll_net_if_available(),
+            _ => panic!("unsupported IRQ {}", irq),
+        }
+    }
+}
 
 /// Initialize board-level devices and PLIC routing.
+#[allow(dead_code)]
 pub fn device_init() {
-    let mut plic = unsafe { PLIC::new(VIRT_PLIC) }; // 创建 PLIC 访问器
-    let hart_id: usize = 0; // 单核环境使用 hart 0
-    let supervisor = IntrTargetPriority::Supervisor;
-    let machine = IntrTargetPriority::Machine;
-    plic.set_threshold(hart_id, supervisor, 0); // S 态阈值设为 0，放开所有优先级
-    plic.set_threshold(hart_id, machine, 1); // M 态阈值提高，避免接管这些中断
-                                             // Enable IRQs for devices that are actually attached.
-    for intr_src_id in [VIRTIO_BLK_IRQ, VIRTIO_NET_IRQ, VIRT_UART_IRQ] {
-        plic.enable(hart_id, supervisor, intr_src_id as usize); // 让该 IRQ 送达 S 态
-        plic.set_priority(intr_src_id as usize, 1); // 设置 IRQ 优先级
-    }
-    arch::enable_supervisor_external(); // 开启 S 态外部中断
+    crate::platform::platform_init();
 }
 
 /// Dispatch a PLIC interrupt to the corresponding device handler.
+#[allow(dead_code)]
 pub fn irq_handler() {
-    // warn!("PLIC interrupt received");
-    let mut plic = unsafe { PLIC::new(VIRT_PLIC) }; // 创建 PLIC 访问器，处理中断
-    let intr_src_id = plic.claim(0, IntrTargetPriority::Supervisor); // 领取 hart 0 的挂起 IRQ
-    match intr_src_id {
-        // 分发到具体设备处理函数
-        5 => KEYBOARD_DEVICE.handle_irq(),           // 键盘输入
-        6 => MOUSE_DEVICE.handle_irq(),              // 鼠标输入
-        VIRTIO_BLK_IRQ => BLOCK_DEVICE.handle_irq(), // virtio 块设备
-        VIRT_UART_IRQ => UART.handle_irq(),          // 串口控制台
-        VIRTIO_NET_IRQ => crate::net::poll_net_if_available(), // VirtIO 网络设备
-        _ => panic!("unsupported IRQ {}", intr_src_id), // 未知 IRQ
-    }
-    plic.complete(0, IntrTargetPriority::Supervisor, intr_src_id); // 完成中断，重新使能该 IRQ
-
-    // warn!("PLIC interrupt handled");
+    crate::platform::handle_external_irq();
 }

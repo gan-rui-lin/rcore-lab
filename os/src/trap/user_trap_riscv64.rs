@@ -1,25 +1,7 @@
 use super::*;
 
-fn riscv_insn_len_at(user_token: usize, sepc: usize) -> usize {
-    let page_table = PageTable::from_token(user_token);
-    let read_byte = |va: usize| -> Option<u8> {
-        let pa = page_table.translate_va(VirtAddr::from(va))?;
-        Some(*pa.get_ref::<u8>())
-    };
-    let (b0, b1) = match (read_byte(sepc), read_byte(sepc.wrapping_add(1))) {
-        (Some(a), Some(b)) => (a, b),
-        _ => return 2,
-    };
-    let insn16 = u16::from_le_bytes([b0, b1]);
-    if (insn16 & 0b11) == 0b11 {
-        4
-    } else {
-        2
-    }
-}
-
 pub(super) fn handle_user_supervisor_external() {
-    crate::board::irq_handler();
+    crate::platform::handle_external_irq();
 }
 
 pub(super) fn handle_user_page_fault(addr: usize) {
@@ -60,8 +42,7 @@ pub(super) fn handle_user_illegal_instruction(addr: usize) {
     let ra = trap_cx[TrapFrameArgs::RA];
     let sp = trap_cx[TrapFrameArgs::SP];
     let tp = trap_cx[TrapFrameArgs::TLS];
-    let in_sigreturn_trampoline =
-        (arch::SIG_RETURN_ADDR..arch::SIG_RETURN_ADDR + crate::config::PAGE_SIZE).contains(&sepc);
+    let in_sigreturn_trampoline = arch::is_sigreturn_trampoline_pc(sepc);
 
     if let Some(task) = current_task() {
         let pid = current_process().pid.0;
@@ -130,8 +111,9 @@ pub(super) fn handle_user_illegal_instruction(addr: usize) {
 pub(super) fn handle_user_breakpoint() {
     let user_token = current_user_token();
     let trap_cx = current_trap_cx();
-    let step = riscv_insn_len_at(user_token, trap_cx.sepc);
-    trap_cx.sepc = trap_cx.sepc.wrapping_add(step);
+    if let Some(next_pc) = arch::breakpoint_next_pc(user_token, trap_cx.sepc) {
+        trap_cx.sepc = next_pc;
+    }
 }
 
 pub(super) fn handle_user_unknown_trap(trap_type: arch::TrapType) {

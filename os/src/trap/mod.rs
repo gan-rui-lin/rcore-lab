@@ -46,7 +46,7 @@ fn handle_user_time_interrupt() {
 pub fn kernel_interrupt_dispatch(trap_type: arch::TrapType) {
     match trap_type {
         arch::TrapType::SupervisorExternal => {
-            crate::board::irq_handler();
+            crate::platform::handle_external_irq();
         }
         arch::TrapType::Time => {
             set_next_trigger();

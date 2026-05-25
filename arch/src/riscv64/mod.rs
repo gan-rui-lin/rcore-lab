@@ -19,8 +19,8 @@ pub mod trap;
 // ---------------------------------------------------------------------------
 // Board constants
 // ---------------------------------------------------------------------------
-pub use board::{CLOCK_FREQ, MEMORY_END, MMIO};
-pub use board::{VIRT_PLIC, VIRT_UART, VIRTIO_BLK};
+pub use board::{platform_config, CLOCK_FREQ, MEMORY_END, MMIO};
+pub use board::{VIRT_PLIC, VIRT_UART, VIRTIO_BLK, VIRTIO_NET_IRQ, VIRT_UART_IRQ};
 
 // ---------------------------------------------------------------------------
 // Console I/O
@@ -107,4 +107,48 @@ pub fn kernel_text_addr(addr: usize) -> usize {
     } else {
         addr | VIRT_ADDR_START
     }
+}
+
+/// Flush all TLB entries on the current hart.
+#[inline]
+pub fn flush_tlb_all() {
+    unsafe {
+        core::arch::asm!("sfence.vma");
+    }
+}
+
+/// Flush one TLB entry on the current hart.
+#[inline]
+pub fn flush_tlb_page(va: usize) {
+    unsafe {
+        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
+    }
+}
+
+/// Is `pc` inside the fixed signal-return trampoline mapping?
+#[inline]
+pub fn is_sigreturn_trampoline_pc(pc: usize) -> bool {
+    (SIG_RETURN_ADDR..SIG_RETURN_ADDR + PAGE_SIZE).contains(&pc)
+}
+
+/// Return the next PC after a user breakpoint instruction.
+pub fn breakpoint_next_pc(user_token: usize, pc: usize) -> Option<usize> {
+    let page_table = PageTable::from_token(user_token);
+    let read_byte = |va: usize| -> Option<u8> {
+        let pa = page_table.translate_va(VirtAddr::from(va))?;
+        Some(*pa.get_ref::<u8>())
+    };
+    let (b0, b1) = match (read_byte(pc), read_byte(pc.wrapping_add(1))) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return Some(pc.wrapping_add(2)),
+    };
+    let insn16 = u16::from_le_bytes([b0, b1]);
+    let step = if (insn16 & 0b11) == 0b11 { 4 } else { 2 };
+    Some(pc.wrapping_add(step))
+}
+
+/// Linux `uname -m` machine string for this architecture.
+#[inline]
+pub fn machine_name() -> &'static str {
+    "riscv64"
 }

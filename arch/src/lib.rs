@@ -27,6 +27,9 @@ extern crate bitflags;
 
 pub mod api;
 pub mod pagetable;
+pub mod platform;
+
+pub use platform::*;
 
 // ---------------------------------------------------------------------------
 // Shared types used by both architectures and the kernel

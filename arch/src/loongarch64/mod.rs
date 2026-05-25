@@ -27,7 +27,7 @@ pub mod unaligned;
 // Unified re-exports
 // ---------------------------------------------------------------------------
 
-pub use board::{CLOCK_FREQ, MEMORY_END, MMIO};
+pub use board::{platform_config, CLOCK_FREQ, MEMORY_END, MMIO};
 pub use console::{console_getchar, console_putchar};
 pub use entry::clear_bss;
 pub use context::TrapFrame;
@@ -89,4 +89,38 @@ pub fn interrupts_enabled() -> bool {
 #[inline]
 pub fn kernel_text_addr(addr: usize) -> usize {
     addr
+}
+
+/// Flush all TLB entries on the current hart.
+#[inline]
+pub fn flush_tlb_all() {
+    unsafe {
+        core::arch::asm!("dbar 0; invtlb 0x00, $r0, $r0");
+    }
+}
+
+/// Flush one TLB entry on the current hart.
+#[inline]
+pub fn flush_tlb_page(va: usize) {
+    unsafe {
+        core::arch::asm!("dbar 0; invtlb 0x06, $r0, {va}", va = in(reg) va);
+    }
+}
+
+/// Is `pc` inside the fixed signal-return trampoline mapping?
+#[inline]
+pub fn is_sigreturn_trampoline_pc(pc: usize) -> bool {
+    (SIG_RETURN_ADDR..SIG_RETURN_ADDR + PAGE_SIZE).contains(&pc)
+}
+
+/// LoongArch breakpoint handling currently preserves the existing PC.
+#[inline]
+pub fn breakpoint_next_pc(_user_token: usize, _pc: usize) -> Option<usize> {
+    None
+}
+
+/// Linux `uname -m` machine string for this architecture.
+#[inline]
+pub fn machine_name() -> &'static str {
+    "loongarch64"
 }

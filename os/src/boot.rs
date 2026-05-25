@@ -33,7 +33,7 @@ fn rust_main_high() -> ! {
     arch::trap_init();
     arch::trap_enable_timer_interrupt();
     crate::timer::set_next_trigger();
-    crate::board::device_init();
+    crate::platform::platform_init();
     #[cfg(feature = "ext4")]
     if crate::fs::mount_ext4_auto() {
         info!("[kernel] ext4 mounted as root");
@@ -80,7 +80,7 @@ pub fn rust_main() -> ! {
     arch::init_timer();
     arch::trap_enable_timer_interrupt();
     crate::timer::set_next_trigger();
-    crate::board::device_init();
+    crate::platform::platform_init();
     #[cfg(feature = "ext4")]
     if crate::fs::mount_ext4_auto() {
         info!("[kernel] ext4 mounted as root");

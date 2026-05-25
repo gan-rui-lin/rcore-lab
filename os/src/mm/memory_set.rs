@@ -110,26 +110,6 @@ pub fn kernel_token() -> usize {
     KERNEL_SPACE.exclusive_access().token()
 }
 
-/// Flush TLB on the current hart (architecture-specific).
-fn flush_tlb() {
-    #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("sfence.vma") }
-    #[cfg(target_arch = "loongarch64")]
-    unsafe { core::arch::asm!("dbar 0; invtlb 0x00, $r0, $r0") }
-}
-
-/// Flush a single TLB entry for the given virtual address.
-#[allow(unused_variables)]
-fn flush_tlb_page(va: usize) {
-    #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("sfence.vma {}, zero", in(reg) va) }
-    #[cfg(target_arch = "loongarch64")]
-    unsafe {
-        // invtlb op=0x05: invalidate entry matching VA (in rj) with ASID 0 (in rk)
-        core::arch::asm!("dbar 0; invtlb 0x06, $r0, {va}", va = in(reg) va)
-    }
-}
-
 /// address space
 pub struct MemorySet {
     page_table: PageTable,
@@ -1281,7 +1261,7 @@ impl MemorySet {
             debug!("[kernel] COW clone area {} done", idx);
         }
         // Flush parent's TLB since we removed W bits from its PTEs
-        flush_tlb();
+        arch::flush_tlb_all();
         trace!("memory_set: COW clone user space done");
         child
     }
@@ -1348,7 +1328,7 @@ impl MemorySet {
             // restore writability directly instead of allocating a private page.
             let shared_flags = pte.flags() | PTEFlags::W;
             self.page_table.change_pte_flags(fault_vpn, shared_flags);
-            flush_tlb();
+            arch::flush_tlb_all();
             return true;
         }
 
@@ -1367,7 +1347,7 @@ impl MemorySet {
         if Arc::strong_count(frame_arc) == 1 {
             // Sole owner: just make it writable again, no copy needed
             self.page_table.change_pte_flags(fault_vpn, new_flags);
-            flush_tlb_page(fault_vpn.0 << 12);
+            arch::flush_tlb_page(fault_vpn.0 << 12);
             trace!(
                 "[cow] sole-owner vpn={:#x} ppn={:#x}",
                 fault_vpn.0, old_ppn.0
@@ -1392,7 +1372,7 @@ impl MemorySet {
 
         // Remap to new frame with write permission
         self.page_table.map(fault_vpn, new_ppn, new_flags);
-        flush_tlb_page(fault_vpn.0 << 12);
+        arch::flush_tlb_page(fault_vpn.0 << 12);
         trace!(
             "[cow] copied vpn={:#x} old_ppn={:#x} new_ppn={:#x}",
             fault_vpn.0, old_ppn.0, new_ppn.0

@@ -2411,10 +2411,7 @@ pub fn sys_uname(uts: *mut UtsName) -> isize {
     fill(&mut uname.nodename, uts_state.0.as_str());
     fill(&mut uname.release, "5.10.0");
     fill(&mut uname.version, "rcore");
-    #[cfg(target_arch = "riscv64")]
-    fill(&mut uname.machine, "riscv64");
-    #[cfg(target_arch = "loongarch64")]
-    fill(&mut uname.machine, "loongarch64");
+    fill(&mut uname.machine, arch::machine_name());
     fill(&mut uname.domainname, uts_state.1.as_str());
     drop(uts_state);
     let bytes = unsafe {
@@ -3751,8 +3748,7 @@ pub fn sys_sigreturn() -> isize {
     }
     let task = current_task().unwrap();
     let trap_sepc = task.with_trap_cx_mut(|trap_cx| trap_cx.sepc);
-    let in_sigreturn_trampoline =
-        (arch::SIG_RETURN_ADDR..arch::SIG_RETURN_ADDR + PAGE_SIZE).contains(&trap_sepc);
+    let in_sigreturn_trampoline = arch::is_sigreturn_trampoline_pc(trap_sepc);
 
     let saved = match task.take_signal_frame() {
         Some(cx) => cx,

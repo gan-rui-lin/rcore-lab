@@ -1,5 +1,9 @@
 //! QEMU virt board constants for RISC-V 64.
 
+use crate::platform::{
+    DeviceDesc, DeviceKind, DeviceTransport, DmaMode, PlatformConfig,
+};
+
 /// Timer clock frequency (Hz) — QEMU virt: aclint-mtimer @ 10MHz.
 pub const CLOCK_FREQ: usize = 10_000_000;
 
@@ -23,3 +27,80 @@ pub const VIRT_UART: usize = 0x1000_0000;
 
 /// VirtIO block device base address.
 pub const VIRTIO_BLK: usize = 0x1000_1000;
+
+/// VirtIO net device IRQ on QEMU virt machine.
+pub const VIRTIO_NET_IRQ: u32 = 2;
+
+/// UART IRQ on QEMU virt machine.
+pub const VIRT_UART_IRQ: u32 = 10;
+
+const DEVICES: &[DeviceDesc] = &[
+    DeviceDesc {
+        kind: DeviceKind::Test,
+        transport: DeviceTransport::Mmio {
+            base: 0x0010_0000,
+            size: 0x2000,
+        },
+        irq: None,
+    },
+    DeviceDesc {
+        kind: DeviceKind::Plic,
+        transport: DeviceTransport::Mmio {
+            base: VIRT_PLIC,
+            size: 0x21_0000,
+        },
+        irq: None,
+    },
+    DeviceDesc {
+        kind: DeviceKind::Uart,
+        transport: DeviceTransport::Mmio {
+            base: VIRT_UART,
+            size: 0x100,
+        },
+        irq: Some(VIRT_UART_IRQ),
+    },
+    DeviceDesc {
+        kind: DeviceKind::Block,
+        transport: DeviceTransport::Mmio {
+            base: VIRTIO_BLK,
+            size: 0x1000,
+        },
+        irq: Some(1),
+    },
+    DeviceDesc {
+        kind: DeviceKind::Net,
+        transport: DeviceTransport::Mmio {
+            base: VIRTIO_BLK + 0x1000,
+            size: 0x1000,
+        },
+        irq: Some(VIRTIO_NET_IRQ),
+    },
+    DeviceDesc {
+        kind: DeviceKind::InputKeyboard,
+        transport: DeviceTransport::Mmio {
+            base: VIRTIO_BLK + 0x4000,
+            size: 0x1000,
+        },
+        irq: Some(5),
+    },
+    DeviceDesc {
+        kind: DeviceKind::InputMouse,
+        transport: DeviceTransport::Mmio {
+            base: VIRTIO_BLK + 0x5000,
+            size: 0x1000,
+        },
+        irq: Some(6),
+    },
+];
+
+static PLATFORM_CONFIG: PlatformConfig = PlatformConfig {
+    memory_end: MEMORY_END,
+    mmio_regions: MMIO,
+    devices: DEVICES,
+    dma_mode: DmaMode::KernelPageTableTranslate,
+};
+
+/// Return the static platform description for the current target.
+pub fn platform_config() -> &'static PlatformConfig {
+    &PLATFORM_CONFIG
+}
