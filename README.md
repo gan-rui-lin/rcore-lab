@@ -1,190 +1,132 @@
-# rCore-Tutorial-Code
+# rCore Lab
 
-## Code
+![Rust](https://img.shields.io/badge/Rust-nightly--2024--08--01-orange)
+![Arch](https://img.shields.io/badge/Arch-RISC--V%20%7C%20LoongArch64-blue)
 
-- [Soure Code of labs](https://github.com/LearningOS/rCore-Tutorial-Code)
+`rcore-lab` 是一个基于 rCore 教学内核继续扩展的实验操作系统项目。项目主要面向 RISC-V64 与 LoongArch64 平台，在 QEMU 上运行，重点探索 Linux 兼容系统调用、动态链接程序支持、文件系统、网络、信号、线程与 LTP/Libc 测试适配。
 
-## Documents
+## 特性
 
-- Concise Manual: [rCore-Tutorial-Guide](https://LearningOS.github.io/rCore-Tutorial-Guide/)
+- 支持 RISC-V64 与 LoongArch64 双架构构建。
+- 支持 musl/glibc 用户程序运行与动态链接相关适配。
+- 实现并扩展进程、线程、信号、futex、文件系统、网络等 Linux 风格接口。
+- 支持 ext4/FAT/easy-fs 相关实验路径与 VirtIO 块设备。
+- 支持 VirtIO 网络设备，提供 user/tap/bridge 等 QEMU 网络运行模式。
+- 内置面向 basic、busybox、libctest、lmbench、LTP、iperf、netperf 等套件的 initcode 启动逻辑。
+- 提供脚本化运行、离线构建、日志抓取和测试结果分析工具。
 
-- Detail Book [rCore-Tutorial-Book-v3](https://rcore-os.github.io/rCore-Tutorial-Book-v3/)
+## 目录结构
 
-## OS API docs of rCore Tutorial Code
+```text
+.
+├── arch/               # 架构相关代码：RISC-V64、LoongArch64、页表、陷入、上下文切换
+├── os/                 # 内核主体：任务、内存、文件系统、网络、系统调用、驱动
+├── user/               # 用户态程序与 initcode，负责启动测试套件
+├── easy-fs/            # rCore 教学文件系统
+├── easy-fs-fuse/       # easy-fs 镜像制作工具
+├── vendor/             # 本地依赖与适配过的第三方库
+├── scripts/            # LTP/日志分析脚本
+├── docs/               # 开发规范、调试记录、评测经验与专题文档
+├── run.sh              # RISC-V QEMU 构建与运行入口
+├── run-la.sh           # LoongArch64 QEMU 构建与运行入口
+└── Makefile            # 顶层构建入口
+```
 
-- [OS API docs of ch1](https://learningos.github.io/rCore-Tutorial-Code/ch1/os/index.html)
-  AND [OS API docs of ch2](https://learningos.github.io/rCore-Tutorial-Code/ch2/os/index.html)
-- [OS API docs of ch3](https://learningos.github.io/rCore-Tutorial-Code/ch3/os/index.html)
-  AND [OS API docs of ch4](https://learningos.github.io/rCore-Tutorial-Code/ch4/os/index.html)
-- [OS API docs of ch5](https://learningos.github.io/rCore-Tutorial-Code/ch5/os/index.html)
-  AND [OS API docs of ch6](https://learningos.github.io/rCore-Tutorial-Code/ch6/os/index.html)
-- [OS API docs of ch7](https://learningos.github.io/rCore-Tutorial-Code/ch7/os/index.html)
-  AND [OS API docs of ch8](https://learningos.github.io/rCore-Tutorial-Code/ch8/os/index.html)
-- [OS API docs of ch9](https://learningos.github.io/rCore-Tutorial-Code/ch9/os/index.html)
+## 环境要求
 
-## Related Resources
+- Rust nightly，仓库使用 `rust-toolchain.toml` 固定到 `nightly-2024-08-01`
+- `rust-src`、`llvm-tools-preview`、`cargo-binutils`
+- `qemu-system-riscv64`
+- `qemu-system-loongarch64`，用于 LoongArch64 运行
+- `python3`、`make`、`xz`
 
-- [Learning Resource](https://github.com/LearningOS/rust-based-os-comp2025/blob/main/relatedinfo.md)
 
-## Setup
+## 快速开始
+
+### RISC-V64
 
 ```bash
-$ git clone https://github.com/LearningOS/2025a-rcore-[YOUR_USER_NAME].git
-$ cd 2025a-rcore-[YOUR_USER_NAME]
+# 编译 RISC-V 内核
+make rv
+
+# 使用 sdcard-rv.img 启动 QEMU
+bash run.sh -f sdcard-rv.img -t rv
 ```
 
-## Build & Run
+### LoongArch64
 
 ```bash
-# setup build&run environment first
-$ git clone https://github.com/LearningOS/rCore-Tutorial-Test.git user
-$ git checkout ch$ID
-$ cd os
-# run OS in ch$ID
-$ make run
+# 编译 LoongArch64 内核
+make la
+
+# 使用 sdcard-la.img 启动 QEMU
+bash run-la.sh -f sdcard-la.img -t la --no-data-disk
 ```
 
-If you want to use docker to build and run, you can use the following command:
-```bash
-# After clone the `rCore-Tutorial-Test` repository to your local machine, you can use the following command to build and run:
-$ make build_docker
-$ make docker
-```
+如果镜像不存在但存在对应的 `.xz` 压缩包，运行脚本会尝试自动解压。
 
-If you experience network issues when accessing foreign resources such as GitHub in Docker, you can follow the following suggestions according to your stage:
+## 运行指定测试
 
-- Docker pull:
-  1. use proxy: https://docs.docker.com/reference/cli/docker/image/pull/#proxy-configuration
-
-  2. use available domestic source (self-search)
-
-- Docker build: use proxy https://docs.docker.com/engine/cli/proxy/#build-with-a-proxy-configuration
-
-- Docker run: use proxy option, related operations are similar to `Docker build`, can refer to the relevant materials by yourself
-
-
-Notice: $ID is from [1-9]
-
-## Grading
+用户态入口在 `user/src/bin/initcode.rs`。可以通过编译期环境变量 `SINGLE_TEST` 控制运行的测试范围：
 
 ```bash
-# setup build&run environment first
-$ rm -rf ci-user
-$ git clone https://github.com/LearningOS/rCore-Tutorial-Checker.git ci-user
-$ git clone https://github.com/LearningOS/rCore-Tutorial-Test.git ci-user/user
-$ git checkout ch$ID
-# check&grade OS in ch$ID with more tests
-$ cd ci-user && make test CHAPTER=$ID
+# 运行全部测试入口
+SINGLE_TEST=all LOG=OFF bash run.sh -f sdcard-rv.img -t rv
+
+# 只运行 musl 下的测试集合
+SINGLE_TEST=musl LOG=ERROR bash run.sh -f sdcard-rv.img -t rv
+
+# 只运行 glibc netperf
+SINGLE_TEST=glibc-netperf LOG=ERROR bash run-la.sh -f sdcard-la.img -t la --no-data-disk
+
+# 从某个 LTP case 开始继续跑
+SINGLE_TEST=all LTP_START_FROM=waitpid10 LOG=OFF bash run.sh -f sdcard-rv.img -t rv
 ```
 
-Notice: $ID is from [3,4,5,6,8]
+常用日志级别：
 
----
-
-## Project Documentation
-
-This repository includes comprehensive documentation for recent development work:
-
-### 📋 [CHANGELOG.md](CHANGELOG.md)
-Quick reference for all major changes and features:
-- Phase 1-3 system call implementations
-- Interrupt safety infrastructure improvements
-- TLS/TCB support fixes
-- Complete commit history with references
-
-### 📚 Technical Documentation
-
-#### [UPIntrFreeCell Migration Guide](docs/UPIntrFreeCell-Migration.md)
-**Essential reading for contributors!**
-
-Comprehensive guide covering the critical infrastructure upgrade from `UPSafeCell` to `UPIntrFreeCell`:
-- **Problem Analysis**: Why interrupt safety matters
-- **Migration Scope**: 18 files across task, mm, fs, sync modules
-- **API Changes**: Return type modifications and new methods
-- **Implementation Details**: Interrupt masking mechanism and RAII guards
-- **Developer Guide**: Best practices and common pitfalls
-- **Performance Considerations**: Optimization tips and trade-offs
-
-**Quick Start**:
-```rust
-use crate::sync::UPIntrFreeCell;
-use lazy_static::lazy_static;
-
-lazy_static! {
-    static ref MY_DATA: UPIntrFreeCell<Data> = unsafe {
-        UPIntrFreeCell::new(Data::new())
-    };
-}
-
-fn use_data() {
-    let mut data = MY_DATA.exclusive_access();
-    // Interrupts are automatically masked
-    data.modify();
-    // Interrupts are restored on drop
-}
-```
-
-#### [Shebang Implementation](docs/shebang-implementation.md)
-Details on script interpreter support and busybox integration.
-
-### 🔍 Recent Improvements
-
-**Interrupt Safety** (Commit: `5f3b8ee`)
-- All global static variables now use `UPIntrFreeCell`
-- Automatic interrupt masking during critical sections
-- Nested access support with reference counting
-- Zero-overhead abstraction with RAII guarantees
-
-**TLS Support** (Commit: `e47e5c3`)
-- Minimal TCB initialization for programs without PT_TLS
-- Proper tp register setup for musl-libc compatibility
-- Support for statically-linked binaries
-
-**System V IPC** (Commit: `6bf2667`)
-- Message queues: `msgget`, `msgsnd`, `msgrcv`, `msgctl`
-- Shared memory: `shmget`, `shmat`, `shmdt`, `shmctl`
-- Signal extensions: `rt_sigtimedwait`
-
-### 🛠️ Development Setup
-
-Current toolchain:
 ```bash
-rustc 1.80.0-nightly (c987ad527 2024-05-01)
-cargo 1.80.0-nightly (6087566b3 2024-04-30)
-target: riscv64gc-unknown-none-elf
+LOG=OFF      # 关闭大部分日志，适合评测
+LOG=ERROR    # 只看错误
+LOG=WARN     # 查看异常、信号、页故障等问题
+LOG=SYSCALL  # 跟踪系统调用
+LOG=TRACE    # 全量调试日志
 ```
 
-Quick build:
+## 常用命令
+
 ```bash
-cd /path/to/rcore-lab
-bash run.sh  # Builds and runs with default test suite
+# 构建两个架构
+make all
+
+# debug 模式构建 RISC-V
+make debug
+
+# 清理构建产物
+make clean
+
+# 进入 Docker 开发环境
+make docker
+
+# 格式化主要 Rust 子工程
+make fmt
 ```
 
-### 📖 For New Contributors
+## 调试与分析
 
-**Start here**:
-1. Read [CHANGELOG.md](CHANGELOG.md) to understand project history
-2. Review [UPIntrFreeCell Migration Guide](docs/UPIntrFreeCell-Migration.md) for current architecture
-3. Check existing commits for code style and documentation standards
+常见调试方式是保存 QEMU 输出，然后用 `rg` 或脚本分析：
 
-**When adding global state**:
-- ✅ Use `UPIntrFreeCell` for interrupt safety
-- ✅ Keep critical sections small
-- ✅ Prefer `try_exclusive_access` for fallible operations
-- ✅ Document complex synchronization patterns
+```bash
+LOG=WARN SINGLE_TEST=all bash run.sh -f sdcard-rv.img -t rv > rv.log 2>&1
 
-**Documentation standards**:
-- Update CHANGELOG.md for all significant changes
-- Create detailed technical docs for infrastructure changes
-- Include code examples and usage patterns
-- Document known issues and future optimizations
+rg "Panicked|SIG|PageFault|IllegalInstruction|ret=-" rv.log
+python3 scripts/ltp/analyze_rv_ltp_log.py rv.log
+```
 
----
+## 项目状态
 
-## Maintenance
+项目处于活跃实验和评测适配阶段。代码中会保留一些针对具体测试点的兼容逻辑、性能优化和调试脚本。适合用于学习 Rust OS、理解 rCore 内核演进、调试 Linux 兼容接口，以及复现实验性系统调用与 libc 测试问题。
 
-**Branch**: `zjy-syscall`
-**Latest Commit**: `578daf6` - docs: 添加项目更新日志
-**Status**: Active development
+## License
 
-For questions or contributions, please refer to the documentation above or contact the development team.
+本项目使用 [GPL-3.0](LICENSE) 许可证。
