@@ -5,19 +5,12 @@
 
 use super::BlockDevice;
 use crate::drivers::bus::virtio::VirtioHal;
+use arch::DeviceKind;
 use spin::Mutex;
 use virtio_drivers_new::device::blk::VirtIOBlk;
 use virtio_drivers_new::transport::pci::bus::{BarInfo, Cam, Command, MemoryBarType, PciRoot};
 use virtio_drivers_new::transport::pci::{virtio_device_type, PciTransport};
 use virtio_drivers_new::transport::DeviceType;
-
-/// LoongArch64 QEMU virt PCI ECAM base (physical address).
-const PCI_ECAM_BASE: usize = 0x2000_0000;
-/// LoongArch64 DMW uncached window base.
-const DMW_BASE: usize = 0x8000_0000_0000_0000;
-/// PCI BAR allocation window (physical address range).
-const VIRT_PCI_BASE: usize = 0x4000_0000;
-const VIRT_PCI_SIZE: usize = 0x0020_0000;
 
 struct PciRangeAllocator {
     end: usize,
@@ -60,8 +53,26 @@ unsafe impl Sync for VirtIOPCIBlock {}
 impl VirtIOPCIBlock {
     /// Scan the PCI bus for a VirtIO block device and create the driver.
     pub fn new() -> Self {
+        let config = arch::platform_config();
+        let ecam_base = config
+            .device(DeviceKind::PciEcam)
+            .and_then(|device| device.mmio_base())
+            .expect("PCI ECAM base missing from platform config");
+        let bar_window = config
+            .device(DeviceKind::PciBarWindow)
+            .expect("PCI BAR window missing from platform config");
+        let bar_base = bar_window
+            .mmio_base()
+            .expect("PCI BAR window base missing from platform config");
+        let bar_size = bar_window
+            .mmio_size()
+            .expect("PCI BAR window size missing from platform config");
+        let dmw_base = config
+            .dma_uncached_base()
+            .expect("LoongArch PCI requires DirectMapWindow dma mode");
+
         // Create a PciRoot pointing at the ECAM MMIO region via DMW.
-        let ecam_vaddr = (PCI_ECAM_BASE | DMW_BASE) as *mut u8;
+        let ecam_vaddr = (ecam_base | dmw_base) as *mut u8;
         let mut pci_root = unsafe { PciRoot::new(ecam_vaddr, Cam::Ecam) };
 
         // Enumerate bus 0 looking for a VirtIO block device.
@@ -77,7 +88,7 @@ impl VirtIOPCIBlock {
         let dev_fn = blk_dev_fn.expect("No VirtIO block device found on PCI bus 0");
 
         // Allocate BARs for the device.
-        let mut allocator = PciRangeAllocator::new(VIRT_PCI_BASE, VIRT_PCI_SIZE);
+        let mut allocator = PciRangeAllocator::new(bar_base, bar_size);
         let mut bar_index = 0u8;
         while bar_index < 6 {
             let bar_info = pci_root.bar_info(dev_fn, bar_index).expect("pci bar_info");

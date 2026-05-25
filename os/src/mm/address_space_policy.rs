@@ -4,9 +4,12 @@
 //! architecture policy that decide where kernel/trampoline mappings live and
 //! which debug checks are meaningful on a given MMU.
 
-use super::{PageTable, PageTableEntry, PhysPageNum, VirtAddr, VirtPageNum};
 use super::memory_set::MapPermission;
+use super::{PageTable, PageTableEntry, VirtAddr, VirtPageNum};
 use alloc::vec::Vec;
+
+#[cfg(target_arch = "riscv64")]
+use super::PhysPageNum;
 
 #[cfg(target_arch = "riscv64")]
 extern "C" {
@@ -225,7 +228,11 @@ pub fn validate_copy_data_first_page(
         data_len,
         start_va.0
     );
-    assert!(pte.bits != 0, "[ELF] copy_data unmapped vpn: vpn={:#x}", vpn.0);
+    assert!(
+        pte.bits != 0,
+        "[ELF] copy_data unmapped vpn: vpn={:#x}",
+        vpn.0
+    );
     assert!(
         pa < arch::platform_config().memory_end,
         "[ELF] copy_data pa out of RAM: pa={:#x} memory_end={:#x}",
@@ -250,18 +257,9 @@ pub fn remap_test(page_table: &PageTable) {
     let mid_text: VirtAddr = ((stext as usize + etext as usize) / 2).into();
     let mid_rodata: VirtAddr = ((srodata as usize + erodata as usize) / 2).into();
     let mid_data: VirtAddr = ((sdata as usize + edata as usize) / 2).into();
-    assert!(!page_table
-        .translate(mid_text.floor())
-        .unwrap()
-        .writable());
-    assert!(!page_table
-        .translate(mid_rodata.floor())
-        .unwrap()
-        .writable());
-    assert!(!page_table
-        .translate(mid_data.floor())
-        .unwrap()
-        .executable());
+    assert!(!page_table.translate(mid_text.floor()).unwrap().writable());
+    assert!(!page_table.translate(mid_rodata.floor()).unwrap().writable());
+    assert!(!page_table.translate(mid_data.floor()).unwrap().executable());
 }
 
 /// Run architecture-specific remap invariants.

@@ -1,7 +1,7 @@
 mod ns16550a;
 
-use crate::board::CharDeviceImpl;
 use alloc::sync::Arc;
+use arch::DeviceKind;
 use lazy_static::*;
 pub use ns16550a::NS16550a;
 
@@ -17,7 +17,14 @@ pub trait CharDevice {
     fn handle_irq(&self);
 }
 
+fn uart_base() -> usize {
+    arch::platform_config()
+        .device(DeviceKind::Uart)
+        .and_then(|device| device.mmio_base())
+        .expect("UART MMIO base missing from platform config")
+}
+
 lazy_static! {
     /// Global UART device instance.
-    pub static ref UART: Arc<CharDeviceImpl> = Arc::new(CharDeviceImpl::new());
+    pub static ref UART: Arc<NS16550a> = Arc::new(NS16550a::new(uart_base()));
 }

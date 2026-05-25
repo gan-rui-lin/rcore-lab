@@ -1,14 +1,11 @@
 use super::BlockDevice;
-use crate::board::VIRTIO_BLK;
 use crate::drivers::bus::virtio::VirtioHal;
 use crate::sync::{Condvar, UPIntrFreeCell};
 use crate::task::schedule;
 use crate::DEV_NON_BLOCKING_ACCESS;
 use alloc::collections::BTreeMap;
+use arch::DeviceKind;
 use virtio_drivers::{BlkResp, Error as VirtIOError, RespStatus, VirtIOBlk, VirtIOHeader};
-
-#[allow(unused)]
-const VIRTIO0: usize = VIRTIO_BLK;
 
 /// VirtIO block device wrapper with interrupt-driven I/O support.
 pub struct VirtIOBlock {
@@ -195,9 +192,13 @@ impl VirtIOBlock {
 impl VirtIOBlock {
     /// Create a new VirtIO block device wrapper.
     pub fn new() -> Self {
+        let base = arch::platform_config()
+            .device(DeviceKind::Block)
+            .and_then(|device| device.mmio_base())
+            .expect("VirtIO block MMIO base missing from platform config");
         let virtio_blk = unsafe {
             UPIntrFreeCell::new(
-                VirtIOBlk::<VirtioHal>::new(&mut *(VIRTIO0 as *mut VirtIOHeader)).unwrap(),
+                VirtIOBlk::<VirtioHal>::new(&mut *(base as *mut VirtIOHeader)).unwrap(),
             )
         };
         let mut condvars = BTreeMap::new();

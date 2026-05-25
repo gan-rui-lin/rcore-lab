@@ -4,14 +4,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::drivers::bus::virtio::VirtioHal;
+use arch::DeviceKind;
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 use virtio_drivers::{DeviceType, VirtIOHeader, VirtIONet};
-
-/// VirtIO MMIO region on QEMU virt machine.
-const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
-const VIRTIO_MMIO_STRIDE: usize = 0x1000;
-const VIRTIO_MMIO_SLOTS: usize = 8;
 
 /// Maximum Ethernet frame size (MTU 1500 + header 14).
 const ETH_FRAME_SIZE: usize = 1514;
@@ -24,18 +20,16 @@ pub struct VirtIONetDevice {
 
 impl VirtIONetDevice {
     fn find_virtio_net_header() -> &'static mut VirtIOHeader {
-        for index in 0..VIRTIO_MMIO_SLOTS {
-            let addr = VIRTIO_MMIO_BASE + index * VIRTIO_MMIO_STRIDE;
-            let header = unsafe { &mut *(addr as *mut VirtIOHeader) };
-            if !header.verify() {
-                continue;
-            }
-            if header.device_type() == DeviceType::Network {
-                log::info!("[net] found virtio-net mmio at {:#x}", addr);
-                return header;
-            }
+        let addr = arch::platform_config()
+            .device(DeviceKind::Net)
+            .and_then(|device| device.mmio_base())
+            .expect("VirtIO net MMIO base missing from platform config");
+        let header = unsafe { &mut *(addr as *mut VirtIOHeader) };
+        if header.verify() && header.device_type() == DeviceType::Network {
+            log::info!("[net] found virtio-net mmio at {:#x}", addr);
+            return header;
         }
-        panic!("virtio-net mmio device not found");
+        panic!("virtio-net mmio device not found at {:#x}", addr);
     }
 
     /// Create a new VirtIO network device.

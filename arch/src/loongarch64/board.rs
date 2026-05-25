@@ -2,9 +2,7 @@
 
 #![allow(missing_docs)]
 
-use crate::platform::{
-    DeviceDesc, DeviceKind, DeviceTransport, DmaMode, PlatformConfig,
-};
+use crate::platform::{DeviceDesc, DeviceKind, DeviceTransport, DmaMode, PlatformConfig};
 
 /// Timer / stable counter frequency (Hz).
 pub const CLOCK_FREQ: usize = 12_500_000;
@@ -18,12 +16,34 @@ pub const MEMORY_END: usize = 0xD000_0000;
 pub const MMIO: &[(usize, usize)] = &[];
 
 const DMW_UC_BASE: usize = 0x8000_0000_0000_0000;
+const PCI_ECAM_BASE: usize = 0x2000_0000;
+const PCI_ECAM_SIZE: usize = 0x1000_0000;
+const PCI_BAR_WINDOW_BASE: usize = 0x4000_0000;
+const PCI_BAR_WINDOW_SIZE: usize = 0x0020_0000;
 
-const DEVICES: &[DeviceDesc] = &[DeviceDesc {
-    kind: DeviceKind::Block,
-    transport: DeviceTransport::Pci,
-    irq: None,
-}];
+const DEVICES: &[DeviceDesc] = &[
+    DeviceDesc {
+        kind: DeviceKind::PciEcam,
+        transport: DeviceTransport::Mmio {
+            base: PCI_ECAM_BASE,
+            size: PCI_ECAM_SIZE,
+        },
+        irq: None,
+    },
+    DeviceDesc {
+        kind: DeviceKind::PciBarWindow,
+        transport: DeviceTransport::Mmio {
+            base: PCI_BAR_WINDOW_BASE,
+            size: PCI_BAR_WINDOW_SIZE,
+        },
+        irq: None,
+    },
+    DeviceDesc {
+        kind: DeviceKind::Block,
+        transport: DeviceTransport::Pci,
+        irq: None,
+    },
+];
 
 static PLATFORM_CONFIG: PlatformConfig = PlatformConfig {
     memory_end: MEMORY_END,

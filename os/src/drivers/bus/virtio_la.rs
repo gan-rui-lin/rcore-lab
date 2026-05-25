@@ -21,8 +21,11 @@ lazy_static! {
 /// HAL implementation for virtio-drivers v0.7.1 on LoongArch64.
 pub struct VirtioHal;
 
-/// LoongArch64 DMW uncached window base address (MMIO).
-const DMW_UC_BASE: usize = 0x8000_0000_0000_0000;
+fn dma_uncached_base() -> usize {
+    arch::platform_config()
+        .dma_uncached_base()
+        .expect("LoongArch VirtIO requires DirectMapWindow dma mode")
+}
 
 unsafe impl Hal for VirtioHal {
     fn dma_alloc(pages: usize, _direction: BufferDirection) -> (VirtioPhysAddr, NonNull<u8>) {
@@ -32,7 +35,8 @@ unsafe impl Hal for VirtioHal {
             .exclusive_access()
             .append(&mut trackers.unwrap());
         let pa: PhysAddr = ppn_base.into();
-        let vaddr = pa.0 | DMW_UC_BASE;
+        let uncached_base = dma_uncached_base();
+        let vaddr = pa.0 | uncached_base;
         // Zero the allocated pages
         unsafe {
             core::ptr::write_bytes(vaddr as *mut u8, 0, pages * PAGE_SIZE);
@@ -51,7 +55,7 @@ unsafe impl Hal for VirtioHal {
     }
 
     unsafe fn mmio_phys_to_virt(paddr: VirtioPhysAddr, _size: usize) -> NonNull<u8> {
-        let vaddr = paddr | DMW_UC_BASE;
+        let vaddr = paddr | dma_uncached_base();
         NonNull::new(vaddr as *mut u8).unwrap()
     }
 
@@ -61,7 +65,7 @@ unsafe impl Hal for VirtioHal {
         if vaddr & VIRT_ADDR_START == VIRT_ADDR_START {
             vaddr & !VIRT_ADDR_START
         } else {
-            vaddr & !DMW_UC_BASE
+            vaddr & !dma_uncached_base()
         }
     }
 
