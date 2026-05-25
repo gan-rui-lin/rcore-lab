@@ -916,7 +916,10 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
                     } else {
                         #[cfg(target_arch = "riscv64")]
                         {
-                            stack.iface.context()
+                            let Some(iface) = stack.iface.as_mut() else {
+                                return Some(tcp::ConnectError::Unaddressable);
+                            };
+                            iface.context()
                         }
                         #[cfg(not(target_arch = "riscv64"))]
                         {
@@ -1003,7 +1006,9 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
             // same port (e.g. iperf3 parallel UDP streams).
             {
                 let _ = with_net_stack_write(|stack| {
-                    let sock = stack.sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
+                    let sock = stack
+                        .sockets
+                        .get_mut::<smoltcp::socket::udp::Socket>(handle);
                     sock.set_remote_endpoint(Some(remote));
                 });
             }

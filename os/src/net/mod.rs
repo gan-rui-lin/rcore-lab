@@ -32,10 +32,10 @@ static NEXT_PORT: AtomicU16 = AtomicU16::new(49152);
 pub struct NetStack {
     /// The VirtIO network device driver (RISC-V only).
     #[cfg(target_arch = "riscv64")]
-    pub device: VirtIONetDevice,
+    pub device: Option<VirtIONetDevice>,
     /// The smoltcp network interface for external network (RISC-V only).
     #[cfg(target_arch = "riscv64")]
-    pub iface: Interface,
+    pub iface: Option<Interface>,
     /// Loopback device for 127.0.0.1 traffic.
     pub lo_device: Loopback,
     /// Loopback interface.
@@ -50,12 +50,12 @@ impl NetStack {
     pub fn poll_external(&mut self, now: smoltcp::time::Instant) {
         #[cfg(target_arch = "riscv64")]
         {
-            self.iface.poll(now, &mut self.device, &mut self.sockets);
+            if let (Some(device), Some(iface)) = (&mut self.device, &mut self.iface) {
+                iface.poll(now, device, &mut self.sockets);
+            }
         }
         let _ = now; // suppress unused warning on non-riscv64
     }
-
-
 }
 
 lazy_static! {
@@ -90,8 +90,7 @@ pub fn init() {
 
     // --- External network interface (RISC-V only) ---
     #[cfg(target_arch = "riscv64")]
-    let (device, iface) = {
-        let mut device = VirtIONetDevice::new();
+    let external = VirtIONetDevice::try_new().map(|mut device| {
         let mac = device.mac_address();
         info!(
             "[net] VirtIO-Net MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -118,7 +117,7 @@ pub fn init() {
             .unwrap();
 
         (device, iface)
-    };
+    });
 
     // --- Loopback interface (all architectures) ---
     let mut lo_device = Loopback::new(Medium::Ip);
@@ -133,6 +132,12 @@ pub fn init() {
     let socket_storage: Vec<SocketStorage<'static>> =
         (0..MAX_SOCKETS).map(|_| SocketStorage::EMPTY).collect();
     let sockets = SocketSet::new(socket_storage);
+
+    #[cfg(target_arch = "riscv64")]
+    let (device, iface) = match external {
+        Some((device, iface)) => (Some(device), Some(iface)),
+        None => (None, None),
+    };
 
     *NET_STACK.write() = Some(NetStack {
         #[cfg(target_arch = "riscv64")]
@@ -160,7 +165,9 @@ pub fn poll_net() {
         let now = smoltcp_now();
         stack.poll_external(now);
         for _ in 0..4 {
-            stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+            stack
+                .lo_iface
+                .poll(now, &mut stack.lo_device, &mut stack.sockets);
         }
     });
 }
@@ -171,7 +178,9 @@ pub fn poll_net_if_available() {
         let now = smoltcp_now();
         stack.poll_external(now);
         for _ in 0..4 {
-            stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+            stack
+                .lo_iface
+                .poll(now, &mut stack.lo_device, &mut stack.sockets);
         }
     });
 }
@@ -182,7 +191,9 @@ pub fn poll_net_force() {
         let now = smoltcp_now();
         stack.poll_external(now);
         for _ in 0..4 {
-            stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+            stack
+                .lo_iface
+                .poll(now, &mut stack.lo_device, &mut stack.sockets);
         }
     });
 }
