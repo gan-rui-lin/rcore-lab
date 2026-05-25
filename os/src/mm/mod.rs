@@ -9,6 +9,7 @@
 mod frame_allocator;
 mod heap_allocator;
 mod memory_set;
+mod address_space_policy;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 pub use arch::{

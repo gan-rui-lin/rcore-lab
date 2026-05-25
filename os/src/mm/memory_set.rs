@@ -1,11 +1,11 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
+use super::address_space_policy;
 use super::{frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::USER_STACK_TOP;
-#[allow(unused_imports)]
-use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, USER_STACK_SIZE};
+use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::File;
 use crate::sync::UPIntrFreeCell;
 use alloc::collections::BTreeMap;
@@ -14,27 +14,6 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use lazy_static::*;
-
-extern "C" {
-    #[cfg(not(target_arch = "loongarch64"))]
-    fn stext();
-    #[cfg(not(target_arch = "loongarch64"))]
-    fn etext();
-    #[cfg(not(target_arch = "loongarch64"))]
-    fn srodata();
-    #[cfg(not(target_arch = "loongarch64"))]
-    fn erodata();
-    #[cfg(not(target_arch = "loongarch64"))]
-    fn sdata();
-    #[cfg(not(target_arch = "loongarch64"))]
-    fn edata();
-    #[cfg(not(target_arch = "loongarch64"))]
-    fn sbss_with_stack();
-    #[cfg(not(target_arch = "loongarch64"))]
-    fn ebss();
-    #[cfg(not(target_arch = "loongarch64"))]
-    fn ekernel();
-}
 
 lazy_static! {
     /// The kernel's initial memory mapping(kernel address space)
@@ -162,16 +141,6 @@ pub enum MapAreaType {
 }
 
 impl MemorySet {
-    #[cfg(target_arch = "riscv64")]
-    #[inline]
-    fn rv_strip_high_alias(addr: usize) -> usize {
-        if addr >= arch::VIRT_ADDR_START {
-            addr & !arch::VIRT_ADDR_START
-        } else {
-            addr
-        }
-    }
-
     /// Create a new empty `MemorySet`.
     pub fn new_bare() -> Self {
         Self {
@@ -632,8 +601,6 @@ impl MemorySet {
         new_area.map_shared_from(&mut self.page_table, area, src_page_table);
         self.areas.push(new_area);
     }
-    /// Mention that trampoline is not collected by areas.
-    #[cfg(not(target_arch = "loongarch64"))]
     fn map_identical_area(
         &mut self,
         start_va: VirtAddr,
@@ -645,20 +612,7 @@ impl MemorySet {
             self.page_table.map(vpn, PhysPageNum(vpn.0), pte_flags);
         }
     }
-    #[cfg(target_arch = "riscv64")]
-    fn install_riscv_high_linear_root(&mut self) {
-        // Keep runtime kernel page table compatible with boot-time high-half
-        // direct map by copying root 1GiB leaf entries.
-        let dst_root = PhysPageNum(self.page_table.token() & ((1usize << 44) - 1));
-        let src_root = PhysPageNum(arch::kernel_page_table_token() & ((1usize << 44) - 1));
-        let dst = dst_root.get_pte_array();
-        let src = src_root.get_pte_array();
-        for idx in [0x100usize, 0x101, 0x102] {
-            if !dst[idx].is_valid() && src[idx].is_valid() {
-                dst[idx] = src[idx];
-            }
-        }
-    }
+
     /// Compatibility no-op: user return no longer depends on trampoline mapping.
     fn map_trampoline(&mut self) {}
     /// Without kernel stacks.
@@ -666,62 +620,18 @@ impl MemorySet {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
-        #[cfg(not(target_arch = "loongarch64"))]
-        {
-            #[cfg(target_arch = "riscv64")]
-            let fix = |addr: usize| Self::rv_strip_high_alias(addr);
-            #[cfg(not(target_arch = "riscv64"))]
-            let fix = |addr: usize| addr;
-
-            // map kernel sections
-            info!(".text [{:#x}, {:#x})", stext as usize, etext as usize);
-            info!(".rodata [{:#x}, {:#x})", srodata as usize, erodata as usize);
-            info!(".data [{:#x}, {:#x})", sdata as usize, edata as usize);
+        for mapping in address_space_policy::kernel_identical_mappings() {
             info!(
-                ".bss [{:#x}, {:#x})",
-                sbss_with_stack as usize, ebss as usize
+                "mapping {} [{:#x}, {:#x})",
+                mapping.label, mapping.start, mapping.end
             );
-            info!("mapping .text section");
             memory_set.map_identical_area(
-                fix(stext as usize).into(),
-                fix(etext as usize).into(),
-                MapPermission::R | MapPermission::X,
+                mapping.start.into(),
+                mapping.end.into(),
+                mapping.permission,
             );
-            info!("mapping .rodata section");
-            memory_set.map_identical_area(
-                fix(srodata as usize).into(),
-                fix(erodata as usize).into(),
-                MapPermission::R,
-            );
-            info!("mapping .data section");
-            memory_set.map_identical_area(
-                fix(sdata as usize).into(),
-                fix(edata as usize).into(),
-                MapPermission::R | MapPermission::W,
-            );
-            info!("mapping .bss section");
-            memory_set.map_identical_area(
-                fix(sbss_with_stack as usize).into(),
-                fix(ebss as usize).into(),
-                MapPermission::R | MapPermission::W,
-            );
-            info!("mapping physical memory");
-            memory_set.map_identical_area(
-                fix(ekernel as usize).into(),
-                MEMORY_END.into(),
-                MapPermission::R | MapPermission::W,
-            );
-            info!("mapping memory-mapped registers");
-            for pair in MMIO {
-                memory_set.map_identical_area(
-                    (*pair).0.into(),
-                    ((*pair).0 + (*pair).1).into(),
-                    MapPermission::R | MapPermission::W,
-                );
-            }
-            #[cfg(target_arch = "riscv64")]
-            memory_set.install_riscv_high_linear_root();
         }
+        address_space_policy::install_kernel_root_mappings(&mut memory_set.page_table);
         memory_set
     }
 
@@ -768,14 +678,12 @@ impl MemorySet {
                 let start_va = VirtAddr::from(load_base + ph.virtual_addr() as usize);
                 let end_va =
                     VirtAddr::from(load_base + (ph.virtual_addr() + ph.mem_size()) as usize);
-                #[cfg(target_arch = "loongarch64")]
-                info!(
-                    "[ELF] PH_LOAD: vaddr={:#x} memsz={:#x} filesz={:#x} start={:#x} end={:#x}",
-                    ph.virtual_addr(),
-                    ph.mem_size(),
-                    ph.file_size(),
-                    start_va.0,
-                    end_va.0
+                address_space_policy::log_load_segment(
+                    ph.virtual_addr() as usize,
+                    ph.mem_size() as usize,
+                    ph.file_size() as usize,
+                    start_va,
+                    end_va,
                 );
                 let mut map_perm = MapPermission::U;
                 let ph_flags = ph.flags();
@@ -911,45 +819,15 @@ impl MemorySet {
             ),
             None,
         );
-        #[cfg(target_arch = "loongarch64")]
-        {
-            let tramp_base = user_stack_bottom.saturating_sub(PAGE_SIZE);
-            let tramp_addr = arch::sigtrx::sigreturn_trampoline_addr();
-            let tramp_page = tramp_addr & !(PAGE_SIZE - 1);
-            info!(
-                "[sigtrx_map] tramp_base={:#x} tramp_addr={:#x} tramp_page={:#x} offset={:#x}",
-                tramp_base,
-                tramp_addr,
-                tramp_page,
-                tramp_addr & (PAGE_SIZE - 1)
-            );
-            let tramp_bytes =
-                unsafe { core::slice::from_raw_parts(tramp_page as *const u8, PAGE_SIZE) };
+        if let Some(trampoline) = address_space_policy::user_trampoline_mapping(user_stack_bottom) {
             memory_set.push(
                 MapArea::new(
-                    tramp_base.into(),
-                    (tramp_base + PAGE_SIZE).into(),
+                    trampoline.base.into(),
+                    (trampoline.base + PAGE_SIZE).into(),
                     MapType::Framed,
-                    MapPermission::R | MapPermission::W | MapPermission::X | MapPermission::U,
+                    trampoline.permission,
                 ),
-                Some(tramp_bytes),
-            );
-        }
-        #[cfg(target_arch = "riscv64")]
-        {
-            let tramp_base = arch::SIG_RETURN_ADDR;
-            let tramp_addr = arch::sigtrx::sigreturn_trampoline_addr();
-            let tramp_page = tramp_addr & !(PAGE_SIZE - 1);
-            let tramp_bytes =
-                unsafe { core::slice::from_raw_parts(tramp_page as *const u8, PAGE_SIZE) };
-            memory_set.push(
-                MapArea::new(
-                    tramp_base.into(),
-                    (tramp_base + PAGE_SIZE).into(),
-                    MapType::Framed,
-                    MapPermission::R | MapPermission::X | MapPermission::U,
-                ),
-                Some(tramp_bytes),
+                Some(trampoline.bytes),
             );
         }
         if let Some(pte) = memory_set
@@ -2093,16 +1971,8 @@ impl MapArea {
     pub fn map(&mut self, page_table: &mut PageTable) {
         for (_i, vpn) in self.vpn_range.into_iter().enumerate() {
             self.map_one(page_table, vpn);
-            #[cfg(target_arch = "loongarch64")]
             if _i == 0 {
-                if let Some(pte) = page_table.translate(vpn) {
-                    info!(
-                        "[ELF] map_one first vpn: vpn={:#x} pte_bits={:#x}",
-                        vpn.0, pte.bits
-                    );
-                } else {
-                    info!("[ELF] map_one first vpn: vpn={:#x} pte=None", vpn.0);
-                }
+                address_space_policy::on_map_one_first_page(page_table, vpn);
             }
         }
     }
@@ -2142,27 +2012,12 @@ impl MapArea {
             };
             let copy_len = (PAGE_SIZE - dst_offset).min(data_len - data_offset);
             let pte = page_table.translate(current_vpn).unwrap();
-            #[cfg(target_arch = "loongarch64")]
             if first_page {
-                let pa = pte.ppn().0 * PAGE_SIZE;
-                info!(
-                    "[ELF] copy_data first page: vpn={:#x} pte_bits={:#x} pa={:#x} data_len={:#x} start_va={:#x}",
-                    current_vpn.0,
-                    pte.bits,
-                    pa,
-                    data_len
-                    ,self.start_va.0
-                );
-                assert!(
-                    pte.bits != 0,
-                    "[ELF] copy_data unmapped vpn: vpn={:#x}",
-                    current_vpn.0
-                );
-                assert!(
-                    pa < MEMORY_END,
-                    "[ELF] copy_data pa out of RAM: pa={:#x} memory_end={:#x}",
-                    pa,
-                    MEMORY_END
+                address_space_policy::validate_copy_data_first_page(
+                    current_vpn,
+                    pte,
+                    data_len,
+                    self.start_va,
                 );
             }
             let page_bytes = pte.ppn().get_bytes_array();
@@ -2231,28 +2086,8 @@ bitflags! {
 #[allow(unused)]
 
 pub fn remap_test() {
-    #[cfg(not(target_arch = "loongarch64"))]
-    {
-        let mut kernel_space = KERNEL_SPACE.exclusive_access();
-        let mid_text: VirtAddr = ((stext as usize + etext as usize) / 2).into();
-        let mid_rodata: VirtAddr = ((srodata as usize + erodata as usize) / 2).into();
-        let mid_data: VirtAddr = ((sdata as usize + edata as usize) / 2).into();
-        assert!(!kernel_space
-            .page_table
-            .translate(mid_text.floor())
-            .unwrap()
-            .writable(),);
-        assert!(!kernel_space
-            .page_table
-            .translate(mid_rodata.floor())
-            .unwrap()
-            .writable(),);
-        assert!(!kernel_space
-            .page_table
-            .translate(mid_data.floor())
-            .unwrap()
-            .executable(),);
-    }
+    let kernel_space = KERNEL_SPACE.exclusive_access();
+    address_space_policy::remap_test(&kernel_space.page_table);
 
     println!("remap_test passed!");
 }
