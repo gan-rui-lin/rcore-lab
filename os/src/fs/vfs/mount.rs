@@ -1,6 +1,8 @@
 #![allow(missing_docs)]
 
-use super::core::{with_root_vfs_read, with_root_vfs_write};
+use super::core::with_root_vfs_write;
+#[cfg(feature = "ext4")]
+use super::core::{ext4_guards_snapshot, take_ext4_guards};
 use super::easyfs::easyfs_root;
 use super::fat32::fat32_root;
 use super::procfs::procfs_root;
@@ -37,7 +39,9 @@ pub fn mount_procfs() {
 
 #[cfg(feature = "ext4")]
 pub fn sync_filesystems() {
-    with_root_vfs_read(|vfs| vfs.flush_ext4());
+    for fs in ext4_guards_snapshot() {
+        fs.flush();
+    }
     crate::drivers::block::sync_block_cache();
 }
 
@@ -48,7 +52,9 @@ pub fn sync_filesystems() {
 
 #[cfg(feature = "ext4")]
 pub fn shutdown_filesystems() {
-    with_root_vfs_write(|vfs| vfs.shutdown_ext4());
+    for fs in take_ext4_guards() {
+        fs.shutdown();
+    }
     crate::drivers::block::sync_block_cache();
 }
 

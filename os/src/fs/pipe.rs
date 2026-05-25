@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 const DEFAULT_PIPE_CAPACITY: usize = 4096;
+const EAGAIN_ERRNO: isize = -11;
 const EPIPE_ERRNO: isize = -32;
 
 struct PipeBuffer {
@@ -118,7 +119,6 @@ impl File for PipeEnd {
     }
 
     fn read(&self, mut user_buf: UserBuffer) -> usize {
-        let nonblock = self.nonblock.load(Ordering::Relaxed);
         let mut total = 0;
         for slice in user_buf.buffers.iter_mut() {
             loop {
@@ -133,13 +133,15 @@ impl File for PipeEnd {
                         return total;
                     } else if total > 0 {
                         return total;
-                    } else if nonblock {
-                        return usize::MAX - 1; // EAGAIN sentinel
-                    } else if has_pending_unmasked_signal(true) {
-                        return usize::MAX; // EINTR sentinel
                     }
                 }
                 if should_block {
+                    if self.nonblock.load(Ordering::Relaxed) {
+                        return usize::MAX - 1; // EAGAIN sentinel
+                    }
+                    if has_pending_unmasked_signal(true) {
+                        return usize::MAX; // EINTR sentinel
+                    }
                     suspend_current_and_run_next();
                 } else {
                     break;
@@ -172,9 +174,6 @@ impl File for PipeEnd {
                         if total > 0 {
                             return total;
                         }
-                        if has_pending_unmasked_signal(true) {
-                            return usize::MAX; // EINTR sentinel
-                        }
                         should_block = true;
                     }
                 }
@@ -182,6 +181,12 @@ impl File for PipeEnd {
                     break;
                 }
                 if should_block {
+                    if self.nonblock.load(Ordering::Relaxed) {
+                        return usize::MAX - 1; // EAGAIN sentinel
+                    }
+                    if has_pending_unmasked_signal(true) {
+                        return usize::MAX; // EINTR sentinel
+                    }
                     suspend_current_and_run_next();
                 }
             }
@@ -225,6 +230,12 @@ impl File for PipeEnd {
                     break;
                 }
                 if should_block {
+                    if self.nonblock.load(Ordering::Relaxed) {
+                        return Err(EAGAIN_ERRNO);
+                    }
+                    if has_pending_unmasked_signal(true) {
+                        return Ok(usize::MAX);
+                    }
                     suspend_current_and_run_next();
                 }
             }
