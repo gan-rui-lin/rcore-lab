@@ -21,7 +21,7 @@ const PATH_ENV: &[u8] = b"PATH=/bin:/usr/bin:/musl:/glibc\0";
 const LD_LIB_MUSL: &[u8] = b"LD_LIBRARY_PATH=/musl/lib\0";
 const LD_LIB_GLIBC: &[u8] = b"LD_LIBRARY_PATH=/glibc/lib\0";
 const TEST_LIBC_ROOTS: [&str; 2] = ["/musl", "/glibc"];
-const TEST_SUITES: [&str; 2] = [
+const TEST_SUITES: [&str; 3] = [
     "basic",
     // "busybox",
     // "cyclictest",
@@ -31,7 +31,7 @@ const TEST_SUITES: [&str; 2] = [
     // "libctest",
     // "lmbench",
     "lmbench",
-    // "ltp",
+    "ltp",
     // "basic",
     // "lua",
     // "netperf",
