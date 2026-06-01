@@ -35,8 +35,10 @@ pub const ENOTEMPTY: isize = 39;
 pub const ELOOP: isize = 40;
 pub const ENOMSG: isize = 42;
 pub const ENODATA: isize = 61;
+pub const EOVERFLOW: isize = 75;
 pub const ENOTSUP: isize = 95;
 pub const ETIMEDOUT: isize = 110;
+pub const ESTALE: isize = 116;
 
 #[inline]
 pub const fn errno(code: isize) -> isize {

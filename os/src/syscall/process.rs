@@ -46,6 +46,8 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new((String::from("rcore"), String::from("ruos"))) };
     static ref SCHED_POLICIES: UPIntrFreeCell<BTreeMap<usize, i32>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref PERSONALITY_STATE: UPIntrFreeCell<BTreeMap<usize, usize>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
 }
 
 #[allow(dead_code)]
@@ -5202,6 +5204,16 @@ pub fn sys_rt_sigtimedwait(
 
 pub fn sys_membarrier(_cmd: isize, _flags: isize) -> isize {
     0
+}
+
+pub fn sys_personality(persona: usize) -> isize {
+    let pid = current_process().pid.0;
+    let mut state = PERSONALITY_STATE.exclusive_access();
+    let old = *state.get(&pid).unwrap_or(&0);
+    if persona != usize::MAX && persona != u32::MAX as usize {
+        state.insert(pid, persona);
+    }
+    old as isize
 }
 
 pub fn sys_unshare(flags: usize) -> isize {

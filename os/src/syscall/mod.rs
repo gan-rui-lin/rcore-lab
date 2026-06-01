@@ -14,6 +14,8 @@
 const SYSCALL_CAPGET: usize = 90;
 /// capset syscall
 const SYSCALL_CAPSET: usize = 91;
+/// personality syscall
+const SYSCALL_PERSONALITY: usize = 92;
 /// getcwd syscall
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_SETXATTR: usize = 5;
@@ -144,6 +146,10 @@ const SYSCALL_RENAMEAT2: usize = 276;
 const SYSCALL_GETRANDOM: usize = 278;
 /// memfd_create syscall
 const SYSCALL_MEMFD_CREATE: usize = 279;
+/// name_to_handle_at syscall
+const SYSCALL_NAME_TO_HANDLE_AT: usize = 264;
+/// open_by_handle_at syscall
+const SYSCALL_OPEN_BY_HANDLE_AT: usize = 265;
 /// exit syscall
 const SYSCALL_EXIT: usize = 93;
 /// exit_group syscall
@@ -515,6 +521,7 @@ const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (87, "timerfd_gettime"),
     (88, "symlink/utimensat"),
     (89, "acct"),
+    (92, "personality"),
     (93, "exit"),
     (94, "exit_group"),
     (95, "waitid"),
@@ -637,6 +644,8 @@ const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (260, "wait4"),
     (261, "prlimit64"),
     (262, "fanotify_init"),
+    (264, "name_to_handle_at"),
+    (265, "open_by_handle_at"),
     (266, "clockadjtime"),
     (268, "setns"),
     (276, "renameat2"),
@@ -1132,6 +1141,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2] as u32),
         SYSCALL_MEMFD_CREATE => sys_memfd_create(args[0] as *const u8, args[1] as u32),
+        SYSCALL_NAME_TO_HANDLE_AT => sys_name_to_handle_at(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3] as *mut i32,
+            args[4] as u32,
+        ),
+        SYSCALL_OPEN_BY_HANDLE_AT => {
+            sys_open_by_handle_at(args[0], args[1] as *const u8, args[2] as u32)
+        }
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_ADJTIMEX => process::sys_adjtimex(args[0] as *mut u8),
         SYSCALL_PRCTL => process::sys_prctl(args[0], args[1], args[2], args[3], args[4]),
@@ -1143,6 +1162,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0], args[1] as *mut TimeSpec),
         SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_GET_TIME => sys_get_time(args[0] as *mut TimeVal, args[1]),
+        SYSCALL_PERSONALITY => process::sys_personality(args[0]),
         SYSCALL_PTRACE => sys_ptrace(args[0], args[1] as isize, args[2], args[3]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),

@@ -76,7 +76,11 @@ lazy_static! {
         unsafe { UPSafeCell::new(BTreeMap::new()) };
     static ref FLOCK_LOCKS: UPSafeCell<BTreeMap<String, (usize, usize)>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
+    static ref FILE_HANDLES: UPSafeCell<BTreeMap<u64, String>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
 }
+
+static NEXT_FILE_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 static GETRANDOM_STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
@@ -991,6 +995,163 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         }
         errno(ENOENT)
     }
+}
+
+const FILE_HANDLE_BYTES: u32 = 8;
+const MAX_FILE_HANDLE_BYTES: u32 = 128;
+const FILE_HANDLE_TYPE_PATH: i32 = 1;
+const CAP_DAC_READ_SEARCH: u64 = 1 << 2;
+
+fn read_file_handle_header(token: usize, handle: *const u8) -> Result<(u32, i32), isize> {
+    if handle.is_null() {
+        return Err(errno(EFAULT));
+    }
+    let mut header = [0u8; 8];
+    user_mem::copy_from_user(token, handle, &mut header, UserReadPolicy::StrictChecked)
+        .map_err(|_| errno(EFAULT))?;
+    let handle_bytes = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let handle_type = i32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    Ok((handle_bytes, handle_type))
+}
+
+fn write_handle_bytes(token: usize, handle: *mut u8, bytes: u32) -> isize {
+    match copy_to_user(token, handle, &bytes.to_le_bytes()) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
+}
+
+/// name_to_handle_at(2) minimal implementation for LTP error-path and reopen tests.
+pub fn sys_name_to_handle_at(
+    dirfd: isize,
+    pathname: *const u8,
+    handle: *mut u8,
+    mount_id: *mut i32,
+    flags: u32,
+) -> isize {
+    const AT_SYMLINK_FOLLOW: u32 = 0x400;
+    const SUPPORTED_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_FOLLOW;
+
+    let token = current_user_token();
+    if pathname.is_null() || handle.is_null() || mount_id.is_null() {
+        return errno(EFAULT);
+    }
+    if flags & !SUPPORTED_FLAGS != 0 {
+        return errno(EINVAL);
+    }
+    let Some(raw_path) = translated_str_checked(token, pathname) else {
+        return errno(EFAULT);
+    };
+    if raw_path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+        return errno(ENOENT);
+    }
+    if raw_path_too_long(&raw_path) {
+        return errno(ENAMETOOLONG);
+    }
+
+    let full_path = if raw_path.is_empty() {
+        match dirfd_base(dirfd) {
+            Ok(path) => path,
+            Err(err) => return err,
+        }
+    } else if raw_path.starts_with('/') {
+        normalize_path(&raw_path)
+    } else {
+        let base = match dirfd_base(dirfd) {
+            Ok(base) => base,
+            Err(err) => return err,
+        };
+        resolve_path(&base, &raw_path)
+    };
+
+    let (handle_bytes, _) = match read_file_handle_header(token, handle) {
+        Ok(header) => header,
+        Err(err) => return err,
+    };
+    if handle_bytes > MAX_FILE_HANDLE_BYTES {
+        return errno(EINVAL);
+    }
+    if handle_bytes < FILE_HANDLE_BYTES {
+        let ret = write_handle_bytes(token, handle, FILE_HANDLE_BYTES);
+        return if ret == 0 { errno(EOVERFLOW) } else { ret };
+    }
+
+    let full_path = match resolve_access_path(&full_path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if !path_exists_for_access(&full_path) {
+        return errno(ENOENT);
+    }
+
+    let id = NEXT_FILE_HANDLE.fetch_add(1, AtomicOrdering::Relaxed);
+    FILE_HANDLES
+        .exclusive_access()
+        .insert(id, full_path.clone());
+
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&FILE_HANDLE_BYTES.to_le_bytes());
+    out[4..8].copy_from_slice(&FILE_HANDLE_TYPE_PATH.to_le_bytes());
+    out[8..16].copy_from_slice(&id.to_le_bytes());
+    if let Err(err) = copy_to_user(token, handle, &out) {
+        return err;
+    }
+    let mount: i32 = 1;
+    if let Err(err) = copy_to_user(token, mount_id as *mut u8, &mount.to_le_bytes()) {
+        return err;
+    }
+    0
+}
+
+/// open_by_handle_at(2) minimal companion to sys_name_to_handle_at.
+pub fn sys_open_by_handle_at(mount_fd: usize, handle: *const u8, flags: u32) -> isize {
+    let token = current_user_token();
+    let (handle_bytes, handle_type) = match read_file_handle_header(token, handle) {
+        Ok(header) => header,
+        Err(err) => return err,
+    };
+    if handle_bytes != FILE_HANDLE_BYTES || handle_type != FILE_HANDLE_TYPE_PATH {
+        return errno(EINVAL);
+    }
+    if current_process().get_file(mount_fd).is_none() {
+        return errno(EBADF);
+    }
+    if (current_process().credentials_snapshot().cap_effective & CAP_DAC_READ_SEARCH) == 0 {
+        return errno(EPERM);
+    }
+    let mut id_bytes = [0u8; 8];
+    let data_ptr = unsafe { handle.add(8) };
+    if user_mem::copy_from_user(
+        token,
+        data_ptr,
+        &mut id_bytes,
+        UserReadPolicy::StrictChecked,
+    )
+    .is_err()
+    {
+        return errno(EFAULT);
+    }
+    let id = u64::from_le_bytes(id_bytes);
+    let Some(path) = FILE_HANDLES.exclusive_access().get(&id).cloned() else {
+        return errno(ESTALE);
+    };
+    if readlink_path(&path).is_some() {
+        return errno(ELOOP);
+    }
+    let mut open_flags = OpenFlags::from_bits_truncate(flags);
+    open_flags.remove(OpenFlags::CLOEXEC);
+    if open_flags
+        .intersects(OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::DIRECTORY | OpenFlags::PATH)
+    {
+        return errno(EINVAL);
+    }
+    let Some(file) = open_file(&path, open_flags) else {
+        return errno(ESTALE);
+    };
+    let Some(fd) = current_process().install_file(file) else {
+        return errno(EMFILE);
+    };
+    fd as isize
 }
 
 /// faccessat - check file existence/permissions
