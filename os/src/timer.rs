@@ -4,10 +4,11 @@
 
 pub use arch::{get_time, get_time_ms, get_time_us, set_next_trigger};
 
-use crate::sync::UPIntrFreeCell;
+use crate::sync::UPIntrRwLock;
 use crate::task::{wakeup_task, TaskControlBlock};
 use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use lazy_static::lazy_static;
@@ -43,25 +44,37 @@ impl Ord for TimerCondVar {
 }
 
 lazy_static! {
-    static ref TIMERS: UPIntrFreeCell<BinaryHeap<TimerCondVar>> =
-        unsafe { UPIntrFreeCell::new(BinaryHeap::<TimerCondVar>::new()) };
+    static ref TIMERS: UPIntrRwLock<BinaryHeap<TimerCondVar>> =
+        unsafe { UPIntrRwLock::new(BinaryHeap::<TimerCondVar>::new()) };
+}
+
+fn with_timers_read<R>(f: impl FnOnce(&BinaryHeap<TimerCondVar>) -> R) -> R {
+    let timers = TIMERS.read();
+    f(&timers)
+}
+
+fn with_timers_write<R>(f: impl FnOnce(&mut BinaryHeap<TimerCondVar>) -> R) -> R {
+    let mut timers = TIMERS.write();
+    f(&mut timers)
 }
 
 pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
-    let mut timers = TIMERS.exclusive_access();
-    timers.push(TimerCondVar { expire_ms, task });
+    with_timers_write(|timers| {
+        timers.push(TimerCondVar { expire_ms, task });
+    });
 }
 
 pub fn remove_timer(task: Arc<TaskControlBlock>) {
-    let mut timers = TIMERS.exclusive_access();
-    let mut temp = BinaryHeap::<TimerCondVar>::new();
-    for condvar in timers.drain() {
-        if Arc::as_ptr(&task) != Arc::as_ptr(&condvar.task) {
-            temp.push(condvar);
+    with_timers_write(|timers| {
+        let mut temp = BinaryHeap::<TimerCondVar>::new();
+        for condvar in timers.drain() {
+            if Arc::as_ptr(&task) != Arc::as_ptr(&condvar.task) {
+                temp.push(condvar);
+            }
         }
-    }
-    timers.clear();
-    timers.append(&mut temp);
+        timers.clear();
+        timers.append(&mut temp);
+    });
 }
 
 pub fn check_timer() {
@@ -74,16 +87,20 @@ pub fn check_timer() {
         );
     }
     let current_ms = get_time_ms();
-    let mut timers = TIMERS.exclusive_access();
-    while let Some(timer) = timers.peek() {
-        if timer.expire_ms <= current_ms {
-            wakeup_task(Arc::clone(&timer.task));
-            timers.pop();
-        } else {
-            break;
+    let mut expired = Vec::new();
+    with_timers_write(|timers| {
+        while let Some(timer) = timers.peek() {
+            if timer.expire_ms <= current_ms {
+                expired.push(Arc::clone(&timer.task));
+                timers.pop();
+            } else {
+                break;
+            }
         }
+    });
+    for task in expired {
+        wakeup_task(task);
     }
-    drop(timers);
     // Poll network stack from timer interrupt so loopback TCP packets
     // get delivered even when all user processes are blocked in recv().
     crate::net::poll_net_if_available();
@@ -96,41 +113,46 @@ fn check_itimers(current_ms: usize) {
     use crate::task::{pid2process_snapshot, wakeup_task, SignalFlags, TaskStatus};
     let procs = pid2process_snapshot();
     for (_pid, process) in procs {
-        // Use try_inner_exclusive_access to avoid deadlocking if the timer
+        // Use try_with_inner_mut to avoid deadlocking if the timer
         // interrupt fires while someone holds this process's inner lock.
-        let mut inner = match process.try_inner_exclusive_access() {
-            Some(inner) => inner,
-            None => continue,
-        };
-        let expire = inner.itimer_real_expire_ms;
-        if expire != 0 && expire <= current_ms {
-            // Fire SIGALRM
-            log::warn!("[itimer] pid={} SIGALRM fired, expire={} now={}", _pid, expire, current_ms);
-            inner.signal_pending |= SignalFlags::SIGALRM;
-            // Reload interval or disarm
-            if inner.itimer_real_interval_ms > 0 {
-                inner.itimer_real_expire_ms = current_ms + inner.itimer_real_interval_ms;
-            } else {
-                inner.itimer_real_expire_ms = 0;
-            }
-            
-            // Wake up any blocked tasks in this process so they can handle the signal
-            for task_opt in inner.tasks.iter() {
-                if let Some(task) = task_opt {
-                    let mut task_inner = task.inner_exclusive_access();
-                    if task_inner.task_status == TaskStatus::Blocked {
-                        task_inner.interrupted_by_signal = true;
-                        task_inner.task_status = TaskStatus::Ready;
-                        drop(task_inner);
-                        wakeup_task(task.clone());
-                        log::info!("[itimer] pid={} woke blocked task", _pid);
-                    }
+        let expire = match process.try_with_timers_mut(|timers| {
+            let expire = timers.itimer_real_expire_ms;
+            if expire != 0 && expire <= current_ms {
+                // Reload interval or disarm
+                if timers.itimer_real_interval_ms > 0 {
+                    timers.itimer_real_expire_ms = current_ms + timers.itimer_real_interval_ms;
+                } else {
+                    timers.itimer_real_expire_ms = 0;
                 }
+                Some(expire)
+            } else {
+                None
+            }
+        }) {
+            Some(Some(expire)) => expire,
+            _ => continue,
+        };
+        // Fire SIGALRM
+        log::warn!(
+            "[itimer] pid={} SIGALRM fired, expire={} now={}",
+            _pid,
+            expire,
+            current_ms
+        );
+        process.insert_process_signal(SignalFlags::SIGALRM, 0, 0);
+
+        // Wake up any blocked tasks in this process so they can handle the signal
+        for task in process.tasks_snapshot() {
+            if task.status() == TaskStatus::Blocked {
+                task.mark_interrupted();
+                task.set_status(TaskStatus::Ready);
+                wakeup_task(task.clone());
+                log::info!("[itimer] pid={} woke blocked task", _pid);
             }
         }
     }
 }
 
 pub fn timer_len() -> usize {
-    TIMERS.exclusive_access().len()
+    with_timers_read(|timers| timers.len())
 }

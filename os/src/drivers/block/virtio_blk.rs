@@ -1,14 +1,11 @@
 use super::BlockDevice;
-use crate::board::VIRTIO_BLK;
 use crate::drivers::bus::virtio::VirtioHal;
 use crate::sync::{Condvar, UPIntrFreeCell};
 use crate::task::schedule;
 use crate::DEV_NON_BLOCKING_ACCESS;
 use alloc::collections::BTreeMap;
+use arch::DeviceKind;
 use virtio_drivers::{BlkResp, Error as VirtIOError, RespStatus, VirtIOBlk, VirtIOHeader};
-
-#[allow(unused)]
-const VIRTIO0: usize = VIRTIO_BLK;
 
 /// VirtIO block device wrapper with interrupt-driven I/O support.
 pub struct VirtIOBlock {
@@ -41,7 +38,7 @@ impl BlockDevice for VirtIOBlock {
                 let mut resp = BlkResp::default();
                 let task_cx_ptr = self.virtio_blk.exclusive_session(|blk| {
                     match unsafe { blk.read_block_nb(block_id, buf, &mut resp) } {
-                        Ok(token) => self.condvars.get(&token).map(|condvar| condvar.wait_no_sched()),
+                        Ok(token) => Some(self.condvars.get(&token).expect("virtio-blk token without condvar").wait_no_sched()),
                         Err(err) => {
                             warn!(
                                 "virtio-blk nb read failed, fallback to blocking: block_id={} err={:?}",
@@ -63,6 +60,8 @@ impl BlockDevice for VirtIOBlock {
                     }
                     return;
                 }
+                self.read_block_blocking_retry(block_id, buf);
+                return;
             }
         } else {
             self.read_block_blocking_retry(block_id, buf);
@@ -90,7 +89,7 @@ impl BlockDevice for VirtIOBlock {
                 let mut resp = BlkResp::default();
                 let task_cx_ptr = self.virtio_blk.exclusive_session(|blk| {
                     match unsafe { blk.write_block_nb(block_id, buf, &mut resp) } {
-                        Ok(token) => self.condvars.get(&token).map(|condvar| condvar.wait_no_sched()),
+                        Ok(token) => Some(self.condvars.get(&token).expect("virtio-blk token without condvar").wait_no_sched()),
                         Err(err) => {
                             warn!(
                                 "virtio-blk nb write failed, fallback to blocking: block_id={} err={:?}",
@@ -112,6 +111,8 @@ impl BlockDevice for VirtIOBlock {
                     }
                     return;
                 }
+                self.write_block_blocking_retry(block_id, buf);
+                return;
             }
         } else {
             self.write_block_blocking_retry(block_id, buf);
@@ -191,9 +192,13 @@ impl VirtIOBlock {
 impl VirtIOBlock {
     /// Create a new VirtIO block device wrapper.
     pub fn new() -> Self {
+        let base = arch::platform_config()
+            .device(DeviceKind::Block)
+            .and_then(|device| device.mmio_base())
+            .expect("VirtIO block MMIO base missing from platform config");
         let virtio_blk = unsafe {
             UPIntrFreeCell::new(
-                VirtIOBlk::<VirtioHal>::new(&mut *(VIRTIO0 as *mut VirtIOHeader)).unwrap(),
+                VirtIOBlk::<VirtioHal>::new(&mut *(base as *mut VirtIOHeader)).unwrap(),
             )
         };
         let mut condvars = BTreeMap::new();

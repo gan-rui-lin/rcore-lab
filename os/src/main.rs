@@ -32,6 +32,8 @@ pub mod lang_items;
 pub mod mm;
 /// Network subsystem (smoltcp-based, loopback on all arches, external net on RISC-V).
 pub mod net;
+/// Platform-level IRQ and device dispatch.
+pub mod platform;
 pub mod sync;
 pub mod syscall;
 pub mod task;

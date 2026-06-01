@@ -1,4 +1,4 @@
-use crate::sync::UPIntrFreeCell;
+use crate::sync::UPIntrRwLock;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
@@ -13,6 +13,50 @@ use super::ext4::Ext4Fs;
 pub enum VfsNodeKind {
     File,
     Dir,
+    Symlink,
+    Char,
+    Block,
+    Fifo,
+    Socket,
+    Unknown,
+}
+
+impl Default for VfsNodeKind {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VfsMetadata {
+    pub kind: VfsNodeKind,
+    pub dev: u64,
+    pub ino: u64,
+    pub mode: u32,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u64,
+    pub size: u64,
+    pub blksize: u32,
+    pub blocks: u64,
+    pub atime_sec: i64,
+    pub mtime_sec: i64,
+    pub ctime_sec: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VfsStatFs {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
 }
 
 pub trait VfsInode: Send + Sync {
@@ -52,6 +96,58 @@ pub trait VfsInode: Send + Sync {
     fn list(&self) -> Vec<String>;
     fn size(&self) -> usize {
         0
+    }
+
+    fn metadata(&self) -> Option<VfsMetadata> {
+        None
+    }
+
+    fn chmod(&self, _mode: u32) -> Result<(), isize> {
+        Err(-95)
+    }
+
+    fn chown(&self, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), isize> {
+        Err(-95)
+    }
+
+    fn utimens(&self, _atime_sec: Option<i64>, _mtime_sec: Option<i64>) -> Result<(), isize> {
+        Err(-95)
+    }
+
+    fn link_to(&self, _new_path: &str) -> Result<(), isize> {
+        Err(-95)
+    }
+
+    fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn VfsInode>, isize> {
+        Err(-95)
+    }
+
+    fn readlink(&self) -> Result<Vec<u8>, isize> {
+        Err(-95)
+    }
+
+    fn mknod(&self, _name: &str, _mode: u32, _dev: u32) -> Result<Arc<dyn VfsInode>, isize> {
+        Err(-95)
+    }
+
+    fn setxattr(&self, _name: &str, _value: &[u8]) -> Result<(), isize> {
+        Err(-95)
+    }
+
+    fn getxattr(&self, _name: &str) -> Result<Vec<u8>, isize> {
+        Err(-95)
+    }
+
+    fn listxattr(&self) -> Result<Vec<u8>, isize> {
+        Err(-95)
+    }
+
+    fn removexattr(&self, _name: &str) -> Result<(), isize> {
+        Err(-95)
+    }
+
+    fn statfs(&self) -> Option<VfsStatFs> {
+        None
     }
 
     fn is_dir(&self) -> bool {
@@ -97,6 +193,13 @@ impl Dentry {
 struct MountPoint {
     path: String,
     root: Arc<dyn VfsInode>,
+    #[cfg(feature = "ext4")]
+    _ext4_guard: Option<Arc<Ext4Fs>>,
+}
+
+struct MountSnapshot {
+    root: Arc<dyn VfsInode>,
+    rel: String,
     #[cfg(feature = "ext4")]
     _ext4_guard: Option<Arc<Ext4Fs>>,
 }
@@ -162,6 +265,22 @@ impl Vfs {
         }
     }
 
+    #[cfg(feature = "ext4")]
+    pub(crate) fn ext4_guards_snapshot(&self) -> Vec<Arc<Ext4Fs>> {
+        self.mounts
+            .iter()
+            .filter_map(|mount| mount._ext4_guard.as_ref().cloned())
+            .collect()
+    }
+
+    #[cfg(feature = "ext4")]
+    pub(crate) fn take_ext4_guards(&mut self) -> Vec<Arc<Ext4Fs>> {
+        self.mounts
+            .iter_mut()
+            .filter_map(|mount| mount._ext4_guard.take())
+            .collect()
+    }
+
     fn resolve_mount<'a>(&'a self, path: &'a str) -> Option<(&'a MountPoint, &'a str)> {
         let mut best: Option<&MountPoint> = None;
         for mount in &self.mounts {
@@ -185,60 +304,102 @@ impl Vfs {
         Some((mount, rel))
     }
 
-    fn resolve_inner(&self, path: &str, log_missing: bool) -> Option<Arc<dyn VfsInode>> {
-        let path = normalize_path(path);
-        let (mount, rel) = self.resolve_mount(&path)?;
-        let mut current = mount.root.clone();
-        if rel.is_empty() {
-            return Some(current);
-        }
-        trace!("vfs: resolve path={} rel={}", path, rel);
-        for comp in rel.split('/').filter(|s| !s.is_empty()) {
-            match current.lookup(comp) {
-                Some(next) => current = next,
-                None => {
-                    if log_missing {
-                        error!("vfs: resolve failed at {} for {}", comp, path);
-                    }
-                    return None;
-                }
-            }
-        }
-        Some(current)
-    }
-
-    pub(crate) fn resolve(&self, path: &str) -> Option<Arc<dyn VfsInode>> {
-        self.resolve_inner(path, true)
-    }
-
-    pub(crate) fn resolve_quiet(&self, path: &str) -> Option<Arc<dyn VfsInode>> {
-        self.resolve_inner(path, false)
-    }
-
-    pub(crate) fn resolve_parent(&self, path: &str) -> Option<(Arc<dyn VfsInode>, String)> {
-        let path = normalize_path(path);
-        if path == "/" {
-            return None;
-        }
-        let mut comps: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        let name = comps.pop()?.to_string();
-        let parent_path = if comps.is_empty() {
-            String::from("/")
-        } else {
-            format!("/{}", comps.join("/"))
-        };
-        let parent = self.resolve(&parent_path)?;
-        Some((parent, name))
-    }
-
-    pub(crate) fn root_inode(&self) -> Option<Arc<dyn VfsInode>> {
-        self.resolve("/")
+    fn resolve_mount_snapshot(&self, path: &str) -> Option<MountSnapshot> {
+        let (mount, rel) = self.resolve_mount(path)?;
+        Some(MountSnapshot {
+            root: mount.root.clone(),
+            rel: rel.to_string(),
+            #[cfg(feature = "ext4")]
+            _ext4_guard: mount._ext4_guard.clone(),
+        })
     }
 }
 
+// Global mount table.
+// Locking rules: keep the scope short and never hold this lock across inode operations.
 lazy_static! {
-    pub(crate) static ref ROOT_VFS: UPIntrFreeCell<Vfs> =
-        unsafe { UPIntrFreeCell::new(Vfs::new()) };
+    pub(crate) static ref ROOT_VFS: UPIntrRwLock<Vfs> = unsafe { UPIntrRwLock::new(Vfs::new()) };
+}
+
+pub(crate) fn with_root_vfs_read<R>(f: impl FnOnce(&Vfs) -> R) -> R {
+    let vfs = ROOT_VFS.read();
+    f(&vfs)
+}
+
+pub(crate) fn with_root_vfs_write<R>(f: impl FnOnce(&mut Vfs) -> R) -> R {
+    let mut vfs = ROOT_VFS.write();
+    f(&mut vfs)
+}
+
+fn resolve_mount_snapshot(path: &str) -> Option<MountSnapshot> {
+    let path = normalize_path(path);
+    with_root_vfs_read(|vfs| vfs.resolve_mount_snapshot(&path))
+}
+
+fn resolve_from_snapshot(
+    snapshot: MountSnapshot,
+    path: &str,
+    log_missing: bool,
+) -> Option<Arc<dyn VfsInode>> {
+    let mut current = snapshot.root;
+    if snapshot.rel.is_empty() {
+        return Some(current);
+    }
+    trace!("vfs: resolve path={} rel={}", path, snapshot.rel);
+    for comp in snapshot.rel.split('/').filter(|s| !s.is_empty()) {
+        match current.lookup(comp) {
+            Some(next) => current = next,
+            None => {
+                if log_missing {
+                    error!("vfs: resolve failed at {} for {}", comp, path);
+                }
+                return None;
+            }
+        }
+    }
+    Some(current)
+}
+
+pub(crate) fn resolve_inode_quiet(path: &str) -> Option<Arc<dyn VfsInode>> {
+    let path = normalize_path(path);
+    let snapshot = resolve_mount_snapshot(&path)?;
+    resolve_from_snapshot(snapshot, &path, false)
+}
+
+pub(crate) fn resolve_inode(path: &str) -> Option<Arc<dyn VfsInode>> {
+    let path = normalize_path(path);
+    let snapshot = resolve_mount_snapshot(&path)?;
+    resolve_from_snapshot(snapshot, &path, true)
+}
+
+pub(crate) fn resolve_parent_inode(path: &str) -> Option<(Arc<dyn VfsInode>, String)> {
+    let path = normalize_path(path);
+    if path == "/" {
+        return None;
+    }
+    let mut comps: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let name = comps.pop()?.to_string();
+    let parent_path = if comps.is_empty() {
+        String::from("/")
+    } else {
+        format!("/{}", comps.join("/"))
+    };
+    let parent = resolve_inode(parent_path.as_str())?;
+    Some((parent, name))
+}
+
+pub(crate) fn root_inode_snapshot() -> Option<Arc<dyn VfsInode>> {
+    resolve_inode("/")
+}
+
+#[cfg(feature = "ext4")]
+pub(crate) fn ext4_guards_snapshot() -> Vec<Arc<Ext4Fs>> {
+    with_root_vfs_read(|vfs| vfs.ext4_guards_snapshot())
+}
+
+#[cfg(feature = "ext4")]
+pub(crate) fn take_ext4_guards() -> Vec<Arc<Ext4Fs>> {
+    with_root_vfs_write(|vfs| vfs.take_ext4_guards())
 }
 
 struct NullInode;

@@ -9,6 +9,8 @@ use alloc::vec::Vec;
 use bitflags::bitflags;
 use lazy_static::lazy_static;
 
+#[cfg(not(target_arch = "loongarch64"))]
+use crate::task::SA_RESTORER;
 use crate::{
     fs::{open_file, path_exists, path_is_dir, File, OpenFlags},
     mm::{
@@ -20,15 +22,12 @@ use crate::{
         exit_current_and_run_next, flags_to_user_mask, futex_remove_waiter,
         futex_remove_waiter_any, futex_requeue, futex_wait, futex_wait_bitset, futex_wake,
         futex_wake_bitset, pid2process, pid2process_snapshot, remove_from_pid2process,
-        suspend_current_and_run_next,
-        user_mask_to_flags, ChildWaitEvent, FutexKey, IntervalTimerState, RLimit, SignalAction,
-        SignalFlags, TaskControlBlock, TaskStatus, UserContext, MAX_SIG, RLIMIT_NLIMITS, SIGCHLD,
-        SIGCONT, SIGKILL, SIGSEGV, SIGSTOP,
+        suspend_current_and_run_next, user_mask_to_flags, ChildWaitEvent, FutexKey,
+        IntervalTimerState, RLimit, SignalAction, SignalFlags, TaskControlBlock, TaskStatus,
+        UserContext, MAX_SIG, RLIMIT_NLIMITS, SIGCHLD, SIGCONT, SIGKILL, SIGSEGV, SIGSTOP,
     },
     timer::{add_timer, get_time, get_time_ms, get_time_us, remove_timer},
 };
-#[cfg(not(target_arch = "loongarch64"))]
-use crate::task::SA_RESTORER;
 
 use arch::TrapFrameArgs;
 
@@ -41,10 +40,8 @@ use crate::sync::UPIntrFreeCell;
 lazy_static! {
     static ref EXEC_IMAGE_CACHE: UPIntrFreeCell<BTreeMap<String, Arc<[u8]>>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
-    static ref UMASK_STATE: UPIntrFreeCell<usize> =
-        unsafe { UPIntrFreeCell::new(0o022) };
-    static ref REALTIME_OFFSET_US: UPIntrFreeCell<i64> =
-        unsafe { UPIntrFreeCell::new(0) };
+    static ref UMASK_STATE: UPIntrFreeCell<usize> = unsafe { UPIntrFreeCell::new(0o022) };
+    static ref REALTIME_OFFSET_US: UPIntrFreeCell<i64> = unsafe { UPIntrFreeCell::new(0) };
     static ref UTS_STATE: UPIntrFreeCell<(String, String)> =
         unsafe { UPIntrFreeCell::new((String::from("rcore"), String::from("ruos"))) };
     static ref SCHED_POLICIES: UPIntrFreeCell<BTreeMap<usize, i32>> =
@@ -315,13 +312,11 @@ pub fn sys_futex(
         pa
     };
     let key = FutexKey::new(key_addr, pid);
-    let name = current_process().inner_exclusive_access().name.clone();
+    let name = current_process().name();
     if matches!(cmd, FutexCmd::FUTEX_WAIT | FutexCmd::FUTEX_WAIT_BITSET)
         && name == "entry-static.exe"
     {
-        let tid = current_task()
-            .and_then(|task| task.inner_exclusive_access().res.as_ref().map(|r| r.tid))
-            .unwrap_or(0);
+        let tid = current_task().map(|task| task.tid()).unwrap_or(0);
         info!(
             "[sys_futex] pid={} tid={} name={} cmd={:?} uaddr1={:#x} pa={:#x} private={} val={}",
             pid_now, tid, name, cmd, uaddr1 as usize, pa.0, private, val
@@ -387,21 +382,35 @@ pub fn sys_futex(
             }
             if ret == errno(EINTR) {
                 let process = current_process();
-                let process_pending = process.inner_exclusive_access().signal_pending;
+                let process_pending = process.pending_signal();
                 let (tid, mask, task_pending, handling_sig, interrupted_by_signal, sepc, ra, tp) =
                     match current_task() {
                         Some(task) => {
-                            let task_inner = task.inner_exclusive_access();
-                            let trap_cx = task_inner.get_trap_cx();
+                            let (mask, task_pending, handling_sig, interrupted_by_signal) = task
+                                .with_signals(|signals| {
+                                    (
+                                        signals.signal_mask,
+                                        signals.signal_pending,
+                                        signals.handling_sig,
+                                        signals.interrupted_by_signal,
+                                    )
+                                });
+                            let (sepc, ra, tp) = task.with_trap_cx_mut(|trap_cx| {
+                                (
+                                    trap_cx.sepc,
+                                    trap_cx[TrapFrameArgs::RA],
+                                    trap_cx[TrapFrameArgs::TLS],
+                                )
+                            });
                             (
-                                task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
-                                task_inner.signal_mask,
-                                task_inner.signal_pending,
-                                task_inner.handling_sig,
-                                task_inner.interrupted_by_signal,
-                                trap_cx.sepc,
-                                trap_cx[TrapFrameArgs::RA],
-                                trap_cx[TrapFrameArgs::TLS],
+                                task.tid(),
+                                mask,
+                                task_pending,
+                                handling_sig,
+                                interrupted_by_signal,
+                                sepc,
+                                ra,
+                                tp,
                             )
                         }
                         None => (
@@ -556,21 +565,35 @@ pub fn sys_futex(
             }
             if ret == errno(EINTR) {
                 let process = current_process();
-                let process_pending = process.inner_exclusive_access().signal_pending;
+                let process_pending = process.pending_signal();
                 let (tid, mask, task_pending, handling_sig, interrupted_by_signal, sepc, ra, tp) =
                     match current_task() {
                         Some(task) => {
-                            let task_inner = task.inner_exclusive_access();
-                            let trap_cx = task_inner.get_trap_cx();
+                            let (mask, task_pending, handling_sig, interrupted_by_signal) = task
+                                .with_signals(|signals| {
+                                    (
+                                        signals.signal_mask,
+                                        signals.signal_pending,
+                                        signals.handling_sig,
+                                        signals.interrupted_by_signal,
+                                    )
+                                });
+                            let (sepc, ra, tp) = task.with_trap_cx_mut(|trap_cx| {
+                                (
+                                    trap_cx.sepc,
+                                    trap_cx[TrapFrameArgs::RA],
+                                    trap_cx[TrapFrameArgs::TLS],
+                                )
+                            });
                             (
-                                task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0),
-                                task_inner.signal_mask,
-                                task_inner.signal_pending,
-                                task_inner.handling_sig,
-                                task_inner.interrupted_by_signal,
-                                trap_cx.sepc,
-                                trap_cx[TrapFrameArgs::RA],
-                                trap_cx[TrapFrameArgs::TLS],
+                                task.tid(),
+                                mask,
+                                task_pending,
+                                handling_sig,
+                                interrupted_by_signal,
+                                sepc,
+                                ra,
+                                tp,
                             )
                         }
                         None => (
@@ -630,7 +653,7 @@ pub fn sys_exit(exit_code: i32) -> ! {
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_exit", pid);
     }
-    let name = current_process().inner_exclusive_access().name.clone();
+    let name = current_process().name();
     if pid == 4 || name == "sh" {
         trace!(
             "[sys_exit] pid={} name={} code={} sepc={:#x}",
@@ -657,8 +680,7 @@ pub fn sys_getpid() -> isize {
 
 pub fn sys_getppid() -> isize {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if let Some(parent) = inner.parent.as_ref().and_then(|p| p.upgrade()) {
+    if let Some(parent) = process.parent() {
         parent.pid.0 as isize
     } else {
         0
@@ -668,9 +690,10 @@ pub fn sys_getppid() -> isize {
 pub fn sys_setsid() -> isize {
     let process = current_process();
     let pid = process.pid.0;
-    let mut inner = process.inner_exclusive_access();
-    inner.session_id = pid;
-    inner.pgid = pid;
+    process.with_identity_mut(|identity| {
+        identity.session_id = pid;
+        identity.pgid = pid;
+    });
     pid as isize
 }
 
@@ -687,52 +710,40 @@ pub fn sys_setpgid(pid: isize, pgid: isize) -> isize {
     };
 
     if target_pid != current_pid {
-        let parent_pid = target
-            .inner_exclusive_access()
-            .parent
-            .as_ref()
-            .and_then(|p| p.upgrade())
-            .map(|p| p.pid.0);
+        let parent_pid = target.parent().map(|p| p.pid.0);
         if parent_pid != Some(current_pid) {
             return errno(ESRCH);
         }
     }
 
-    let current_session = process.inner_exclusive_access().session_id;
-    let target_session = target.inner_exclusive_access().session_id;
+    let current_session = process.session_id();
+    let target_session = target.session_id();
     if current_session != target_session {
         return errno(EPERM);
     }
     if target_pgid != target_pid {
         let group_exists = pid2process(target_pgid)
-            .map(|leader| {
-                let inner = leader.inner_exclusive_access();
-                inner.session_id == current_session && inner.pgid == target_pgid
-            })
+            .map(|leader| leader.session_id() == current_session && leader.pgid() == target_pgid)
             .unwrap_or(false);
         if !group_exists {
             return errno(EPERM);
         }
     }
-    target.inner_exclusive_access().pgid = target_pgid;
+    target.set_pgid(target_pgid);
     0
 }
 
 pub fn sys_getpgid(pid: isize) -> isize {
     let process = current_process();
     if pid == 0 || pid as usize == process.pid.0 {
-        let inner = process.inner_exclusive_access();
-        inner.pgid as isize
+        process.pgid() as isize
     } else if pid < 0 {
         // Negative pid: no process can have a negative pid → ESRCH.
         errno(ESRCH)
     } else {
         // Look up target process; return ESRCH if it doesn't exist.
         match pid2process(pid as usize) {
-            Some(target) => {
-                let inner = target.inner_exclusive_access();
-                inner.pgid as isize
-            }
+            Some(target) => target.pgid() as isize,
             None => errno(ESRCH),
         }
     }
@@ -741,17 +752,13 @@ pub fn sys_getpgid(pid: isize) -> isize {
 pub fn sys_getsid(pid: isize) -> isize {
     let process = current_process();
     if pid == 0 || pid as usize == process.pid.0 {
-        let inner = process.inner_exclusive_access();
-        inner.session_id as isize
+        process.session_id() as isize
     } else if pid < 0 {
         errno(EINVAL)
     } else {
         // Look up target process; return ESRCH if it doesn't exist.
         match pid2process(pid as usize) {
-            Some(target) => {
-                let inner = target.inner_exclusive_access();
-                inner.session_id as isize
-            }
+            Some(target) => target.session_id() as isize,
             None => errno(ESRCH),
         }
     }
@@ -764,20 +771,20 @@ pub fn sys_fork() -> isize {
     let current_process = current_process();
     let new_process = current_process.fork();
     let new_pid = new_process.pid.0;
-    let new_task = new_process.inner_exclusive_access().get_task(0);
+    let new_task = new_process.get_task(0);
     let parent_cx = *current_trap_cx();
     let clone_stack = parent_cx[TrapFrameArgs::ARG1];
-    let new_task_inner = new_task.inner_exclusive_access();
-    let trap_cx = new_task_inner.get_trap_cx();
-    *trap_cx = parent_cx;
-    trap_cx[TrapFrameArgs::RET] = 0;
-    #[cfg(target_arch = "loongarch64")]
-    if trap_cx[TrapFrameArgs::TLS] == 0 {
-        trap_cx[TrapFrameArgs::TLS] = 0x7000_1000;
-    }
-    if clone_stack != 0 {
-        trap_cx[TrapFrameArgs::SP] = clone_stack;
-    }
+    new_task.with_trap_cx_mut(|trap_cx| {
+        *trap_cx = parent_cx;
+        trap_cx[TrapFrameArgs::RET] = 0;
+        #[cfg(target_arch = "loongarch64")]
+        if trap_cx[TrapFrameArgs::TLS] == 0 {
+            trap_cx[TrapFrameArgs::TLS] = 0x7000_1000;
+        }
+        if clone_stack != 0 {
+            trap_cx[TrapFrameArgs::SP] = clone_stack;
+        }
+    });
     new_pid as isize
 }
 
@@ -806,7 +813,9 @@ pub fn sys_clone3(args_ptr: *const u8, size: usize) -> isize {
     }
 
     let exit_signal = args.exit_signal as i32;
-    if args.exit_signal > 0xff || (exit_signal != 0 && (exit_signal <= 0 || exit_signal > MAX_SIG as i32)) {
+    if args.exit_signal > 0xff
+        || (exit_signal != 0 && (exit_signal <= 0 || exit_signal > MAX_SIG as i32))
+    {
         return errno(EINVAL);
     }
 
@@ -861,20 +870,19 @@ pub fn sys_clone(
     let parent_cx = *current_trap_cx();
 
     if !clone_flags.contains(CloneFlags::THREAD) {
-        let has_extended_clone_semantics =
-            clone_flags.intersects(
-                CloneFlags::PARENT
-                    | CloneFlags::VFORK
-                    | CloneFlags::PARENT_SETTID
-                    | CloneFlags::CHILD_CLEARTID
-                    | CloneFlags::CHILD_SETTID
-                    | CloneFlags::SETTLS
-                    | CloneFlags::VM
-                    | CloneFlags::FS
-                    | CloneFlags::FILES
-                    | CloneFlags::SIGHAND
-                    | CloneFlags::SYSVSEM,
-            ) || !stack.is_null();
+        let has_extended_clone_semantics = clone_flags.intersects(
+            CloneFlags::PARENT
+                | CloneFlags::VFORK
+                | CloneFlags::PARENT_SETTID
+                | CloneFlags::CHILD_CLEARTID
+                | CloneFlags::CHILD_SETTID
+                | CloneFlags::SETTLS
+                | CloneFlags::VM
+                | CloneFlags::FS
+                | CloneFlags::FILES
+                | CloneFlags::SIGHAND
+                | CloneFlags::SYSVSEM,
+        ) || !stack.is_null();
         if !has_extended_clone_semantics {
             return sys_fork();
         }
@@ -883,58 +891,46 @@ pub fn sys_clone(
         let new_process = current.fork();
         let new_pid = new_process.pid.0;
         if clone_flags.contains(CloneFlags::VM) && clone_flags.contains(CloneFlags::VFORK) {
-            new_process.inner_exclusive_access().vfork_vm_parent = Some(Arc::downgrade(&current));
+            new_process.set_vfork_parent(Some(Arc::downgrade(&current)));
         }
 
-        let new_task = new_process.inner_exclusive_access().get_task(0);
-        {
-            let new_task_inner = new_task.inner_exclusive_access();
-            let trap_cx = new_task_inner.get_trap_cx();
+        let new_task = new_process.get_task(0);
+        new_task.with_trap_cx_mut(|trap_cx| {
             *trap_cx = parent_cx;
             trap_cx[TrapFrameArgs::RET] = 0;
             if !stack.is_null() {
                 trap_cx[TrapFrameArgs::SP] = stack as usize;
             }
-        }
+        });
 
         if clone_flags.contains(CloneFlags::CHILD_CLEARTID) && !ctid.is_null() {
-            let mut inner = new_task.inner_exclusive_access();
-            inner.clear_child_tid = ctid as usize;
+            new_task.set_clear_child_tid(ctid as usize);
         }
 
         if clone_flags.contains(CloneFlags::PARENT_SETTID) && !ptid.is_null() {
             let parent_token = current_user_token();
             *translated_refmut(parent_token, ptid) = new_pid as i32;
             // Make sure child can observe the same value as Linux clone semantics.
-            let child_token = new_process.inner_exclusive_access().memory_set.token();
+            let child_token = new_process.get_user_token();
             *translated_refmut(child_token, ptid) = new_pid as i32;
         }
         if clone_flags.contains(CloneFlags::CHILD_SETTID) && !ctid.is_null() {
-            let child_token = new_process.inner_exclusive_access().memory_set.token();
+            let child_token = new_process.get_user_token();
             *translated_refmut(child_token, ctid) = new_pid as i32;
         }
 
         if clone_flags.contains(CloneFlags::PARENT) {
-            let parent_weak = current.inner_exclusive_access().parent.clone();
-            {
-                let mut cur_inner = current.inner_exclusive_access();
-                cur_inner.children.retain(|c| c.pid.0 != new_pid);
-            }
-            {
-                let mut child_inner = new_process.inner_exclusive_access();
-                child_inner.parent = parent_weak.clone();
-            }
+            let parent_weak = current.parent_weak();
+            current.remove_child_by_pid(new_pid);
+            new_process.set_parent(parent_weak.clone());
             if let Some(parent) = parent_weak.and_then(|p| p.upgrade()) {
-                parent
-                    .inner_exclusive_access()
-                    .children
-                    .push(Arc::clone(&new_process));
+                parent.push_child(Arc::clone(&new_process));
             }
         }
 
         if clone_flags.contains(CloneFlags::VFORK) {
             loop {
-                if new_process.inner_exclusive_access().is_zombie {
+                if new_process.is_zombie() {
                     break;
                 }
                 suspend_current_and_run_next();
@@ -947,10 +943,8 @@ pub fn sys_clone(
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
 
-    let parent_task_inner = task.inner_exclusive_access();
-    let ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base;
-    let parent_signal_mask = parent_task_inner.signal_mask;
-    drop(parent_task_inner);
+    let ustack_base = task.ustack_base();
+    let parent_signal_mask = task.signal_mask();
 
     let alloc_user_stack = stack.is_null();
     let new_task = Arc::new(TaskControlBlock::new(
@@ -959,47 +953,35 @@ pub fn sys_clone(
         alloc_user_stack,
     ));
     // 新线程继承父线程的信号掩码（Linux 语义：clone(CLONE_THREAD) 继承 signal_mask）
-    {
-        let mut inner = new_task.inner_exclusive_access();
-        inner.signal_mask = parent_signal_mask;
-    }
-    let new_task_inner = new_task.inner_exclusive_access();
-    let new_task_res = new_task_inner.res.as_ref().unwrap();
-    let new_task_tid = new_task_res.tid;
-    let mut process_inner = process.inner_exclusive_access();
-    let tasks = &mut process_inner.tasks;
-    while tasks.len() < new_task_tid + 1 {
-        tasks.push(None);
-    }
-    tasks[new_task_tid] = Some(Arc::clone(&new_task));
-    drop(process_inner);
+    new_task.set_signal_mask(parent_signal_mask);
+    let new_task_tid = new_task.tid();
+    process.insert_task(new_task_tid, Arc::clone(&new_task));
 
-    let new_trap_cx = new_task_inner.get_trap_cx();
-    *new_trap_cx = parent_cx;
-    new_trap_cx[TrapFrameArgs::RET] = 0;
-    if !stack.is_null() {
-        new_trap_cx[TrapFrameArgs::SP] = stack as usize;
-    }
-    if clone_flags.contains(CloneFlags::SETTLS) && !tls.is_null() {
-        new_trap_cx[TrapFrameArgs::TLS] = tls as usize;
-        let name = current_process().inner_exclusive_access().name.clone();
-        if name == "entry-static.exe" {
-            let token = current_user_token();
-            let tls_addr = tls as usize;
-            info!(
-                "[clone-tls] pid={} tid={} tls={:#x} stack={:#x}",
-                pid, new_task_tid, tls_addr, stack as usize
-            );
-            let base = tls_addr.saturating_sub(256);
-            dump_user_bytes("tp-0x100", token, base, 128);
-            dump_user_bytes("tp-0x80", token, tls_addr.saturating_sub(128), 128);
-            dump_user_bytes("tp+0x0", token, tls_addr, 64);
+    new_task.with_trap_cx_mut(|new_trap_cx| {
+        *new_trap_cx = parent_cx;
+        new_trap_cx[TrapFrameArgs::RET] = 0;
+        if !stack.is_null() {
+            new_trap_cx[TrapFrameArgs::SP] = stack as usize;
         }
-    }
-    drop(new_task_inner);
+        if clone_flags.contains(CloneFlags::SETTLS) && !tls.is_null() {
+            new_trap_cx[TrapFrameArgs::TLS] = tls as usize;
+            let name = current_process().name();
+            if name == "entry-static.exe" {
+                let token = current_user_token();
+                let tls_addr = tls as usize;
+                info!(
+                    "[clone-tls] pid={} tid={} tls={:#x} stack={:#x}",
+                    pid, new_task_tid, tls_addr, stack as usize
+                );
+                let base = tls_addr.saturating_sub(256);
+                dump_user_bytes("tp-0x100", token, base, 128);
+                dump_user_bytes("tp-0x80", token, tls_addr.saturating_sub(128), 128);
+                dump_user_bytes("tp+0x0", token, tls_addr, 64);
+            }
+        }
+    });
     if clone_flags.contains(CloneFlags::CHILD_CLEARTID) && !ctid.is_null() {
-        let mut inner = new_task.inner_exclusive_access();
-        inner.clear_child_tid = ctid as usize;
+        new_task.set_clear_child_tid(ctid as usize);
         info!(
             "[clone] pid={} tid={} child_cleartid={:#x}",
             pid, new_task_tid, ctid as usize
@@ -1065,7 +1047,7 @@ fn parse_shebang(data: &[u8]) -> Option<(String, Option<String>)> {
 }
 
 fn resolve_relative_path(path: &str) -> String {
-    let cwd = current_process().inner_exclusive_access().cwd.clone();
+    let cwd = current_process().cwd();
     if cwd == "/" {
         format!("/{}", path)
     } else {
@@ -1154,8 +1136,7 @@ fn read_exec_image(path: &str, file: &Arc<dyn File>) -> Arc<[u8]> {
         if file_size >= 8 * 1024 * 1024 {
             info!(
                 "[exec-image] large file path={} size={} bytes",
-                path,
-                file_size
+                path, file_size
             );
         }
     }
@@ -1369,7 +1350,7 @@ fn sys_exec_internal(
         }
         // 如果没有找到任何候选文件，返回 ENOENT
         let Some(app) = app else {
-            let name = current_process().inner_exclusive_access().name.clone();
+            let name = current_process().name();
             if name == "busybox" && exec_path.starts_with("./") {
                 trace!(
                     "[sys_exec] pid={} name={} raw={} -> ENOENT (no candidate)",
@@ -1387,7 +1368,7 @@ fn sys_exec_internal(
         };
         // 如果找到的候选文件路径和原始 exec_path 不同，说明是通过 PATH 环境变量解析得到的，打印解析信息
         let exec_path_resolved = resolved_path.unwrap_or_else(|| exec_path.clone());
-        let name = current_process().inner_exclusive_access().name.clone();
+        let name = current_process().name();
         trace_exec_resolution(&name, &exec_path, &exec_path_resolved, &args);
         let all_data = read_exec_image(exec_path_resolved.as_str(), &app);
         trace_entry_bytes(&exec_path_resolved, all_data.as_ref(), &app);
@@ -1542,12 +1523,11 @@ fn sys_exec_internal(
         }
         let process = current_process();
         {
-            let mut inner = process.inner_exclusive_access();
             let name = exec_path
                 .rsplit('/')
                 .find(|part| !part.is_empty())
                 .unwrap_or(exec_path.as_str());
-            inner.name = String::from(name);
+            process.set_name(String::from(name));
             trace!(
                 "[sys_exec] set process name to {} for path {}",
                 name,
@@ -1560,7 +1540,7 @@ fn sys_exec_internal(
         //     trace!("[sys_exec] /bin/sh argv0={} argv1={}", argv0, argv1);
         // }
         process.exec_with_interp(all_data.as_ref(), interp_data.as_deref(), args, envs);
-        let after_name = current_process().inner_exclusive_access().name.clone();
+        let after_name = current_process().name();
         trace!("[sys_exec] after exec name={}", after_name);
         return 0;
     }
@@ -1658,8 +1638,10 @@ fn write_waitid_siginfo(info_ptr: *mut u8, info: LinuxSigInfo) -> Result<(), isi
 }
 
 fn waitid_options_valid(options: i32) -> bool {
-    let known = WAITID_WNOHANG | WAITID_WSTOPPED | WAITID_WEXITED | WAITID_WCONTINUED | WAITID_WNOWAIT;
-    (options & !known) == 0 && (options & (WAITID_WSTOPPED | WAITID_WEXITED | WAITID_WCONTINUED)) != 0
+    let known =
+        WAITID_WNOHANG | WAITID_WSTOPPED | WAITID_WEXITED | WAITID_WCONTINUED | WAITID_WNOWAIT;
+    (options & !known) == 0
+        && (options & (WAITID_WSTOPPED | WAITID_WEXITED | WAITID_WCONTINUED)) != 0
 }
 
 fn exit_code_to_waitid(exit_code: i32) -> (i32, i32) {
@@ -1676,25 +1658,24 @@ fn exit_code_to_waitid(exit_code: i32) -> (i32, i32) {
 
 pub(crate) fn has_unmasked_user_signal_without_restart() -> bool {
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
     let task = current_task().unwrap();
-    let task_inner = task.inner_exclusive_access();
-    let unmasked = (process_inner.signal_pending | task_inner.signal_pending) & !task_inner.signal_mask;
+    let (task_pending, signal_mask) =
+        task.with_signals(|signals| (signals.signal_pending, signals.signal_mask));
+    let unmasked = (process.pending_signal() | task_pending) & !signal_mask;
     if unmasked.is_empty() {
         return false;
     }
     use crate::task::SA_RESTART;
-    let actions = &process_inner.signal_actions;
     let raw = unmasked.bits();
     for bit in 0..64u32 {
         if raw & (1u64 << bit) == 0 {
             continue;
         }
         let signum = bit as usize + 1;
-        if signum >= actions.table.len() {
+        if signum >= MAX_SIG {
             continue;
         }
-        let action = &actions.table[signum];
+        let action = process.with_signal_action(signum, |action| action);
         if action.handler == 1 {
             continue; // SIG_IGN
         }
@@ -1735,57 +1716,50 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
     let want_continued = (options & WAITID_WCONTINUED) != 0;
     let nohang = (options & WAITID_WNOHANG) != 0;
     let nowait = (options & WAITID_WNOWAIT) != 0;
-    let caller_pgid = current_process().inner_exclusive_access().pgid;
-    let target_pgid = if idtype == P_PGID && id == 0 { caller_pgid } else { id };
+    let caller_pgid = current_process().pgid();
+    let target_pgid = if idtype == P_PGID && id == 0 {
+        caller_pgid
+    } else {
+        id
+    };
 
     loop {
         let process = current_process();
-        let mut inner = process.inner_exclusive_access();
+        let children = process.children_snapshot();
         let mut has_matching_child = false;
 
         // 1) report non-exit events first (WSTOPPED/WCONTINUED)
-        for child in inner.children.iter() {
+        for child in children.iter() {
             let child_pid = child.getpid();
-            let mut child_inner = child.inner_exclusive_access();
             let matched = match idtype {
                 P_ALL => true,
                 P_PID => child_pid == id,
-                P_PGID => child_inner.pgid == target_pgid,
+                P_PGID => child.pgid() == target_pgid,
                 _ => false,
             };
             if !matched {
                 continue;
             }
             has_matching_child = true;
-            if let Some(event) = child_inner.child_wait_event {
+            if let Some(event) = child.child_wait_event() {
                 match event {
                     ChildWaitEvent::Stopped(sig) if want_stopped => {
-                        let info = LinuxSigInfo::for_sigchld(
-                            child_pid as i32,
-                            sig,
-                            WAITID_CLD_STOPPED,
-                        );
+                        let info =
+                            LinuxSigInfo::for_sigchld(child_pid as i32, sig, WAITID_CLD_STOPPED);
                         if !nowait {
-                            child_inner.child_wait_event = None;
+                            child.take_child_wait_event();
                         }
-                        drop(child_inner);
-                        drop(inner);
                         if write_waitid_siginfo(infop, info).is_err() {
                             return errno(EFAULT);
                         }
                         return 0;
                     }
                     ChildWaitEvent::Continued(sig) if want_continued => {
-                        let info = LinuxSigInfo::for_sigchld(
-                            child_pid as i32,
-                            sig,
-                            WAITID_CLD_CONTINUED,
-                        );
+                        let info =
+                            LinuxSigInfo::for_sigchld(child_pid as i32, sig, WAITID_CLD_CONTINUED);
                         if !nowait {
-                            child_inner.child_wait_event = None;
+                            child.take_child_wait_event();
                         }
-                        drop(child_inner);
-                        drop(inner);
                         if write_waitid_siginfo(infop, info).is_err() {
                             return errno(EFAULT);
                         }
@@ -1798,30 +1772,28 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
 
         // 2) report exit events
         if want_exited {
-            let pair = inner.children.iter().enumerate().find(|(_, child)| {
+            let pair = children.iter().find(|child| {
                 let child_pid = child.getpid();
-                let child_inner = child.inner_exclusive_access();
                 let matched = match idtype {
                     P_ALL => true,
                     P_PID => child_pid == id,
-                    P_PGID => child_inner.pgid == target_pgid,
+                    P_PGID => child.pgid() == target_pgid,
                     _ => false,
                 };
                 if matched {
                     has_matching_child = true;
                 }
-                matched && child_inner.is_zombie
+                matched && child.is_zombie()
             });
-            if let Some((idx, _)) = pair {
+            if let Some(child) = pair {
                 let (found_pid, exit_code, reaped) = if nowait {
-                    let child = inner.children[idx].clone();
                     let found_pid = child.getpid();
-                    let exit_code = child.inner_exclusive_access().exit_code;
+                    let exit_code = child.exit_code();
                     (found_pid, exit_code, false)
                 } else {
-                    let child = inner.children.remove(idx);
                     let found_pid = child.getpid();
-                    let exit_code = child.inner_exclusive_access().exit_code;
+                    let exit_code = child.exit_code();
+                    process.remove_child_by_pid(found_pid);
                     (found_pid, exit_code, true)
                 };
                 if reaped {
@@ -1829,7 +1801,6 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
                 }
                 let (status, code) = exit_code_to_waitid(exit_code);
                 let info = LinuxSigInfo::for_sigchld(found_pid as i32, status, code);
-                drop(inner);
                 if write_waitid_siginfo(infop, info).is_err() {
                     return errno(EFAULT);
                 }
@@ -1844,13 +1815,11 @@ pub fn sys_waitid(idtype: usize, id: usize, infop: *mut u8, options: i32, _ru: *
         // No reportable event.
         if nohang {
             let info = LinuxSigInfo::zeroed();
-            drop(inner);
             if write_waitid_siginfo(infop, info).is_err() {
                 return errno(EFAULT);
             }
             return 0;
         }
-        drop(inner);
         suspend_current_and_run_next();
         if has_unmasked_user_signal_without_restart() {
             return errno(EINTR);
@@ -1865,55 +1834,51 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
     const WNOHANG: i32 = 1;
     const WUNTRACED: i32 = 2;
     let my_pid = current_process().getpid();
-    let my_pgid = current_process().inner_exclusive_access().pgid;
+    let my_pgid = current_process().pgid();
     #[allow(dead_code)]
     const SIG_DFL: usize = 0;
     #[allow(dead_code)]
     const SIG_IGN: usize = 1;
-    
+
     // Helper: check if child matches the pid criteria
     let matches_pid = |child_pid: usize, child_pgid: usize| -> bool {
         match pid {
-            -1 => true,  // Any child
-            0 => child_pgid == my_pgid,  // Same process group
-            p if p > 0 => child_pid == p as usize,  // Specific PID
-            p => child_pgid == (-p) as usize,  // Specific process group (pid < -1)
+            -1 => true,                            // Any child
+            0 => child_pgid == my_pgid,            // Same process group
+            p if p > 0 => child_pid == p as usize, // Specific PID
+            p => child_pgid == (-p) as usize,      // Specific process group (pid < -1)
         }
     };
-    
+
     loop {
         let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-        
+        let children = process.children_snapshot();
+
         // Check if any child matches the criteria
-        let has_matching_child = inner.children.iter().any(|p| {
-            let child_inner = p.inner_exclusive_access();
-            matches_pid(p.getpid(), child_inner.pgid)
-        });
-        
+        let has_matching_child = children.iter().any(|p| matches_pid(p.getpid(), p.pgid()));
+
         if !has_matching_child {
             return errno(ECHILD);
         }
-        
+
         // First, check for ptrace-stopped children (higher priority than zombies)
-        let ptrace_pair = inner.children.iter().enumerate().find(|(_, p)| {
-            let child_inner = p.inner_exclusive_access();
-            child_inner.ptrace_stop_signal.is_some() && matches_pid(p.getpid(), child_inner.pgid)
-        });
-        if let Some((idx, _)) = ptrace_pair {
-            let child = &inner.children[idx];
+        let ptrace_child = children
+            .iter()
+            .find(|p| p.ptrace_stop_signal().is_some() && matches_pid(p.getpid(), p.pgid()));
+        if let Some(child) = ptrace_child {
             let found_pid = child.getpid();
-            let mut child_inner = child.inner_exclusive_access();
-            
-            if let Some(signum) = child_inner.ptrace_stop_signal.take() {
+
+            if let Some(signum) = child.take_ptrace_stop_signal() {
                 if !exit_code_ptr.is_null() {
                     // WIFSTOPPED encoding: (signal << 8) | 0x7f
                     let status = ((signum & 0xff) << 8) | 0x7f;
-                    *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
+                    *translated_refmut(current_user_token(), exit_code_ptr) = status;
                 }
                 trace!(
                     "[sys_waitpid] pid={} reports ptrace-stop of child pid={} signal={}",
-                    my_pid, found_pid, signum
+                    my_pid,
+                    found_pid,
+                    signum
                 );
                 return found_pid as isize;
             }
@@ -1921,24 +1886,23 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
 
         // Then, if caller requests WUNTRACED, report group-stopped children.
         if (options & WUNTRACED) != 0 {
-            let stopped_pair = inner.children.iter().enumerate().find_map(|(idx, p)| {
-                let mut child_inner = p.inner_exclusive_access();
-                if !matches_pid(p.getpid(), child_inner.pgid) {
+            let stopped_pair = children.iter().find_map(|p| {
+                if !matches_pid(p.getpid(), p.pgid()) {
                     return None;
                 }
-                let stop_sig = match child_inner.child_wait_event.take() {
+                let stop_sig = match p.take_child_wait_event() {
                     Some(ChildWaitEvent::Stopped(sig)) => Some(sig),
                     Some(other) => {
                         // Keep non-stopped event for waitid()/other wait semantics.
-                        child_inner.child_wait_event = Some(other);
+                        p.set_child_wait_event(Some(other));
                         None
                     }
                     None => None,
                 };
-                stop_sig.map(|sig| (idx, sig))
+                stop_sig.map(|sig| (p.clone(), sig))
             });
-            if let Some((idx, signum)) = stopped_pair {
-                let found_pid = inner.children[idx].getpid();
+            if let Some((child, signum)) = stopped_pair {
+                let found_pid = child.getpid();
                 if !exit_code_ptr.is_null() {
                     let stop_sig = if (1..=(MAX_SIG as i32)).contains(&signum) {
                         signum
@@ -1947,7 +1911,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
                     };
                     // WIFSTOPPED encoding.
                     let status = ((stop_sig & 0xff) << 8) | 0x7f;
-                    *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
+                    *translated_refmut(current_user_token(), exit_code_ptr) = status;
                 }
                 trace!(
                     "[sys_waitpid] pid={} reports group-stop of child pid={} signal={}",
@@ -1958,28 +1922,28 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: i32) -> isize {
                 return found_pid as isize;
             }
         }
-        
+
         // Then check for zombie children
-        let pair = inner.children.iter().enumerate().find(|(_, p)| {
-            let child_inner = p.inner_exclusive_access();
-            child_inner.is_zombie && matches_pid(p.getpid(), child_inner.pgid)
-        });
-        if let Some((idx, _)) = pair {
-            let child = inner.children.remove(idx);
+        let pair = children
+            .iter()
+            .find(|p| p.is_zombie() && matches_pid(p.getpid(), p.pgid()));
+        if let Some(child) = pair {
             let found_pid = child.getpid();
-            let exit_code = child.inner_exclusive_access().exit_code;
+            let exit_code = child.exit_code();
+            process.remove_child_by_pid(found_pid);
             remove_from_pid2process(found_pid);
             if !exit_code_ptr.is_null() {
                 let status = encode_wait_status(exit_code);
-                *translated_refmut(inner.memory_set.token(), exit_code_ptr) = status;
+                *translated_refmut(current_user_token(), exit_code_ptr) = status;
             }
             trace!(
                 "[sys_waitpid] pid={} reaped child pid={} exit_code={}",
-                my_pid, found_pid, exit_code
+                my_pid,
+                found_pid,
+                exit_code
             );
             return found_pid as isize;
         }
-        drop(inner);
 
         // WNOHANG: return 0 immediately if no zombie child
         if (options & WNOHANG) != 0 {
@@ -2047,7 +2011,7 @@ pub fn sys_clock_settime(clock_id: usize, ts: *const TimeSpec) -> isize {
         return errno(EFAULT);
     }
     let process = current_process();
-    let euid = process.inner_exclusive_access().effective_uid;
+    let euid = process.effective_uid();
     if euid != 0 {
         return errno(EPERM);
     }
@@ -2074,10 +2038,6 @@ pub fn sys_clock_settime(clock_id: usize, ts: *const TimeSpec) -> isize {
 }
 
 pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
-    let pid = current_process().pid.0;
-    if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_clock_gettime", pid);
-    }
     if ts.is_null() {
         return errno(EFAULT);
     }
@@ -2094,14 +2054,13 @@ pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
                 tv_sec: us / 1_000_000,
                 tv_nsec: (us % 1_000_000) * 1_000,
             };
-            let bytes = unsafe {
-                core::slice::from_raw_parts(
-                    (&spec as *const TimeSpec) as *const u8,
-                    core::mem::size_of::<TimeSpec>(),
-                )
-            };
             let token = current_user_token();
-            match copy_to_user(token, ts as *mut u8, bytes) {
+            match user_mem::write_value_to_user(
+                token,
+                ts,
+                spec,
+                UserWritePolicy::RelaxedReadableMapping,
+            ) {
                 Ok(_) => 0,
                 Err(err) => err,
             }
@@ -2111,10 +2070,6 @@ pub fn sys_clock_gettime(clock_id: usize, ts: *mut TimeSpec) -> isize {
 }
 
 pub fn sys_clock_getres(clock_id: usize, res: *mut TimeSpec) -> isize {
-    let pid = current_process().pid.0;
-    if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_clock_getres", pid);
-    }
     match clock_id {
         0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 => {
             if res.is_null() {
@@ -2124,14 +2079,13 @@ pub fn sys_clock_getres(clock_id: usize, res: *mut TimeSpec) -> isize {
                 tv_sec: 0,
                 tv_nsec: 1000, // 1µs resolution
             };
-            let bytes = unsafe {
-                core::slice::from_raw_parts(
-                    (&spec as *const TimeSpec) as *const u8,
-                    core::mem::size_of::<TimeSpec>(),
-                )
-            };
             let token = current_user_token();
-            match copy_to_user(token, res as *mut u8, bytes) {
+            match user_mem::write_value_to_user(
+                token,
+                res,
+                spec,
+                UserWritePolicy::RelaxedReadableMapping,
+            ) {
                 Ok(_) => 0,
                 Err(err) => err,
             }
@@ -2161,15 +2115,13 @@ pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
 
     let unmasked_pending_signal = || -> Option<(SignalFlags, SignalFlags, SignalFlags)> {
         let process = current_process();
-        let process_inner = process.inner_exclusive_access();
         let task = match current_task() {
             Some(task) => task,
             None => return None,
         };
-        let task_inner = task.inner_exclusive_access();
-        let process_pending = process_inner.signal_pending;
-        let task_pending = task_inner.signal_pending;
-        let signal_mask = task_inner.signal_mask;
+        let process_pending = process.pending_signal();
+        let (task_pending, signal_mask) =
+            task.with_signals(|signals| (signals.signal_pending, signals.signal_mask));
         let pending = (process_pending | task_pending) & !signal_mask;
         if pending.is_empty() {
             None
@@ -2245,23 +2197,28 @@ pub fn sys_getitimer(which: isize, curr_value: *mut ITimerVal) -> isize {
     }
     let timer = {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if which == 0 {
-            // ITIMER_REAL: compute actual remaining time from expire deadline
-            let expire_ms = inner.itimer_real_expire_ms;
-            let remaining_us = if expire_ms == 0 {
-                0usize
+        process.with_timers(|timers| {
+            if which == 0 {
+                // ITIMER_REAL: compute actual remaining time from expire deadline
+                let expire_ms = timers.itimer_real_expire_ms;
+                let remaining_us = if expire_ms == 0 {
+                    0usize
+                } else {
+                    let now_ms = get_time_ms();
+                    if expire_ms > now_ms {
+                        (expire_ms - now_ms) * 1000
+                    } else {
+                        0
+                    }
+                };
+                ITimerVal {
+                    it_interval: us_to_timeval(timers.itimer_real_interval_ms * 1000),
+                    it_value: us_to_timeval(remaining_us),
+                }
             } else {
-                let now_ms = get_time_ms();
-                if expire_ms > now_ms { (expire_ms - now_ms) * 1000 } else { 0 }
-            };
-            ITimerVal {
-                it_interval: us_to_timeval(inner.itimer_real_interval_ms * 1000),
-                it_value: us_to_timeval(remaining_us),
+                itimer_state_to_user(timers.itimers[which as usize])
             }
-        } else {
-            itimer_state_to_user(inner.itimers[which as usize])
-        }
+        })
     };
     let bytes = unsafe {
         core::slice::from_raw_parts(
@@ -2296,39 +2253,44 @@ pub fn sys_setitimer(
     let new_state = itimer_state_from_user(new_timer);
     let old_timer = {
         let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-        let old_timer = if which == 0 {
-            // ITIMER_REAL: compute actual remaining time
-            let expire_ms = inner.itimer_real_expire_ms;
-            let remaining_us = if expire_ms == 0 {
-                0usize
+        process.with_timers_mut(|timers| {
+            let old_timer = if which == 0 {
+                // ITIMER_REAL: compute actual remaining time
+                let expire_ms = timers.itimer_real_expire_ms;
+                let remaining_us = if expire_ms == 0 {
+                    0usize
+                } else {
+                    let now_ms = get_time_ms();
+                    if expire_ms > now_ms {
+                        (expire_ms - now_ms) * 1000
+                    } else {
+                        0
+                    }
+                };
+                // Keep user-visible interval precision from the canonical itimer state,
+                // instead of the millisecond scheduling cache field.
+                let interval_us = timers.itimers[0].interval_us;
+                ITimerVal {
+                    it_interval: us_to_timeval(interval_us),
+                    it_value: us_to_timeval(remaining_us),
+                }
             } else {
-                let now_ms = get_time_ms();
-                if expire_ms > now_ms { (expire_ms - now_ms) * 1000 } else { 0 }
+                itimer_state_to_user(timers.itimers[which as usize])
             };
-            // Keep user-visible interval precision from the canonical itimer state,
-            // instead of the millisecond scheduling cache field.
-            let interval_us = inner.itimers[0].interval_us;
-            ITimerVal {
-                it_interval: us_to_timeval(interval_us),
-                it_value: us_to_timeval(remaining_us),
+            timers.itimers[which as usize] = new_state;
+            // Update itimer_real_expire_ms for ITIMER_REAL
+            if which == 0 {
+                let now_ms = get_time_ms();
+                let remaining_us = new_state.remaining_us;
+                if remaining_us == 0 {
+                    timers.itimer_real_expire_ms = 0;
+                } else {
+                    timers.itimer_real_expire_ms = now_ms + remaining_us / 1000;
+                }
+                timers.itimer_real_interval_ms = new_state.interval_us / 1000;
             }
-        } else {
-            itimer_state_to_user(inner.itimers[which as usize])
-        };
-        inner.itimers[which as usize] = new_state;
-        // Update itimer_real_expire_ms for ITIMER_REAL
-        if which == 0 {
-            let now_ms = get_time_ms();
-            let remaining_us = new_state.remaining_us;
-            if remaining_us == 0 {
-                inner.itimer_real_expire_ms = 0;
-            } else {
-                inner.itimer_real_expire_ms = now_ms + remaining_us / 1000;
-            }
-            inner.itimer_real_interval_ms = new_state.interval_us / 1000;
-        }
-        old_timer
+            old_timer
+        })
     };
     if !old_value.is_null() {
         let bytes = unsafe {
@@ -2471,10 +2433,7 @@ pub fn sys_uname(uts: *mut UtsName) -> isize {
     fill(&mut uname.nodename, uts_state.0.as_str());
     fill(&mut uname.release, "5.10.0");
     fill(&mut uname.version, "rcore");
-    #[cfg(target_arch = "riscv64")]
-    fill(&mut uname.machine, "riscv64");
-    #[cfg(target_arch = "loongarch64")]
-    fill(&mut uname.machine, "loongarch64");
+    fill(&mut uname.machine, arch::machine_name());
     fill(&mut uname.domainname, uts_state.1.as_str());
     drop(uts_state);
     let bytes = unsafe {
@@ -2500,7 +2459,7 @@ fn sys_set_uts_name(name: *const u8, len: usize, is_hostname: bool) -> isize {
     }
 
     let process = current_process();
-    if process.inner_exclusive_access().effective_uid != 0 {
+    if process.effective_uid() != 0 {
         return errno(EPERM);
     }
 
@@ -2541,23 +2500,25 @@ fn user_range_in_area(start: usize, len: usize) -> bool {
         return true;
     }
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    inner.memory_set.is_user_range_mapped_area(start, len)
+    process.with_memory_set(|memory_set| memory_set.is_user_range_mapped_area(start, len))
 }
 
 fn user_page_resident_bitmap(start: usize, pages: usize) -> Vec<u8> {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    let mut out = Vec::new();
-    for i in 0..pages {
-        let va = start.saturating_add(i * PAGE_SIZE);
-        out.push(if inner.memory_set.translate(VirtAddr::from(va).floor()).is_some() {
-            1
-        } else {
-            0
-        });
-    }
-    out
+    process.with_memory_set(|memory_set| {
+        let mut out = Vec::new();
+        for i in 0..pages {
+            let va = start.saturating_add(i * PAGE_SIZE);
+            out.push(
+                if memory_set.translate(VirtAddr::from(va).floor()).is_some() {
+                    1
+                } else {
+                    0
+                },
+            );
+        }
+        out
+    })
 }
 
 pub fn sys_mlock(addr: usize, len: usize) -> isize {
@@ -2569,10 +2530,8 @@ pub fn sys_mlock(addr: usize, len: usize) -> isize {
         return errno(ENOMEM);
     };
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    let euid = inner.effective_uid;
-    let limit = inner.rlimits[RLIMIT_MEMLOCK].rlim_cur as usize;
-    drop(inner);
+    let euid = process.effective_uid();
+    let limit = process.with_limits(|limits| limits.rlimits[RLIMIT_MEMLOCK].rlim_cur as usize);
     if euid != 0 {
         if limit == 0 {
             return errno(EPERM);
@@ -2590,12 +2549,13 @@ pub fn sys_mlock(addr: usize, len: usize) -> isize {
         len,
         UserReadPolicy::DemandPaged,
     );
-    let writable = readable || user_mem::ensure_user_writable(
-        current_user_token(),
-        addr as *const u8,
-        len,
-        UserWritePolicy::DemandCowWithForkFallback,
-    );
+    let writable = readable
+        || user_mem::ensure_user_writable(
+            current_user_token(),
+            addr as *const u8,
+            len,
+            UserWritePolicy::DemandCowWithForkFallback,
+        );
     if !writable {
         return errno(ENOMEM);
     }
@@ -2664,7 +2624,7 @@ pub fn sys_syslog(_log_type: usize, buf: *mut u8, len: usize) -> isize {
         0..=10 => {}
         _ => return errno(EINVAL),
     }
-    if current_process().inner_exclusive_access().effective_uid != 0 {
+    if current_process().effective_uid() != 0 {
         return errno(EPERM);
     }
     if log_type == 8 && len > 8 {
@@ -2756,16 +2716,14 @@ pub fn sys_msync(start: usize, len: usize, _flags: usize) -> isize {
     let ms_invalidate = (_flags & MS_INVALIDATE) != 0;
     let ms_writeback = (_flags & (MS_SYNC | MS_ASYNC)) != 0;
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    match inner
-        .memory_set
-        .msync_file_range(
+    match process.with_memory_set_mut(|memory_set| {
+        memory_set.msync_file_range(
             VirtAddr::from(start),
             VirtAddr::from(end),
             ms_invalidate,
             ms_writeback,
         )
-    {
+    }) {
         Ok(_) => 0,
         Err(crate::mm::MsyncError::Busy) => errno(EBUSY),
         Err(crate::mm::MsyncError::Unmapped) => errno(ENOMEM),
@@ -2792,7 +2750,7 @@ pub fn sys_mmap(
     const MAP_TYPE_MASK: usize = MAP_SHARED | MAP_PRIVATE;
 
     let pid = current_process().pid.0;
-    let proc_name = current_process().inner_exclusive_access().name.clone();
+    let proc_name = current_process().name();
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_mmap", pid);
     }
@@ -2815,12 +2773,9 @@ pub fn sys_mmap(
         // let ra = cx[TrapFrameArgs::RA];
         // let gp = cx.gp();
         // let process = current_process();
-        // let inner = process.inner_exclusive_access();
-        // let name = inner.name.clone();
-        // let heap_bottom = inner.heap_bottom;
-        // let program_brk = inner.program_brk;
-        // let mmap_base = inner.mmap_base;
-        // drop(inner);
+        // let name = process.name();
+        // let (heap_bottom, program_brk, mmap_base) =
+        //     process.with_memory(|memory| (memory.heap_bottom, memory.program_brk, memory.mmap_base));
         // let token = current_user_token();
         // let heap_struct = gp.wrapping_add(0x688);
         // let heap_align = *translated_ref(token, (heap_struct + 0x38) as *const usize);
@@ -2901,15 +2856,11 @@ pub fn sys_mmap(
     let is_anon = (flags & MAP_ANON) != 0;
     let process = current_process();
 
-    let file_info = if !is_anon {
+    let file_for_mapping = if !is_anon {
         if offset % PAGE_SIZE != 0 {
             return errno(EINVAL);
         }
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return errno(EBADF);
-        }
-        let Some(file) = inner.fd_table[fd].as_ref() else {
+        let Some(file) = process.get_file(fd) else {
             return errno(EBADF);
         };
         if map_perm.contains(MapPermission::R) && !file.readable() {
@@ -2924,186 +2875,187 @@ pub fn sys_mmap(
         {
             return errno(EPERM);
         }
-        let writable = file.writable();
-        let inode = file.inode();
-        drop(inner);
-        Some((inode, writable))
+        Some(file)
     } else {
         None
     };
+    let file_writable = file_for_mapping
+        .as_ref()
+        .map(|file| file.writable())
+        .unwrap_or(true);
 
     // 计算 mmap 起始地址：
     // - MAP_FIXED: 使用调用方给定地址
     // - 非 MAP_FIXED: 从 hint/mmap_base 出发，向上跳过所有重叠区间后再放置
-    let mut inner = process.inner_exclusive_access();
     let req_start = start;
     let is_fixed = (flags & MAP_FIXED) != 0 && req_start != 0;
-    let mut start = if is_fixed {
-        req_start
-    } else if req_start != 0 {
-        (req_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
-    } else {
-        (inner.mmap_base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
-    };
+    let mmap_result = process.with_memory_mut(|memory| -> Result<usize, isize> {
+        let mut start = if is_fixed {
+            req_start
+        } else if req_start != 0 {
+            (req_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+        } else {
+            (memory.mmap_base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+        };
 
-    if !is_fixed {
-        loop {
+        if !is_fixed {
+            loop {
+                let end = match start.checked_add(len) {
+                    Some(v) => v,
+                    None => return Err(errno(ENOMEM)),
+                };
+                let overlaps = memory
+                    .memory_set
+                    .overlap_ranges(VirtAddr(start), VirtAddr(end));
+                if overlaps.is_empty() {
+                    break;
+                }
+                let jump_to = overlaps
+                    .iter()
+                    .map(|(_, r_end)| r_end.0)
+                    .max()
+                    .unwrap_or(start);
+                let next = (jump_to + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                if next <= start {
+                    return Err(errno(ENOMEM));
+                }
+                start = next;
+            }
             let end = match start.checked_add(len) {
                 Some(v) => v,
-                None => return errno(ENOMEM),
+                None => return Err(errno(ENOMEM)),
             };
-            let overlaps = inner
-                .memory_set
-                .overlap_ranges(VirtAddr(start), VirtAddr(end));
-            if overlaps.is_empty() {
-                break;
-            }
-            let jump_to = overlaps
-                .iter()
-                .map(|(_, r_end)| r_end.0)
-                .max()
-                .unwrap_or(start);
-            let next = (jump_to + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-            if next <= start {
-                return errno(ENOMEM);
-            }
-            start = next;
-        }
-        let end = match start.checked_add(len) {
-            Some(v) => v,
-            None => return errno(ENOMEM),
-        };
-        if end > inner.mmap_base {
-            inner.mmap_base = end;
-        }
-    }
-    // TODO(grl): harden mmap end-range validation in one place for both MAP_FIXED
-    // and non-fixed paths:
-    // 1) compute/check `end = start.checked_add(len)` once;
-    // 2) enforce `end <= USER_ADDR_MAX`;
-    // 3) stop using raw `start + len` in overlap/unmap/insert calls.
-    if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
-        let overlap = inner
-            .memory_set
-            .overlap_count(VirtAddr(start), VirtAddr(start + len));
-        trace!(
-            "[sys_mmap] pid={} name={} req={:#x} len={:#x} prot={:#x} flags={:#x} -> start={:#x} overlap={} fixed={}",
-            pid,
-            inner.name,
-            req_start,
-            len,
-            prot,
-            flags,
-            start,
-            overlap,
-            is_fixed
-        );
-        if is_fixed && overlap > 0 {
-            let ranges = inner
-                .memory_set
-                .overlap_ranges(VirtAddr(start), VirtAddr(start + len));
-            for (idx, (r_start, r_end)) in ranges.into_iter().enumerate() {
-                trace!(
-                    "[sys_mmap] pid={} fixed overlap[{}]=[{:#x},{:#x})",
-                    pid,
-                    idx,
-                    r_start.0,
-                    r_end.0
-                );
+            if end > memory.mmap_base {
+                memory.mmap_base = end;
             }
         }
-    }
-    trace!(
-        "[sys_mmap] pid={} req={:#x} len={:#x} flags={:#x} -> start={:#x}",
-        pid,
-        req_start,
-        len,
-        flags,
-        start
-    );
 
-    let overlap = inner
-        .memory_set
-        .overlap_count(VirtAddr(start), VirtAddr(start + len));
-    if overlap > 0 {
-        if is_fixed {
-            // MAP_FIXED: unmap overlapping pages in the target range.
-            inner.memory_set.unmap_range(VirtAddr(start), VirtAddr(start + len));
-        } else {
-            // Non-MAP_FIXED mappings must not overlap existing VMAs.
-            return errno(ENOMEM);
-        }
-    }
-
-    // Lazy VMA insertion: register VMA, allocate pages on fault.
-    // Preserve MapAreaType tracking from dev for bookkeeping.
-    let meta = MmapMeta {
-        shared: is_shared,
-        file_backed: !is_anon && fd != usize::MAX,
-        file_writable: file_info
-            .as_ref()
-            .map(|(_, writable)| *writable)
-            .unwrap_or(true),
-        map_locked: (flags & MAP_LOCKED) != 0,
-    };
-    if is_anon || fd == usize::MAX {
-        if is_shared {
-            // MAP_SHARED anonymous: eagerly allocate so that all forked processes
-            // share the same physical frames. Lazy allocation creates per-process
-            // pages on fault, breaking MAP_SHARED semantics (e.g. getpid02 test).
-            inner.memory_set.insert_mmap_area(
-                VirtAddr(start),
-                VirtAddr(start + len),
-                map_perm,
-                meta,
-                MapAreaType::MmapAnon,
+        // TODO(grl): harden mmap end-range validation in one place for both MAP_FIXED
+        // and non-fixed paths:
+        // 1) compute/check `end = start.checked_add(len)` once;
+        // 2) enforce `end <= USER_ADDR_MAX`;
+        // 3) stop using raw `start + len` in overlap/unmap/insert calls.
+        let mmap_proc_name = proc_name.as_str();
+        if mmap_proc_name == "busybox" || mmap_proc_name == "ld-linux-riscv64-lp64d.so.1" {
+            let overlap = memory
+                .memory_set
+                .overlap_count(VirtAddr(start), VirtAddr(start + len));
+            trace!(
+                "[sys_mmap] pid={} name={} req={:#x} len={:#x} prot={:#x} flags={:#x} -> start={:#x} overlap={} fixed={}",
+                pid,
+                mmap_proc_name,
+                req_start,
+                len,
+                prot,
+                flags,
+                start,
+                overlap,
+                is_fixed
             );
-        } else {
-            inner.memory_set.insert_lazy_anon_area(
-                VirtAddr(start),
-                VirtAddr(start + len),
-                map_perm,
-                meta,
-            );
-        }
-    } else {
-        let file = if fd < inner.fd_table.len() {
-            inner.fd_table[fd].as_ref().map(|f| f.clone())
-        } else {
-            None
-        };
-        match file {
-            Some(file) => {
-                if is_shared {
-                    // MAP_SHARED file-backed mappings must materialize shared
-                    // frames before fork(). Keeping them lazy can cause parent
-                    // and child to fault different private pages, corrupting
-                    // shared userspace state (e.g. LTP summary counters).
-                    inner.memory_set.insert_shared_file_mmap_area(
-                        VirtAddr(start),
-                        VirtAddr(start + len),
-                        map_perm,
-                        file,
-                        offset as u64,
-                        meta,
-                    );
-                } else {
-                    inner.memory_set.insert_lazy_file_area(
-                        VirtAddr(start),
-                        VirtAddr(start + len),
-                        map_perm,
-                        file,
-                        offset as u64,
-                        meta,
+            if is_fixed && overlap > 0 {
+                let ranges = memory
+                    .memory_set
+                    .overlap_ranges(VirtAddr(start), VirtAddr(start + len));
+                for (idx, (r_start, r_end)) in ranges.into_iter().enumerate() {
+                    trace!(
+                        "[sys_mmap] pid={} fixed overlap[{}]=[{:#x},{:#x})",
+                        pid,
+                        idx,
+                        r_start.0,
+                        r_end.0
                     );
                 }
             }
-            None => return errno(EBADF),
         }
-    }
-    drop(inner);
+        trace!(
+            "[sys_mmap] pid={} req={:#x} len={:#x} flags={:#x} -> start={:#x}",
+            pid,
+            req_start,
+            len,
+            flags,
+            start
+        );
 
-    start as isize
+        let overlap = memory
+            .memory_set
+            .overlap_count(VirtAddr(start), VirtAddr(start + len));
+        if overlap > 0 {
+            if is_fixed {
+                // MAP_FIXED: unmap overlapping pages in the target range.
+                memory
+                    .memory_set
+                    .unmap_range(VirtAddr(start), VirtAddr(start + len));
+            } else {
+                // Non-MAP_FIXED mappings must not overlap existing VMAs.
+                return Err(errno(ENOMEM));
+            }
+        }
+
+        // Lazy VMA insertion: register VMA, allocate pages on fault.
+        // Preserve MapAreaType tracking from dev for bookkeeping.
+        let meta = MmapMeta {
+            shared: is_shared,
+            file_backed: !is_anon && fd != usize::MAX,
+            file_writable,
+            map_locked: (flags & MAP_LOCKED) != 0,
+        };
+        if is_anon || fd == usize::MAX {
+            if is_shared {
+                // MAP_SHARED anonymous: eagerly allocate so that all forked processes
+                // share the same physical frames. Lazy allocation creates per-process
+                // pages on fault, breaking MAP_SHARED semantics (e.g. getpid02 test).
+                memory.memory_set.insert_mmap_area(
+                    VirtAddr(start),
+                    VirtAddr(start + len),
+                    map_perm,
+                    meta,
+                    MapAreaType::MmapAnon,
+                );
+            } else {
+                memory.memory_set.insert_lazy_anon_area(
+                    VirtAddr(start),
+                    VirtAddr(start + len),
+                    map_perm,
+                    meta,
+                );
+            }
+        } else {
+            match file_for_mapping.clone() {
+                Some(file) => {
+                    if is_shared {
+                        // MAP_SHARED file-backed mappings must materialize shared
+                        // frames before fork(). Keeping them lazy can cause parent
+                        // and child to fault different private pages, corrupting
+                        // shared userspace state (e.g. LTP summary counters).
+                        memory.memory_set.insert_shared_file_mmap_area(
+                            VirtAddr(start),
+                            VirtAddr(start + len),
+                            map_perm,
+                            file,
+                            offset as u64,
+                            meta,
+                        );
+                    } else {
+                        memory.memory_set.insert_lazy_file_area(
+                            VirtAddr(start),
+                            VirtAddr(start + len),
+                            map_perm,
+                            file,
+                            offset as u64,
+                            meta,
+                        );
+                    }
+                }
+                None => return Err(errno(EBADF)),
+            }
+        }
+        Ok(start)
+    });
+
+    match mmap_result {
+        Ok(start) => start as isize,
+        Err(err) => err,
+    }
 }
 
 /// YOUR JOB: Implement munmap.
@@ -3117,7 +3069,6 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     }
     let len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
     // if inner.name == "busybox" || inner.name == "ld-linux-riscv64-lp64d.so.1" {
     //     let before = inner
     //         .memory_set
@@ -3146,9 +3097,9 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     //     }
     // }
     let aligned_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    inner
-        .memory_set
-        .unmap_range(VirtAddr(start), VirtAddr(start + aligned_len));
+    process.with_memory_set_mut(|memory_set| {
+        memory_set.unmap_range(VirtAddr(start), VirtAddr(start + aligned_len));
+    });
     0
 }
 
@@ -3159,11 +3110,10 @@ pub fn sys_sbrk(arg: isize) -> isize {
         syscall!("kernel:pid[{}] sys_sbrk", pid);
     }
     let sepc = current_trap_cx().sepc;
-    let name = current_process().inner_exclusive_access().name.clone();
+    let name = current_process().name();
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let current_brk = inner.program_brk;
-    let heap_bottom = inner.heap_bottom;
+    let (current_brk, heap_bottom) =
+        process.with_memory(|memory| (memory.program_brk, memory.heap_bottom));
     if arg == 0 {
         // if name == "busybox" {
         //     trace!(
@@ -3226,19 +3176,21 @@ pub fn sys_sbrk(arg: isize) -> isize {
         return errno(ENOMEM);
     }
     // delta == 0 is a no-op (brk query or same address)
-    let result = if delta == 0 {
-        true
-    } else if delta < 0 {
-        // Shrink heap using type-based lookup
-        inner.memory_set.shrink_heap_to(VirtAddr(new_brk))
-    } else {
-        // Expand heap using type-based lookup
-        inner
-            .memory_set
-            .append_heap_to(VirtAddr(new_brk), VirtAddr(heap_bottom))
-    };
+    let result = process.with_memory_mut(|memory| {
+        if delta == 0 {
+            true
+        } else if delta < 0 {
+            // Shrink heap using type-based lookup
+            memory.memory_set.shrink_heap_to(VirtAddr(new_brk))
+        } else {
+            // Expand heap using type-based lookup
+            memory
+                .memory_set
+                .append_heap_to(VirtAddr(new_brk), VirtAddr(heap_bottom))
+        }
+    });
     if result {
-        inner.program_brk = new_brk;
+        process.set_brk(new_brk);
         trace!(
             "[sys_sbrk] pid={} name={} sepc={:#x} arg={} cur={:#x} heap_bottom={:#x} new={:#x} ok",
             pid,
@@ -3292,10 +3244,8 @@ fn clamp_nice(prio: isize) -> i32 {
 
 fn collect_priority_target_pids(which: isize, who: isize) -> Result<Vec<usize>, isize> {
     let current = current_process();
-    let (self_pid, self_pgid, self_euid) = {
-        let inner = current.inner_exclusive_access();
-        (current.getpid(), inner.pgid, inner.effective_uid)
-    };
+    let (self_pid, self_pgid, self_euid) =
+        { (current.getpid(), current.pgid(), current.effective_uid()) };
     match which {
         PRIO_PROCESS => {
             if who < 0 {
@@ -3315,8 +3265,7 @@ fn collect_priority_target_pids(which: isize, who: isize) -> Result<Vec<usize>, 
             let target_pgid = if who == 0 { self_pgid } else { who as usize };
             let mut pids = Vec::new();
             for (pid, process) in pid2process_snapshot() {
-                let inner = process.inner_exclusive_access();
-                if inner.pgid == target_pgid {
+                if process.pgid() == target_pgid {
                     pids.push(pid);
                 }
             }
@@ -3333,8 +3282,7 @@ fn collect_priority_target_pids(which: isize, who: isize) -> Result<Vec<usize>, 
             let target_uid = if who == 0 { self_euid } else { who as u32 };
             let mut pids = Vec::new();
             for (pid, process) in pid2process_snapshot() {
-                let inner = process.inner_exclusive_access();
-                if inner.effective_uid == target_uid {
+                if process.effective_uid() == target_uid {
                     pids.push(pid);
                 }
             }
@@ -3351,7 +3299,7 @@ fn collect_priority_target_pids(which: isize, who: isize) -> Result<Vec<usize>, 
 /// setpriority(which, who, prio)
 pub fn sys_set_priority(which: isize, who: isize, prio: isize) -> isize {
     let caller = current_process();
-    let caller_euid = caller.inner_exclusive_access().effective_uid;
+    let caller_euid = caller.effective_uid();
     let is_privileged = caller_euid == 0;
     let target_pids = match collect_priority_target_pids(which, who) {
         Ok(v) => v,
@@ -3363,14 +3311,15 @@ pub fn sys_set_priority(which: isize, who: isize, prio: isize) -> isize {
         let Some(target) = pid2process(pid) else {
             continue;
         };
-        let target_inner = target.inner_exclusive_access();
+        let target_identity =
+            target.with_identity(|identity| (identity.effective_uid, identity.nice));
         if !is_privileged {
             // Unprivileged caller can only modify its own processes.
-            if target_inner.effective_uid != caller_euid {
+            if target_identity.0 != caller_euid {
                 return errno(EPERM);
             }
             // Unprivileged caller cannot lower nice value (raise priority).
-            if new_nice < target_inner.nice {
+            if new_nice < target_identity.1 {
                 return errno(EACCES);
             }
         }
@@ -3379,7 +3328,7 @@ pub fn sys_set_priority(which: isize, who: isize, prio: isize) -> isize {
     let mut applied = false;
     for pid in target_pids {
         if let Some(target) = pid2process(pid) {
-            target.inner_exclusive_access().nice = new_nice;
+            target.with_identity_mut(|identity| identity.nice = new_nice);
             applied = true;
         }
     }
@@ -3404,7 +3353,7 @@ pub fn sys_get_priority(which: isize, who: isize) -> isize {
         let Some(target) = pid2process(pid) else {
             continue;
         };
-        let nice = target.inner_exclusive_access().nice;
+        let nice = target.with_identity(|identity| identity.nice);
         best_nice = Some(best_nice.map(|old| old.min(nice)).unwrap_or(nice));
     }
     let Some(nice) = best_nice else {
@@ -3423,12 +3372,11 @@ pub fn sys_ptrace(request: usize, pid: isize, _addr: usize, _data: usize) -> isi
     match request {
         PTRACE_TRACEME => {
             let process = current_process();
-            let mut inner = process.inner_exclusive_access();
-            if inner.ptrace_traceme {
+            if process.ptrace_traceme() {
                 return errno(EPERM);
             }
-            inner.ptrace_traceme = true;
-            inner.ptrace_stop_signal = None;
+            process.set_ptrace_traceme(true);
+            process.set_ptrace_stop_signal(None);
             0
         }
         PTRACE_CONT | PTRACE_KILL => {
@@ -3441,11 +3389,10 @@ pub fn sys_ptrace(request: usize, pid: isize, _addr: usize, _data: usize) -> isi
             };
             let current_pid = current_process().getpid();
             let traced_by_me = {
-                let inner = target.inner_exclusive_access();
-                if !inner.ptrace_traceme {
+                if !target.ptrace_traceme() {
                     false
                 } else {
-                    match inner.parent.as_ref().and_then(|p| p.upgrade()) {
+                    match target.parent() {
                         Some(parent) => parent.getpid() == current_pid,
                         None => false,
                     }
@@ -3455,20 +3402,11 @@ pub fn sys_ptrace(request: usize, pid: isize, _addr: usize, _data: usize) -> isi
                 return errno(EPERM);
             }
             if request == PTRACE_CONT {
-                target.inner_exclusive_access().ptrace_stop_signal = None;
-                let tasks = {
-                    let inner = target.inner_exclusive_access();
-                    inner
-                        .tasks
-                        .iter()
-                        .filter_map(|t| t.as_ref().cloned())
-                        .collect::<Vec<_>>()
-                };
+                target.set_ptrace_stop_signal(None);
+                let tasks = target.tasks_snapshot();
                 for task in tasks {
-                    let mut task_inner = task.inner_exclusive_access();
-                    if task_inner.task_status == TaskStatus::Blocked {
-                        task_inner.task_status = TaskStatus::Ready;
-                        drop(task_inner);
+                    if task.status() == TaskStatus::Blocked {
+                        task.set_status(TaskStatus::Ready);
                         add_task(task);
                     }
                 }
@@ -3504,7 +3442,7 @@ pub fn sys_kill(pid: isize, signum: i32) -> isize {
     if pid > 0 {
         kill_single(pid as usize, signum, flag, pid_now)
     } else if pid == 0 {
-        let caller_pgid = current_process().inner_exclusive_access().pgid;
+        let caller_pgid = current_process().pgid();
         kill_group(Some(caller_pgid), signum, flag, pid_now)
     } else if pid == -1 {
         kill_group(None, signum, flag, pid_now)
@@ -3514,12 +3452,7 @@ pub fn sys_kill(pid: isize, signum: i32) -> isize {
     }
 }
 
-fn kill_single(
-    pid: usize,
-    signum: i32,
-    flag: Option<SignalFlags>,
-    sender_pid: usize,
-) -> isize {
+fn kill_single(pid: usize, signum: i32, flag: Option<SignalFlags>, sender_pid: usize) -> isize {
     let process = match pid2process(pid) {
         Some(p) => p,
         None => return errno(ESRCH),
@@ -3531,19 +3464,16 @@ fn kill_single(
         return 0;
     }
     let flag = flag.unwrap();
-    let mut inner = process.inner_exclusive_access();
     let mut yielded_after_continue = false;
-    if flag == SignalFlags::SIGCONT && inner.group_stopped {
-        inner.child_wait_event = Some(ChildWaitEvent::Continued(SIGCONT as i32));
-        inner.group_stopped = false;
+    if flag == SignalFlags::SIGCONT && process.group_stopped() {
+        process.set_child_wait_event(Some(ChildWaitEvent::Continued(SIGCONT as i32)));
+        process.set_group_stopped(false);
         yielded_after_continue = true;
     }
-    inner.set_pending_signal_siginfo(signum as usize, sender_pid as i32, 0);
-    inner.signal_pending |= flag;
-    for task in inner.tasks.iter().filter_map(|t| t.as_ref()) {
-        wake_task_for_signal(task, flag);
+    process.insert_process_signal(flag, sender_pid as i32, 0);
+    for task in process.tasks_snapshot() {
+        wake_task_for_signal(&task, flag);
     }
-    drop(inner);
     if yielded_after_continue {
         suspend_current_and_run_next();
     }
@@ -3558,29 +3488,39 @@ fn kill_group(
 ) -> isize {
     let mut found = false;
     for (p, process) in pid2process_snapshot() {
-        if p == 1 { continue; }
-        if target_pgid.is_none() && p == sender_pid { continue; }
+        if p == 1 {
+            continue;
+        }
+        if target_pgid.is_none() && p == sender_pid {
+            continue;
+        }
         let matches = if let Some(pgid) = target_pgid {
-            process.inner_exclusive_access().pgid == pgid
+            process.pgid() == pgid
         } else {
             true
         };
-        if !matches { continue; }
-        found = true;
-        if signum == 0 { continue; }
-        let flag = flag.unwrap();
-        let mut inner = process.inner_exclusive_access();
-        if flag == SignalFlags::SIGCONT && inner.group_stopped {
-            inner.child_wait_event = Some(ChildWaitEvent::Continued(SIGCONT as i32));
-            inner.group_stopped = false;
+        if !matches {
+            continue;
         }
-        inner.set_pending_signal_siginfo(signum as usize, sender_pid as i32, 0);
-        inner.signal_pending |= flag;
-        for task in inner.tasks.iter().filter_map(|t| t.as_ref()) {
-            wake_task_for_signal(task, flag);
+        found = true;
+        if signum == 0 {
+            continue;
+        }
+        let flag = flag.unwrap();
+        if flag == SignalFlags::SIGCONT && process.group_stopped() {
+            process.set_child_wait_event(Some(ChildWaitEvent::Continued(SIGCONT as i32)));
+            process.set_group_stopped(false);
+        }
+        process.insert_process_signal(flag, sender_pid as i32, 0);
+        for task in process.tasks_snapshot() {
+            wake_task_for_signal(&task, flag);
         }
     }
-    if found { 0 } else { errno(ESRCH) }
+    if found {
+        0
+    } else {
+        errno(ESRCH)
+    }
 }
 
 fn signal_flag_from_signum(signum: i32) -> Result<SignalFlags, isize> {
@@ -3598,14 +3538,12 @@ fn signal_flag_from_signum(signum: i32) -> Result<SignalFlags, isize> {
 }
 
 fn wake_task_for_signal(task: &Arc<TaskControlBlock>, flag: SignalFlags) {
-    let mut task_inner = task.inner_exclusive_access();
-    let signal_unmasked = !task_inner.signal_mask.contains(flag);
+    let signal_unmasked = !task.signal_mask().contains(flag);
     let force_wake = flag == SignalFlags::SIGKILL || flag == SignalFlags::SIGCONT;
-    if task_inner.task_status == TaskStatus::Blocked && (signal_unmasked || force_wake) {
+    if task.status() == TaskStatus::Blocked && (signal_unmasked || force_wake) {
         futex_remove_waiter_any(task);
-        task_inner.interrupted_by_signal = true;
-        task_inner.task_status = TaskStatus::Ready;
-        drop(task_inner);
+        task.mark_interrupted();
+        task.set_status(TaskStatus::Ready);
         add_task(task.clone());
     }
 }
@@ -3615,30 +3553,23 @@ fn task_matches_linux_tid(
     task: &Arc<TaskControlBlock>,
     target_tid: usize,
 ) -> bool {
-    let task_inner = task.inner_exclusive_access();
-    let Some(res) = task_inner.res.as_ref() else {
-        return false;
-    };
-    super::thread::match_user_tid(process_pid, res.tid, target_tid)
+    super::thread::match_user_tid(process_pid, task.tid(), target_tid)
 }
 
 fn send_signal_to_task_from_list(
     target_tid: usize,
     process_pid: usize,
-    tasks: &[Option<Arc<TaskControlBlock>>],
+    tasks: &[Arc<TaskControlBlock>],
     flag: SignalFlags,
 ) -> isize {
     let target = tasks
         .iter()
-        .filter_map(|t| t.as_ref())
         .find(|task| task_matches_linux_tid(process_pid, task, target_tid))
         .cloned();
     let Some(task) = target else {
         return errno(ESRCH);
     };
-    let mut task_inner = task.inner_exclusive_access();
-    task_inner.signal_pending |= flag;
-    drop(task_inner);
+    task.insert_pending_signal(flag);
     wake_task_for_signal(&task, flag);
     0
 }
@@ -3666,9 +3597,8 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
     // for cross-process tkill.
     let process = current_process();
     let process_pid = process.getpid();
-    let inner = process.inner_exclusive_access();
-    let ret = send_signal_to_task_from_list(tid, process_pid, &inner.tasks, flag);
-    drop(inner);
+    let tasks = process.tasks_snapshot();
+    let ret = send_signal_to_task_from_list(tid, process_pid, &tasks, flag);
     if ret == 0 {
         return 0;
     }
@@ -3678,9 +3608,8 @@ pub fn sys_tkill(tid: isize, signum: i32) -> isize {
         if process_pid == 1 && pid_now != 1 {
             return errno(EPERM);
         }
-        let inner = process.inner_exclusive_access();
-        let ret = send_signal_to_task_from_list(tid, process_pid, &inner.tasks, flag);
-        drop(inner);
+        let tasks = process.tasks_snapshot();
+        let ret = send_signal_to_task_from_list(tid, process_pid, &tasks, flag);
         return ret;
     }
     ret
@@ -3723,11 +3652,10 @@ pub fn sys_sigaction(
         return errno(EINVAL);
     }
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
     let idx = signum as usize;
-    let token = inner.memory_set.token();
+    let token = current_user_token();
     if !old_action.is_null() {
-        let old = inner.signal_actions.table[idx];
+        let old = process.with_signal_action(idx, |action| action);
         let bytes = unsafe {
             core::slice::from_raw_parts(
                 (&old as *const SignalAction) as *const u8,
@@ -3782,7 +3710,7 @@ pub fn sys_sigaction(
                 );
             }
         }
-        inner.signal_actions.table[idx] = new_action;
+        process.update_signal_action(idx, |slot| *slot = new_action);
     }
     0
 }
@@ -3809,11 +3737,10 @@ pub fn sys_sigprocmask(
     }
     let token = current_user_token();
     let task = current_task().unwrap();
-    let mut task_inner = task.inner_exclusive_access();
 
     if !oldset.is_null() {
         // 使用 flags_to_user_mask 简化转换
-        let user_mask = flags_to_user_mask(task_inner.signal_mask) as usize;
+        let user_mask = flags_to_user_mask(task.signal_mask()) as usize;
         let bytes = unsafe {
             core::slice::from_raw_parts(
                 (&user_mask as *const usize) as *const u8,
@@ -3826,21 +3753,26 @@ pub fn sys_sigprocmask(
     }
 
     if !set.is_null() {
+        if !matches!(how, 0 | 1 | 2) {
+            return errno(EINVAL);
+        }
         let user_mask = match read_from_user::<usize>(token, set) {
             Ok(v) => v,
             Err(err) => return err,
         };
         let mut new_flags = user_mask_to_flags(user_mask as u64);
         new_flags.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
-        match how {
-            0 => task_inner.signal_mask |= new_flags,  // SIG_BLOCK
-            1 => task_inner.signal_mask &= !new_flags, // SIG_UNBLOCK
-            2 => task_inner.signal_mask = new_flags,   // SIG_SETMASK
-            _ => return errno(EINVAL),
-        }
-        task_inner
-            .signal_mask
-            .remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
+        task.with_signals_mut(|signals| {
+            match how {
+                0 => signals.signal_mask |= new_flags,  // SIG_BLOCK
+                1 => signals.signal_mask &= !new_flags, // SIG_UNBLOCK
+                2 => signals.signal_mask = new_flags,   // SIG_SETMASK
+                _ => {}
+            }
+            signals
+                .signal_mask
+                .remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
+        });
     }
     0
 }
@@ -3851,12 +3783,10 @@ pub fn sys_sigreturn() -> isize {
         syscall!("kernel:pid[{}] sys_sigreturn", pid);
     }
     let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
-    let trap_sepc = inner.get_trap_cx().sepc;
-    let in_sigreturn_trampoline =
-        (arch::SIG_RETURN_ADDR..arch::SIG_RETURN_ADDR + PAGE_SIZE).contains(&trap_sepc);
+    let trap_sepc = task.with_trap_cx_mut(|trap_cx| trap_cx.sepc);
+    let in_sigreturn_trampoline = arch::is_sigreturn_trampoline_pc(trap_sepc);
 
-    let saved = match inner.signal_trap_cx.take() {
+    let saved = match task.take_signal_frame() {
         Some(cx) => cx,
         None => {
             if in_sigreturn_trampoline {
@@ -3864,10 +3794,11 @@ pub fn sys_sigreturn() -> isize {
                     "[sigreturn] missing signal frame in trampoline context, pid={} sepc={:#x}, force SIGSEGV",
                     pid, trap_sepc
                 );
-                inner.handling_sig = -1;
-                inner.signal_ucontext_ptr = 0;
-                inner.signal_canary_ptr = 0;
-                drop(inner);
+                task.with_signals_mut(|signals| {
+                    signals.handling_sig = -1;
+                    signals.signal_ucontext_ptr = 0;
+                    signals.signal_canary_ptr = 0;
+                });
                 exit_current_and_run_next(-(SIGSEGV as i32));
                 panic!("Unreachable after fatal sigreturn frame error");
             }
@@ -3876,9 +3807,12 @@ pub fn sys_sigreturn() -> isize {
     };
 
     // 检查信号帧 canary（使用投递时记录的精确地址，避免依赖当前 SP）
-    let current_sp = inner.get_trap_cx()[TrapFrameArgs::SP];
-    let canary_ptr = inner.signal_canary_ptr;
-    inner.signal_canary_ptr = 0;
+    let current_sp = task.with_trap_cx_mut(|trap_cx| trap_cx[TrapFrameArgs::SP]);
+    let canary_ptr = task.with_signals_mut(|signals| {
+        let canary_ptr = signals.signal_canary_ptr;
+        signals.signal_canary_ptr = 0;
+        canary_ptr
+    });
     let token = current_user_token();
     if canary_ptr != 0 {
         match read_from_user::<usize>(token, canary_ptr as *const _) {
@@ -3900,8 +3834,11 @@ pub fn sys_sigreturn() -> isize {
         }
     }
     let saved_a0 = saved[TrapFrameArgs::RET] as isize;
-    let ucontext_ptr = inner.signal_ucontext_ptr;
-    inner.signal_ucontext_ptr = 0;
+    let ucontext_ptr = task.with_signals_mut(|signals| {
+        let ucontext_ptr = signals.signal_ucontext_ptr;
+        signals.signal_ucontext_ptr = 0;
+        ucontext_ptr
+    });
 
     // 恢复 trap context 和 signal_mask
     let return_pc;
@@ -3916,8 +3853,7 @@ pub fn sys_sigreturn() -> isize {
                     "[sigreturn] cannot read ucontext! pid={} ucontext_ptr={:#x}, force SIGSEGV",
                     pid, ucontext_ptr
                 );
-                inner.handling_sig = -1;
-                drop(inner);
+                task.set_handling_sig(-1);
                 exit_current_and_run_next(-(SIGSEGV as i32));
                 panic!("Unreachable after fatal sigreturn ucontext read failure");
             }
@@ -3932,52 +3868,54 @@ pub fn sys_sigreturn() -> isize {
         );
         let mut restored = saved;
         ucontext.restore_trap_context(&mut restored);
-        *inner.get_trap_cx() = restored;
+        task.with_trap_cx_mut(|trap_cx| *trap_cx = restored);
         // 从 ucontext 恢复信号掩码（per-thread）
         let mut new_mask = user_mask_to_flags(ucontext.signal_mask_word0());
         new_mask.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
-        inner.signal_mask = new_mask;
+        task.set_signal_mask(new_mask);
         return_pc = restored.sepc;
         ret_a0 = restored[TrapFrameArgs::RET] as isize;
     } else {
-        *inner.get_trap_cx() = saved;
+        task.with_trap_cx_mut(|trap_cx| *trap_cx = saved);
         // 从 backup 恢复信号掩码（per-thread）
-        inner.signal_mask = inner.signal_mask_backup;
+        let signal_mask_backup = task.with_signals(|signals| signals.signal_mask_backup);
+        task.set_signal_mask(signal_mask_backup);
         return_pc = saved.sepc;
         ret_a0 = saved_a0;
     }
 
     #[cfg(target_arch = "loongarch64")]
     {
-        let trap_cx = inner.get_trap_cx();
+        let (sp, ra) = task
+            .with_trap_cx_mut(|trap_cx| (trap_cx[TrapFrameArgs::SP], trap_cx[TrapFrameArgs::RA]));
         trace!(
             "[sigreturn] pid={} sig={} ucontext_ptr={:#x} saved_pc={:#x} return_pc={:#x} sp={:#x} ra={:#x}",
             pid,
-            inner.handling_sig,
+            task.handling_sig(),
             ucontext_ptr,
             saved_pc,
             return_pc,
-            trap_cx[TrapFrameArgs::SP],
-            trap_cx[TrapFrameArgs::RA]
+            sp,
+            ra
         );
     }
 
     // SA_RESETHAND 处理
-    let current_sig = inner.handling_sig;
-    inner.handling_sig = -1;
+    let current_sig = task.handling_sig();
+    task.set_handling_sig(-1);
     let mut process_pending_snapshot = SignalFlags::empty();
 
     if current_sig >= 0 && (current_sig as usize) <= crate::task::MAX_SIG {
         let process = current_process();
-        let mut process_inner = process.inner_exclusive_access();
-        process_pending_snapshot = process_inner.signal_pending;
-        let action = process_inner.signal_actions.table[current_sig as usize];
+        process_pending_snapshot = process.pending_signal();
+        let action = process.with_signal_action(current_sig as usize, |action| action);
         if (action.flags & crate::task::SA_RESETHAND) != 0 {
             info!(
                 "[sigreturn] SA_RESETHAND set for signal {}, resetting handler to SIG_DFL",
                 current_sig
             );
-            process_inner.signal_actions.table[current_sig as usize] = SignalAction::default();
+            process
+                .update_signal_action(current_sig as usize, |slot| *slot = SignalAction::default());
         }
     }
 
@@ -3992,13 +3930,14 @@ pub fn sys_sigreturn() -> isize {
     // 如果 handler 修改了 PC（重定向到 __cancel），确保 SIG33 不阻塞后续行为。
     if current_sig == 33 && return_pc != saved_pc {
         // handler 成功修改了 PC，确保 SIG33 不被掩码
-        inner.signal_mask.remove(SignalFlags::SIG33);
+        task.update_signal_mask(|mask| mask.remove(SignalFlags::SIG33));
     }
 
     if current_sig == 32 || current_sig == 33 {
-        let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-        let tp = inner.get_trap_cx()[TrapFrameArgs::TLS];
-        let task_pending = inner.signal_pending;
+        let tid = task.tid();
+        let tp = task.with_trap_cx_mut(|trap_cx| trap_cx[TrapFrameArgs::TLS]);
+        let (task_pending, signal_mask) =
+            task.with_signals(|signals| (signals.signal_pending, signals.signal_mask));
         info!(
             "[signal-flow] route=sigreturn pid={} tid={} sig{} tp={:#x} saved_pc={:#x} return_pc={:#x} pc_changed={} handling_reset=-1 mask_after={:?} task_pending={:?} proc_pending={:?}",
             pid,
@@ -4008,7 +3947,7 @@ pub fn sys_sigreturn() -> isize {
             saved_pc,
             return_pc,
             return_pc != saved_pc,
-            inner.signal_mask,
+            signal_mask,
             task_pending,
             process_pending_snapshot
         );
@@ -4021,7 +3960,7 @@ pub fn sys_sigreturn() -> isize {
 pub fn sys_getuid() -> isize {
     let process = current_process();
     syscall!("kernel:pid[{}] sys_getuid", process.pid.0);
-    let uid = process.inner_exclusive_access().real_uid as isize;
+    let uid = process.real_uid() as isize;
     uid
 }
 
@@ -4029,7 +3968,7 @@ pub fn sys_getuid() -> isize {
 pub fn sys_geteuid() -> isize {
     let process = current_process();
     syscall!("kernel:pid[{}] sys_geteuid", process.pid.0);
-    let uid = process.inner_exclusive_access().effective_uid as isize;
+    let uid = process.effective_uid() as isize;
     uid
 }
 
@@ -4037,7 +3976,7 @@ pub fn sys_geteuid() -> isize {
 pub fn sys_getgid() -> isize {
     let process = current_process();
     syscall!("kernel:pid[{}] sys_getgid", process.pid.0);
-    let gid = process.inner_exclusive_access().real_gid as isize;
+    let gid = process.real_gid() as isize;
     gid
 }
 
@@ -4045,7 +3984,7 @@ pub fn sys_getgid() -> isize {
 pub fn sys_getegid() -> isize {
     let process = current_process();
     syscall!("kernel:pid[{}] sys_getegid", process.pid.0);
-    let gid = process.inner_exclusive_access().effective_gid as isize;
+    let gid = process.effective_gid() as isize;
     gid
 }
 
@@ -4053,48 +3992,50 @@ pub fn sys_getegid() -> isize {
 /// Linux semantics: always returns previous fsuid, never fails.
 pub fn sys_setfsuid(uid: u32) -> isize {
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let prev = inner.fs_uid;
-    let neg1 = u32::MAX;
+    process.with_identity_mut(|inner| {
+        let prev = inner.fs_uid;
+        let neg1 = u32::MAX;
 
-    if uid == neg1 {
-        return prev as isize;
-    }
+        if uid == neg1 {
+            return prev as isize;
+        }
 
-    let is_privileged = inner.effective_uid == 0;
-    if is_privileged
-        || uid == inner.real_uid
-        || uid == inner.effective_uid
-        || uid == inner.saved_uid
-        || uid == inner.fs_uid
-    {
-        inner.fs_uid = uid;
-    }
-    prev as isize
+        let is_privileged = inner.effective_uid == 0;
+        if is_privileged
+            || uid == inner.real_uid
+            || uid == inner.effective_uid
+            || uid == inner.saved_uid
+            || uid == inner.fs_uid
+        {
+            inner.fs_uid = uid;
+        }
+        prev as isize
+    })
 }
 
 /// Set filesystem group ID.
 /// Linux semantics: always returns previous fsgid, never fails.
 pub fn sys_setfsgid(gid: u32) -> isize {
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let prev = inner.fs_gid;
-    let neg1 = u32::MAX;
+    process.with_identity_mut(|inner| {
+        let prev = inner.fs_gid;
+        let neg1 = u32::MAX;
 
-    if gid == neg1 {
-        return prev as isize;
-    }
+        if gid == neg1 {
+            return prev as isize;
+        }
 
-    let is_privileged = inner.effective_uid == 0;
-    if is_privileged
-        || gid == inner.real_gid
-        || gid == inner.effective_gid
-        || gid == inner.saved_gid
-        || gid == inner.fs_gid
-    {
-        inner.fs_gid = gid;
-    }
-    prev as isize
+        let is_privileged = inner.effective_uid == 0;
+        if is_privileged
+            || gid == inner.real_gid
+            || gid == inner.effective_gid
+            || gid == inner.saved_gid
+            || gid == inner.fs_gid
+        {
+            inner.fs_gid = gid;
+        }
+        prev as isize
+    })
 }
 
 /// Set user ID with minimal Linux-like semantics needed by LTP.
@@ -4104,19 +4045,20 @@ pub fn sys_setuid(uid: u32) -> isize {
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_setuid uid={}", pid, uid);
     }
-    let mut inner = process.inner_exclusive_access();
-    if inner.effective_uid == 0 {
-        inner.real_uid = uid;
-        inner.effective_uid = uid;
-        inner.fs_uid = uid;
-        return 0;
-    }
-    if uid == inner.real_uid || uid == inner.effective_uid {
-        inner.effective_uid = uid;
-        inner.fs_uid = uid;
-        return 0;
-    }
-    errno(EPERM)
+    process.with_identity_mut(|inner| {
+        if inner.effective_uid == 0 {
+            inner.real_uid = uid;
+            inner.effective_uid = uid;
+            inner.fs_uid = uid;
+            return 0;
+        }
+        if uid == inner.real_uid || uid == inner.effective_uid {
+            inner.effective_uid = uid;
+            inner.fs_uid = uid;
+            return 0;
+        }
+        errno(EPERM)
+    })
 }
 
 /// Set group ID with minimal Linux-like semantics needed by LTP.
@@ -4126,21 +4068,21 @@ pub fn sys_setgid(gid: u32) -> isize {
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_setgid gid={}", pid, gid);
     }
-    let mut inner = process.inner_exclusive_access();
-    if inner.effective_gid == 0 {
-        inner.real_gid = gid;
-        inner.effective_gid = gid;
-        inner.fs_gid = gid;
-        return 0;
-    }
-    if gid == inner.real_gid || gid == inner.effective_gid {
-        inner.effective_gid = gid;
-        inner.fs_gid = gid;
-        return 0;
-    }
-    errno(EPERM)
+    process.with_identity_mut(|inner| {
+        if inner.effective_gid == 0 {
+            inner.real_gid = gid;
+            inner.effective_gid = gid;
+            inner.fs_gid = gid;
+            return 0;
+        }
+        if gid == inner.real_gid || gid == inner.effective_gid {
+            inner.effective_gid = gid;
+            inner.fs_gid = gid;
+            return 0;
+        }
+        errno(EPERM)
+    })
 }
-
 
 /// getgroups(size, list) - syscall 158
 /// Returns the supplementary group IDs of the calling process.
@@ -4148,7 +4090,12 @@ pub fn sys_setgid(gid: u32) -> isize {
 pub fn sys_getgroups(size: i32, list: *mut u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_getgroups size={} list={:p}", pid, size, list);
+        syscall!(
+            "kernel:pid[{}] sys_getgroups size={} list={:p}",
+            pid,
+            size,
+            list
+        );
     }
     // size < 0 is invalid
     if size < 0 {
@@ -4182,7 +4129,12 @@ pub fn sys_getgroups(size: i32, list: *mut u32) -> isize {
 pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_setgroups size={} list={:p}", pid, size, list);
+        syscall!(
+            "kernel:pid[{}] sys_setgroups size={} list={:p}",
+            pid,
+            size,
+            list
+        );
     }
     const NGROUPS_MAX: usize = 65536;
     if size > NGROUPS_MAX {
@@ -4201,121 +4153,149 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
 /// Set real and/or effective group ID.
 pub fn sys_setregid(rgid: u32, egid: u32) -> isize {
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let is_root = inner.effective_gid == 0;
-    let neg1 = u32::MAX;
+    process.with_identity_mut(|inner| {
+        let is_root = inner.effective_gid == 0;
+        let neg1 = u32::MAX;
 
-    if !is_root {
-        // unprivileged: can only set to one of real/effective/saved
-        if rgid != neg1 && rgid != inner.real_gid && rgid != inner.effective_gid {
-            return errno(EPERM);
+        if !is_root {
+            // unprivileged: can only set to one of real/effective/saved
+            if rgid != neg1 && rgid != inner.real_gid && rgid != inner.effective_gid {
+                return errno(EPERM);
+            }
+            if egid != neg1
+                && egid != inner.real_gid
+                && egid != inner.effective_gid
+                && egid != inner.saved_gid
+            {
+                return errno(EPERM);
+            }
         }
-        if egid != neg1 && egid != inner.real_gid && egid != inner.effective_gid && egid != inner.saved_gid {
-            return errno(EPERM);
-        }
-    }
 
-    let old_real_gid = inner.real_gid;
-    if rgid != neg1 {
-        inner.real_gid = rgid;
-    }
-    let new_egid = if egid != neg1 { egid } else { inner.effective_gid };
-    if egid != neg1 {
-        inner.effective_gid = new_egid;
-        inner.fs_gid = new_egid;
-    }
-    // Linux setregid: saved_gid is set to new effective GID if:
-    //   1. real GID was changed, OR
-    //   2. new effective GID != old real GID
-    if rgid != neg1 || new_egid != old_real_gid {
-        inner.saved_gid = new_egid;
-    }
-    0
+        let old_real_gid = inner.real_gid;
+        if rgid != neg1 {
+            inner.real_gid = rgid;
+        }
+        let new_egid = if egid != neg1 {
+            egid
+        } else {
+            inner.effective_gid
+        };
+        if egid != neg1 {
+            inner.effective_gid = new_egid;
+            inner.fs_gid = new_egid;
+        }
+        // Linux setregid: saved_gid is set to new effective GID if:
+        //   1. real GID was changed, OR
+        //   2. new effective GID != old real GID
+        if rgid != neg1 || new_egid != old_real_gid {
+            inner.saved_gid = new_egid;
+        }
+        0
+    })
 }
 
 /// setreuid(ruid, euid) - syscall 145
 pub fn sys_setreuid(ruid: u32, euid: u32) -> isize {
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let is_root = inner.effective_uid == 0;
-    let neg1 = u32::MAX;
+    process.with_identity_mut(|inner| {
+        let is_root = inner.effective_uid == 0;
+        let neg1 = u32::MAX;
 
-    if !is_root {
-        if ruid != neg1 && ruid != inner.real_uid && ruid != inner.effective_uid {
-            return errno(EPERM);
+        if !is_root {
+            if ruid != neg1 && ruid != inner.real_uid && ruid != inner.effective_uid {
+                return errno(EPERM);
+            }
+            if euid != neg1
+                && euid != inner.real_uid
+                && euid != inner.effective_uid
+                && euid != inner.saved_uid
+            {
+                return errno(EPERM);
+            }
         }
-        if euid != neg1 && euid != inner.real_uid && euid != inner.effective_uid && euid != inner.saved_uid {
-            return errno(EPERM);
-        }
-    }
 
-    let old_real_uid = inner.real_uid;
-    if ruid != neg1 {
-        inner.real_uid = ruid;
-    }
-    let new_euid = if euid != neg1 { euid } else { inner.effective_uid };
-    if euid != neg1 {
-        inner.effective_uid = new_euid;
-        inner.fs_uid = new_euid;
-    }
-    // Linux setreuid: saved_uid is set to new effective UID if:
-    //   1. real UID was changed, OR
-    //   2. new effective UID != old real UID
-    if ruid != neg1 || new_euid != old_real_uid {
-        inner.saved_uid = new_euid;
-    }
-    0
+        let old_real_uid = inner.real_uid;
+        if ruid != neg1 {
+            inner.real_uid = ruid;
+        }
+        let new_euid = if euid != neg1 {
+            euid
+        } else {
+            inner.effective_uid
+        };
+        if euid != neg1 {
+            inner.effective_uid = new_euid;
+            inner.fs_uid = new_euid;
+        }
+        // Linux setreuid: saved_uid is set to new effective UID if:
+        //   1. real UID was changed, OR
+        //   2. new effective UID != old real UID
+        if ruid != neg1 || new_euid != old_real_uid {
+            inner.saved_uid = new_euid;
+        }
+        0
+    })
 }
 
 /// setresuid(ruid, euid, suid) - syscall 147
 pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> isize {
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let is_root = inner.effective_uid == 0;
-    let neg1 = u32::MAX;
+    process.with_identity_mut(|inner| {
+        let is_root = inner.effective_uid == 0;
+        let neg1 = u32::MAX;
 
-    if !is_root {
-        // Non-root: can only set to one of current real/effective/saved
-        let allowed = [inner.real_uid, inner.effective_uid, inner.saved_uid];
-        if ruid != neg1 && !allowed.contains(&ruid) {
-            return errno(EPERM);
+        if !is_root {
+            // Non-root: can only set to one of current real/effective/saved
+            let allowed = [inner.real_uid, inner.effective_uid, inner.saved_uid];
+            if ruid != neg1 && !allowed.contains(&ruid) {
+                return errno(EPERM);
+            }
+            if euid != neg1 && !allowed.contains(&euid) {
+                return errno(EPERM);
+            }
+            if suid != neg1 && !allowed.contains(&suid) {
+                return errno(EPERM);
+            }
         }
-        if euid != neg1 && !allowed.contains(&euid) {
-            return errno(EPERM);
-        }
-        if suid != neg1 && !allowed.contains(&suid) {
-            return errno(EPERM);
-        }
-    }
 
-    if ruid != neg1 { inner.real_uid = ruid; }
-    if euid != neg1 {
-        inner.effective_uid = euid;
-        inner.fs_uid = euid;
-    }
-    if suid != neg1 { inner.saved_uid = suid; }
-    0
+        if ruid != neg1 {
+            inner.real_uid = ruid;
+        }
+        if euid != neg1 {
+            inner.effective_uid = euid;
+            inner.fs_uid = euid;
+        }
+        if suid != neg1 {
+            inner.saved_uid = suid;
+        }
+        0
+    })
 }
 
 /// getresuid(ruid, euid, suid) - syscall 148
 pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    let (r, e, s) = (inner.real_uid, inner.effective_uid, inner.saved_uid);
-    drop(inner);
+    let (r, e, s) =
+        process.with_identity(|inner| (inner.real_uid, inner.effective_uid, inner.saved_uid));
     drop(process);
     let token = current_user_token();
     let r_bytes = r.to_ne_bytes();
     let e_bytes = e.to_ne_bytes();
     let s_bytes = s.to_ne_bytes();
     if !ruid.is_null() {
-        if copy_to_user(token, ruid as *mut u8, &r_bytes).is_err() { return errno(EFAULT); }
+        if copy_to_user(token, ruid as *mut u8, &r_bytes).is_err() {
+            return errno(EFAULT);
+        }
     }
     if !euid.is_null() {
-        if copy_to_user(token, euid as *mut u8, &e_bytes).is_err() { return errno(EFAULT); }
+        if copy_to_user(token, euid as *mut u8, &e_bytes).is_err() {
+            return errno(EFAULT);
+        }
     }
     if !suid.is_null() {
-        if copy_to_user(token, suid as *mut u8, &s_bytes).is_err() { return errno(EFAULT); }
+        if copy_to_user(token, suid as *mut u8, &s_bytes).is_err() {
+            return errno(EFAULT);
+        }
     }
     0
 }
@@ -4323,51 +4303,61 @@ pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
 /// setresgid(rgid, egid, sgid) - syscall 149
 pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> isize {
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let is_root = inner.effective_gid == 0;
-    let neg1 = u32::MAX;
+    process.with_identity_mut(|inner| {
+        let is_root = inner.effective_gid == 0;
+        let neg1 = u32::MAX;
 
-    if !is_root {
-        let allowed = [inner.real_gid, inner.effective_gid, inner.saved_gid];
-        if rgid != neg1 && !allowed.contains(&rgid) {
-            return errno(EPERM);
+        if !is_root {
+            let allowed = [inner.real_gid, inner.effective_gid, inner.saved_gid];
+            if rgid != neg1 && !allowed.contains(&rgid) {
+                return errno(EPERM);
+            }
+            if egid != neg1 && !allowed.contains(&egid) {
+                return errno(EPERM);
+            }
+            if sgid != neg1 && !allowed.contains(&sgid) {
+                return errno(EPERM);
+            }
         }
-        if egid != neg1 && !allowed.contains(&egid) {
-            return errno(EPERM);
-        }
-        if sgid != neg1 && !allowed.contains(&sgid) {
-            return errno(EPERM);
-        }
-    }
 
-    if rgid != neg1 { inner.real_gid = rgid; }
-    if egid != neg1 {
-        inner.effective_gid = egid;
-        inner.fs_gid = egid;
-    }
-    if sgid != neg1 { inner.saved_gid = sgid; }
-    0
+        if rgid != neg1 {
+            inner.real_gid = rgid;
+        }
+        if egid != neg1 {
+            inner.effective_gid = egid;
+            inner.fs_gid = egid;
+        }
+        if sgid != neg1 {
+            inner.saved_gid = sgid;
+        }
+        0
+    })
 }
 
 /// getresgid(rgid, egid, sgid) - syscall 150
 pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> isize {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    let (r, e, s) = (inner.real_gid, inner.effective_gid, inner.saved_gid);
-    drop(inner);
+    let (r, e, s) =
+        process.with_identity(|inner| (inner.real_gid, inner.effective_gid, inner.saved_gid));
     drop(process);
     let token = current_user_token();
     let r_bytes = r.to_ne_bytes();
     let e_bytes = e.to_ne_bytes();
     let s_bytes = s.to_ne_bytes();
     if !rgid.is_null() {
-        if copy_to_user(token, rgid as *mut u8, &r_bytes).is_err() { return errno(EFAULT); }
+        if copy_to_user(token, rgid as *mut u8, &r_bytes).is_err() {
+            return errno(EFAULT);
+        }
     }
     if !egid.is_null() {
-        if copy_to_user(token, egid as *mut u8, &e_bytes).is_err() { return errno(EFAULT); }
+        if copy_to_user(token, egid as *mut u8, &e_bytes).is_err() {
+            return errno(EFAULT);
+        }
     }
     if !sgid.is_null() {
-        if copy_to_user(token, sgid as *mut u8, &s_bytes).is_err() { return errno(EFAULT); }
+        if copy_to_user(token, sgid as *mut u8, &s_bytes).is_err() {
+            return errno(EFAULT);
+        }
     }
     0
 }
@@ -4391,11 +4381,10 @@ pub fn sys_rt_sigsuspend(mask_ptr: *const usize, sigsetsize: usize) -> isize {
     // Save old mask, install new mask
     let task = current_task().unwrap();
     let old_mask = {
-        let mut inner = task.inner_exclusive_access();
-        let old = inner.signal_mask;
+        let old = task.signal_mask();
         let mut m = new_mask;
         m.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
-        inner.signal_mask = m;
+        task.set_signal_mask(m);
         old
     };
 
@@ -4403,10 +4392,9 @@ pub fn sys_rt_sigsuspend(mask_ptr: *const usize, sigsetsize: usize) -> isize {
     loop {
         let has_signal = {
             let process = current_process();
-            let inner = process.inner_exclusive_access();
-            let task_inner = task.inner_exclusive_access();
-            let pending = inner.signal_pending | task_inner.signal_pending;
-            let mask = task_inner.signal_mask;
+            let (task_pending, mask) =
+                task.with_signals(|signals| (signals.signal_pending, signals.signal_mask));
+            let pending = process.pending_signal() | task_pending;
             !(pending & !mask).is_empty()
         };
         if has_signal {
@@ -4416,10 +4404,7 @@ pub fn sys_rt_sigsuspend(mask_ptr: *const usize, sigsetsize: usize) -> isize {
     }
 
     // Restore old mask
-    {
-        let mut inner = task.inner_exclusive_access();
-        inner.signal_mask = old_mask;
-    }
+    task.set_signal_mask(old_mask);
     errno(EINTR)
 }
 
@@ -4458,11 +4443,9 @@ pub fn sys_adjtimex(buf: *mut u8) -> isize {
     // Any "set" operation requires CAP_SYS_TIME (root). modes == 0 is read-only.
     if modes != 0 {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if inner.effective_uid != 0 {
+        if process.effective_uid() != 0 {
             return errno(EPERM);
         }
-        drop(inner);
     }
 
     // ADJ_ADJTIME (0x8000) without ADJ_OFFSET (0x0001) is invalid
@@ -4565,7 +4548,11 @@ pub fn sys_capget(header_ptr: *mut u8, data_ptr: *mut u8) -> isize {
     // If data_ptr is provided, fill capability data
     if !data_ptr.is_null() {
         // Determine data count (V2/V3 have 2 sets)
-        let data_count: usize = if hdr.version == _LINUX_CAPABILITY_VERSION_1 { 1 } else { 2 };
+        let data_count: usize = if hdr.version == _LINUX_CAPABILITY_VERSION_1 {
+            1
+        } else {
+            2
+        };
         let data_bytes_len = data_count * core::mem::size_of::<CapData>();
         if !user_mem::ensure_user_writable(
             token,
@@ -4578,17 +4565,26 @@ pub fn sys_capget(header_ptr: *mut u8, data_ptr: *mut u8) -> isize {
 
         // Get caps for the target process
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        let (eff_lo, eff_hi) = ((inner.cap_effective & 0xFFFFFFFF) as u32,
-                                 ((inner.cap_effective >> 32) & 0xFFFFFFFF) as u32);
-        let (perm_lo, perm_hi) = ((inner.cap_permitted & 0xFFFFFFFF) as u32,
-                                   ((inner.cap_permitted >> 32) & 0xFFFFFFFF) as u32);
-        let (inh_lo, inh_hi) = ((inner.cap_inheritable & 0xFFFFFFFF) as u32,
-                                  ((inner.cap_inheritable >> 32) & 0xFFFFFFFF) as u32);
-        drop(inner);
+        let caps = process.credentials_snapshot();
+        let (eff_lo, eff_hi) = (
+            (caps.cap_effective & 0xFFFFFFFF) as u32,
+            ((caps.cap_effective >> 32) & 0xFFFFFFFF) as u32,
+        );
+        let (perm_lo, perm_hi) = (
+            (caps.cap_permitted & 0xFFFFFFFF) as u32,
+            ((caps.cap_permitted >> 32) & 0xFFFFFFFF) as u32,
+        );
+        let (inh_lo, inh_hi) = (
+            (caps.cap_inheritable & 0xFFFFFFFF) as u32,
+            ((caps.cap_inheritable >> 32) & 0xFFFFFFFF) as u32,
+        );
         drop(process);
 
-        let data0 = CapData { effective: eff_lo, permitted: perm_lo, inheritable: inh_lo };
+        let data0 = CapData {
+            effective: eff_lo,
+            permitted: perm_lo,
+            inheritable: inh_lo,
+        };
         let data_bytes0 = unsafe {
             core::slice::from_raw_parts(
                 &data0 as *const CapData as *const u8,
@@ -4600,7 +4596,11 @@ pub fn sys_capget(header_ptr: *mut u8, data_ptr: *mut u8) -> isize {
         }
 
         if data_count == 2 {
-            let data1 = CapData { effective: eff_hi, permitted: perm_hi, inheritable: inh_hi };
+            let data1 = CapData {
+                effective: eff_hi,
+                permitted: perm_hi,
+                inheritable: inh_hi,
+            };
             let data_bytes1 = unsafe {
                 core::slice::from_raw_parts(
                     &data1 as *const CapData as *const u8,
@@ -4637,9 +4637,12 @@ pub fn sys_capset(header_ptr: *const u8, data_ptr: *const u8) -> isize {
     if !valid_versions.contains(&hdr.version) {
         // Write preferred version back to header before returning EINVAL
         hdr.version = _LINUX_CAPABILITY_VERSION_3;
-        let _ = copy_to_user(token, header_ptr as *mut u8,
-            unsafe { core::slice::from_raw_parts(&hdr as *const CapHeader as *const u8,
-                core::mem::size_of::<CapHeader>()) });
+        let _ = copy_to_user(token, header_ptr as *mut u8, unsafe {
+            core::slice::from_raw_parts(
+                &hdr as *const CapHeader as *const u8,
+                core::mem::size_of::<CapHeader>(),
+            )
+        });
         return errno(EINVAL);
     }
 
@@ -4657,7 +4660,11 @@ pub fn sys_capset(header_ptr: *const u8, data_ptr: *const u8) -> isize {
         return errno(EFAULT);
     }
 
-    let data_count: usize = if hdr.version == _LINUX_CAPABILITY_VERSION_1 { 1 } else { 2 };
+    let data_count: usize = if hdr.version == _LINUX_CAPABILITY_VERSION_1 {
+        1
+    } else {
+        2
+    };
 
     let data0 = match read_from_user::<CapData>(token, data_ptr as *const CapData) {
         Ok(v) => v,
@@ -4680,34 +4687,34 @@ pub fn sys_capset(header_ptr: *const u8, data_ptr: *const u8) -> isize {
 
     // Validate and update process capability sets
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-
-    // new_effective must be subset of new_permitted
-    if (new_effective & !new_permitted) != 0 {
-        return errno(EPERM);
-    }
-    // new_permitted must be subset of old_permitted (can't raise permitted)
-    if (new_permitted & !inner.cap_permitted) != 0 {
-        return errno(EPERM);
-    }
-    // new_inheritable must be subset of (old_inheritable | old_permitted), unless CAP_SETPCAP
-    // With CAP_SETPCAP, still bounded by bounding set
-    // CAP_SETPCAP = bit 8
-    const CAP_SETPCAP: u64 = 1 << 8;
-    if (new_inheritable & !(inner.cap_inheritable | inner.cap_permitted)) != 0 {
-        if (inner.cap_effective & CAP_SETPCAP) == 0 {
+    process.with_identity_mut(|inner| {
+        // new_effective must be subset of new_permitted
+        if (new_effective & !new_permitted) != 0 {
             return errno(EPERM);
         }
-        // Even with CAP_SETPCAP, can't exceed bounding set
-        if (new_inheritable & !inner.cap_bounding) != 0 {
+        // new_permitted must be subset of old_permitted (can't raise permitted)
+        if (new_permitted & !inner.cap_permitted) != 0 {
             return errno(EPERM);
         }
-    }
+        // new_inheritable must be subset of (old_inheritable | old_permitted), unless CAP_SETPCAP
+        // With CAP_SETPCAP, still bounded by bounding set
+        // CAP_SETPCAP = bit 8
+        const CAP_SETPCAP: u64 = 1 << 8;
+        if (new_inheritable & !(inner.cap_inheritable | inner.cap_permitted)) != 0 {
+            if (inner.cap_effective & CAP_SETPCAP) == 0 {
+                return errno(EPERM);
+            }
+            // Even with CAP_SETPCAP, can't exceed bounding set
+            if (new_inheritable & !inner.cap_bounding) != 0 {
+                return errno(EPERM);
+            }
+        }
 
-    inner.cap_effective = new_effective;
-    inner.cap_permitted = new_permitted;
-    inner.cap_inheritable = new_inheritable;
-    0
+        inner.cap_effective = new_effective;
+        inner.cap_permitted = new_permitted;
+        inner.cap_inheritable = new_inheritable;
+        0
+    })
 }
 
 /// prctl(option, arg2, arg3, arg4, arg5) - syscall 167
@@ -4780,8 +4787,13 @@ pub fn sys_prctl(option: usize, arg2: usize, arg3: usize, _arg4: usize, _arg5: u
                 return errno(EINVAL);
             }
             let process = current_process();
-            let inner = process.inner_exclusive_access();
-            if (inner.cap_bounding >> arg2) & 1 == 1 { 1 } else { 0 }
+            process.with_identity(|inner| {
+                if (inner.cap_bounding >> arg2) & 1 == 1 {
+                    1
+                } else {
+                    0
+                }
+            })
         }
         PR_CAPBSET_DROP => {
             // Drop a capability from the bounding set
@@ -4789,17 +4801,17 @@ pub fn sys_prctl(option: usize, arg2: usize, arg3: usize, _arg4: usize, _arg5: u
                 return errno(EINVAL);
             }
             let process = current_process();
-            let mut inner = process.inner_exclusive_access();
-            if (inner.cap_effective & CAP_SETPCAP) == 0 {
-                return errno(EPERM);
-            }
-            inner.cap_bounding &= !(1u64 << arg2);
-            0
+            process.with_identity_mut(|inner| {
+                if (inner.cap_effective & CAP_SETPCAP) == 0 {
+                    return errno(EPERM);
+                }
+                inner.cap_bounding &= !(1u64 << arg2);
+                0
+            })
         }
         PR_SET_SECUREBITS => {
             let process = current_process();
-            let inner = process.inner_exclusive_access();
-            if (inner.cap_effective & CAP_SETPCAP) == 0 {
+            if (process.credentials_snapshot().cap_effective & CAP_SETPCAP) == 0 {
                 return errno(EPERM);
             }
             0
@@ -4867,15 +4879,13 @@ pub fn sys_getrlimit(resource: usize, rlim: *mut RLimit) -> isize {
         return errno(EINVAL);
     }
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    let limit = inner.rlimits[resource];
+    let limit = process.with_limits(|limits| limits.rlimits[resource]);
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&limit as *const RLimit) as *const u8,
             core::mem::size_of::<RLimit>(),
         )
     };
-    drop(inner);
     drop(process);
     let token = current_user_token();
     match copy_to_user(token, rlim as *mut u8, bytes) {
@@ -4908,8 +4918,7 @@ pub fn sys_prlimit64(
 
     let token = current_user_token();
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let old = inner.rlimits[resource];
+    let old = process.with_limits(|limits| limits.rlimits[resource]);
     if !old_limit.is_null() {
         let bytes = unsafe {
             core::slice::from_raw_parts(
@@ -4929,7 +4938,7 @@ pub fn sys_prlimit64(
         if new_val.rlim_cur > new_val.rlim_max {
             return errno(EINVAL);
         }
-        inner.rlimits[resource] = new_val;
+        process.with_limits_mut(|limits| limits.rlimits[resource] = new_val);
     }
     0
 }
@@ -4948,19 +4957,16 @@ pub fn sys_exit_group(exit_code: i32) -> ! {
 
     // Send SIGKILL to all sibling threads so they exit on next schedule
     {
-        let process_inner = process.inner_exclusive_access();
-        for other_task in process_inner.tasks.iter().filter_map(|t| t.as_ref()) {
-            if !Arc::ptr_eq(other_task, &task) {
-                let mut other_inner = other_task.inner_exclusive_access();
-                if other_inner.exit_code.is_some() {
+        for other_task in process.tasks_snapshot() {
+            if !Arc::ptr_eq(&other_task, &task) {
+                if other_task.exit_code().is_some() {
                     continue; // already exited
                 }
-                other_inner.signal_pending.insert(SignalFlags::SIGKILL);
-                if other_inner.task_status == TaskStatus::Blocked {
-                    futex_remove_waiter_any(other_task);
-                    other_inner.interrupted_by_signal = true;
-                    other_inner.task_status = TaskStatus::Ready;
-                    drop(other_inner);
+                other_task.insert_pending_signal(SignalFlags::SIGKILL);
+                if other_task.status() == TaskStatus::Blocked {
+                    futex_remove_waiter_any(&other_task);
+                    other_task.mark_interrupted();
+                    other_task.set_status(TaskStatus::Ready);
                     add_task(other_task.clone());
                 }
             }
@@ -4975,6 +4981,7 @@ pub fn sys_exit_group(exit_code: i32) -> ! {
 
 pub fn sys_shutdown() -> ! {
     trace!("kernel:pid[{}] sys_shutdown", current_process().pid.0);
+    crate::fs::shutdown_filesystems();
     arch::shutdown();
 }
 
@@ -5033,9 +5040,6 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
         map_perm |= MapPermission::X;
     }
 
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-
     // Round up length to page boundary
     let page_count = (len + PAGE_SIZE - 1) / PAGE_SIZE;
     let Some(end_addr) = addr.checked_add(page_count * PAGE_SIZE) else {
@@ -5043,9 +5047,10 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     };
 
     // Change protection for the memory region
-    let result = inner
-        .memory_set
-        .change_protection(VirtAddr(addr), VirtAddr(end_addr), map_perm);
+    let process = current_process();
+    let result = process.with_memory_set_mut(|memory_set| {
+        memory_set.change_protection(VirtAddr(addr), VirtAddr(end_addr), map_perm)
+    });
 
     match result {
         Ok(()) => 0,
@@ -5117,11 +5122,10 @@ pub fn sys_rt_sigtimedwait(
         let mut interrupted_by_other = false;
         {
             let process = current_process();
-            let process_inner = process.inner_exclusive_access();
             let task = current_task().unwrap();
-            let task_inner = task.inner_exclusive_access();
-            let process_pending = process_inner.signal_pending;
-            let task_pending = task_inner.signal_pending;
+            let process_pending = process.pending_signal();
+            let (task_pending, signal_mask) =
+                task.with_signals(|signals| (signals.signal_pending, signals.signal_mask));
             let pending_any = process_pending | task_pending;
 
             // SIGKILL/SIGSTOP must break out of kernel wait loops immediately.
@@ -5144,8 +5148,7 @@ pub fn sys_rt_sigtimedwait(
                 }
                 if (sigset & (1usize << (signum - 1))) != 0 {
                     if process_pending.contains(flag) {
-                        let (sender_pid, si_code) =
-                            process_inner.get_pending_signal_siginfo(signum);
+                        let (sender_pid, si_code) = process.process_signal_siginfo(signum);
                         found = Some((signum, true, sender_pid, si_code));
                     } else {
                         found = Some((signum, false, 0, 0));
@@ -5153,8 +5156,8 @@ pub fn sys_rt_sigtimedwait(
                     break;
                 }
                 // Non-waited unmasked signal interrupts with EINTR.
-                if !task_inner.signal_mask.contains(flag) {
-                    let action = process_inner.signal_actions.table[signum];
+                if !signal_mask.contains(flag) {
+                    let action = process.with_signal_action(signum, |action| action);
                     if action.handler == SIG_IGN_HANDLER
                         || (action.handler == 0 && signal_default_ignored(signum))
                     {
@@ -5174,15 +5177,12 @@ pub fn sys_rt_sigtimedwait(
                 }
             }
             let process = current_process();
-            let mut process_inner = process.inner_exclusive_access();
             let task = current_task().unwrap();
-            let mut task_inner = task.inner_exclusive_access();
             let flag = SignalFlags::from_bits_truncate(1u64 << (signum - 1));
             if from_process {
-                process_inner.signal_pending.remove(flag);
-                process_inner.clear_pending_signal_siginfo(signum);
+                process.take_process_signal(signum);
             } else {
-                task_inner.signal_pending.remove(flag);
+                task.remove_pending_signal(flag);
             }
             return signum as isize;
         }
@@ -5215,7 +5215,7 @@ pub fn sys_unshare(flags: usize) -> isize {
     }
     if flags & CLONE_NEWNS != 0 {
         let process = current_process();
-        if process.inner_exclusive_access().effective_uid != 0 {
+        if process.effective_uid() != 0 {
             return errno(EPERM);
         }
     }
@@ -5325,7 +5325,7 @@ pub fn sys_sched_getattr(_pid: usize, attr: *mut u8, size: usize, _flags: usize)
     //   u64 sched_period = 0
     let mut buf = [0u8; 48];
     buf[0..4].copy_from_slice(&48u32.to_le_bytes()); // size = 48
-    // All other fields are 0 (SCHED_OTHER, no priority, etc.)
+                                                     // All other fields are 0 (SCHED_OTHER, no priority, etc.)
     match copy_to_user(token, attr, &buf) {
         Ok(_) => 0,
         Err(e) => e,

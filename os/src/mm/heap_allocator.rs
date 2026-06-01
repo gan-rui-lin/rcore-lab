@@ -130,10 +130,7 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
     let (fa_cur, fa_end, fa_recycled, fa_avail) = crate::mm::frame_allocator_stats();
     println!(
         "[kernel] alloc_error frames: current={:#x} end={:#x} recycled={} available_est={}",
-        fa_cur,
-        fa_end,
-        fa_recycled,
-        fa_avail
+        fa_cur, fa_end, fa_recycled, fa_avail
     );
     crate::task::print_current_task_brief_for_alloc_error();
     let proc_len = crate::task::pid2process_len();
@@ -186,9 +183,7 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
     );
     println!(
         "[kernel] alloc_error diag5: total_fd_slots={} max_fd_slots={} max_fd_pid={}",
-        total_fd_slots,
-        max_fd_slots,
-        max_fd_pid
+        total_fd_slots, max_fd_slots, max_fd_pid
     );
     crate::task::print_ready_queue_brief(8);
     crate::task::print_pid2process_top_by_fd(5);
@@ -198,11 +193,11 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
 
 #[inline]
 fn rounded_alloc_size(layout: core::alloc::Layout) -> usize {
-    let size_pow2 = layout.size().checked_next_power_of_two().unwrap_or(usize::MAX);
-    max(
-        size_pow2,
-        max(layout.align(), size_of::<usize>()),
-    )
+    let size_pow2 = layout
+        .size()
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX);
+    max(size_pow2, max(layout.align(), size_of::<usize>()))
 }
 
 #[inline]
@@ -238,9 +233,7 @@ fn print_recent_alloc_trace(limit: usize) {
     };
     println!(
         "[kernel] alloc_error recent_alloc: cap={} next={} min_size={}",
-        ALLOC_TRACE_CAP,
-        ring.next,
-        ALLOC_TRACE_MIN_SIZE
+        ALLOC_TRACE_CAP, ring.next, ALLOC_TRACE_MIN_SIZE
     );
     let mut printed = 0usize;
     for step in 0..ALLOC_TRACE_CAP {

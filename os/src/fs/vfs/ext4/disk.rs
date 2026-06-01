@@ -35,12 +35,8 @@ fn maybe_log_ext4_io_stats() {
     }
     let mut prev = LAST_LOG_STEP.load(Ordering::Relaxed);
     while step > prev {
-        match LAST_LOG_STEP.compare_exchange_weak(
-            prev,
-            step,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match LAST_LOG_STEP.compare_exchange_weak(prev, step, Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => {
                 info!(
                     "[ext4-io] t_ms={} kdev_read_calls={} kdev_write_calls={} dev_reads={} dev_writes={} partial_reads={} partial_writes={}",
@@ -101,7 +97,8 @@ impl Ext4Disk {
             );
         }
         let read_size = if self.offset == 0 && buf.len() >= BLOCK_SIZE {
-            self.device.read_block(self.block_id, &mut buf[..BLOCK_SIZE]);
+            self.device
+                .read_block(self.block_id, &mut buf[..BLOCK_SIZE]);
             DEV_READ_OPS.fetch_add(1, Ordering::Relaxed);
             self.block_id += 1;
             BLOCK_SIZE

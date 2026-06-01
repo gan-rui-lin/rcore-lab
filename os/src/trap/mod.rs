@@ -46,7 +46,7 @@ fn handle_user_time_interrupt() {
 pub fn kernel_interrupt_dispatch(trap_type: arch::TrapType) {
     match trap_type {
         arch::TrapType::SupervisorExternal => {
-            crate::board::irq_handler();
+            crate::platform::handle_external_irq();
         }
         arch::TrapType::Time => {
             set_next_trigger();
@@ -58,16 +58,14 @@ pub fn kernel_interrupt_dispatch(trap_type: arch::TrapType) {
                 if let Some(task) = current_task() {
                     if let Some(process) = task.process.upgrade() {
                         let pid = process.pid.0;
-                        let name = process.inner_exclusive_access().name.clone();
-                        let (sepc, sp, ra) = {
-                            let task_inner = task.inner_exclusive_access();
-                            let trap_cx = task_inner.get_trap_cx();
+                        let name = process.name();
+                        let (sepc, sp, ra) = task.with_trap_cx_mut(|trap_cx| {
                             (
                                 trap_cx.sepc,
                                 trap_cx[TrapFrameArgs::SP],
                                 trap_cx[TrapFrameArgs::RA],
                             )
-                        };
+                        });
                         info!(
                             "[sample-k] pid={} name={} sepc={:#x} sp={:#x} ra={:#x}",
                             pid, name, sepc, sp, ra

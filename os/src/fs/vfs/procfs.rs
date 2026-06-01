@@ -206,7 +206,9 @@ impl VfsInode for ProcPidDirInode {
             // /proc/self/mounts, /proc/self/mountinfo, /proc/self/mountstats
             "mounts" => Some(ProcFileInode::new(proc_mounts)),
             "mountinfo" => Some(ProcFileInode::new(proc_mountinfo)),
-            "mountstats" => Some(ProcFileInode::new(|| String::from("device rootfs mounted on / with fstype rootfs\n"))),
+            "mountstats" => Some(ProcFileInode::new(|| {
+                String::from("device rootfs mounted on / with fstype rootfs\n")
+            })),
             // /proc/self/cgroup - needed by cgroup tests
             "cgroup" => Some(ProcFileInode::new(|| String::from("0::/\n"))),
             // /proc/self/status - needed by various tests
@@ -270,14 +272,15 @@ impl VfsInode for ProcPidTaskDirInode {
     fn lookup(&self, name: &str) -> Option<Arc<dyn VfsInode>> {
         let tid = name.parse::<usize>().ok()?;
         let process = pid2process(self.pid)?;
-        let inner = process.inner_exclusive_access();
-        let (task_idx, _) = inner
-            .tasks
-            .iter()
-            .enumerate()
-            .find(|(idx, t)| {
-                t.is_some() && ((if *idx == 0 { self.pid } else { self.pid + *idx }) == tid)
-            })?;
+        let task_idx = process.with_threads(|threads| {
+            threads.tasks.iter().enumerate().find_map(|(idx, t)| {
+                if t.is_some() && ((if idx == 0 { self.pid } else { self.pid + idx }) == tid) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+        })?;
         Some(ProcPidTaskTidDirInode::new(self.pid, task_idx))
     }
 
@@ -291,20 +294,21 @@ impl VfsInode for ProcPidTaskDirInode {
         let Some(process) = pid2process(self.pid) else {
             return Vec::new();
         };
-        let inner = process.inner_exclusive_access();
-        let mut out: Vec<String> = inner
-            .tasks
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, t)| {
-                if t.is_some() {
-                    Some(if idx == 0 { self.pid } else { self.pid + idx })
-                } else {
-                    None
-                }
-            })
-            .map(|tid| format!("{}", tid))
-            .collect();
+        let mut out: Vec<String> = process.with_threads(|threads| {
+            threads
+                .tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, t)| {
+                    if t.is_some() {
+                        Some(if idx == 0 { self.pid } else { self.pid + idx })
+                    } else {
+                        None
+                    }
+                })
+                .map(|tid| format!("{}", tid))
+                .collect()
+        });
         out.sort();
         out
     }
@@ -366,23 +370,27 @@ impl ProcPidTaskStatInode {
         let Some(process) = pid2process(self.pid) else {
             return String::new();
         };
-        let inner = process.inner_exclusive_access();
-        let comm = inner.name.clone();
-        let mut state = if inner.is_zombie { 'Z' } else { 'R' };
-        if !inner.is_zombie {
-            if let Some(Some(task)) = inner.tasks.get(self.task_idx) {
-                if let Some(task_inner) = task.try_inner_exclusive_access() {
-                state = match task_inner.task_status {
-                    TaskStatus::Blocked => 'S',
-                    TaskStatus::Running => 'R',
-                    TaskStatus::Ready => {
-                        if task_inner.last_syscall == SYSCALL_WAITPID {
-                            'S'
-                        } else {
-                            'R'
+        let comm = process.name();
+        let mut state = if process.is_zombie() { 'Z' } else { 'R' };
+        if !process.is_zombie() {
+            if let Some(task) = process.with_threads(|threads| {
+                threads
+                    .tasks
+                    .get(self.task_idx)
+                    .and_then(|task| task.as_ref().cloned())
+            }) {
+                if let Some(snapshot) = task.try_debug_snapshot() {
+                    state = match snapshot.status {
+                        TaskStatus::Blocked => 'S',
+                        TaskStatus::Running => 'R',
+                        TaskStatus::Ready => {
+                            if snapshot.last_syscall == SYSCALL_WAITPID {
+                                'S'
+                            } else {
+                                'R'
+                            }
                         }
-                    }
-                };
+                    };
                 }
             }
         }
@@ -450,10 +458,8 @@ impl ProcPidMapsInode {
         let Some(process) = pid2process(self.pid) else {
             return String::new();
         };
-        let inner = process.inner_exclusive_access();
-        inner
-            .memory_set
-            .render_proc_maps(&inner.name, inner.heap_bottom, inner.program_brk)
+        let name = process.name();
+        process.memory_snapshot_for_proc_maps(&name)
     }
 }
 
@@ -509,19 +515,20 @@ impl ProcPidStatInode {
         let Some(process) = pid2process(self.pid) else {
             return String::new();
         };
-        let inner = process.inner_exclusive_access();
-        let comm = inner.name.clone();
+        let comm = process.name();
         // /proc/<pid>/stat should reflect the thread-group leader state.
         // LTP's TST_PROCESS_STATE_WAIT() relies on this for parent process sleep detection.
-        let mut state = if inner.is_zombie { 'Z' } else { 'R' };
-        if !inner.is_zombie {
-            if let Some(Some(leader)) = inner.tasks.get(0) {
-                if let Some(task_inner) = leader.try_inner_exclusive_access() {
-                    state = match task_inner.task_status {
+        let mut state = if process.is_zombie() { 'Z' } else { 'R' };
+        if !process.is_zombie() {
+            if let Some(leader) = process.with_threads(|threads| {
+                threads.tasks.get(0).and_then(|task| task.as_ref().cloned())
+            }) {
+                if let Some(snapshot) = leader.try_debug_snapshot() {
+                    state = match snapshot.status {
                         TaskStatus::Blocked => 'S',
                         TaskStatus::Running => 'R',
                         TaskStatus::Ready => {
-                            if task_inner.last_syscall == SYSCALL_WAITPID {
+                            if snapshot.last_syscall == SYSCALL_WAITPID {
                                 'S'
                             } else {
                                 'R'
@@ -590,11 +597,9 @@ impl ProcPidStatusInode {
         let Some(process) = pid2process(self.pid) else {
             return String::new();
         };
-        let inner = process.inner_exclusive_access();
-        let name = inner.name.clone();
+        let name = process.name();
         let pid = self.pid;
-        let uid = inner.effective_uid;
-        drop(inner);
+        let uid = process.effective_uid();
         format!(
             "Name:\t{name}\n\
              Tgid:\t{pid}\n\
@@ -915,7 +920,10 @@ fn proc_sysvipc() -> Arc<dyn VfsInode> {
 pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
     let mut entries: BTreeMap<String, Arc<dyn VfsInode>> = BTreeMap::new();
     entries.insert(String::from("mounts"), ProcFileInode::new(proc_mounts));
-    entries.insert(String::from("mountinfo"), ProcFileInode::new(proc_mountinfo));
+    entries.insert(
+        String::from("mountinfo"),
+        ProcFileInode::new(proc_mountinfo),
+    );
     entries.insert(String::from("meminfo"), ProcFileInode::new(proc_meminfo));
     entries.insert(String::from("stat"), ProcFileInode::new(proc_stat));
     entries.insert(String::from("uptime"), ProcFileInode::new(proc_uptime));
@@ -928,9 +936,7 @@ pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
     // /proc/cgroups - needed by cgroup tests (empty = no cgroup controllers)
     entries.insert(
         String::from("cgroups"),
-        ProcFileInode::new(|| {
-            String::from("#subsys_name\thierarchy\tnum_cgroups\tenabled\n")
-        }),
+        ProcFileInode::new(|| String::from("#subsys_name\thierarchy\tnum_cgroups\tenabled\n")),
     );
     // /proc/filesystems - needed by various tests
     entries.insert(

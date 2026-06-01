@@ -4,14 +4,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::drivers::bus::virtio::VirtioHal;
+use arch::DeviceKind;
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 use virtio_drivers::{DeviceType, VirtIOHeader, VirtIONet};
-
-/// VirtIO MMIO region on QEMU virt machine.
-const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
-const VIRTIO_MMIO_STRIDE: usize = 0x1000;
-const VIRTIO_MMIO_SLOTS: usize = 8;
 
 /// Maximum Ethernet frame size (MTU 1500 + header 14).
 const ETH_FRAME_SIZE: usize = 1514;
@@ -23,30 +19,61 @@ pub struct VirtIONetDevice {
 }
 
 impl VirtIONetDevice {
-    fn find_virtio_net_header() -> &'static mut VirtIOHeader {
-        for index in 0..VIRTIO_MMIO_SLOTS {
-            let addr = VIRTIO_MMIO_BASE + index * VIRTIO_MMIO_STRIDE;
-            let header = unsafe { &mut *(addr as *mut VirtIOHeader) };
-            if !header.verify() {
-                continue;
+    fn header_at(addr: usize) -> Option<&'static mut VirtIOHeader> {
+        let header = unsafe { &mut *(addr as *mut VirtIOHeader) };
+        if header.verify() && header.device_type() == DeviceType::Network {
+            Some(header)
+        } else {
+            None
+        }
+    }
+
+    fn find_virtio_net_header() -> Option<&'static mut VirtIOHeader> {
+        let addr = arch::platform_config()
+            .device(DeviceKind::Net)
+            .and_then(|device| device.mmio_base())
+            .expect("VirtIO net MMIO base missing from platform config");
+        if let Some(header) = Self::header_at(addr) {
+            log::info!("[net] found virtio-net mmio at {:#x}", addr);
+            return Some(header);
+        }
+
+        for device in arch::platform_config().devices {
+            match device.kind {
+                DeviceKind::Block
+                | DeviceKind::Net
+                | DeviceKind::InputKeyboard
+                | DeviceKind::InputMouse => {}
+                _ => continue,
             }
-            if header.device_type() == DeviceType::Network {
-                log::info!("[net] found virtio-net mmio at {:#x}", addr);
-                return header;
+            if let Some(probe) = device.mmio_base() {
+                if probe != addr {
+                    if let Some(header) = Self::header_at(probe) {
+                        log::info!("[net] found virtio-net mmio at {:#x}", probe);
+                        return Some(header);
+                    }
+                }
             }
         }
-        panic!("virtio-net mmio device not found");
+
+        log::warn!("[net] virtio-net mmio device not found");
+        None
     }
 
     /// Create a new VirtIO network device.
-    pub fn new() -> Self {
-        let header = Self::find_virtio_net_header();
-        let inner =
-            VirtIONet::<VirtioHal>::new(header).expect("failed to create virtio-net device");
-        Self {
+    pub fn try_new() -> Option<Self> {
+        let header = Self::find_virtio_net_header()?;
+        let inner = match VirtIONet::<VirtioHal>::new(header) {
+            Ok(inner) => inner,
+            Err(err) => {
+                log::warn!("[net] failed to create virtio-net device: {:?}", err);
+                return None;
+            }
+        };
+        Some(Self {
             inner,
             rx_buf: vec![0u8; 2048],
-        }
+        })
     }
 
     /// Get the MAC address from VirtIO config space.

@@ -1,16 +1,20 @@
 //! Simple in-memory pipe implementation.
 use super::{File, PollEvents};
 use crate::mm::UserBuffer;
-use crate::sync::UPIntrFreeCell;
-use crate::task::{current_task, has_pending_unmasked_signal, suspend_current_and_run_next, SignalFlags};
+use crate::sync::UPIntrMutex;
+use crate::task::{
+    current_task, has_pending_unmasked_signal, suspend_current_and_run_next, SignalFlags,
+};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 const DEFAULT_PIPE_CAPACITY: usize = 4096;
+const EAGAIN_ERRNO: isize = -11;
 const EPIPE_ERRNO: isize = -32;
 
-struct Pipe {
+struct PipeBuffer {
     buf: Vec<u8>,
     head: usize,
     tail: usize,
@@ -19,7 +23,7 @@ struct Pipe {
     write_open: bool,
 }
 
-impl Pipe {
+impl PipeBuffer {
     fn new(capacity: usize) -> Self {
         Self {
             buf: vec![0; capacity.max(1)],
@@ -66,24 +70,24 @@ impl Pipe {
 pub struct PipeEnd {
     readable: bool,
     writable: bool,
-    pipe: Arc<UPIntrFreeCell<Pipe>>,
-    nonblock: UPIntrFreeCell<bool>,
+    pipe: Arc<UPIntrMutex<PipeBuffer>>,
+    nonblock: AtomicBool,
 }
 
 impl PipeEnd {
-    fn new(pipe: Arc<UPIntrFreeCell<Pipe>>, readable: bool, writable: bool) -> Self {
+    fn new(pipe: Arc<UPIntrMutex<PipeBuffer>>, readable: bool, writable: bool) -> Self {
         Self {
             readable,
             writable,
             pipe,
-            nonblock: unsafe { UPIntrFreeCell::new(false) },
+            nonblock: AtomicBool::new(false),
         }
     }
 }
 
 impl Drop for PipeEnd {
     fn drop(&mut self) {
-        let mut pipe = self.pipe.exclusive_access();
+        let mut pipe = self.pipe.lock();
         if self.readable {
             pipe.read_open = false;
         }
@@ -103,11 +107,15 @@ impl File for PipeEnd {
     }
 
     fn status_flags(&self) -> u32 {
-        if *self.nonblock.exclusive_access() { 0x800 } else { 0 }
+        if self.nonblock.load(Ordering::Relaxed) {
+            0x800
+        } else {
+            0
+        }
     }
 
     fn set_status_flags(&self, flags: u32) {
-        *self.nonblock.exclusive_access() = (flags & 0x800) != 0;
+        self.nonblock.store((flags & 0x800) != 0, Ordering::Relaxed);
     }
 
     fn is_pipe(&self) -> bool {
@@ -119,30 +127,33 @@ impl File for PipeEnd {
     }
 
     fn read(&self, mut user_buf: UserBuffer) -> usize {
-        let is_nonblock = *self.nonblock.exclusive_access();
         let mut total = 0;
         for slice in user_buf.buffers.iter_mut() {
             loop {
-                let mut pipe = self.pipe.exclusive_access();
-                if pipe.len > 0 {
-                    let n = pipe.read_into(*slice);
-                    total += n;
+                let mut should_block = true;
+                {
+                    let mut pipe = self.pipe.lock();
+                    if pipe.len > 0 {
+                        let n = pipe.read_into(*slice);
+                        total += n;
+                        should_block = false;
+                    } else if !pipe.write_open {
+                        return total;
+                    } else if total > 0 {
+                        return total;
+                    }
+                }
+                if should_block {
+                    if self.nonblock.load(Ordering::Relaxed) {
+                        return usize::MAX - 1; // EAGAIN sentinel
+                    }
+                    if has_pending_unmasked_signal(true) {
+                        return usize::MAX; // EINTR sentinel
+                    }
+                    suspend_current_and_run_next();
+                } else {
                     break;
                 }
-                if !pipe.write_open {
-                    return total;
-                }
-                if total > 0 {
-                    return total;
-                }
-                if is_nonblock {
-                    return usize::MAX - 1; // EAGAIN sentinel
-                }
-                if has_pending_unmasked_signal(true) {
-                    return usize::MAX; // EINTR sentinel
-                }
-                drop(pipe);
-                suspend_current_and_run_next();
             }
         }
         total
@@ -153,25 +164,37 @@ impl File for PipeEnd {
         for slice in user_buf.buffers.iter() {
             let mut offset = 0;
             while offset < slice.len() {
-                let mut pipe = self.pipe.exclusive_access();
-                if !pipe.read_open {
-                    return total;
-                }
-                if pipe.len < pipe.capacity() {
-                    let n = pipe.write_from(&slice[offset..]);
-                    total += n;
-                    offset += n;
-                    if n == 0 {
-                        break;
-                    }
-                } else {
-                    if total > 0 {
+                let mut should_block = false;
+                let mut break_loop = false;
+                {
+                    let mut pipe = self.pipe.lock();
+                    if !pipe.read_open {
                         return total;
+                    }
+                    if pipe.len < pipe.capacity() {
+                        let n = pipe.write_from(&slice[offset..]);
+                        total += n;
+                        offset += n;
+                        if n == 0 {
+                            break_loop = true;
+                        }
+                    } else {
+                        if total > 0 {
+                            return total;
+                        }
+                        should_block = true;
+                    }
+                }
+                if break_loop {
+                    break;
+                }
+                if should_block {
+                    if self.nonblock.load(Ordering::Relaxed) {
+                        return usize::MAX - 1; // EAGAIN sentinel
                     }
                     if has_pending_unmasked_signal(true) {
                         return usize::MAX; // EINTR sentinel
                     }
-                    drop(pipe);
                     suspend_current_and_run_next();
                 }
             }
@@ -184,29 +207,43 @@ impl File for PipeEnd {
         for slice in user_buf.buffers.iter() {
             let mut offset = 0usize;
             while offset < slice.len() {
-                let mut pipe = self.pipe.exclusive_access();
-                if !pipe.read_open {
-                    if total == 0 {
-                        if let Some(task) = current_task() {
-                            let mut task_inner = task.inner_exclusive_access();
-                            task_inner.signal_pending |= SignalFlags::SIGPIPE;
+                let mut should_block = false;
+                let mut break_loop = false;
+                {
+                    let mut pipe = self.pipe.lock();
+                    if !pipe.read_open {
+                        if total == 0 {
+                            if let Some(task) = current_task() {
+                                task.insert_pending_signal(SignalFlags::SIGPIPE);
+                            }
+                            return Err(EPIPE_ERRNO);
                         }
-                        return Err(EPIPE_ERRNO);
-                    }
-                    return Ok(total);
-                }
-                if pipe.len < pipe.capacity() {
-                    let n = pipe.write_from(&slice[offset..]);
-                    total += n;
-                    offset += n;
-                    if n == 0 {
-                        break;
-                    }
-                } else {
-                    if total > 0 {
                         return Ok(total);
                     }
-                    drop(pipe);
+                    if pipe.len < pipe.capacity() {
+                        let n = pipe.write_from(&slice[offset..]);
+                        total += n;
+                        offset += n;
+                        if n == 0 {
+                            break_loop = true;
+                        }
+                    } else {
+                        if total > 0 {
+                            return Ok(total);
+                        }
+                        should_block = true;
+                    }
+                }
+                if break_loop {
+                    break;
+                }
+                if should_block {
+                    if self.nonblock.load(Ordering::Relaxed) {
+                        return Err(EAGAIN_ERRNO);
+                    }
+                    if has_pending_unmasked_signal(true) {
+                        return Ok(usize::MAX);
+                    }
                     suspend_current_and_run_next();
                 }
             }
@@ -215,7 +252,7 @@ impl File for PipeEnd {
     }
 
     fn poll(&self, events: PollEvents) -> PollEvents {
-        let pipe = self.pipe.exclusive_access();
+        let pipe = self.pipe.lock();
         let mut revents = PollEvents::empty();
         if events.contains(PollEvents::POLLIN)
             && self.readable
@@ -236,7 +273,7 @@ impl File for PipeEnd {
 /// Create a pipe and return (read_end, write_end).
 pub fn make_pipe(capacity: usize) -> (Arc<dyn File + Send + Sync>, Arc<dyn File + Send + Sync>) {
     let pipe =
-        Arc::new(unsafe { UPIntrFreeCell::new(Pipe::new(capacity.max(DEFAULT_PIPE_CAPACITY))) });
+        Arc::new(unsafe { UPIntrMutex::new(PipeBuffer::new(capacity.max(DEFAULT_PIPE_CAPACITY))) });
     let read_end = Arc::new(PipeEnd::new(pipe.clone(), true, false));
     let write_end = Arc::new(PipeEnd::new(pipe, false, true));
     (read_end, write_end)

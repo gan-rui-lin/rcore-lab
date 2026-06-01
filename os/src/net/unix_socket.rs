@@ -86,8 +86,7 @@ impl UnixSocketFile {
 // Key = path for pathname sockets, "\0name" for abstract sockets.
 // Using Weak so that when all fds to a socket are closed, the address becomes reusable.
 lazy_static! {
-    static ref UNIX_REGISTRY: Mutex<BTreeMap<String, Weak<dyn File>>> =
-        Mutex::new(BTreeMap::new());
+    static ref UNIX_REGISTRY: Mutex<BTreeMap<String, Weak<dyn File>>> = Mutex::new(BTreeMap::new());
 }
 
 /// Register a unix socket in the global registry (for listen/connect).
@@ -339,10 +338,18 @@ impl File for UnixSocketFile {
     }
 
     fn fd_flags(&self) -> u32 {
-        if self.cloexec { 1 } else { 0 }
+        if self.cloexec {
+            1
+        } else {
+            0
+        }
     }
 
     fn status_flags(&self) -> u32 {
-        if self.nonblock { 0o4000 } else { 0 }
+        if self.nonblock {
+            0o4000
+        } else {
+            0
+        }
     }
 }

@@ -128,10 +128,9 @@ struct MsgInfoUser {
 fn current_ipc_identity() -> (u32, u32, usize, bool) {
     let process = current_process();
     let pid = process.pid.0;
-    let inner = process.inner_exclusive_access();
-    let euid = inner.effective_uid;
-    let egid = inner.effective_gid;
-    drop(inner);
+    let creds = process.credentials_snapshot();
+    let euid = creds.effective_uid;
+    let egid = creds.effective_gid;
     (euid, egid, pid, euid == 0)
 }
 
@@ -465,7 +464,12 @@ impl IpcManager {
         self.message_queues.remove(&id).is_some()
     }
 
-    pub fn create_shm(&mut self, key: IpcKey, size: usize, permissions: u32) -> Result<IpcId, isize> {
+    pub fn create_shm(
+        &mut self,
+        key: IpcKey,
+        size: usize,
+        permissions: u32,
+    ) -> Result<IpcId, isize> {
         if self.shm_segments.len() >= SHMMNI {
             return Err(errno(ENOMEM));
         }
@@ -833,7 +837,11 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, _buf: usize) -> isize {
                 return errno(EPERM);
             }
             drop(q);
-            if manager.remove_msgq(msqid) { 0 } else { errno(EINVAL) }
+            if manager.remove_msgq(msqid) {
+                0
+            } else {
+                errno(EINVAL)
+            }
         }
         IPC_STAT => {
             if _buf == 0 {
@@ -1072,10 +1080,7 @@ pub fn sys_shmat(shmid: i32, shmaddr: usize, _shmflg: i32) -> isize {
     let (size, frames) = {
         let shm_locked = shm.lock();
         if shm_locked.marked_for_delete {
-            error!(
-                "[shm] shmat on deleted segment shmid={} pid={}",
-                shmid, pid
-            );
+            error!("[shm] shmat on deleted segment shmid={} pid={}", shmid, pid);
             return errno(EINVAL);
         }
         (shm_locked.size, shm_locked.frames.clone())
@@ -1089,21 +1094,20 @@ pub fn sys_shmat(shmid: i32, shmaddr: usize, _shmflg: i32) -> isize {
         map_perm |= MapPermission::X;
     }
 
-    let mut inner = process.inner_exclusive_access();
-    let mmap_base_before = inner.mmap_base;
+    let mmap_base_before = process.mmap_base();
     let attach_addr = if shmaddr == 0 {
-        let base = align_up(inner.mmap_base, PAGE_SIZE);
-        inner.mmap_base = match base.checked_add(size) {
-            Some(v) => v,
-            None => {
+        match process.alloc_mmap_base(size) {
+            Ok(base) => base,
+            Err(err) => {
                 error!(
                     "[shm] shmat mmap_base overflow pid={} base={:#x} size={:#x}",
-                    pid, base, size
+                    pid,
+                    align_up(mmap_base_before, PAGE_SIZE),
+                    size
                 );
-                return errno(ENOMEM);
+                return err;
             }
-        };
-        base
+        }
     } else {
         if (shmaddr & (PAGE_SIZE - 1)) != 0 {
             if _shmflg & SHM_RND != 0 {
@@ -1130,9 +1134,9 @@ pub fn sys_shmat(shmid: i32, shmaddr: usize, _shmflg: i32) -> isize {
         }
     };
 
-    let overlap = inner
-        .memory_set
-        .overlap_count(VirtAddr(attach_addr), VirtAddr(attach_end));
+    let overlap = process.with_memory_set(|memory_set| {
+        memory_set.overlap_count(VirtAddr(attach_addr), VirtAddr(attach_end))
+    });
     if overlap > 0 {
         error!(
             "[shm] shmat overlap pid={} shmid={} addr=[{:#x},{:#x}) overlap={} mmap_base_before={:#x} mmap_base_after={:#x}",
@@ -1142,29 +1146,32 @@ pub fn sys_shmat(shmid: i32, shmaddr: usize, _shmflg: i32) -> isize {
             attach_end,
             overlap,
             mmap_base_before,
-            inner.mmap_base
+            process.mmap_base()
         );
         return errno(EINVAL);
     }
-    if !inner.memory_set.insert_shm_area(
-        VirtAddr(attach_addr),
-        VirtAddr(attach_end),
-        map_perm,
-        frames,
-    ) {
+    if !process.with_memory_set_mut(|memory_set| {
+        memory_set.insert_shm_area(
+            VirtAddr(attach_addr),
+            VirtAddr(attach_end),
+            map_perm,
+            frames,
+        )
+    }) {
         error!(
             "[shm] shmat map failed pid={} shmid={} addr=[{:#x},{:#x})",
             pid, shmid, attach_addr, attach_end
         );
         return errno(EINVAL);
     }
-    drop(inner);
 
-    if manager.add_attachment(pid, attach_addr, shmid, size).is_err() {
-        let mut inner = process.inner_exclusive_access();
-        inner
-            .memory_set
-            .remove_area_with_start_vpn(VirtAddr(attach_addr).floor());
+    if manager
+        .add_attachment(pid, attach_addr, shmid, size)
+        .is_err()
+    {
+        process.with_memory_set_mut(|memory_set| {
+            memory_set.remove_area_with_start_vpn(VirtAddr(attach_addr).floor());
+        });
         error!(
             "[shm] shmat attachment table conflict pid={} shmid={} addr={:#x}",
             pid, shmid, attach_addr
@@ -1198,10 +1205,9 @@ pub fn sys_shmdt(shmaddr: usize) -> isize {
     };
 
     {
-        let mut inner = process.inner_exclusive_access();
-        inner
-            .memory_set
-            .remove_area_with_start_vpn(VirtAddr(shmaddr).floor());
+        process.with_memory_set_mut(|memory_set| {
+            memory_set.remove_area_with_start_vpn(VirtAddr(shmaddr).floor());
+        });
     }
 
     let mut should_remove = false;

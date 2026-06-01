@@ -6,7 +6,7 @@ use super::{
 };
 use crate::sync::UPIntrFreeCell;
 use alloc::sync::Arc;
-use arch::{TrapContext, TrapFrameArgs};
+use arch::TrapContext;
 use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::*;
 
@@ -55,10 +55,7 @@ pub fn run_tasks() {
         if let Some(task) = fetch_task() {
             task.kstack.check_guard();
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
-            let mut task_inner = task.inner_exclusive_access();
-            let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
-            task_inner.task_status = TaskStatus::Running;
-            drop(task_inner);
+            let next_task_cx_ptr = task.task_cx_ptr_for_switch(TaskStatus::Running);
             let pt_token = task.get_user_token();
             processor.current = Some(task);
             drop(processor);
@@ -93,20 +90,11 @@ pub fn current_user_token() -> usize {
 }
 
 pub fn current_trap_cx() -> &'static mut TrapContext {
-    current_task()
-        .unwrap()
-        .inner_exclusive_access()
-        .get_trap_cx()
+    current_task().unwrap().trap_cx()
 }
 
 pub fn current_trap_cx_user_va() -> usize {
-    current_task()
-        .unwrap()
-        .inner_exclusive_access()
-        .res
-        .as_ref()
-        .unwrap()
-        .trap_cx_user_va()
+    current_task().unwrap().trap_cx_user_va()
 }
 
 pub fn current_kstack_top() -> usize {
@@ -125,9 +113,8 @@ pub fn current_task_context_for_alloc_trace() -> (usize, usize, usize, bool) {
     drop(processor);
 
     let pid = task.process.upgrade().map(|p| p.getpid()).unwrap_or(0);
-    let result = if let Some(task_inner) = task.try_inner_exclusive_access() {
-        let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-        (pid, tid, task_inner.last_syscall, true)
+    let result = if let Some(snapshot) = task.try_debug_snapshot() {
+        (pid, snapshot.tid, snapshot.last_syscall, true)
     } else {
         (pid, 0, 0, false)
     };
@@ -146,45 +133,25 @@ pub fn print_current_task_brief_for_alloc_error() {
         return;
     };
     let pid = process.getpid();
-    if let Some(task_inner) = task.try_inner_exclusive_access() {
-        let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-        let trap_cx = task_inner.get_trap_cx();
-        if let Some(proc_inner) = process.try_inner_exclusive_access() {
-            println!(
-                "[kernel] alloc_error current: pid={} tid={} name={} zombie={} status={:?} last_syscall={} sepc={:#x} sp={:#x} ra={:#x} sampled=true",
-                pid,
-                tid,
-                proc_inner.name.as_str(),
-                proc_inner.is_zombie,
-                task_inner.task_status,
-                task_inner.last_syscall,
-                trap_cx.sepc,
-                trap_cx[TrapFrameArgs::SP],
-                trap_cx[TrapFrameArgs::RA]
-            );
-        } else {
-            println!(
-                "[kernel] alloc_error current: pid={} tid={} name=<proc_busy> status={:?} last_syscall={} sepc={:#x} sp={:#x} ra={:#x} sampled=false",
-                pid,
-                tid,
-                task_inner.task_status,
-                task_inner.last_syscall,
-                trap_cx.sepc,
-                trap_cx[TrapFrameArgs::SP],
-                trap_cx[TrapFrameArgs::RA]
-            );
-        }
-    } else if let Some(proc_inner) = process.try_inner_exclusive_access() {
+    if let Some(snapshot) = task.try_debug_snapshot() {
         println!(
-            "[kernel] alloc_error current: pid={} name={} zombie={} <task_busy> sampled=true",
+            "[kernel] alloc_error current: pid={} tid={} name={} zombie={} status={:?} last_syscall={} sepc={:#x} sp={:#x} ra={:#x} sampled=true",
             pid,
-            proc_inner.name.as_str(),
-            proc_inner.is_zombie
+            snapshot.tid,
+            process.name().as_str(),
+            process.is_zombie(),
+            snapshot.status,
+            snapshot.last_syscall,
+            snapshot.sepc,
+            snapshot.sp,
+            snapshot.ra
         );
     } else {
         println!(
-            "[kernel] alloc_error current: pid={} name=<proc_busy> <task_busy> sampled=false",
-            pid
+            "[kernel] alloc_error current: pid={} name={} zombie={} <task_busy> sampled=true",
+            pid,
+            process.name().as_str(),
+            process.is_zombie()
         );
     };
 }
@@ -203,10 +170,9 @@ pub fn has_pending_unmasked_signal(ignore_sigchld: bool) -> bool {
         Some(p) => p,
         None => return false,
     };
-    let process_inner = process.inner_exclusive_access();
-    let task_inner = task.inner_exclusive_access();
-    let mut pending =
-        (process_inner.signal_pending | task_inner.signal_pending) & !task_inner.signal_mask;
+    let signal_snapshot =
+        task.with_signals(|signals| (signals.signal_pending, signals.signal_mask));
+    let mut pending = (process.pending_signal() | signal_snapshot.0) & !signal_snapshot.1;
     if ignore_sigchld {
         pending &= !super::SignalFlags::SIGCHLD;
     }

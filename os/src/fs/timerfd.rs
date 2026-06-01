@@ -142,7 +142,7 @@ impl File for TimerFdFile {
         if buf.len() < 8 {
             // EINVAL: buffer too small
             return usize::MAX; // use EINTR sentinel, sys_read will return -EINTR
-            // (ideally we'd return EINVAL, but that needs a new sentinel)
+                               // (ideally we'd return EINVAL, but that needs a new sentinel)
         }
         loop {
             {
@@ -188,14 +188,24 @@ impl File for TimerFdFile {
     }
 
     fn fd_flags(&self) -> u32 {
-        if self.cloexec { 1 } else { 0 }
+        if self.cloexec {
+            1
+        } else {
+            0
+        }
     }
 
     fn status_flags(&self) -> u32 {
-        if self.nonblock { 0x800 } else { 0 } // O_NONBLOCK
+        if self.nonblock {
+            0x800
+        } else {
+            0
+        } // O_NONBLOCK
     }
 
-    fn is_timerfd(&self) -> bool { true }
+    fn is_timerfd(&self) -> bool {
+        true
+    }
 
     fn timerfd_arm(&self, expiry_us: u64, interval_us: u64) {
         self.arm(expiry_us, interval_us);

@@ -1,9 +1,13 @@
 #![allow(missing_docs)]
 
 use super::super::{File, OpenFlags};
-use super::core::{normalize_path, VfsInode, VfsNodeKind, ROOT_VFS};
+use super::core::{
+    normalize_path, resolve_inode_quiet, resolve_parent_inode, root_inode_snapshot, VfsInode,
+    VfsNodeKind,
+};
 use crate::mm::UserBuffer;
-use crate::sync::UPIntrFreeCell;
+use crate::sync::UPIntrMutex;
+use crate::syscall::user_mem::{self, UserWritePolicy};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -14,16 +18,13 @@ pub struct VfsFile {
     status_flags: u32,
     path: String,
     ts_id: usize,
-    inner: UPIntrFreeCell<VfsFileInner>,
+    inode: Arc<dyn VfsInode>,
+    offset: UPIntrMutex<usize>,
 }
 
 /// Monotonic counter for timestamp tracking IDs.
 static NEXT_TS_ID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
-
-struct VfsFileInner {
-    offset: usize,
-    inode: Arc<dyn VfsInode>,
-}
+const EFAULT_ERRNO: isize = -14;
 
 impl VfsFile {
     #[allow(dead_code)]
@@ -44,13 +45,21 @@ impl VfsFile {
             status_flags,
             path,
             ts_id: NEXT_TS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-            inner: unsafe { UPIntrFreeCell::new(VfsFileInner { offset: 0, inode }) },
+            inode,
+            offset: unsafe { UPIntrMutex::new(0) },
         }
     }
 
+    pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.inode.read_at(offset, buf)
+    }
+
+    pub fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
+        self.inode.write_at(offset, buf)
+    }
+
     pub fn read_all(&self) -> Vec<u8> {
-        let mut inner = self.inner.exclusive_access();
-        let file_size = inner.inode.size();
+        let file_size = self.inode.size();
         let mut offset = 0usize;
         let out = if file_size > 0 {
             // Pre-allocate exact size to avoid geometric Vec growth spikes
@@ -60,7 +69,7 @@ impl VfsFile {
             const READ_ALL_CHUNK: usize = 16 * 1024;
             while offset < file_size {
                 let end = core::cmp::min(offset + READ_ALL_CHUNK, file_size);
-                let n = inner.inode.read_at(offset, &mut data[offset..end]);
+                let n = self.read_at(offset, &mut data[offset..end]);
                 if n == 0 {
                     break;
                 }
@@ -73,7 +82,7 @@ impl VfsFile {
             let mut data = Vec::new();
             let mut buf = [0u8; READ_ALL_CHUNK];
             loop {
-                let n = inner.inode.read_at(offset, &mut buf);
+                let n = self.read_at(offset, &mut buf);
                 if n == 0 {
                     break;
                 }
@@ -82,7 +91,7 @@ impl VfsFile {
             }
             data
         };
-        inner.offset = offset;
+        *self.offset.lock() = offset;
         out
     }
 }
@@ -96,15 +105,16 @@ impl File for VfsFile {
         self.writable
     }
 
+    // 锁绑定到局部变量 offset，一直保持到函数返回，整个读取循环（执行多次 inode.read_at 并更新 offset）都在锁内执行——所以临界区较长
     fn read(&self, mut buf: UserBuffer) -> usize {
-        let mut inner = self.inner.exclusive_access();
+        let mut offset = self.offset.lock();
         let mut total = 0usize;
         for slice in buf.buffers.iter_mut() {
-            let n = inner.inode.read_at(inner.offset, *slice);
+            let n = self.inode.read_at(*offset, *slice);
             if n == 0 {
                 break;
             }
-            inner.offset += n;
+            *offset += n;
             total += n;
             if n < slice.len() {
                 break;
@@ -113,19 +123,78 @@ impl File for VfsFile {
         total
     }
 
-    fn write(&self, buf: UserBuffer) -> usize {
-        let mut inner = self.inner.exclusive_access();
-        if (self.status_flags & OpenFlags::APPEND.bits()) != 0 {
-            // O_APPEND: each write starts at current EOF.
-            inner.offset = inner.inode.size();
+    fn read_user_buffer(
+        &self,
+        token: usize,
+        ptr: *const u8,
+        len: usize,
+    ) -> Option<Result<usize, isize>> {
+        if len == 0 {
+            return Some(Ok(0));
         }
+        if !user_mem::ensure_user_writable(
+            token,
+            ptr,
+            len,
+            UserWritePolicy::DemandCowWithForkFallback,
+        ) {
+            return Some(Err(EFAULT_ERRNO));
+        }
+
+        const BOUNCE_CHUNK: usize = 16 * 1024;
+        let mut bounce = Vec::new();
+        bounce.resize(BOUNCE_CHUNK.min(len), 0u8);
         let mut total = 0usize;
-        for slice in buf.buffers.iter() {
-            let n = inner.inode.write_at(inner.offset, *slice);
+        while total < len {
+            let chunk_len = (len - total).min(BOUNCE_CHUNK);
+            if bounce.len() != chunk_len {
+                bounce.resize(chunk_len, 0u8);
+            }
+            let n = {
+                let mut offset = self.offset.lock();
+                let n = self.inode.read_at(*offset, &mut bounce[..chunk_len]);
+                if n > 0 {
+                    *offset += n;
+                }
+                n
+            };
             if n == 0 {
                 break;
             }
-            inner.offset += n;
+            let dst = (ptr as usize).wrapping_add(total) as *mut u8;
+            if let Err(err) = user_mem::copy_to_user_inline(
+                token,
+                dst,
+                &bounce[..n],
+                UserWritePolicy::DemandCowWithForkFallback,
+            ) {
+                return if total > 0 {
+                    Some(Ok(total))
+                } else {
+                    Some(Err(err))
+                };
+            }
+            total += n;
+            if n < chunk_len {
+                break;
+            }
+        }
+        Some(Ok(total))
+    }
+
+    fn write(&self, buf: UserBuffer) -> usize {
+        let mut offset = self.offset.lock();
+        if (self.status_flags & OpenFlags::APPEND.bits()) != 0 {
+            // O_APPEND: each write starts at current EOF.
+            *offset = self.inode.size();
+        }
+        let mut total = 0usize;
+        for slice in buf.buffers.iter() {
+            let n = self.inode.write_at(*offset, *slice);
+            if n == 0 {
+                break;
+            }
+            *offset += n;
             total += n;
             if n < slice.len() {
                 break;
@@ -139,8 +208,7 @@ impl File for VfsFile {
     }
 
     fn inode(&self) -> Option<Arc<dyn VfsInode>> {
-        let inner = self.inner.exclusive_access();
-        Some(inner.inode.clone())
+        Some(self.inode.clone())
     }
 
     fn path(&self) -> Option<&str> {
@@ -148,13 +216,11 @@ impl File for VfsFile {
     }
 
     fn get_offset(&self) -> Option<usize> {
-        let inner = self.inner.exclusive_access();
-        Some(inner.offset)
+        Some(*self.offset.lock())
     }
 
     fn set_offset(&self, offset: usize) {
-        let mut inner = self.inner.exclusive_access();
-        inner.offset = offset;
+        *self.offset.lock() = offset;
     }
 
     fn ts_id(&self) -> Option<usize> {
@@ -166,15 +232,13 @@ impl File for VfsFile {
     }
 
     fn read_at_kernel(&self, offset: usize, buf: &mut [u8]) -> usize {
-        let inner = self.inner.exclusive_access();
-        inner.inode.read_at(offset, buf)
+        self.inode.read_at(offset, buf)
     }
 }
 
 pub fn list_apps() {
     debug!("/**** APPS ****");
-    let vfs = ROOT_VFS.exclusive_access();
-    if let Some(root) = vfs.root_inode() {
+    if let Some(root) = root_inode_snapshot() {
         for app in root.list() {
             debug!("{}", app);
         }
@@ -191,56 +255,32 @@ pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<dyn File>> {
         readable = false;
         writable = false;
     }
-    let vfs = ROOT_VFS.exclusive_access();
-    if flags.contains(OpenFlags::CREATE) {
-        if let Some(inode) = vfs.resolve_quiet(&path) {
-            if flags.contains(OpenFlags::TRUNC) {
-                inode.truncate();
-                crate::mm::invalidate_shared_file_pages_by_path(path.as_str());
-            }
-            return Some(Arc::new(VfsFile::new_with_flags(
-                readable,
-                writable,
-                status_flags,
-                inode,
-                path,
-            )));
+    let inode = if flags.contains(OpenFlags::CREATE) {
+        if let Some(inode) = resolve_inode_quiet(&path) {
+            inode
+        } else {
+            let (parent, name) = resolve_parent_inode(&path)?;
+            parent.create(&name)?
         }
-        let (parent, name) = vfs.resolve_parent(&path)?;
-        let inode = parent.create(&name)?;
-        // Keep O_CREAT|O_TRUNC semantics even if create() returns an
-        // existing inode (some backends may take that path).
-        if flags.contains(OpenFlags::TRUNC) {
-            inode.truncate();
-            crate::mm::invalidate_shared_file_pages_by_path(path.as_str());
-        }
-        Some(Arc::new(VfsFile::new_with_flags(
-            readable,
-            writable,
-            status_flags,
-            inode,
-            path,
-        )))
     } else {
-        let inode = vfs.resolve_quiet(&path)?;
-        if flags.contains(OpenFlags::TRUNC) {
-            inode.truncate();
-            crate::mm::invalidate_shared_file_pages_by_path(path.as_str());
-        }
-        Some(Arc::new(VfsFile::new_with_flags(
-            readable,
-            writable,
-            status_flags,
-            inode,
-            path,
-        )))
+        resolve_inode_quiet(&path)?
+    };
+    if flags.contains(OpenFlags::TRUNC) {
+        inode.truncate();
+        crate::mm::invalidate_shared_file_pages_by_path(path.as_str());
     }
+    Some(Arc::new(VfsFile::new_with_flags(
+        readable,
+        writable,
+        status_flags,
+        inode,
+        path,
+    )))
 }
 
 pub fn path_is_dir(path: &str) -> bool {
     let path = normalize_path(path);
-    let vfs = ROOT_VFS.exclusive_access();
-    match vfs.resolve_quiet(&path) {
+    match resolve_inode_quiet(&path) {
         Some(inode) => inode.kind() == VfsNodeKind::Dir,
         None => {
             trace!("vfs: path_is_dir not found {}", path);
@@ -251,11 +291,10 @@ pub fn path_is_dir(path: &str) -> bool {
 
 pub fn create_dir(path: &str) -> bool {
     let path = normalize_path(path);
-    let vfs = ROOT_VFS.exclusive_access();
-    if vfs.resolve_quiet(&path).is_some() {
+    if resolve_inode_quiet(&path).is_some() {
         return false;
     }
-    let Some((parent, name)) = vfs.resolve_parent(&path) else {
+    let Some((parent, name)) = resolve_parent_inode(&path) else {
         return false;
     };
     parent.create_dir(&name).is_some()
@@ -263,14 +302,12 @@ pub fn create_dir(path: &str) -> bool {
 
 pub fn path_exists(path: &str) -> bool {
     let path = normalize_path(path);
-    let vfs = ROOT_VFS.exclusive_access();
-    vfs.resolve_quiet(&path).is_some()
+    resolve_inode_quiet(&path).is_some()
 }
 
 pub fn remove_path(path: &str, is_dir: bool) -> bool {
     let path = normalize_path(path);
-    let vfs = ROOT_VFS.exclusive_access();
-    let Some((parent, name)) = vfs.resolve_parent(&path) else {
+    let Some((parent, name)) = resolve_parent_inode(&path) else {
         return false;
     };
     parent.remove(&name, is_dir)

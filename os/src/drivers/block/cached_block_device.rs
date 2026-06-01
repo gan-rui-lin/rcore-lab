@@ -6,7 +6,8 @@
 use super::BlockDevice;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 
 /// Logical block size used by the block device API.
@@ -43,15 +44,20 @@ const fn cache_size_blocks_from_env() -> usize {
 
 const fn cache_page_capacity_from_blocks(blocks: usize) -> usize {
     let pages = (blocks + BLOCKS_PER_PAGE - 1) / BLOCKS_PER_PAGE;
-    if pages == 0 { 1 } else { pages }
+    if pages == 0 {
+        1
+    } else {
+        pages
+    }
 }
 
 /// Cache capacity in logical 512-byte blocks (compatible with old meaning).
 const CACHE_SIZE_BLOCKS: usize = cache_size_blocks_from_env();
-/// Actual cache entry capacity in 4KiB pages.
+/// Actual cache entry capacity in 16KiB pages.
 const CACHE_PAGE_CAPACITY: usize = cache_page_capacity_from_blocks(CACHE_SIZE_BLOCKS);
 
 const TRACE_BLOCK_CACHE_STATS: bool = option_env!("TRACE_BLOCK_CACHE_STATS").is_some();
+const BLOCK_CACHE_WRITE_THROUGH: bool = option_env!("BLOCK_CACHE_WRITE_THROUGH").is_some();
 const CACHE_STATS_LOG_EVERY_GETS: u64 = 20_000;
 const CACHE_PRESSURE_WARN_BURST: u64 = 1;
 const CACHE_PRESSURE_WARN_EVERY: u64 = 4096;
@@ -148,106 +154,117 @@ const fn page_block_range(block_off: usize) -> (usize, usize) {
     (start, start + BLOCK_SIZE)
 }
 
-/// A cached 4KiB page with per-512B block dirty/load tracking.
-pub struct CachedPage {
+struct CachedPageInner {
     data: [u8; CACHE_PAGE_SIZE],
-    page_id: usize,
-    device: Arc<dyn BlockDevice>,
     loaded_mask: u64,
     dirty_mask: u64,
-    accessed: bool,
+}
+
+/// A cached 16KiB page with per-512B block dirty/load tracking.
+pub struct CachedPage {
+    page_id: usize,
+    device: Arc<dyn BlockDevice>,
+    accessed: AtomicBool,
+    inner: Mutex<CachedPageInner>,
 }
 
 impl CachedPage {
     pub fn new_empty(page_id: usize, device: Arc<dyn BlockDevice>) -> Self {
         Self {
-            data: [0u8; CACHE_PAGE_SIZE],
             page_id,
             device,
-            loaded_mask: 0,
-            dirty_mask: 0,
-            accessed: true,
+            accessed: AtomicBool::new(true),
+            inner: Mutex::new(CachedPageInner {
+                data: [0u8; CACHE_PAGE_SIZE],
+                loaded_mask: 0,
+                dirty_mask: 0,
+            }),
         }
     }
 
-    fn ensure_block_loaded(&mut self, block_off: usize) {
+    fn ensure_block_loaded(&self, inner: &mut CachedPageInner, block_off: usize) {
         let mask = block_mask(block_off);
-        if self.loaded_mask & mask != 0 {
+        if inner.loaded_mask & mask != 0 {
             return;
         }
         let lba = self.page_id * BLOCKS_PER_PAGE + block_off;
         let (start, end) = page_block_range(block_off);
-        self.device.read_block(lba, &mut self.data[start..end]);
+        self.device.read_block(lba, &mut inner.data[start..end]);
         CACHE_BACKEND_READS.fetch_add(1, Ordering::Relaxed);
-        self.loaded_mask |= mask;
+        inner.loaded_mask |= mask;
     }
 
-    pub fn read_block(&mut self, block_off: usize, buf: &mut [u8]) {
-        self.ensure_block_loaded(block_off);
+    pub fn read_block(&self, block_off: usize, buf: &mut [u8]) {
+        let mut inner = self.inner.lock();
+        self.ensure_block_loaded(&mut inner, block_off);
         let (start, end) = page_block_range(block_off);
         let len = buf.len().min(BLOCK_SIZE);
-        buf[..len].copy_from_slice(&self.data[start..end][..len]);
+        buf[..len].copy_from_slice(&inner.data[start..end][..len]);
     }
 
-    pub fn write_block(&mut self, block_off: usize, buf: &[u8], full_overwrite: bool) {
+    pub fn write_block(&self, block_off: usize, buf: &[u8], full_overwrite: bool) {
+        let mut inner = self.inner.lock();
         if !full_overwrite {
-            self.ensure_block_loaded(block_off);
+            self.ensure_block_loaded(&mut inner, block_off);
         }
         let (start, end) = page_block_range(block_off);
         let len = buf.len().min(BLOCK_SIZE);
-        self.data[start..start + len].copy_from_slice(&buf[..len]);
+        inner.data[start..start + len].copy_from_slice(&buf[..len]);
         if len < BLOCK_SIZE {
             // Partial overwrite must preserve trailing bytes.
-            self.ensure_block_loaded(block_off);
+            self.ensure_block_loaded(&mut inner, block_off);
         }
         let mask = block_mask(block_off);
-        self.loaded_mask |= mask;
-        self.dirty_mask |= mask;
-        let _ = end;
-    }
-
-    pub fn has_dirty(&self) -> bool {
-        self.dirty_mask != 0
+        inner.loaded_mask |= mask;
+        inner.dirty_mask |= mask;
+        if BLOCK_CACHE_WRITE_THROUGH {
+            self.device.write_block(
+                self.page_id * BLOCKS_PER_PAGE + block_off,
+                &inner.data[start..end],
+            );
+            CACHE_BACKEND_WRITES.fetch_add(1, Ordering::Relaxed);
+            inner.dirty_mask &= !mask;
+        }
     }
 
     #[inline]
-    pub fn mark_accessed(&mut self) {
-        self.accessed = true;
+    pub fn mark_accessed(&self) {
+        self.accessed.store(true, Ordering::Relaxed);
     }
 
     #[inline]
-    pub fn take_accessed(&mut self) -> bool {
-        let was = self.accessed;
-        self.accessed = false;
-        was
+    pub fn take_accessed(&self) -> bool {
+        self.accessed.swap(false, Ordering::Relaxed)
     }
 
     pub fn dirty_blocks_count(&self) -> usize {
-        self.dirty_mask.count_ones() as usize
+        self.inner.lock().dirty_mask.count_ones() as usize
     }
 
-    pub fn sync(&mut self) {
-        if self.dirty_mask == 0 {
-            return;
+    pub fn sync(&self) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.dirty_mask == 0 {
+            return false;
         }
         let base_lba = self.page_id * BLOCKS_PER_PAGE;
         for block_off in 0..BLOCKS_PER_PAGE {
             let mask = block_mask(block_off);
-            if self.dirty_mask & mask == 0 {
+            if inner.dirty_mask & mask == 0 {
                 continue;
             }
             let (start, end) = page_block_range(block_off);
             self.device
-                .write_block(base_lba + block_off, &self.data[start..end]);
+                .write_block(base_lba + block_off, &inner.data[start..end]);
             CACHE_BACKEND_WRITES.fetch_add(1, Ordering::Relaxed);
-            self.dirty_mask &= !mask;
+            inner.dirty_mask &= !mask;
         }
+        true
     }
 }
 
 impl Drop for CachedPage {
     fn drop(&mut self) {
-        self.sync();
+        let _ = self.sync();
     }
 }
 
@@ -257,7 +274,7 @@ pub struct CacheManager {
     /// Front = newest insertion, Back = oldest candidate.
     queue: VecDeque<usize>,
     /// Cached pages indexed by page id.
-    pages: BTreeMap<usize, Arc<Mutex<CachedPage>>>,
+    pages: BTreeMap<usize, Arc<CachedPage>>,
     /// Reference to the underlying device.
     device: Arc<dyn BlockDevice>,
 }
@@ -271,9 +288,10 @@ impl CacheManager {
         }
     }
 
-    fn evict_if_needed(&mut self) {
+    fn evict_if_needed(&mut self) -> Vec<Arc<CachedPage>> {
+        let mut evicted = Vec::new();
         if self.pages.len() < CACHE_PAGE_CAPACITY {
-            return;
+            return evicted;
         }
 
         // Second-chance scan: recently accessed pages get one extra turn.
@@ -298,73 +316,71 @@ impl CacheManager {
                 continue;
             };
 
-            let mut guard = candidate.lock();
-            if guard.take_accessed() {
-                drop(guard);
+            if candidate.take_accessed() {
                 self.queue.push_front(candidate_id);
                 continue;
             }
-            let was_dirty = guard.has_dirty();
-            drop(guard);
-            self.pages.remove(&candidate_id);
-            CACHE_EVICT_CALLS.fetch_add(1, Ordering::Relaxed);
-            if was_dirty {
-                CACHE_DIRTY_EVICT_CALLS.fetch_add(1, Ordering::Relaxed);
+            if let Some(removed) = self.pages.remove(&candidate_id) {
+                CACHE_EVICT_CALLS.fetch_add(1, Ordering::Relaxed);
+                evicted.push(removed);
             }
-            return;
+            return evicted;
         }
 
         maybe_warn_cache_pressure();
-        if let Some(candidate_id) = self.queue.pop_back() {
+        let fallback_budget = self.queue.len();
+        for _ in 0..fallback_budget {
+            let Some(candidate_id) = self.queue.pop_back() else {
+                break;
+            };
+            let externally_held = self
+                .pages
+                .get(&candidate_id)
+                .map(|arc| Arc::strong_count(arc) > 1)
+                .unwrap_or(false);
+            if externally_held {
+                self.queue.push_front(candidate_id);
+                continue;
+            }
             if let Some(candidate) = self.pages.remove(&candidate_id) {
                 CACHE_EVICT_CALLS.fetch_add(1, Ordering::Relaxed);
-                if candidate.lock().has_dirty() {
-                    CACHE_DIRTY_EVICT_CALLS.fetch_add(1, Ordering::Relaxed);
-                }
+                evicted.push(candidate);
+                break;
             }
         }
-
+        evicted
     }
 
-    fn get_cached_page(&mut self, page_id: usize) -> Option<Arc<Mutex<CachedPage>>> {
+    fn get_cached_page(&mut self, page_id: usize) -> Option<Arc<CachedPage>> {
         if let Some(cached) = self.pages.get(&page_id).cloned() {
             CACHE_HIT_CALLS.fetch_add(1, Ordering::Relaxed);
-            cached.lock().mark_accessed();
+            cached.mark_accessed();
             maybe_log_cache_stats();
             return Some(cached);
         }
         None
     }
 
-    pub fn get_page(&mut self, page_id: usize) -> Arc<Mutex<CachedPage>> {
+    pub fn get_page(&mut self, page_id: usize) -> (Arc<CachedPage>, Vec<Arc<CachedPage>>) {
         CACHE_GET_CALLS.fetch_add(1, Ordering::Relaxed);
         if let Some(cached) = self.get_cached_page(page_id) {
-            return cached;
+            return (cached, Vec::new());
         }
-        CACHE_MISS_CALLS.fetch_add(1, Ordering::Relaxed);
-        self.evict_if_needed();
 
-        let cached_page = Arc::new(Mutex::new(CachedPage::new_empty(
-            page_id,
-            Arc::clone(&self.device),
-        )));
+        CACHE_MISS_CALLS.fetch_add(1, Ordering::Relaxed);
+        let evicted = self.evict_if_needed();
+        let cached_page = Arc::new(CachedPage::new_empty(page_id, Arc::clone(&self.device)));
         self.queue.push_front(page_id);
         self.pages.insert(page_id, Arc::clone(&cached_page));
         maybe_log_cache_stats();
-        cached_page
+        (cached_page, evicted)
     }
 
-    pub fn sync_all(&mut self) {
-        for cached in self.pages.values() {
-            cached.lock().sync();
-        }
+    pub fn page_snapshot(&self) -> Vec<Arc<CachedPage>> {
+        self.pages.values().cloned().collect()
     }
 
-    pub fn stats(&self) -> CacheStats {
-        let mut dirty_count = 0;
-        for cached in self.pages.values() {
-            dirty_count += cached.lock().dirty_blocks_count();
-        }
+    pub fn stats_from_dirty_count(&self, dirty_count: usize) -> CacheStats {
         CacheStats {
             total_blocks: self.pages.len().saturating_mul(BLOCKS_PER_PAGE),
             dirty_blocks: dirty_count,
@@ -387,24 +403,48 @@ pub struct CacheStats {
 /// Cached block device wrapper.
 pub struct CachedBlockDevice {
     cache: Mutex<CacheManager>,
+    device: Arc<dyn BlockDevice>,
 }
 
 impl CachedBlockDevice {
     /// Wrap a block device with caching.
     pub fn new(device: Arc<dyn BlockDevice>) -> Arc<Self> {
         Arc::new(Self {
-            cache: Mutex::new(CacheManager::new(device)),
+            cache: Mutex::new(CacheManager::new(Arc::clone(&device))),
+            device,
         })
     }
 
     /// Sync all cached dirty data to the underlying device.
     pub fn sync(&self) {
-        self.cache.lock().sync_all();
+        let pages = self.cache.lock().page_snapshot();
+        for page in pages {
+            let _ = page.sync();
+        }
     }
 
     /// Get current cache statistics.
     pub fn stats(&self) -> CacheStats {
-        self.cache.lock().stats()
+        let (stats_without_dirty, pages) = {
+            let cache = self.cache.lock();
+            (cache.stats_from_dirty_count(0), cache.page_snapshot())
+        };
+        let dirty_blocks = pages
+            .iter()
+            .map(|page| page.dirty_blocks_count())
+            .sum::<usize>();
+        CacheStats {
+            dirty_blocks,
+            ..stats_without_dirty
+        }
+    }
+
+    fn sync_evicted_pages(pages: Vec<Arc<CachedPage>>) {
+        for page in pages {
+            if page.sync() {
+                CACHE_DIRTY_EVICT_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -412,20 +452,22 @@ impl BlockDevice for CachedBlockDevice {
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
         let page_id = page_id_of(block_id);
         let block_off = block_off_in_page(block_id);
-        let cached = self.cache.lock().get_page(page_id);
-        cached.lock().read_block(block_off, buf);
+        let (cached, evicted) = self.cache.lock().get_page(page_id);
+        Self::sync_evicted_pages(evicted);
+        cached.read_block(block_off, buf);
     }
 
     fn write_block(&self, block_id: usize, buf: &[u8]) {
         let page_id = page_id_of(block_id);
         let block_off = block_off_in_page(block_id);
         let full_overwrite = buf.len() >= BLOCK_SIZE;
-        let cached = self.cache.lock().get_page(page_id);
-        cached.lock().write_block(block_off, buf, full_overwrite);
+        let (cached, evicted) = self.cache.lock().get_page(page_id);
+        Self::sync_evicted_pages(evicted);
+        cached.write_block(block_off, buf, full_overwrite);
     }
 
     fn handle_irq(&self) {
-        // Caching layer does not need special IRQ handling.
+        self.device.handle_irq();
     }
 }
 

@@ -13,7 +13,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 #[cfg(feature = "ext4")]
 use lwext4_rust::bindings::ext4_flink;
-use vfs::VfsInode;
+pub(crate) use vfs::{VfsInode, VfsMetadata, VfsStatFs};
 
 /// trait File for all file types
 pub trait File: Send + Sync {
@@ -25,6 +25,18 @@ pub trait File: Send + Sync {
     fn read(&self, buf: UserBuffer) -> usize;
     /// write to the file from buf, return the number of bytes written
     fn write(&self, buf: UserBuffer) -> usize;
+    /// Optional fast path for reading directly into user memory without first
+    /// collecting page slices into a Vec. Return None to use the generic path.
+    /// 先读到内核的 bounce buffer 再拷回用户页（涉及 inode 读写），并不是零拷贝，不过将内核拷贝移出了临界区。
+    /// 快路径那快在那些直接在用户页上逐片写入的实现，如 DevZero;对普通盘上文件的加速很有限
+    fn read_user_buffer(
+        &self,
+        _token: usize,
+        _ptr: *const u8,
+        _len: usize,
+    ) -> Option<Result<usize, isize>> {
+        None
+    }
     /// write to the file from buf, returning either bytes written or errno
     fn write_user_buffer(&self, buf: UserBuffer) -> Result<usize, isize> {
         Ok(self.write(buf))
@@ -77,17 +89,25 @@ pub trait File: Send + Sync {
     /// Optional: set file status flags (O_NONBLOCK, O_APPEND, etc.).
     fn set_status_flags(&self, _flags: u32) {}
     /// Optional: get/add memfd seals. Regular files do not support them.
-    fn get_seals(&self) -> Option<u32> { None }
+    fn get_seals(&self) -> Option<u32> {
+        None
+    }
     /// Optional: add memfd seals.
-    fn add_seals(&self, _seals: u32) -> isize { -22 }
+    fn add_seals(&self, _seals: u32) -> isize {
+        -22
+    }
     /// Check if O_NONBLOCK is set.
     fn is_nonblock(&self) -> bool {
         self.status_flags() & 0x800 != 0 // O_NONBLOCK = 0x800
     }
     /// True for pipe endpoints.
-    fn is_pipe(&self) -> bool { false }
+    fn is_pipe(&self) -> bool {
+        false
+    }
     /// Stable identity for both ends of the same pipe.
-    fn pipe_id(&self) -> usize { 0 }
+    fn pipe_id(&self) -> usize {
+        0
+    }
     /// Optional: get bound port for TCP sockets.
     fn bound_port(&self) -> u16 {
         0
@@ -105,33 +125,59 @@ pub trait File: Send + Sync {
     /// Optional: set the connected remote endpoint for UDP sockets (used by connect()).
     fn set_connected_remote(&self, _addr: smoltcp::wire::IpEndpoint) {}
     /// Optional: get the connected remote endpoint for UDP sockets (used by getpeername()).
-    fn get_connected_remote(&self) -> Option<smoltcp::wire::IpEndpoint> { None }
+    fn get_connected_remote(&self) -> Option<smoltcp::wire::IpEndpoint> {
+        None
+    }
     /// Returns true if this file is an AF_UNIX domain socket.
-    fn is_unix_socket(&self) -> bool { false }
+    fn is_unix_socket(&self) -> bool {
+        false
+    }
     /// For AF_UNIX sockets: get address family (always 1) and socket type.
-    fn unix_socket_type(&self) -> u8 { 0 }
+    fn unix_socket_type(&self) -> u8 {
+        0
+    }
     /// For AF_UNIX sockets: bind to a path.
     /// `path`: the sun_path bytes (null-terminated or abstract if first byte is \0).
     /// Returns 0 on success, negative errno on failure.
-    fn unix_do_bind(&self, _path: alloc::string::String, _is_abstract: bool) -> isize { -88 }
+    fn unix_do_bind(&self, _path: alloc::string::String, _is_abstract: bool) -> isize {
+        -88
+    }
     /// For AF_UNIX sockets: get the bound path (None if unbound).
-    fn unix_bound_path(&self) -> Option<alloc::string::String> { None }
+    fn unix_bound_path(&self) -> Option<alloc::string::String> {
+        None
+    }
     /// For AF_UNIX sockets: mark as listening with given backlog.
-    fn unix_do_listen(&self, _backlog: usize) -> isize { -95 } // EOPNOTSUPP
+    fn unix_do_listen(&self, _backlog: usize) -> isize {
+        -95
+    } // EOPNOTSUPP
     /// For AF_UNIX sockets: accept a pending connection. Returns new socket file or None.
-    fn unix_do_accept(&self) -> Option<alloc::sync::Arc<dyn File>> { None }
+    fn unix_do_accept(&self) -> Option<alloc::sync::Arc<dyn File>> {
+        None
+    }
     /// For AF_UNIX sockets: connect to a listening socket.
-    fn unix_do_connect(&self, _path: alloc::string::String, _is_abstract: bool) -> isize { -111 } // ECONNREFUSED
+    fn unix_do_connect(&self, _path: alloc::string::String, _is_abstract: bool) -> isize {
+        -111
+    } // ECONNREFUSED
     /// For AF_UNIX sockets: read data, returns bytes read.
-    fn unix_read(&self, _buf: &mut [u8]) -> isize { 0 }
+    fn unix_read(&self, _buf: &mut [u8]) -> isize {
+        0
+    }
     /// For AF_UNIX sockets: write data, returns bytes written.
-    fn unix_write(&self, _buf: &[u8]) -> isize { -32 } // EPIPE
+    fn unix_write(&self, _buf: &[u8]) -> isize {
+        -32
+    } // EPIPE
     /// For AF_UNIX sockets: peek/check if readable.
-    fn unix_readable(&self) -> bool { false }
+    fn unix_readable(&self) -> bool {
+        false
+    }
     /// For AF_UNIX sockets: poll events.
-    fn unix_poll(&self, _events: PollEvents) -> PollEvents { PollEvents::empty() }
+    fn unix_poll(&self, _events: PollEvents) -> PollEvents {
+        PollEvents::empty()
+    }
     /// For AF_UNIX sockets: push bytes into receive queue (internal use).
-    fn unix_push_rx_bytes(&self, _data: &[u8]) -> usize { 0 }
+    fn unix_push_rx_bytes(&self, _data: &[u8]) -> usize {
+        0
+    }
     /// For AF_UNIX sockets: push an accepted socket into listen backlog (internal use).
     fn unix_push_backlog(&self, _sock: Arc<dyn File>) {}
     /// For AF_UNIX sockets: set peer socket by dynamic weak pointer (internal use).
@@ -139,21 +185,33 @@ pub trait File: Send + Sync {
     /// For AF_UNIX sockets: mark peer as closed (internal use).
     fn unix_mark_peer_closed(&self) {}
     /// For AF_UNIX sockets: get current internal state code.
-    fn unix_get_state_u8(&self) -> u8 { 0 }
+    fn unix_get_state_u8(&self) -> u8 {
+        0
+    }
     /// For AF_UNIX sockets: set peer credentials (pid, uid, gid) on server-side socket.
     fn unix_set_peer_cred(&self, _pid: u32, _uid: u32, _gid: u32) {}
     /// For AF_UNIX sockets: get peer credentials (pid, uid, gid). None if not set.
-    fn unix_get_peer_cred(&self) -> Option<(u32, u32, u32)> { None }
+    fn unix_get_peer_cred(&self) -> Option<(u32, u32, u32)> {
+        None
+    }
     /// Returns true if this is a timerfd file descriptor.
-    fn is_timerfd(&self) -> bool { false }
+    fn is_timerfd(&self) -> bool {
+        false
+    }
     /// For timerfd: arm the timer (expiry_us = absolute monotonic µs, interval_us = 0 for one-shot).
     fn timerfd_arm(&self, _expiry_us: u64, _interval_us: u64) {}
     /// For timerfd: disarm the timer. Returns remaining µs.
-    fn timerfd_disarm(&self) -> u64 { 0 }
+    fn timerfd_disarm(&self) -> u64 {
+        0
+    }
     /// For timerfd: get (remaining_us, interval_us). Returns None if not a timerfd.
-    fn timerfd_gettime(&self) -> Option<(u64, u64)> { None }
+    fn timerfd_gettime(&self) -> Option<(u64, u64)> {
+        None
+    }
     /// For timerfd: clockid (0=REALTIME, 1=MONOTONIC).
-    fn timerfd_clockid(&self) -> i32 { -1 }
+    fn timerfd_clockid(&self) -> i32 {
+        -1
+    }
 }
 
 /// Linux-compatible stat layout (riscv64, matches musl struct stat).
@@ -255,7 +313,10 @@ bitflags::bitflags! {
     }
 }
 
+pub use memfd::MemFdFile;
 pub use pipe::make_pipe;
+pub use stdio::{DevNull, DevUrandom, DevZero, Stdin, Stdout};
+pub use timerfd::{TimerFdFile, TIMERFD_EAGAIN};
 #[cfg(feature = "ext4")]
 /// Mount ext4 as root with explicit device size.
 pub use vfs::mount_ext4;
@@ -264,11 +325,8 @@ pub use vfs::mount_ext4;
 pub use vfs::mount_ext4_auto;
 pub use vfs::{
     create_dir, list_apps, mount_easyfs, mount_fat32, mount_fat32_auto, mount_procfs, open_file,
-    path_exists, path_is_dir, remove_path,
+    path_exists, path_is_dir, remove_path, shutdown_filesystems, sync_filesystems,
 };
-pub use memfd::MemFdFile;
-pub use stdio::{DevNull, DevUrandom, DevZero, Stdin, Stdout};
-pub use timerfd::{TimerFdFile, TIMERFD_EAGAIN};
 
 /// Create minimal /etc and /dev files used by BusyBox tests.
 pub fn ensure_basic_paths() {
@@ -334,7 +392,10 @@ games:x:60:\n\
 users:x:100:\n\
 ",
     );
-    append_line_if_missing("/etc/passwd", "nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n");
+    append_line_if_missing(
+        "/etc/passwd",
+        "nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n",
+    );
     append_line_if_missing("/etc/group", "nogroup:x:65534:\n");
     write_file_if_missing("/etc/localtime", "");
     write_file_if_missing("/etc/adjtime", "");
@@ -425,7 +486,10 @@ fn append_line_if_missing(path: &str, line: &str) {
         return;
     };
     let existing = file.read_all();
-    if existing.windows(line.len()).any(|window| window == line.as_bytes()) {
+    if existing
+        .windows(line.len())
+        .any(|window| window == line.as_bytes())
+    {
         return;
     }
     let mut data = existing;
@@ -510,12 +574,21 @@ pub fn ensure_busybox_links() {
 
     #[cfg(target_arch = "riscv64")]
     if open_file("/glibc/lib/ld-linux-riscv64-lp64d.so.1", OpenFlags::empty()).is_some() {
-        ensure_hardlink("/lib/ld-linux-riscv64-lp64d.so.1", "/glibc/lib/ld-linux-riscv64-lp64d.so.1");
+        ensure_hardlink(
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
+        );
         // glibc ld.so searches /lib/ for shared libraries; create hardlinks so it finds them
         // RV sdcard may have libc.so (no .6 suffix) or libc.so.6 — handle both
         for (soname, candidates) in [
-            ("libc.so.6", &["/glibc/lib/libc.so.6", "/glibc/lib/libc.so"][..]),
-            ("libm.so.6", &["/glibc/lib/libm.so.6", "/glibc/lib/libm.so"][..]),
+            (
+                "libc.so.6",
+                &["/glibc/lib/libc.so.6", "/glibc/lib/libc.so"][..],
+            ),
+            (
+                "libm.so.6",
+                &["/glibc/lib/libm.so.6", "/glibc/lib/libm.so"][..],
+            ),
         ] {
             for src in candidates {
                 if open_file(src, OpenFlags::empty()).is_some() {
@@ -528,8 +601,16 @@ pub fn ensure_busybox_links() {
     }
 
     #[cfg(target_arch = "loongarch64")]
-    if open_file("/glibc/lib/ld-linux-loongarch-lp64d.so.1", OpenFlags::empty()).is_some() {
-        ensure_hardlink("/lib64/ld-linux-loongarch-lp64d.so.1", "/glibc/lib/ld-linux-loongarch-lp64d.so.1");
+    if open_file(
+        "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+        OpenFlags::empty(),
+    )
+    .is_some()
+    {
+        ensure_hardlink(
+            "/lib64/ld-linux-loongarch-lp64d.so.1",
+            "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+        );
         // glibc ld.so searches /lib64/ for shared libraries; create hardlinks so it finds them
         if open_file("/glibc/lib/libc.so.6", OpenFlags::empty()).is_some() {
             ensure_hardlink("/lib64/libc.so.6", "/glibc/lib/libc.so.6");

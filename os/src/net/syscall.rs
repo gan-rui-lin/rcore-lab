@@ -1,7 +1,7 @@
 //! Network system call implementations.
 
-use alloc::sync::Arc;
 use alloc::collections::BTreeSet;
+use alloc::sync::Arc;
 use alloc::vec;
 use core::sync::atomic::{AtomicBool, AtomicU16};
 use lazy_static::lazy_static;
@@ -14,11 +14,15 @@ use spin::Mutex;
 use crate::fs::{open_file, path_is_dir, OpenFlags};
 use crate::mm::translated_refmut;
 use crate::syscall::user_mem::{self, UserReadPolicy, UserWritePolicy};
-use crate::task::{current_process, current_user_token, has_pending_unmasked_signal, suspend_current_and_run_next};
+use crate::task::{
+    current_process, current_user_token, has_pending_unmasked_signal, suspend_current_and_run_next,
+};
 
 use super::socket_file::{SocketFile, SocketType};
-use super::unix_socket::{unix_registry_get, unix_registry_has, unix_registry_insert, UnixSocketFile};
-use super::{alloc_ephemeral_port, poll_net, NET_STACK};
+use super::unix_socket::{
+    unix_registry_get, unix_registry_has, unix_registry_insert, UnixSocketFile,
+};
+use super::{alloc_ephemeral_port, poll_net, with_net_stack_read, with_net_stack_write};
 
 // Address family
 const AF_UNIX: usize = 1;
@@ -86,8 +90,7 @@ fn read_sockaddr(addr_ptr: *const u8, addr_len: usize, token: usize) -> Option<I
         return None;
     }
     let mut raw = [0u8; 16];
-    if user_mem::copy_from_user(token, addr_ptr, &mut raw, UserReadPolicy::StrictChecked).is_err()
-    {
+    if user_mem::copy_from_user(token, addr_ptr, &mut raw, UserReadPolicy::StrictChecked).is_err() {
         return None;
     }
     let family = u16::from_ne_bytes([raw[0], raw[1]]);
@@ -116,8 +119,7 @@ fn read_sockaddr_for_connect(
         return Err(EFAULT);
     }
     let mut raw = [0u8; 16];
-    if user_mem::copy_from_user(token, addr_ptr, &mut raw, UserReadPolicy::StrictChecked).is_err()
-    {
+    if user_mem::copy_from_user(token, addr_ptr, &mut raw, UserReadPolicy::StrictChecked).is_err() {
         return Err(EFAULT);
     }
     let family = u16::from_ne_bytes([raw[0], raw[1]]);
@@ -162,10 +164,10 @@ fn write_sockaddr(
     // - Both NULL is OK (caller doesn't want the address)
     // - Only one NULL is EFAULT (inconsistent state)
     if addr_ptr.is_null() && addrlen_ptr.is_null() {
-        return Ok(());  // Caller doesn't want address info
+        return Ok(()); // Caller doesn't want address info
     }
     if addr_ptr.is_null() || addrlen_ptr.is_null() {
-        return Err(EFAULT);  // Only one NULL is an error
+        return Err(EFAULT); // Only one NULL is an error
     }
     let mut raw = [0u8; 16];
     raw[0] = AF_INET as u8;
@@ -193,11 +195,7 @@ fn write_sockaddr(
 /// Helper: get socket handle and type from fd.
 fn get_socket_info(fd: usize) -> Result<(SocketHandle, SocketType), isize> {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return Err(EBADF);
-    }
-    match inner.fd_table[fd].as_ref() {
+    match process.get_file(fd) {
         Some(file) => {
             if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
                 return Err(EBADF);
@@ -214,11 +212,7 @@ fn get_socket_info(fd: usize) -> Result<(SocketHandle, SocketType), isize> {
 /// Helper: get socket file's bound_port and listening state.
 fn get_socket_extra(fd: usize) -> Result<(SocketHandle, SocketType, u16, bool), isize> {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return Err(EBADF);
-    }
-    match inner.fd_table[fd].as_ref() {
+    match process.get_file(fd) {
         Some(file) => {
             if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
                 return Err(EBADF);
@@ -279,7 +273,7 @@ fn resolve_unix_bind_path(path: &str) -> alloc::string::String {
     if path.starts_with('/') {
         return normalize_abs_path(path);
     }
-    let cwd = current_process().inner_exclusive_access().cwd.clone();
+    let cwd = current_process().cwd();
     if cwd == "/" {
         normalize_abs_path(&alloc::format!("/{}", path))
     } else {
@@ -305,12 +299,10 @@ pub fn sys_socket(domain: usize, sock_type: usize, _protocol: usize) -> isize {
         };
         let sock = UnixSocketFile::new(unix_type, nonblock, cloexec);
         let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-        let fd = match inner.alloc_fd() {
+        let fd = match process.install_file(sock) {
             Some(fd) => fd,
             None => return EMFILE,
         };
-        inner.fd_table[fd] = Some(sock);
         return fd as isize;
     }
 
@@ -324,28 +316,24 @@ pub fn sys_socket(domain: usize, sock_type: usize, _protocol: usize) -> isize {
         _ => return EINVAL,
     };
 
-    let handle = {
-        let mut net = NET_STACK.exclusive_access();
-        let stack = match net.as_mut() {
-            Some(s) => s,
-            None => return EINVAL,
-        };
-        match st {
-            SocketType::Tcp => {
-                let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
-                let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
-                let socket = tcp::Socket::new(rx_buf, tx_buf);
-                stack.sockets.add(socket)
-            }
-            SocketType::Udp => {
-                let rx_buf =
-                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0u8; 65536]);
-                let tx_buf =
-                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0u8; 65536]);
-                let socket = udp::Socket::new(rx_buf, tx_buf);
-                stack.sockets.add(socket)
-            }
+    let handle = match with_net_stack_write(|stack| match st {
+        SocketType::Tcp => {
+            let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
+            let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
+            let socket = tcp::Socket::new(rx_buf, tx_buf);
+            stack.sockets.add(socket)
         }
+        SocketType::Udp => {
+            let rx_buf =
+                udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0u8; 65536]);
+            let tx_buf =
+                udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0u8; 65536]);
+            let socket = udp::Socket::new(rx_buf, tx_buf);
+            stack.sockets.add(socket)
+        }
+    }) {
+        Some(handle) => handle,
+        None => return EINVAL,
     };
 
     let mut socket_file = SocketFile::new(handle, st);
@@ -353,12 +341,10 @@ pub fn sys_socket(domain: usize, sock_type: usize, _protocol: usize) -> isize {
     socket_file.cloexec = cloexec;
 
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd = match inner.alloc_fd() {
+    let fd = match process.install_file(Arc::new(socket_file)) {
         Some(fd) => fd,
         None => return EMFILE,
     };
-    inner.fd_table[fd] = Some(Arc::new(socket_file));
     fd as isize
 }
 
@@ -388,8 +374,7 @@ fn read_sockaddr_family(addr_ptr: *const u8, addr_len: usize, token: usize) -> O
         return None;
     }
     let mut raw = [0u8; 2];
-    if user_mem::copy_from_user(token, addr_ptr, &mut raw, UserReadPolicy::StrictChecked).is_err()
-    {
+    if user_mem::copy_from_user(token, addr_ptr, &mut raw, UserReadPolicy::StrictChecked).is_err() {
         return None;
     }
     Some(u16::from_ne_bytes(raw))
@@ -397,7 +382,11 @@ fn read_sockaddr_family(addr_ptr: *const u8, addr_len: usize, token: usize) -> O
 
 /// Read AF_UNIX sockaddr path from user memory.
 /// Returns (path_string, is_abstract).
-fn read_unix_sockaddr(addr_ptr: *const u8, addr_len: usize, token: usize) -> Option<(alloc::string::String, bool)> {
+fn read_unix_sockaddr(
+    addr_ptr: *const u8,
+    addr_len: usize,
+    token: usize,
+) -> Option<(alloc::string::String, bool)> {
     if addr_ptr.is_null() || addr_len < 3 {
         return None;
     }
@@ -421,13 +410,18 @@ fn read_unix_sockaddr(addr_ptr: *const u8, addr_len: usize, token: usize) -> Opt
     }
     if path_bytes[0] == 0 {
         // Abstract socket: name starts after the leading \0
-        let name_end = path_bytes.iter().position(|&b| b == 0 && path_bytes.iter().position(|&x| x == b).unwrap_or(0) != 0)
+        let name_end = path_bytes
+            .iter()
+            .position(|&b| b == 0 && path_bytes.iter().position(|&x| x == b).unwrap_or(0) != 0)
             .unwrap_or(path_bytes.len());
         let name = alloc::string::String::from_utf8_lossy(&path_bytes[1..name_end]).into_owned();
         Some((name, true))
     } else {
         // Pathname socket: null-terminated
-        let end = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+        let end = path_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(path_bytes.len());
         let path = alloc::string::String::from_utf8_lossy(&path_bytes[..end]).into_owned();
         Some((path, false))
     }
@@ -481,15 +475,10 @@ pub fn sys_bind(fd: usize, addr: *const u8, addr_len: usize) -> isize {
     // Check if fd is valid and get file
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return EBADF;
-        }
-        let file = match inner.fd_table[fd].as_ref() {
-            Some(f) => f.clone(),
+        let file = match process.get_file(fd) {
+            Some(f) => f,
             None => return EBADF,
         };
-        drop(inner);
 
         // Handle AF_UNIX sockets
         if file.is_unix_socket() {
@@ -527,10 +516,7 @@ pub fn sys_bind(fd: usize, addr: *const u8, addr_len: usize) -> isize {
             if ret == 0 {
                 if !is_abstract {
                     // Create a filesystem node so unlink() succeeds for pathname sockets.
-                    let _ = open_file(
-                        registry_key.as_str(),
-                        OpenFlags::CREATE | OpenFlags::WRONLY,
-                    );
+                    let _ = open_file(registry_key.as_str(), OpenFlags::CREATE | OpenFlags::WRONLY);
                 }
                 unix_registry_insert(registry_key, file.clone());
             }
@@ -569,17 +555,14 @@ pub fn sys_bind(fd: usize, addr: *const u8, addr_len: usize) -> isize {
     // Check privileged port access (ports < 1024 require root)
     if listen_ep.port > 0 && listen_ep.port < 1024 {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if inner.effective_uid != 0 {
+        if process.effective_uid() != 0 {
             return EACCES;
         }
     }
 
-    let mut net = NET_STACK.exclusive_access();
-    let stack = match net.as_mut() {
-        Some(s) => s,
-        None => return EINVAL,
-    };
+    if with_net_stack_read(|_| ()).is_none() {
+        return EINVAL;
+    }
 
     match sock_type {
         SocketType::Tcp => {
@@ -590,31 +573,34 @@ pub fn sys_bind(fd: usize, addr: *const u8, addr_len: usize) -> isize {
                 listen_ep.port
             };
             // Store via File trait's set_bound_port
-            drop(net);
             let process = current_process();
-            let inner = process.inner_exclusive_access();
-            if let Some(file) = &inner.fd_table[fd] {
+            if let Some(file) = process.get_file(fd) {
                 file.set_bound_port(port);
             }
             0
         }
         SocketType::Udp => {
-            let socket = stack.sockets.get_mut::<udp::Socket>(handle);
-            // port=0 means kernel should auto-assign an ephemeral port
-            let bind_ep = if listen_ep.port == 0 {
-                IpListenEndpoint {
-                    addr: listen_ep.addr,
-                    port: alloc_ephemeral_port(),
+            match with_net_stack_write(|stack| {
+                let socket = stack.sockets.get_mut::<udp::Socket>(handle);
+                // port=0 means kernel should auto-assign an ephemeral port
+                let bind_ep = if listen_ep.port == 0 {
+                    IpListenEndpoint {
+                        addr: listen_ep.addr,
+                        port: alloc_ephemeral_port(),
+                    }
+                } else {
+                    listen_ep
+                };
+                match socket.bind(bind_ep) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        warn!("[net] UDP bind failed: {:?}", e);
+                        EADDRINUSE
+                    }
                 }
-            } else {
-                listen_ep
-            };
-            match socket.bind(bind_ep) {
-                Ok(()) => 0,
-                Err(e) => {
-                    warn!("[net] UDP bind failed: {:?}", e);
-                    EADDRINUSE
-                }
+            }) {
+                Some(ret) => ret,
+                None => EINVAL,
             }
         }
     }
@@ -625,13 +611,10 @@ pub fn sys_listen(fd: usize, _backlog: usize) -> isize {
     // Handle AF_UNIX sockets first (not tracked via smoltcp).
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd < inner.fd_table.len() {
-            if let Some(ref file) = inner.fd_table[fd] {
-                if file.is_unix_socket() {
-                    let ret = file.unix_do_listen(_backlog);
-                    return ret;
-                }
+        if let Some(file) = process.get_file(fd) {
+            if file.is_unix_socket() {
+                let ret = file.unix_do_listen(_backlog);
+                return ret;
             }
         }
     }
@@ -651,24 +634,25 @@ pub fn sys_listen(fd: usize, _backlog: usize) -> isize {
         bound_port
     };
 
-    let mut net = NET_STACK.exclusive_access();
-    let stack = match net.as_mut() {
-        Some(s) => s,
+    let result = match with_net_stack_write(|stack| {
+        let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+        let listen_ep = IpListenEndpoint { addr: None, port };
+        if let Err(e) = socket.listen(listen_ep) {
+            warn!("[net] TCP listen failed: {:?}", e);
+            return EINVAL;
+        }
+        0
+    }) {
+        Some(ret) => ret,
         None => return EINVAL,
     };
-
-    let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-    let listen_ep = IpListenEndpoint { addr: None, port };
-    if let Err(e) = socket.listen(listen_ep) {
-        warn!("[net] TCP listen failed: {:?}", e);
-        return EINVAL;
+    if result != 0 {
+        return result;
     }
-    drop(net);
 
     // Update the socket file's state
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    if let Some(file) = &inner.fd_table[fd] {
+    if let Some(file) = process.get_file(fd) {
         file.set_bound_port(port);
         file.set_listening(true);
     }
@@ -683,41 +667,35 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32, flags: us
     // Handle AF_UNIX sockets (not tracked via smoltcp).
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if listen_fd < inner.fd_table.len() {
-            if let Some(ref file) = inner.fd_table[listen_fd] {
-                if file.is_unix_socket() {
-                    let listen_file = file.clone();
-                    let state = listen_file.unix_get_state_u8();
-                    drop(inner);
-                    if state != 2 {
-                        // Not in listening state
-                        return EINVAL;
+        if let Some(file) = process.get_file(listen_fd) {
+            if file.is_unix_socket() {
+                let listen_file = file.clone();
+                let state = listen_file.unix_get_state_u8();
+                if state != 2 {
+                    // Not in listening state
+                    return EINVAL;
+                }
+                // Block until a connection appears in the backlog.
+                // sys_connect pushes a new socket into the backlog (for STREAM sockets)
+                // or directly sets the peer (for DGRAM), so we poll the backlog.
+                loop {
+                    if let Some(accepted_sock) = listen_file.unix_do_accept() {
+                        // Write the peer addr (empty for anonymous Unix sockets).
+                        if !addr.is_null() && !addr_len.is_null() {
+                            let _ = write_unix_sockaddr("", addr, addr_len, token);
+                        }
+                        // Allocate a new fd for the accepted socket.
+                        let proc = current_process();
+                        let new_fd = match proc.install_file(accepted_sock) {
+                            Some(fd) => fd,
+                            None => return EMFILE,
+                        };
+                        return new_fd as isize;
                     }
-                    // Block until a connection appears in the backlog.
-                    // sys_connect pushes a new socket into the backlog (for STREAM sockets)
-                    // or directly sets the peer (for DGRAM), so we poll the backlog.
-                    loop {
-                        if let Some(accepted_sock) = listen_file.unix_do_accept() {
-                            // Write the peer addr (empty for anonymous Unix sockets).
-                            if !addr.is_null() && !addr_len.is_null() {
-                                let _ = write_unix_sockaddr("", addr, addr_len, token);
-                            }
-                            // Allocate a new fd for the accepted socket.
-                            let proc = current_process();
-                            let mut inner2 = proc.inner_exclusive_access();
-                            let new_fd = match inner2.alloc_fd() {
-                                Some(fd) => fd,
-                                None => return EMFILE,
-                            };
-                            inner2.fd_table[new_fd] = Some(accepted_sock);
-                            return new_fd as isize;
-                        }
-                        crate::task::suspend_current_and_run_next();
-                        // Check if we should give up (e.g., pending signal).
-                        if crate::task::has_pending_unmasked_signal(false) {
-                            return EINTR;
-                        }
+                    crate::task::suspend_current_and_run_next();
+                    // Check if we should give up (e.g., pending signal).
+                    if crate::task::has_pending_unmasked_signal(false) {
+                        return EINTR;
                     }
                 }
             }
@@ -746,14 +724,18 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32, flags: us
     // Wait for the listening socket to become active (SYN received → ESTABLISHED)
     loop {
         poll_net();
-        let mut net = NET_STACK.exclusive_access();
-        let stack = match net.as_mut() {
-            Some(s) => s,
-            None => return EINVAL,
-        };
-        let socket = stack.sockets.get_mut::<tcp::Socket>(listen_handle);
+        enum AcceptDecision {
+            Wait,
+            Ready { new_listen_handle: SocketHandle },
+            Error(isize),
+        }
 
-        if socket.is_active() {
+        let decision = match with_net_stack_write(|stack| {
+            let socket = stack.sockets.get_mut::<tcp::Socket>(listen_handle);
+            if !socket.is_active() {
+                return AcceptDecision::Wait;
+            }
+
             // Connection established! Get remote endpoint.
             let remote_ep = socket.remote_endpoint();
             let _local_ep = socket.local_endpoint();
@@ -762,7 +744,7 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32, flags: us
             if let Some(ep) = remote_ep {
                 if !addr.is_null() {
                     if let Err(e) = write_sockaddr(&ep, addr, addr_len, token) {
-                        return e;
+                        return AcceptDecision::Error(e);
                     }
                 }
             }
@@ -781,45 +763,49 @@ pub fn sys_accept(listen_fd: usize, addr: *mut u8, addr_len: *mut u32, flags: us
             let new_listen_handle = stack.sockets.add(new_listen_sock);
             // Preserve multicast membership on the listening socket only.
             mcast_transfer_membership(listen_handle, new_listen_handle);
+            AcceptDecision::Ready { new_listen_handle }
+        }) {
+            Some(result) => result,
+            None => return EINVAL,
+        };
 
-            drop(net);
+        match decision {
+            AcceptDecision::Error(err) => return err,
+            AcceptDecision::Ready { new_listen_handle } => {
+                // Swap: the accepted connection keeps listen_handle,
+                // but update the listen fd to point to new_listen_handle
+                let accepted_file = {
+                    let mut sf = SocketFile::new(listen_handle, SocketType::Tcp);
+                    sf.cloexec = (flags & SOCK_CLOEXEC) != 0;
+                    sf.nonblock = (flags & SOCK_NONBLOCK) != 0;
+                    Arc::new(sf)
+                };
 
-            // Swap: the accepted connection keeps listen_handle,
-            // but update the listen fd to point to new_listen_handle
-            let accepted_file = {
-                let mut sf = SocketFile::new(listen_handle, SocketType::Tcp);
-                sf.cloexec = (flags & SOCK_CLOEXEC) != 0;
-                sf.nonblock = (flags & SOCK_NONBLOCK) != 0;
-                Arc::new(sf)
-            };
+                // Update listen fd to new listen socket
+                let process = current_process();
+                // Mark old SocketFile as transferred so Drop doesn't destroy the socket
+                if let Some(old_file) = process.get_file(listen_fd) {
+                    old_file.mark_transferred();
+                }
+                // Replace the listen socket with the new one
+                let new_listen_file = {
+                    let mut sf = SocketFile::new(new_listen_handle, SocketType::Tcp);
+                    sf.cloexec = false;
+                    sf.bound_port = AtomicU16::new(bound_port);
+                    sf.listening = AtomicBool::new(true);
+                    Arc::new(sf)
+                };
+                process.install_file_at(listen_fd, new_listen_file);
 
-            // Update listen fd to new listen socket
-            let process = current_process();
-            let mut inner = process.inner_exclusive_access();
-            // Mark old SocketFile as transferred so Drop doesn't destroy the socket
-            if let Some(old_file) = &inner.fd_table[listen_fd] {
-                old_file.mark_transferred();
+                // Allocate fd for the accepted connection
+                let new_fd = match process.install_file(accepted_file) {
+                    Some(fd) => fd,
+                    None => return EMFILE,
+                };
+                return new_fd as isize;
             }
-            // Replace the listen socket with the new one
-            let new_listen_file = {
-                let mut sf = SocketFile::new(new_listen_handle, SocketType::Tcp);
-                sf.cloexec = false;
-                sf.bound_port = AtomicU16::new(bound_port);
-                sf.listening = AtomicBool::new(true);
-                Arc::new(sf)
-            };
-            inner.fd_table[listen_fd] = Some(new_listen_file);
-
-            // Allocate fd for the accepted connection
-            let new_fd = match inner.alloc_fd() {
-                Some(fd) => fd,
-                None => return EMFILE,
-            };
-            inner.fd_table[new_fd] = Some(accepted_file);
-            return new_fd as isize;
+            AcceptDecision::Wait => {}
         }
-
-        drop(net);
         suspend_current_and_run_next();
         // Check for pending signals -> EINTR so SIGALRM can be delivered
         if has_pending_unmasked_signal(false) {
@@ -835,18 +821,13 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
     // AF_UNIX connect path.
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return EBADF;
-        }
-        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+        let Some(file) = process.get_file(fd) else {
             return EBADF;
         };
         if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
             return EBADF;
         }
         if file.is_unix_socket() {
-            drop(inner);
             let family = match read_sockaddr_family(addr, addr_len, token) {
                 Some(f) => f,
                 None => return EINVAL,
@@ -882,10 +863,9 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
                 let server_side = UnixSocketFile::new(sock_type, nonblock, false);
                 let server_side_arc: Arc<dyn crate::fs::File> = server_side;
                 // Record connecting process credentials (for SO_PEERCRED on accepted socket).
-                let (cred_pid, cred_uid, cred_gid) = {
-                    let inner2 = process.inner_exclusive_access();
-                    (process.pid.0 as u32, inner2.real_uid, inner2.real_gid)
-                };
+                let creds = process.credentials_snapshot();
+                let (cred_pid, cred_uid, cred_gid) =
+                    (process.pid.0 as u32, creds.real_uid, creds.real_gid);
                 server_side_arc.unix_set_peer_cred(cred_pid, cred_uid, cred_gid);
                 // Link peers: client ↔ server_side
                 file.unix_set_peer_dyn(Arc::downgrade(&server_side_arc));
@@ -928,25 +908,33 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
             };
             {
                 poll_net();
-                let mut net = NET_STACK.exclusive_access();
-                let stack = match net.as_mut() {
-                    Some(s) => s,
+                let connect_error = match with_net_stack_write(|stack| {
+                    // Use loopback context for 127.x.x.x; external context otherwise
+                    // (on LoongArch loopback-only mode, always uses loopback)
+                    let cx = if is_loopback {
+                        stack.lo_iface.context()
+                    } else {
+                        #[cfg(target_arch = "riscv64")]
+                        {
+                            let Some(iface) = stack.iface.as_mut() else {
+                                return Some(tcp::ConnectError::Unaddressable);
+                            };
+                            iface.context()
+                        }
+                        #[cfg(not(target_arch = "riscv64"))]
+                        {
+                            stack.lo_iface.context()
+                        }
+                    };
+                    let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+                    socket.connect(cx, connect_remote, local_port).err()
+                }) {
+                    Some(err) => err,
                     None => return EINVAL,
                 };
-                // Use loopback context for 127.x.x.x; external context otherwise
-                // (on LoongArch loopback-only mode, always uses loopback)
-                let cx = if is_loopback {
-                    stack.lo_iface.context()
-                } else {
-                    #[cfg(target_arch = "riscv64")]
-                    { stack.iface.context() }
-                    #[cfg(not(target_arch = "riscv64"))]
-                    { stack.lo_iface.context() }
-                };
-                let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-                if let Err(e) = socket.connect(cx, connect_remote, local_port) {
-                    warn!("[net] TCP connect failed: {:?}", e);
-                    return match e {
+                if let Some(err) = connect_error {
+                    warn!("[net] TCP connect failed: {:?}", err);
+                    return match err {
                         tcp::ConnectError::InvalidState => EISCONN,
                         _ => ECONNREFUSED,
                     };
@@ -958,35 +946,49 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
             let mut retries_left: i32 = if is_loopback { 3 } else { 0 };
             loop {
                 poll_net();
-                let mut net = NET_STACK.exclusive_access();
-                let stack = match net.as_mut() {
-                    Some(s) => s,
-                    None => return EINVAL,
-                };
-                let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-
-                match socket.state() {
-                    tcp::State::Established => return 0,
-                    tcp::State::Closed => {
-                        if retries_left > 0 {
-                            retries_left -= 1;
-                            // Re-initiate connect with a new ephemeral port
-                            let new_port = alloc_ephemeral_port();
-                            let cx = stack.lo_iface.context();
-                            let _ = socket.connect(cx, connect_remote, new_port);
-                            drop(net);
-                            // Yield to let server process run
-                            for _ in 0..5 {
-                                suspend_current_and_run_next();
-                            }
-                            continue;
-                        }
-                        return ECONNREFUSED;
-                    }
-                    _ => {}
+                enum ConnectDecision {
+                    Established,
+                    Closed,
+                    Retried,
+                    Pending,
                 }
 
-                drop(net);
+                let decision = match with_net_stack_write(|stack| {
+                    let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+                    match socket.state() {
+                        tcp::State::Established => ConnectDecision::Established,
+                        tcp::State::Closed => {
+                            if retries_left > 0 {
+                                retries_left -= 1;
+                                // Re-initiate connect with a new ephemeral port
+                                let new_port = alloc_ephemeral_port();
+                                let cx = stack.lo_iface.context();
+                                let _ = socket.connect(cx, connect_remote, new_port);
+                                ConnectDecision::Retried
+                            } else {
+                                ConnectDecision::Closed
+                            }
+                        }
+                        _ => ConnectDecision::Pending,
+                    }
+                }) {
+                    Some(result) => result,
+                    None => return EINVAL,
+                };
+
+                match decision {
+                    ConnectDecision::Established => return 0,
+                    ConnectDecision::Closed => return ECONNREFUSED,
+                    ConnectDecision::Retried => {
+                        // Yield to let server process run
+                        for _ in 0..5 {
+                            suspend_current_and_run_next();
+                        }
+                        continue;
+                    }
+                    ConnectDecision::Pending => {}
+                }
+
                 suspend_current_and_run_next();
                 if has_pending_unmasked_signal(false) {
                     return EINTR;
@@ -996,21 +998,19 @@ pub fn sys_connect(fd: usize, addr: *const u8, addr_len: usize) -> isize {
         SocketType::Udp => {
             // UDP connect stores the default destination for write()/send()
             let process = current_process();
-            let inner = process.inner_exclusive_access();
-            if fd < inner.fd_table.len() {
-                if let Some(ref file) = inner.fd_table[fd] {
-                    file.set_connected_remote(remote);
-                }
+            if let Some(file) = process.get_file(fd) {
+                file.set_connected_remote(remote);
             }
             // Also set smoltcp-level remote filter so that this connected
             // socket won't steal packets destined for other sockets on the
             // same port (e.g. iperf3 parallel UDP streams).
             {
-                let mut net = NET_STACK.exclusive_access();
-                if let Some(ref mut ns) = *net {
-                    let sock = ns.sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
+                let _ = with_net_stack_write(|stack| {
+                    let sock = stack
+                        .sockets
+                        .get_mut::<smoltcp::socket::udp::Socket>(handle);
                     sock.set_remote_endpoint(Some(remote));
-                }
+                });
             }
             0
         }
@@ -1024,19 +1024,16 @@ pub fn sys_getsockname(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
     // AF_UNIX sockets are stored as generic File objects (not smoltcp sockets).
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return EBADF;
-        }
-        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+        let Some(file) = process.get_file(fd) else {
             return EBADF;
         };
         if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
             return EBADF;
         }
         if file.is_unix_socket() {
-            let path = file.unix_bound_path().unwrap_or_else(alloc::string::String::new);
-            drop(inner);
+            let path = file
+                .unix_bound_path()
+                .unwrap_or_else(alloc::string::String::new);
             return match write_unix_sockaddr(&path, addr, addr_len, token) {
                 Ok(()) => 0,
                 Err(e) => e,
@@ -1049,13 +1046,7 @@ pub fn sys_getsockname(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
         Err(e) => return e,
     };
 
-    let mut net = NET_STACK.exclusive_access();
-    let stack = match net.as_mut() {
-        Some(s) => s,
-        None => return EINVAL,
-    };
-
-    let ep = match sock_type {
+    let ep = match with_net_stack_write(|stack| match sock_type {
         SocketType::Tcp => {
             let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
             socket.local_endpoint().unwrap_or_else(|| {
@@ -1071,8 +1062,10 @@ pub fn sys_getsockname(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
                 listen_ep.port,
             )
         }
+    }) {
+        Some(ep) => ep,
+        None => return EINVAL,
     };
-    drop(net);
 
     match write_sockaddr(&ep, addr, addr_len, token) {
         Ok(()) => 0,
@@ -1087,11 +1080,7 @@ pub fn sys_getpeername(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
     // Handle AF_UNIX sockets (not tracked via smoltcp).
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return EBADF;
-        }
-        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+        let Some(file) = process.get_file(fd) else {
             return EBADF;
         };
         if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
@@ -1099,7 +1088,6 @@ pub fn sys_getpeername(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
         }
         if file.is_unix_socket() {
             let state = file.unix_get_state_u8();
-            drop(inner);
             if state != 3 {
                 // Not Connected
                 return ENOTCONN;
@@ -1120,17 +1108,14 @@ pub fn sys_getpeername(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
 
     match sock_type {
         SocketType::Tcp => {
-            let mut net = NET_STACK.exclusive_access();
-            let stack = match net.as_mut() {
-                Some(s) => s,
+            let ep = match with_net_stack_write(|stack| {
+                let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+                socket.remote_endpoint().ok_or(ENOTCONN)
+            }) {
+                Some(Ok(ep)) => ep,
+                Some(Err(err)) => return err,
                 None => return EINVAL,
             };
-            let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-            let ep = match socket.remote_endpoint() {
-                Some(ep) => ep,
-                None => return ENOTCONN,
-            };
-            drop(net);
             match write_sockaddr(&ep, addr, addr_len, token) {
                 Ok(()) => 0,
                 Err(e) => e,
@@ -1139,16 +1124,12 @@ pub fn sys_getpeername(fd: usize, addr: *mut u8, addr_len: *mut u32) -> isize {
         SocketType::Udp => {
             // Return the connected remote endpoint if set
             let process = current_process();
-            let inner = process.inner_exclusive_access();
-            if fd < inner.fd_table.len() {
-                if let Some(ref file) = inner.fd_table[fd] {
-                    if let Some(ep) = file.get_connected_remote() {
-                        drop(inner);
-                        return match write_sockaddr(&ep, addr, addr_len, token) {
-                            Ok(()) => 0,
-                            Err(e) => e,
-                        };
-                    }
+            if let Some(file) = process.get_file(fd) {
+                if let Some(ep) = file.get_connected_remote() {
+                    return match write_sockaddr(&ep, addr, addr_len, token) {
+                        Ok(()) => 0,
+                        Err(e) => e,
+                    };
                 }
             }
             ENOTCONN
@@ -1174,13 +1155,8 @@ pub fn sys_sendto(
 
     // Read user data into kernel buffer
     let mut data = vec![0u8; len];
-    if user_mem::copy_from_user(
-        token,
-        buf,
-        data.as_mut_slice(),
-        UserReadPolicy::DemandPaged,
-    )
-    .is_err()
+    if user_mem::copy_from_user(token, buf, data.as_mut_slice(), UserReadPolicy::DemandPaged)
+        .is_err()
     {
         return EFAULT;
     }
@@ -1188,18 +1164,13 @@ pub fn sys_sendto(
     // AF_UNIX sendto path.
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return EBADF;
-        }
-        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+        let Some(file) = process.get_file(fd) else {
             return EBADF;
         };
         if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
             return EBADF;
         }
         if file.is_unix_socket() {
-            drop(inner);
             // If destination is provided, try direct pathname/abstract delivery first.
             if !dest_addr.is_null() {
                 if let Some((path, is_abstract)) = read_unix_sockaddr(dest_addr, addr_len, token) {
@@ -1232,40 +1203,48 @@ pub fn sys_sendto(
     match sock_type {
         SocketType::Tcp => loop {
             poll_net();
-            let mut net = NET_STACK.exclusive_access();
-            let stack = match net.as_mut() {
-                Some(s) => s,
+            let outcome = match with_net_stack_write(|stack| {
+                let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+
+                if !socket.may_send() {
+                    use smoltcp::socket::tcp::State;
+                    let state = socket.state();
+                    // Closed/non-established socket: EPIPE (not connected)
+                    // CloseWait/LastAck/etc: return 0 (connection closed after established)
+                    if matches!(
+                        state,
+                        State::Closed | State::Listen | State::SynSent | State::SynReceived
+                    ) {
+                        const EPIPE: isize = -32;
+                        return Some(EPIPE);
+                    }
+                    return Some(0);
+                }
+                if socket.can_send() {
+                    match socket.send_slice(&data) {
+                        Ok(n) => {
+                            // Flush through loopback so peer can receive immediately
+                            let now = super::smoltcp_now();
+                            for _ in 0..4 {
+                                stack
+                                    .lo_iface
+                                    .poll(now, &mut stack.lo_device, &mut stack.sockets);
+                            }
+                            stack.poll_external(now);
+                            return Some(n as isize);
+                        }
+                        Err(_) => return Some(ENOTCONN),
+                    }
+                }
+
+                None
+            }) {
+                Some(result) => result,
                 None => return EINVAL,
             };
-            let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-
-            if !socket.may_send() {
-                use smoltcp::socket::tcp::State;
-                let state = socket.state();
-                // Closed/non-established socket: EPIPE (not connected)
-                // CloseWait/LastAck/etc: return 0 (connection closed after established)
-                if matches!(state, State::Closed | State::Listen | State::SynSent | State::SynReceived) {
-                    const EPIPE: isize = -32;
-                    return EPIPE;
-                }
-                return 0;
+            if let Some(ret) = outcome {
+                return ret;
             }
-            if socket.can_send() {
-                match socket.send_slice(&data) {
-                    Ok(n) => {
-                        // Flush through loopback so peer can receive immediately
-                        let now = super::smoltcp_now();
-                        for _ in 0..4 {
-                            stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
-                        }
-                        stack.poll_external(now);
-                        return n as isize;
-                    }
-                    Err(_) => return ENOTCONN,
-                }
-            }
-
-            drop(net);
             suspend_current_and_run_next();
             if has_pending_unmasked_signal(false) {
                 return EINTR;
@@ -1293,48 +1272,48 @@ pub fn sys_sendto(
             };
 
             poll_net();
-            let mut net = NET_STACK.exclusive_access();
-            let stack = match net.as_mut() {
-                Some(s) => s,
+            let result = match with_net_stack_write(|stack| {
+                // Auto-bind sender to ephemeral port if not yet bound
+                {
+                    let socket = stack.sockets.get_mut::<udp::Socket>(handle);
+                    if !socket.is_open() {
+                        let local_port = alloc_ephemeral_port();
+                        if let Err(e) = socket.bind(IpListenEndpoint {
+                            addr: None,
+                            port: local_port,
+                        }) {
+                            warn!("[net] UDP auto-bind failed: {:?}", e);
+                            return EINVAL;
+                        }
+                    }
+                }
+
+                if is_loopback {
+                    // Loopback: inject directly into target socket's rx buffer
+                    let sender_port = stack.sockets.get_mut::<udp::Socket>(handle).endpoint().port;
+                    let sender_meta = udp::UdpMetadata {
+                        endpoint: IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), sender_port),
+                        meta: Default::default(),
+                    };
+                    let target_port = dest.port;
+                    super::loopback_udp_inject(stack, handle, target_port, &data, sender_meta);
+                    data.len() as isize
+                } else {
+                    // Normal send via smoltcp network stack
+                    let socket = stack.sockets.get_mut::<udp::Socket>(handle);
+                    match socket.send_slice(&data, dest) {
+                        Ok(()) => data.len() as isize,
+                        Err(e) => {
+                            warn!("[net] UDP sendto failed: {:?}", e);
+                            EINVAL
+                        }
+                    }
+                }
+            }) {
+                Some(ret) => ret,
                 None => return EINVAL,
             };
-
-            // Auto-bind sender to ephemeral port if not yet bound
-            {
-                let socket = stack.sockets.get_mut::<udp::Socket>(handle);
-                if !socket.is_open() {
-                    let local_port = alloc_ephemeral_port();
-                    if let Err(e) = socket.bind(IpListenEndpoint {
-                        addr: None,
-                        port: local_port,
-                    }) {
-                        warn!("[net] UDP auto-bind failed: {:?}", e);
-                        return EINVAL;
-                    }
-                }
-            }
-
-            if is_loopback {
-                // Loopback: inject directly into target socket's rx buffer
-                let sender_port = stack.sockets.get_mut::<udp::Socket>(handle).endpoint().port;
-                let sender_meta = udp::UdpMetadata {
-                    endpoint: IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), sender_port),
-                    meta: Default::default(),
-                };
-                let target_port = dest.port;
-                super::loopback_udp_inject(stack, handle, target_port, &data, sender_meta);
-                data.len() as isize
-            } else {
-                // Normal send via smoltcp network stack
-                let socket = stack.sockets.get_mut::<udp::Socket>(handle);
-                match socket.send_slice(&data, dest) {
-                    Ok(()) => data.len() as isize,
-                    Err(e) => {
-                        warn!("[net] UDP sendto failed: {:?}", e);
-                        EINVAL
-                    }
-                }
-            }
+            result
         }
     }
 }
@@ -1353,18 +1332,13 @@ pub fn sys_recvfrom(
     // AF_UNIX recvfrom path.
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return EBADF;
-        }
-        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+        let Some(file) = process.get_file(fd) else {
             return EBADF;
         };
         if (file.status_flags() & OpenFlags::PATH.bits()) != 0 {
             return EBADF;
         }
         if file.is_unix_socket() {
-            drop(inner);
             loop {
                 let mut tmp = vec![0u8; len];
                 let n = file.unix_read(&mut tmp);
@@ -1398,37 +1372,49 @@ pub fn sys_recvfrom(
     match sock_type {
         SocketType::Tcp => loop {
             poll_net();
-            let mut net = NET_STACK.exclusive_access();
-            let stack = match net.as_mut() {
-                Some(s) => s,
+            let outcome = match with_net_stack_write(|stack| {
+                let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+                let state = socket.state();
+
+                if socket.can_recv() {
+                    let mut tmp = vec![0u8; len];
+                    match socket.recv_slice(&mut tmp) {
+                        Ok(n) => {
+                            let pid = current_process().getpid();
+                            trace!(
+                                "[net] recvfrom TCP fd={} pid={} got {} bytes state={:?}",
+                                fd,
+                                pid,
+                                n,
+                                state
+                            );
+                            // Write back to user buffer
+                            if copy_to_user(token, buf, &tmp[..n]).is_err() {
+                                return Some(EFAULT);
+                            }
+                            return Some(n as isize);
+                        }
+                        Err(_) => return Some(ENOTCONN),
+                    }
+                }
+
+                if !socket.may_recv() {
+                    let pid = current_process().getpid();
+                    info!(
+                        "[net] recvfrom TCP fd={} pid={} EOF state={:?}",
+                        fd, pid, state
+                    );
+                    return Some(0); // EOF
+                }
+
+                None
+            }) {
+                Some(result) => result,
                 None => return EINVAL,
             };
-            let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-            let state = socket.state();
-
-            if socket.can_recv() {
-                let mut tmp = vec![0u8; len];
-                match socket.recv_slice(&mut tmp) {
-                    Ok(n) => {
-                        let pid = current_process().getpid();
-                        trace!("[net] recvfrom TCP fd={} pid={} got {} bytes state={:?}", fd, pid, n, state);
-                        // Write back to user buffer
-                        if copy_to_user(token, buf, &tmp[..n]).is_err() {
-                            return EFAULT;
-                        }
-                        return n as isize;
-                    }
-                    Err(_) => return ENOTCONN,
-                }
+            if let Some(ret) = outcome {
+                return ret;
             }
-
-            if !socket.may_recv() {
-                let pid = current_process().getpid();
-                info!("[net] recvfrom TCP fd={} pid={} EOF state={:?}", fd, pid, state);
-                return 0; // EOF
-            }
-
-            drop(net);
             suspend_current_and_run_next();
             if has_pending_unmasked_signal(false) {
                 return EINTR;
@@ -1436,34 +1422,39 @@ pub fn sys_recvfrom(
         },
         SocketType::Udp => loop {
             poll_net();
-            let mut net = NET_STACK.exclusive_access();
-            let stack = match net.as_mut() {
-                Some(s) => s,
+            let outcome = match with_net_stack_write(|stack| {
+                let socket = stack.sockets.get_mut::<udp::Socket>(handle);
+
+                if socket.can_recv() {
+                    let mut tmp = vec![0u8; len];
+                    match socket.recv_slice(&mut tmp) {
+                        Ok((n, endpoint)) => {
+                            // Write data to user buffer
+                            if copy_to_user(token, buf, &tmp[..n]).is_err() {
+                                return Some(EFAULT);
+                            }
+                            // Write source address
+                            if !src_addr.is_null() {
+                                if let Err(e) =
+                                    write_sockaddr(&endpoint.endpoint, src_addr, addr_len, token)
+                                {
+                                    return Some(e);
+                                }
+                            }
+                            return Some(n as isize);
+                        }
+                        Err(_) => return Some(EINVAL),
+                    }
+                }
+
+                None
+            }) {
+                Some(result) => result,
                 None => return EINVAL,
             };
-            let socket = stack.sockets.get_mut::<udp::Socket>(handle);
-
-            if socket.can_recv() {
-                let mut tmp = vec![0u8; len];
-                match socket.recv_slice(&mut tmp) {
-                    Ok((n, endpoint)) => {
-                        // Write data to user buffer
-                        if copy_to_user(token, buf, &tmp[..n]).is_err() {
-                            return EFAULT;
-                        }
-                        // Write source address
-                        if !src_addr.is_null() {
-                            if let Err(e) = write_sockaddr(&endpoint.endpoint, src_addr, addr_len, token) {
-                                return e;
-                            }
-                        }
-                        return n as isize;
-                    }
-                    Err(_) => return EINVAL,
-                }
+            if let Some(ret) = outcome {
+                return ret;
             }
-
-            drop(net);
             suspend_current_and_run_next();
             if has_pending_unmasked_signal(false) {
                 return EINTR;
@@ -1493,8 +1484,7 @@ pub fn sys_setsockopt(
     }
     let token = current_user_token();
     let mut probe = [0u8; 1];
-    if user_mem::copy_from_user(token, optval, &mut probe, UserReadPolicy::StrictChecked).is_err()
-    {
+    if user_mem::copy_from_user(token, optval, &mut probe, UserReadPolicy::StrictChecked).is_err() {
         return EFAULT;
     }
 
@@ -1561,62 +1551,60 @@ pub fn sys_getsockopt(
     // Handle AF_UNIX sockets: limited support for SOL_SOCKET options.
     {
         let process = current_process();
-        let inner = process.inner_exclusive_access();
-        if fd < inner.fd_table.len() {
-            if let Some(file_cloned) = inner.fd_table[fd].as_ref().cloned() {
-                let file = &file_cloned;
-                if file.is_unix_socket() {
-                    let unix_type = file.unix_socket_type() as u32;
-                    drop(inner);
-                    let write_u32 = |val: u32| -> isize {
-                        if copy_to_user(token, optval, &val.to_ne_bytes()).is_err() {
-                            return EFAULT;
-                        }
-                        let len_ref = translated_refmut(token, optlen);
-                        *len_ref = 4;
-                        0
-                    };
-                    if level == SOL_SOCKET {
-                        const SO_TYPE: usize = 3;
-                        const SO_DOMAIN: usize = 39;
-                        const SO_PROTOCOL: usize = 38;
-                        const SO_ERROR_OPT: usize = 4;
-                        const SO_SNDBUF_OPT: usize = 7;
-                        const SO_RCVBUF_OPT: usize = 8;
-                        const SO_REUSEADDR_OPT: usize = 2;
-                        const SO_KEEPALIVE_OPT: usize = 9;
-                        const SO_PEERCRED: usize = 17;
-                        match optname {
-                            SO_TYPE => return write_u32(unix_type),
-                            SO_DOMAIN => return write_u32(1), // AF_UNIX = 1
-                            SO_PROTOCOL => return write_u32(0),
-                            SO_ERROR_OPT | SO_SNDBUF_OPT | SO_RCVBUF_OPT |
-                            SO_REUSEADDR_OPT | SO_KEEPALIVE_OPT => {
-                                return write_u32(0);
-                            }
-                            SO_PEERCRED => {
-                                // Write struct ucred { pid: u32, uid: u32, gid: u32 }
-                                if (optlen_val as usize) < 12 { return EINVAL; }
-                                let (p, u, g) = file.unix_get_peer_cred().unwrap_or((0, 0, 0));
-                                let ucred_bytes: [u8; 12] = {
-                                    let mut b = [0u8; 12];
-                                    b[0..4].copy_from_slice(&p.to_ne_bytes());
-                                    b[4..8].copy_from_slice(&u.to_ne_bytes());
-                                    b[8..12].copy_from_slice(&g.to_ne_bytes());
-                                    b
-                                };
-                                if copy_to_user(token, optval, &ucred_bytes).is_err() {
-                                    return EFAULT;
-                                }
-                                let len_ref = translated_refmut(token, optlen);
-                                *len_ref = 12;
-                                return 0;
-                            }
-                            _ => return EOPNOTSUPP,
-                        }
+        if let Some(file_cloned) = process.get_file(fd) {
+            let file = &file_cloned;
+            if file.is_unix_socket() {
+                let unix_type = file.unix_socket_type() as u32;
+                let write_u32 = |val: u32| -> isize {
+                    if copy_to_user(token, optval, &val.to_ne_bytes()).is_err() {
+                        return EFAULT;
                     }
-                    return EOPNOTSUPP;
+                    let len_ref = translated_refmut(token, optlen);
+                    *len_ref = 4;
+                    0
+                };
+                if level == SOL_SOCKET {
+                    const SO_TYPE: usize = 3;
+                    const SO_DOMAIN: usize = 39;
+                    const SO_PROTOCOL: usize = 38;
+                    const SO_ERROR_OPT: usize = 4;
+                    const SO_SNDBUF_OPT: usize = 7;
+                    const SO_RCVBUF_OPT: usize = 8;
+                    const SO_REUSEADDR_OPT: usize = 2;
+                    const SO_KEEPALIVE_OPT: usize = 9;
+                    const SO_PEERCRED: usize = 17;
+                    match optname {
+                        SO_TYPE => return write_u32(unix_type),
+                        SO_DOMAIN => return write_u32(1), // AF_UNIX = 1
+                        SO_PROTOCOL => return write_u32(0),
+                        SO_ERROR_OPT | SO_SNDBUF_OPT | SO_RCVBUF_OPT | SO_REUSEADDR_OPT
+                        | SO_KEEPALIVE_OPT => {
+                            return write_u32(0);
+                        }
+                        SO_PEERCRED => {
+                            // Write struct ucred { pid: u32, uid: u32, gid: u32 }
+                            if (optlen_val as usize) < 12 {
+                                return EINVAL;
+                            }
+                            let (p, u, g) = file.unix_get_peer_cred().unwrap_or((0, 0, 0));
+                            let ucred_bytes: [u8; 12] = {
+                                let mut b = [0u8; 12];
+                                b[0..4].copy_from_slice(&p.to_ne_bytes());
+                                b[4..8].copy_from_slice(&u.to_ne_bytes());
+                                b[8..12].copy_from_slice(&g.to_ne_bytes());
+                                b
+                            };
+                            if copy_to_user(token, optval, &ucred_bytes).is_err() {
+                                return EFAULT;
+                            }
+                            let len_ref = translated_refmut(token, optlen);
+                            *len_ref = 12;
+                            return 0;
+                        }
+                        _ => return EOPNOTSUPP,
+                    }
                 }
+                return EOPNOTSUPP;
             }
         }
     }
@@ -1648,36 +1636,60 @@ pub fn sys_getsockopt(
                 SO_REUSEADDR => write_u32(1),
                 SO_KEEPALIVE => write_u32(0),
                 _ => {
-                    warn!("[net] getsockopt SOL_SOCKET unsupported optname={}", optname);
+                    warn!(
+                        "[net] getsockopt SOL_SOCKET unsupported optname={}",
+                        optname
+                    );
                     EOPNOTSUPP
                 }
             }
         }
         SOL_IP => {
             // IPPROTO_IP = SOL_IP = 0; unknown option names → ENOPROTOOPT
-            warn!("[net] getsockopt IPPROTO_IP unsupported optname={}", optname);
+            warn!(
+                "[net] getsockopt IPPROTO_IP unsupported optname={}",
+                optname
+            );
             ENOPROTOOPT
         }
         IPPROTO_TCP => {
             match optname {
-                TCP_NODELAY => { write_u32(0); 0 }
+                TCP_NODELAY => {
+                    write_u32(0);
+                    0
+                }
                 // TCP_MAXSEG (2): return default MSS
-                2 => { write_u32(65495); 0 }
+                2 => {
+                    write_u32(65495);
+                    0
+                }
                 // TCP_INFO (11): not supported, return 0
-                11 => { write_u32(0); 0 }
+                11 => {
+                    write_u32(0);
+                    0
+                }
                 _ => {
-                    warn!("[net] getsockopt IPPROTO_TCP unsupported optname={}", optname);
+                    warn!(
+                        "[net] getsockopt IPPROTO_TCP unsupported optname={}",
+                        optname
+                    );
                     ENOPROTOOPT
                 }
             }
         }
         IPPROTO_UDP => {
             // UDP has very limited getsockopt support; most options return EOPNOTSUPP
-            warn!("[net] getsockopt IPPROTO_UDP unsupported optname={}", optname);
+            warn!(
+                "[net] getsockopt IPPROTO_UDP unsupported optname={}",
+                optname
+            );
             EOPNOTSUPP
         }
         _ => {
-            warn!("[net] getsockopt unsupported level={} optname={}", level, optname);
+            warn!(
+                "[net] getsockopt unsupported level={} optname={}",
+                level, optname
+            );
             EOPNOTSUPP
         }
     }
@@ -1690,13 +1702,7 @@ pub fn sys_shutdown_socket(fd: usize, how: i32) -> isize {
         Err(e) => return e,
     };
 
-    let mut net = NET_STACK.exclusive_access();
-    let stack = match net.as_mut() {
-        Some(s) => s,
-        None => return EINVAL,
-    };
-
-    match sock_type {
+    match with_net_stack_write(|stack| match sock_type {
         SocketType::Tcp => {
             let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
             let old_state = socket.state();
@@ -1704,12 +1710,17 @@ pub fn sys_shutdown_socket(fd: usize, how: i32) -> isize {
             // Flush FIN through loopback immediately
             let now = super::smoltcp_now();
             for _ in 0..8 {
-                stack.lo_iface.poll(now, &mut stack.lo_device, &mut stack.sockets);
+                stack
+                    .lo_iface
+                    .poll(now, &mut stack.lo_device, &mut stack.sockets);
             }
             stack.poll_external(now);
             let new_state = stack.sockets.get_mut::<tcp::Socket>(handle).state();
             let pid = current_process().getpid();
-            info!("[net] shutdown TCP fd={} pid={} how={} state {:?} -> {:?}", fd, pid, how, old_state, new_state);
+            info!(
+                "[net] shutdown TCP fd={} pid={} how={} state {:?} -> {:?}",
+                fd, pid, how, old_state, new_state
+            );
             0
         }
         SocketType::Udp => {
@@ -1717,6 +1728,9 @@ pub fn sys_shutdown_socket(fd: usize, how: i32) -> isize {
             socket.close();
             0
         }
+    }) {
+        Some(ret) => ret,
+        None => EINVAL,
     }
 }
 
@@ -1767,8 +1781,7 @@ pub fn sys_socketpair(domain: usize, sock_type: usize, protocol: usize, sv: *mut
         sv as *const u8,
         core::mem::size_of::<i32>() * 2,
         UserReadPolicy::StrictChecked,
-    )
-    {
+    ) {
         return EFAULT;
     }
 
@@ -1780,21 +1793,17 @@ pub fn sys_socketpair(domain: usize, sock_type: usize, protocol: usize, sv: *mut
     right_file.unix_set_peer_dyn(Arc::downgrade(&left_file));
 
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let fd0 = match inner.alloc_fd() {
+    let fd0 = match process.install_file(left_file) {
         Some(fd) => fd,
         None => return EMFILE,
     };
-    inner.fd_table[fd0] = Some(left_file);
-    let fd1 = match inner.alloc_fd() {
+    let fd1 = match process.install_file(right_file) {
         Some(fd) => fd,
         None => {
-            inner.fd_table[fd0] = None;
+            process.take_fd(fd0);
             return EMFILE;
         }
     };
-    inner.fd_table[fd1] = Some(right_file);
-    drop(inner);
 
     *translated_refmut(token, sv) = fd0 as i32;
     *translated_refmut(token, unsafe { sv.add(1) }) = fd1 as i32;

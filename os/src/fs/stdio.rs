@@ -2,6 +2,7 @@
 use super::File;
 use super::PollEvents;
 use crate::mm::UserBuffer;
+use crate::syscall::user_mem::{self, UserWritePolicy};
 use core::sync::atomic::{AtomicU64, Ordering};
 /// Read a character from the SBI console, returning the raw usize value.
 /// 0 means no character available.
@@ -167,8 +168,12 @@ impl File for DevNull {
     fn writable(&self) -> bool {
         self.writable
     }
-    fn read(&self, _user_buf: UserBuffer) -> usize { 0 }
-    fn write(&self, user_buf: UserBuffer) -> usize { user_buf.len() }
+    fn read(&self, _user_buf: UserBuffer) -> usize {
+        0
+    }
+    fn write(&self, user_buf: UserBuffer) -> usize {
+        user_buf.len()
+    }
     fn path(&self) -> Option<&str> {
         Some(self.path)
     }
@@ -189,7 +194,26 @@ impl File for DevZero {
         }
         total
     }
-    fn write(&self, user_buf: UserBuffer) -> usize { user_buf.len() }
+    fn read_user_buffer(
+        &self,
+        token: usize,
+        ptr: *const u8,
+        len: usize,
+    ) -> Option<Result<usize, isize>> {
+        Some(user_mem::for_each_user_write_slice(
+            token,
+            ptr,
+            len,
+            UserWritePolicy::DemandCowWithForkFallback,
+            |slice| {
+                slice.fill(0);
+                Ok(slice.len())
+            },
+        ))
+    }
+    fn write(&self, user_buf: UserBuffer) -> usize {
+        user_buf.len()
+    }
     fn path(&self) -> Option<&str> {
         Some(self.path)
     }
@@ -217,6 +241,34 @@ impl File for DevUrandom {
         }
         URANDOM_SEED.store(seed, Ordering::Relaxed);
         total
+    }
+    fn read_user_buffer(
+        &self,
+        token: usize,
+        ptr: *const u8,
+        len: usize,
+    ) -> Option<Result<usize, isize>> {
+        let mut total = 0usize;
+        let mut seed = URANDOM_SEED.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
+            ^ (crate::timer::get_time_us() as u64);
+        let result = user_mem::for_each_user_write_slice(
+            token,
+            ptr,
+            len,
+            UserWritePolicy::DemandCowWithForkFallback,
+            |slice| {
+                for byte in slice.iter_mut() {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    *byte = (seed >> 56) as u8;
+                }
+                total += slice.len();
+                Ok(slice.len())
+            },
+        );
+        URANDOM_SEED.store(seed, Ordering::Relaxed);
+        Some(result.map(|_| total))
     }
     fn write(&self, user_buf: UserBuffer) -> usize {
         user_buf.len()

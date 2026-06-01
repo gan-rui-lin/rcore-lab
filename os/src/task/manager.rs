@@ -1,12 +1,11 @@
 #![allow(missing_docs)]
 
 use super::{ProcessControlBlock, TaskControlBlock, TaskStatus};
-use crate::sync::UPIntrFreeCell;
+use crate::sync::UPIntrRwLock;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 #[allow(unused_imports)]
 use alloc::vec::Vec;
-use arch::TrapFrameArgs;
 use lazy_static::*;
 
 pub struct TaskManager {
@@ -46,65 +45,84 @@ impl TaskManager {
 }
 
 lazy_static! {
-    pub static ref TASK_MANAGER: UPIntrFreeCell<TaskManager> =
-        unsafe { UPIntrFreeCell::new(TaskManager::new()) };
-    pub static ref PID2PCB: UPIntrFreeCell<BTreeMap<usize, Arc<ProcessControlBlock>>> =
-        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    pub static ref TASK_MANAGER: UPIntrRwLock<TaskManager> =
+        unsafe { UPIntrRwLock::new(TaskManager::new()) };
+    pub static ref PID2PCB: UPIntrRwLock<BTreeMap<usize, Arc<ProcessControlBlock>>> =
+        unsafe { UPIntrRwLock::new(BTreeMap::new()) };
+}
+
+fn with_task_manager_read<R>(f: impl FnOnce(&TaskManager) -> R) -> R {
+    let manager = TASK_MANAGER.read();
+    f(&manager)
+}
+
+fn with_task_manager_write<R>(f: impl FnOnce(&mut TaskManager) -> R) -> R {
+    let mut manager = TASK_MANAGER.write();
+    f(&mut manager)
+}
+
+fn with_pid2pcb_read<R>(f: impl FnOnce(&BTreeMap<usize, Arc<ProcessControlBlock>>) -> R) -> R {
+    let map = PID2PCB.read();
+    f(&map)
+}
+
+fn with_pid2pcb_write<R>(f: impl FnOnce(&mut BTreeMap<usize, Arc<ProcessControlBlock>>) -> R) -> R {
+    let mut map = PID2PCB.write();
+    f(&mut map)
 }
 
 pub fn add_task(task: Arc<TaskControlBlock>) {
-    TASK_MANAGER.exclusive_access().add(task);
+    with_task_manager_write(|manager| manager.add(task));
 }
 
 pub fn wakeup_task(task: Arc<TaskControlBlock>) {
-    let mut task_inner = task.inner_exclusive_access();
-    task_inner.task_status = TaskStatus::Ready;
-    drop(task_inner);
+    task.set_status(TaskStatus::Ready);
     add_task(task);
 }
 
 pub fn remove_task(task: Arc<TaskControlBlock>) {
-    TASK_MANAGER.exclusive_access().remove(task);
+    with_task_manager_write(|manager| manager.remove(task));
 }
 
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
-    TASK_MANAGER.exclusive_access().fetch()
+    with_task_manager_write(|manager| manager.fetch())
 }
 
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
-    let map = PID2PCB.exclusive_access();
-    map.get(&pid).map(Arc::clone)
+    with_pid2pcb_read(|map| map.get(&pid).map(Arc::clone))
 }
 
 pub fn pid2process_snapshot() -> Vec<(usize, Arc<ProcessControlBlock>)> {
-    PID2PCB
-        .exclusive_access()
-        .iter()
-        .map(|(pid, pcb)| (*pid, Arc::clone(pcb)))
-        .collect()
+    with_pid2pcb_read(|map| {
+        map.iter()
+            .map(|(pid, pcb)| (*pid, Arc::clone(pcb)))
+            .collect()
+    })
 }
 
 pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
-    PID2PCB.exclusive_access().insert(pid, process);
+    with_pid2pcb_write(|map| {
+        map.insert(pid, process);
+    });
 }
 
 pub fn remove_from_pid2process(pid: usize) {
-    let mut map = PID2PCB.exclusive_access();
-    if map.remove(&pid).is_none() {
+    let removed = with_pid2pcb_write(|map| map.remove(&pid));
+    if removed.is_none() {
         panic!("cannot find pid {} in pid2process!", pid);
     }
 }
 
 pub fn ready_queue_snapshot() -> Vec<Arc<TaskControlBlock>> {
-    TASK_MANAGER.exclusive_access().ready_snapshot()
+    with_task_manager_read(|manager| manager.ready_snapshot())
 }
 
 pub fn ready_queue_len() -> usize {
-    TASK_MANAGER.exclusive_access().ready_len()
+    with_task_manager_read(|manager| manager.ready_len())
 }
 
 pub fn pid2process_len() -> usize {
-    PID2PCB.exclusive_access().len()
+    with_pid2pcb_read(|map| map.len())
 }
 
 pub fn pid2process_aggregate() -> (
@@ -120,10 +138,10 @@ pub fn pid2process_aggregate() -> (
     usize,
     usize,
 ) {
-    let map = PID2PCB.exclusive_access();
+    let map = PID2PCB.read();
     let total_processes = map.len();
     let mut sampled_processes = 0usize;
-    let mut skipped_processes = 0usize;
+    let skipped_processes = 0usize;
     let mut total_children = 0usize;
     let mut total_tasks = 0usize;
     let total_exited_threads = 0usize;
@@ -133,17 +151,13 @@ pub fn pid2process_aggregate() -> (
     let total_sem_waiters = 0usize;
     let total_cond_waiters = 0usize;
     for (pid, process) in map.iter() {
-        if let Some(inner) = process.try_inner_exclusive_access() {
-            sampled_processes += 1;
-            let child_len = inner.children.len();
-            total_children += child_len;
-            total_tasks += inner.tasks.iter().filter(|t| t.is_some()).count();
-            if child_len > max_children {
-                max_children = child_len;
-                max_children_pid = *pid;
-            }
-        } else {
-            skipped_processes += 1;
+        sampled_processes += 1;
+        let child_len = process.child_count();
+        total_children += child_len;
+        total_tasks += process.thread_count();
+        if child_len > max_children {
+            max_children = child_len;
+            max_children_pid = *pid;
         }
     }
     (
@@ -163,18 +177,16 @@ pub fn pid2process_aggregate() -> (
 
 #[allow(dead_code)]
 pub fn pid2process_fdtable_summary() -> (usize, usize, usize) {
-    let map = PID2PCB.exclusive_access();
+    let map = PID2PCB.read();
     let mut total_fd_slots = 0usize;
     let mut max_fd_slots = 0usize;
     let mut max_fd_pid = 0usize;
     for (pid, process) in map.iter() {
-        if let Some(inner) = process.try_inner_exclusive_access() {
-            let fd_len = inner.fd_table.len();
-            total_fd_slots += fd_len;
-            if fd_len > max_fd_slots {
-                max_fd_slots = fd_len;
-                max_fd_pid = *pid;
-            }
+        let fd_len = process.with_fs(|fs| fs.fd_table.len());
+        total_fd_slots += fd_len;
+        if fd_len > max_fd_slots {
+            max_fd_slots = fd_len;
+            max_fd_pid = *pid;
         }
     }
     (total_fd_slots, max_fd_slots, max_fd_pid)
@@ -214,16 +226,17 @@ pub fn print_pid2process_top_by_fd(limit: usize) {
         return;
     }
     let mut top = [TopFdEntry::empty(); MAX_TOP];
-    let map = PID2PCB.exclusive_access();
+    let map = PID2PCB.read();
     for (pid, process) in map.iter() {
-        let Some(inner) = process.try_inner_exclusive_access() else {
-            continue;
-        };
-        let fd_slots = inner.fd_table.len();
-        let fd_used = inner.fd_table.iter().filter(|fd| fd.is_some()).count();
-        let tasks_alive = inner.tasks.iter().filter(|t| t.is_some()).count();
-        let children = inner.children.len();
-        let is_zombie = inner.is_zombie;
+        let (fd_slots, fd_used) = process.with_fs(|fs| {
+            (
+                fs.fd_table.len(),
+                fs.fd_table.iter().filter(|fd| fd.is_some()).count(),
+            )
+        });
+        let tasks_alive = process.thread_count();
+        let children = process.child_count();
+        let is_zombie = process.is_zombie();
         let candidate = TopFdEntry {
             valid: true,
             pid: *pid,
@@ -252,12 +265,12 @@ pub fn print_pid2process_top_by_fd(limit: usize) {
             break;
         }
         if let Some(process) = pid2process(entry.pid) {
-            if let Some(inner) = process.try_inner_exclusive_access() {
+            if process.try_with_sync_objects_mut(|_| ()).is_some() {
                 println!(
                     "[kernel] alloc_error top_fd[{}]: pid={} name={} zombie={} tasks_alive={} children={} fd_used={} fd_slots={} sampled=true",
                     idx,
                     entry.pid,
-                    inner.name.as_str(),
+                    process.name().as_str(),
                     entry.is_zombie,
                     entry.tasks_alive,
                     entry.children,
@@ -293,28 +306,25 @@ pub fn print_pid2process_top_by_fd(limit: usize) {
 
 /// Print brief ready-queue context for alloc_error diagnostics.
 pub fn print_ready_queue_brief(limit: usize) {
-    let mgr = TASK_MANAGER.exclusive_access();
+    let mgr = TASK_MANAGER.read();
     for (idx, task) in mgr.ready_queue.iter().take(limit).enumerate() {
         let pid = task.process.upgrade().map(|p| p.getpid()).unwrap_or(0);
-        if let Some(task_inner) = task.try_inner_exclusive_access() {
-            let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(0);
-            let trap_cx = task_inner.get_trap_cx();
+        if let Some(snapshot) = task.try_debug_snapshot() {
             println!(
                 "[kernel] alloc_error ready[{}]: pid={} tid={} status={:?} last_syscall={} sepc={:#x} sp={:#x} ra={:#x}",
                 idx,
                 pid,
-                tid,
-                task_inner.task_status,
-                task_inner.last_syscall,
-                trap_cx.sepc,
-                trap_cx[TrapFrameArgs::SP],
-                trap_cx[TrapFrameArgs::RA]
+                snapshot.tid,
+                snapshot.status,
+                snapshot.last_syscall,
+                snapshot.sepc,
+                snapshot.sp,
+                snapshot.ra
             );
         } else {
             println!(
                 "[kernel] alloc_error ready[{}]: pid={} <task_busy>",
-                idx,
-                pid
+                idx, pid
             );
         }
     }

@@ -1,19 +1,14 @@
 use super::*;
 
 pub(super) fn handle_user_supervisor_external() {
-    let trap_cx = current_trap_cx();
-    warn!("[kernel] trap_handler: unknown trap at sepc={:#x}", trap_cx.sepc);
+    crate::platform::handle_external_irq();
 }
 
 pub(super) fn handle_user_page_fault(addr: usize) {
     // Try COW first, then demand paging (both under the process lock)
     {
         let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-        if inner.memory_set.handle_cow_fault(addr) {
-            return;
-        }
-        if inner.memory_set.handle_demand_fault(addr) {
+        if process.handle_cow_or_demand_fault(addr) {
             return;
         }
     }
@@ -34,10 +29,11 @@ pub(super) fn handle_user_page_fault(addr: usize) {
     if let Some(task) = current_task() {
         // Synchronous faults should be delivered to the faulting thread.
         // If SIGSEGV stays masked, user mode can loop on the same fault forever.
-        let mut task_inner = task.inner_exclusive_access();
-        task_inner.signal_mask.remove(SignalFlags::SIGSEGV);
-        task_inner.signal_pending.insert(SignalFlags::SIGSEGV);
-        task_inner.interrupted_by_signal = true;
+        task.with_signals_mut(|signals| {
+            signals.signal_mask.remove(SignalFlags::SIGSEGV);
+            signals.signal_pending.insert(SignalFlags::SIGSEGV);
+            signals.interrupted_by_signal = true;
+        });
     } else {
         current_add_signal(SignalFlags::SIGSEGV);
     }
@@ -48,8 +44,7 @@ pub(super) fn handle_user_illegal_instruction(addr: usize) {
     let args = trap_cx.args();
     error!(
         "[kernel] trap_handler: illegal instruction addr={:#x} sepc={:#x}",
-        addr,
-        trap_cx.sepc
+        addr, trap_cx.sepc
     );
     error!(
         "[kernel] trap_handler: ra={:#x} sp={:#x} tp={:#x} syscall={:#x} args={:x?}",
@@ -64,10 +59,20 @@ pub(super) fn handle_user_illegal_instruction(addr: usize) {
 
 pub(super) fn handle_user_breakpoint() {
     let trap_cx = current_trap_cx();
-    warn!("[kernel] trap_handler: unknown trap at sepc={:#x}", trap_cx.sepc);
+    if let Some(next_pc) = arch::breakpoint_next_pc(current_user_token(), trap_cx.sepc) {
+        trap_cx.sepc = next_pc;
+    } else {
+        warn!(
+            "[kernel] trap_handler: unknown trap at sepc={:#x}",
+            trap_cx.sepc
+        );
+    }
 }
 
 pub(super) fn handle_user_unknown_trap(_trap_type: arch::TrapType) {
     let trap_cx = current_trap_cx();
-    warn!("[kernel] trap_handler: unknown trap at sepc={:#x}", trap_cx.sepc);
+    warn!(
+        "[kernel] trap_handler: unknown trap at sepc={:#x}",
+        trap_cx.sepc
+    );
 }

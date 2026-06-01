@@ -3,11 +3,9 @@ use crate::sync::{Condvar, UPIntrFreeCell};
 use crate::task::schedule;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use arch::DeviceKind;
 use core::any::Any;
 use virtio_drivers::{VirtIOHeader, VirtIOInput};
-
-const VIRTIO5: usize = 0x10005000;
-const VIRTIO6: usize = 0x10006000;
 
 struct VirtIOInputInner {
     virtio_input: VirtIOInput<'static, VirtioHal>,
@@ -31,10 +29,19 @@ pub trait InputDevice: Send + Sync + Any {
 
 lazy_static::lazy_static!(
     /// Global keyboard input device.
-    pub static ref KEYBOARD_DEVICE: Arc<dyn InputDevice> = Arc::new(VirtIOInputWrapper::new(VIRTIO5));
+    pub static ref KEYBOARD_DEVICE: Arc<dyn InputDevice> =
+        Arc::new(VirtIOInputWrapper::new(input_base(DeviceKind::InputKeyboard)));
     /// Global mouse input device.
-    pub static ref MOUSE_DEVICE: Arc<dyn InputDevice> = Arc::new(VirtIOInputWrapper::new(VIRTIO6));
+    pub static ref MOUSE_DEVICE: Arc<dyn InputDevice> =
+        Arc::new(VirtIOInputWrapper::new(input_base(DeviceKind::InputMouse)));
 );
+
+fn input_base(kind: DeviceKind) -> usize {
+    arch::platform_config()
+        .device(kind)
+        .and_then(|device| device.mmio_base())
+        .expect("VirtIO input MMIO base missing from platform config")
+}
 
 impl VirtIOInputWrapper {
     pub fn new(addr: usize) -> Self {
