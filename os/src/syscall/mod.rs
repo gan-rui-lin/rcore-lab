@@ -1029,6 +1029,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[0] as i32,
             args[1] as *const SignalAction,
             args[2] as *mut SignalAction,
+            args[3],
         ),
         SYSCALL_SIGPROCMASK => sys_sigprocmask(
             args[0],
@@ -1149,7 +1150,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4] as u32,
         ),
         SYSCALL_OPEN_BY_HANDLE_AT => {
-            sys_open_by_handle_at(args[0], args[1] as *const u8, args[2] as u32)
+            sys_open_by_handle_at(args[0] as isize, args[1] as *const u8, args[2] as u32)
         }
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_ADJTIMEX => process::sys_adjtimex(args[0] as *mut u8),

@@ -3641,10 +3641,19 @@ pub fn sys_sigaction(
     signum: i32,
     action: *const SignalAction,
     old_action: *mut SignalAction,
+    sigsetsize: usize,
 ) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
-        syscall!("kernel:pid[{}] sys_sigaction signum={}", pid, signum);
+        syscall!(
+            "kernel:pid[{}] sys_sigaction signum={} size={}",
+            pid,
+            signum,
+            sigsetsize
+        );
+    }
+    if sigsetsize != core::mem::size_of::<usize>() {
+        return errno(EINVAL);
     }
     if signum <= 0
         || signum > MAX_SIG as i32

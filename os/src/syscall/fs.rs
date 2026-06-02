@@ -659,6 +659,19 @@ fn dirfd_base(dirfd: isize) -> Result<String, isize> {
     }
 }
 
+fn fd_path_for_empty_path(dirfd: isize) -> Result<String, isize> {
+    if dirfd == AT_FDCWD {
+        return Ok(current_process().cwd());
+    }
+    if dirfd < 0 {
+        return Err(errno(EBADF));
+    }
+    let Some(file) = current_process().get_file(dirfd as usize) else {
+        return Err(errno(EBADF));
+    };
+    file.path().map(String::from).ok_or(errno(ENOENT))
+}
+
 fn copy_to_user(token: usize, dst: *mut u8, data: &[u8]) -> Result<(), isize> {
     if dst.is_null() {
         return Err(errno(EFAULT));
@@ -1048,9 +1061,17 @@ pub fn sys_name_to_handle_at(
     if raw_path_too_long(&raw_path) {
         return errno(ENAMETOOLONG);
     }
+    if !user_mem::ensure_user_writable(
+        token,
+        mount_id as *mut u8,
+        core::mem::size_of::<i32>(),
+        UserWritePolicy::DemandCowWithForkFallback,
+    ) {
+        return errno(EFAULT);
+    }
 
     let full_path = if raw_path.is_empty() {
-        match dirfd_base(dirfd) {
+        match fd_path_for_empty_path(dirfd) {
             Ok(path) => path,
             Err(err) => return err,
         }
@@ -1076,7 +1097,11 @@ pub fn sys_name_to_handle_at(
         return if ret == 0 { errno(EOVERFLOW) } else { ret };
     }
 
-    let full_path = match resolve_access_path(&full_path) {
+    let full_path = match if flags & AT_SYMLINK_FOLLOW != 0 {
+        resolve_access_path(&full_path)
+    } else {
+        resolve_access_path_nofollow(&full_path)
+    } {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -1104,7 +1129,7 @@ pub fn sys_name_to_handle_at(
 }
 
 /// open_by_handle_at(2) minimal companion to sys_name_to_handle_at.
-pub fn sys_open_by_handle_at(mount_fd: usize, handle: *const u8, flags: u32) -> isize {
+pub fn sys_open_by_handle_at(mount_fd: isize, handle: *const u8, flags: u32) -> isize {
     let token = current_user_token();
     let (handle_bytes, handle_type) = match read_file_handle_header(token, handle) {
         Ok(header) => header,
@@ -1113,11 +1138,19 @@ pub fn sys_open_by_handle_at(mount_fd: usize, handle: *const u8, flags: u32) -> 
     if handle_bytes != FILE_HANDLE_BYTES || handle_type != FILE_HANDLE_TYPE_PATH {
         return errno(EINVAL);
     }
-    if current_process().get_file(mount_fd).is_none() {
-        return errno(EBADF);
-    }
     if (current_process().credentials_snapshot().cap_effective & CAP_DAC_READ_SEARCH) == 0 {
         return errno(EPERM);
+    }
+    if mount_fd != AT_FDCWD {
+        if mount_fd < 0 {
+            return errno(EBADF);
+        }
+        let Some(file) = current_process().get_file(mount_fd as usize) else {
+            return errno(EBADF);
+        };
+        if file.inode().is_none() {
+            return errno(ESTALE);
+        }
     }
     let mut id_bytes = [0u8; 8];
     let data_ptr = unsafe { handle.add(8) };
