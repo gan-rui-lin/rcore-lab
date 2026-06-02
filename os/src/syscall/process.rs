@@ -4098,7 +4098,6 @@ pub fn sys_setgid(gid: u32) -> isize {
 
 /// getgroups(size, list) - syscall 158
 /// Returns the supplementary group IDs of the calling process.
-/// Root (gid=0) has one supplementary group: gid 0.
 pub fn sys_getgroups(size: i32, list: *mut u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
@@ -4109,35 +4108,35 @@ pub fn sys_getgroups(size: i32, list: *mut u32) -> isize {
             list
         );
     }
-    // size < 0 is invalid
     if size < 0 {
         return errno(EINVAL);
     }
-    // Root has one supplementary group: gid 0.
-    const NSUPP: i32 = 1;
+
+    let groups = current_process().with_identity(|identity| identity.supplementary_groups.clone());
+    let group_count = groups.len();
     if size == 0 {
-        // Just return the count.
-        return NSUPP as isize;
+        return group_count as isize;
     }
-    // Validate list pointer when size > 0.
-    if (list as usize) == 0 {
+    if list.is_null() {
         return errno(EFAULT);
     }
-    if size < NSUPP {
-        // Buffer too small to hold all groups.
+    if (size as usize) < group_count {
         return errno(EINVAL);
     }
-    // Write gid 0 to the list.
-    let token = current_user_token();
-    {
-        let gid_ref = translated_refmut(token, list);
-        *gid_ref = 0u32;
+
+    let mut bytes = Vec::with_capacity(group_count * core::mem::size_of::<u32>());
+    for gid in groups {
+        bytes.extend_from_slice(&gid.to_ne_bytes());
     }
-    NSUPP as isize
+    let token = current_user_token();
+    if copy_to_user(token, list as *mut u8, &bytes).is_err() {
+        return errno(EFAULT);
+    }
+    group_count as isize
 }
 
 /// setgroups(size, list) - syscall 159
-/// Set supplementary group IDs. We always pretend to accept it (root-only kernel).
+/// Set supplementary group IDs.
 pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
@@ -4152,12 +4151,37 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
     if size > NGROUPS_MAX {
         return errno(EINVAL);
     }
-    // Validate pointer when size > 0
-    if size > 0 && (list as usize) == 0 {
+
+    let process = current_process();
+    if process.effective_uid() != 0 {
+        return errno(EPERM);
+    }
+
+    if size > 0 && list.is_null() {
         return errno(EFAULT);
     }
-    // We always run as root (uid=0), so accept the call.
-    // We don't actually store the groups since we have no user/group database.
+
+    let mut groups = Vec::with_capacity(size);
+    if size > 0 {
+        let byte_len = size * core::mem::size_of::<u32>();
+        let mut bytes = vec![0u8; byte_len];
+        if user_mem::copy_from_user(
+            current_user_token(),
+            list as *const u8,
+            &mut bytes,
+            UserReadPolicy::DemandPaged,
+        )
+        .is_err()
+        {
+            return errno(EFAULT);
+        }
+        for chunk in bytes.chunks_exact(core::mem::size_of::<u32>()) {
+            groups.push(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+    }
+    process.with_identity_mut(|identity| {
+        identity.supplementary_groups = groups;
+    });
     0
 }
 

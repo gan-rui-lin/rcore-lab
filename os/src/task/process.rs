@@ -181,6 +181,7 @@ pub struct ProcessIdentity {
     pub effective_gid: u32,
     pub saved_gid: u32,
     pub fs_gid: u32,
+    pub supplementary_groups: Vec<u32>,
     /// Nice value in Linux range [-20, 19], default 0.
     pub nice: i32,
     /// Capability sets (bit mask, Linux kernel format).
@@ -480,6 +481,7 @@ impl ProcessControlBlock {
                     effective_gid: 0,
                     saved_gid: 0,
                     fs_gid: 0,
+                    supplementary_groups: vec![0],
                     nice: 0,
                     cap_permitted: u64::MAX,
                     cap_effective: u64::MAX,
