@@ -700,6 +700,23 @@ fn translated_user_read_buffer(
     user_mem::translated_user_read_buffer(token, ptr, len, UserReadPolicy::DemandPaged)
 }
 
+fn translated_cstr_demand(token: usize, ptr: *const u8, max_len: usize) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut out = String::new();
+    for offset in 0..max_len {
+        let addr = (ptr as usize).checked_add(offset)? as *const u8;
+        let slices = translated_user_read_buffer(token, addr, 1)?;
+        let byte = *slices.first()?.first()?;
+        if byte == 0 {
+            return Some(out);
+        }
+        out.push(byte as char);
+    }
+    Some(out)
+}
+
 fn max_user_write_len(token: usize, ptr: *const u8, len: usize) -> usize {
     if len == 0 || ptr.is_null() {
         return 0;
@@ -868,7 +885,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     }
     let process = current_process();
     let token = current_user_token();
-    let Some(raw_path) = translated_str_checked(token, path) else {
+    let Some(raw_path) = translated_cstr_demand(token, path, PATH_MAX + 1) else {
         return errno(EFAULT);
     };
     if raw_path.is_empty() {
@@ -1197,7 +1214,7 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: u32, _flags: u32) -> i
         return errno(EFAULT);
     }
     let token = current_user_token();
-    let Some(raw_path) = translated_str_checked(token, path) else {
+    let Some(raw_path) = translated_cstr_demand(token, path, PATH_MAX + 1) else {
         return errno(EFAULT);
     };
     if mode & !0o7 != 0 {
@@ -1238,7 +1255,7 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsize: usiz
     }
 
     let token = current_user_token();
-    let Some(raw_path) = translated_str_checked(token, path) else {
+    let Some(raw_path) = translated_cstr_demand(token, path, PATH_MAX + 1) else {
         return errno(EFAULT);
     };
     if raw_path.is_empty() {
@@ -1562,7 +1579,7 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: u32) -> 
     }
 
     let token = current_user_token();
-    let Some(raw_path) = translated_str_checked(token, path) else {
+    let Some(raw_path) = translated_cstr_demand(token, path, PATH_MAX + 1) else {
         return errno(EFAULT);
     };
     // AT_EMPTY_PATH: stat the fd itself when path is empty

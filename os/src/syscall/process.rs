@@ -4080,9 +4080,10 @@ pub fn sys_setgid(gid: u32) -> isize {
         syscall!("kernel:pid[{}] sys_setgid gid={}", pid, gid);
     }
     process.with_identity_mut(|inner| {
-        if inner.effective_gid == 0 {
+        if inner.effective_uid == 0 {
             inner.real_gid = gid;
             inner.effective_gid = gid;
+            inner.saved_gid = gid;
             inner.fs_gid = gid;
             return 0;
         }
@@ -4165,7 +4166,7 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
 pub fn sys_setregid(rgid: u32, egid: u32) -> isize {
     let process = current_process();
     process.with_identity_mut(|inner| {
-        let is_root = inner.effective_gid == 0;
+        let is_root = inner.effective_uid == 0;
         let neg1 = u32::MAX;
 
         if !is_root {
@@ -4315,7 +4316,7 @@ pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
 pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> isize {
     let process = current_process();
     process.with_identity_mut(|inner| {
-        let is_root = inner.effective_gid == 0;
+        let is_root = inner.effective_uid == 0;
         let neg1 = u32::MAX;
 
         if !is_root {
