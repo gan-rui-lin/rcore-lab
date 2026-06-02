@@ -2581,7 +2581,7 @@ pub fn sys_getcwd(buf: *mut u8, len: usize) -> isize {
     out.extend_from_slice(bytes);
     out.push(0);
     match copy_to_user(token, buf, &out) {
-        Ok(_) => buf as isize,
+        Ok(_) => out.len() as isize,
         Err(err) => err,
     }
 }
