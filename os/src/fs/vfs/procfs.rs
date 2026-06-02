@@ -784,6 +784,18 @@ fn proc_sys_kernel() -> Arc<dyn VfsInode> {
             crate::syscall::set_msgmni_from_proc_write,
         ),
     );
+    entries.insert(
+        String::from("shmmax"),
+        ProcFileInode::new(crate::syscall::proc_kernel_shmmax),
+    );
+    entries.insert(
+        String::from("shmmni"),
+        ProcFileInode::new(crate::syscall::proc_kernel_shmmni),
+    );
+    entries.insert(
+        String::from("shmall"),
+        ProcFileInode::new(crate::syscall::proc_kernel_shmall),
+    );
     // /proc/sys/kernel/ostype and /proc/sys/kernel/osrelease.
     entries.insert(
         String::from("ostype"),
@@ -913,6 +925,10 @@ fn proc_sysvipc() -> Arc<dyn VfsInode> {
     entries.insert(
         String::from("msg"),
         ProcFileInode::new(crate::syscall::proc_sysvipc_msg),
+    );
+    entries.insert(
+        String::from("shm"),
+        ProcFileInode::new(crate::syscall::proc_sysvipc_shm),
     );
     ProcStaticDirInode::new(entries)
 }

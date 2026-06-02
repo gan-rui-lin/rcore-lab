@@ -1015,6 +1015,7 @@ impl ProcessControlBlock {
         });
         // info!("[fork-stage] pid={} child pcb allocated new_pid={}", self.pid.0, new_pid_value);
         self.push_child(Arc::clone(&child));
+        crate::syscall::inherit_shm_for_process_fork(self.pid.0, child.pid.0);
         info!("[fork-stage] pid={} child linked to parent", self.pid.0);
         let parent_task = self.get_task(0);
         let ustack_base = parent_task.ustack_base();

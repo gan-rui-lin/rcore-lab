@@ -48,6 +48,13 @@ pub const IPC_STAT: i32 = 2; // Get options
 pub const IPC_INFO: i32 = 3; // Get info
 pub const MSG_STAT: i32 = 11;
 pub const MSG_INFO: i32 = 12;
+pub const SHM_LOCK: i32 = 11;
+pub const SHM_UNLOCK: i32 = 12;
+pub const SHM_STAT: i32 = 13;
+pub const SHM_INFO: i32 = 14;
+pub const SHM_STAT_ANY: i32 = 15;
+pub const SHM_DEST: u32 = 0o1000;
+pub const SHM_LOCKED: u32 = 0o2000;
 
 /// Message queue limits
 const MSGMAX: usize = 8192; // Max message size
@@ -61,6 +68,7 @@ const SHMMAX: usize = 32 * 1024 * 1024; // Max segment size (32MB)
 const SHMMIN: usize = 1; // Min segment size
 const SHMMNI: usize = 128; // Max number of segments
 const SHMSEG: usize = 128; // Max segments per process
+const SHMALL: usize = (SHMMAX / PAGE_SIZE) * SHMMNI;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -125,6 +133,46 @@ struct MsgInfoUser {
     msgseg: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ShmidDsUser {
+    shm_perm: IpcPermUser,
+    shm_segsz: usize,
+    shm_atime: i64,
+    shm_dtime: i64,
+    shm_ctime: i64,
+    shm_cpid: i32,
+    shm_lpid: i32,
+    shm_nattch: u64,
+    unused4: u64,
+    unused5: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ShminfoUser {
+    shmmax: u64,
+    shmmin: u64,
+    shmmni: u64,
+    shmseg: u64,
+    shmall: u64,
+    reserved1: u64,
+    reserved2: u64,
+    reserved3: u64,
+    reserved4: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ShmInfoUser {
+    used_ids: i32,
+    shm_tot: u64,
+    shm_rss: u64,
+    shm_swp: u64,
+    swap_attempts: u64,
+    swap_successes: u64,
+}
+
 fn current_ipc_identity() -> (u32, u32, usize, bool) {
     let process = current_process();
     let pid = process.pid.0;
@@ -167,6 +215,21 @@ fn msgq_to_user_ds(msgq: &MessageQueue) -> MsqidDsUser {
     }
 }
 
+fn shm_to_user_ds(shm: &ShmSegment) -> ShmidDsUser {
+    ShmidDsUser {
+        shm_perm: make_shm_perm_user(shm),
+        shm_segsz: shm.size,
+        shm_atime: shm.atime,
+        shm_dtime: shm.dtime,
+        shm_ctime: shm.ctime,
+        shm_cpid: shm.cpid,
+        shm_lpid: shm.lpid,
+        shm_nattch: shm.attach_count as u64,
+        unused4: 0,
+        unused5: 0,
+    }
+}
+
 #[cfg(target_arch = "loongarch64")]
 fn make_ipc_perm_user(msgq: &MessageQueue) -> IpcPermUser {
     IpcPermUser {
@@ -179,6 +242,40 @@ fn make_ipc_perm_user(msgq: &MessageQueue) -> IpcPermUser {
         seq: 0,
         pad2: 0,
         pad3: 0,
+        unused1: 0,
+        unused2: 0,
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn make_shm_perm_user(shm: &ShmSegment) -> IpcPermUser {
+    IpcPermUser {
+        key: shm.key,
+        uid: shm.uid,
+        gid: shm.gid,
+        cuid: shm.cuid,
+        cgid: shm.cgid,
+        mode: shm.mode_bits(),
+        seq: 0,
+        pad2: 0,
+        pad3: 0,
+        unused1: 0,
+        unused2: 0,
+    }
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn make_shm_perm_user(shm: &ShmSegment) -> IpcPermUser {
+    IpcPermUser {
+        key: shm.key,
+        uid: shm.uid,
+        gid: shm.gid,
+        cuid: shm.cuid,
+        cgid: shm.cgid,
+        mode: shm.mode_bits() as u16,
+        pad1: 0,
+        seq: 0,
+        pad2: 0,
         unused1: 0,
         unused2: 0,
     }
@@ -376,14 +473,34 @@ pub struct ShmSegment {
     pub key: IpcKey,
     pub id: IpcId,
     pub size: usize,
+    pub mapped_size: usize,
     pub frames: Vec<Arc<FrameTracker>>,
     pub permissions: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub cuid: u32,
+    pub cgid: u32,
+    pub ctime: i64,
+    pub atime: i64,
+    pub dtime: i64,
+    pub cpid: i32,
+    pub lpid: i32,
+    pub locked: bool,
     pub attach_count: usize,
     pub marked_for_delete: bool,
 }
 
 impl ShmSegment {
-    pub fn new(key: IpcKey, id: IpcId, size: usize, permissions: u32) -> Result<Self, isize> {
+    pub fn new(
+        key: IpcKey,
+        id: IpcId,
+        size: usize,
+        permissions: u32,
+        uid: u32,
+        gid: u32,
+        pid: usize,
+        now_sec: i64,
+    ) -> Result<Self, isize> {
         let aligned_size = align_up(size, PAGE_SIZE);
         let page_count = aligned_size / PAGE_SIZE;
         let mut frames = Vec::with_capacity(page_count);
@@ -394,12 +511,56 @@ impl ShmSegment {
         Ok(Self {
             key,
             id,
-            size: aligned_size,
+            size,
+            mapped_size: aligned_size,
             frames,
             permissions,
+            uid,
+            gid,
+            cuid: uid,
+            cgid: gid,
+            ctime: now_sec,
+            atime: 0,
+            dtime: 0,
+            cpid: pid as i32,
+            lpid: 0,
+            locked: false,
             attach_count: 0,
             marked_for_delete: false,
         })
+    }
+
+    pub fn mode_bits(&self) -> u32 {
+        let mut mode = self.permissions & 0o777;
+        if self.marked_for_delete {
+            mode |= SHM_DEST;
+        }
+        if self.locked {
+            mode |= SHM_LOCKED;
+        }
+        mode
+    }
+
+    pub fn access_bits_for(&self, uid: u32, gid: u32) -> u16 {
+        if uid == self.uid || uid == self.cuid {
+            ((self.permissions >> 6) & 0o7) as u16
+        } else if gid == self.gid || gid == self.cgid {
+            ((self.permissions >> 3) & 0o7) as u16
+        } else {
+            (self.permissions & 0o7) as u16
+        }
+    }
+
+    pub fn has_access(&self, uid: u32, gid: u32, req: u16) -> bool {
+        if req == 0 {
+            return true;
+        }
+        let granted = self.access_bits_for(uid, gid);
+        (granted & req) == req
+    }
+
+    pub fn can_ctl(&self, uid: u32) -> bool {
+        uid == self.uid || uid == self.cuid
     }
 }
 
@@ -469,13 +630,25 @@ impl IpcManager {
         key: IpcKey,
         size: usize,
         permissions: u32,
+        uid: u32,
+        gid: u32,
+        pid: usize,
     ) -> Result<IpcId, isize> {
         if self.shm_segments.len() >= SHMMNI {
             return Err(errno(ENOMEM));
         }
         let id = self.next_shmid;
         self.next_shmid += 1;
-        let shm = Arc::new(Mutex::new(ShmSegment::new(key, id, size, permissions)?));
+        let shm = Arc::new(Mutex::new(ShmSegment::new(
+            key,
+            id,
+            size,
+            permissions,
+            uid,
+            gid,
+            pid,
+            now_epoch_sec(),
+        )?));
         self.shm_segments.insert(id, shm);
         Ok(id)
     }
@@ -526,6 +699,27 @@ impl IpcManager {
     pub fn remove_attachment(&mut self, pid: usize, addr: usize) -> Option<(IpcId, usize)> {
         self.shm_attachments.remove(&(pid, addr))
     }
+
+    pub fn inherit_attachments_for_fork(&mut self, parent_pid: usize, child_pid: usize) {
+        let inherited: Vec<(usize, IpcId, usize)> = self
+            .shm_attachments
+            .iter()
+            .filter_map(|((pid, addr), (shmid, size))| {
+                if *pid == parent_pid {
+                    Some((*addr, *shmid, *size))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (addr, shmid, size) in inherited {
+            self.shm_attachments
+                .insert((child_pid, addr), (shmid, size));
+            if let Some(shm) = self.get_shm(shmid) {
+                shm.lock().attach_count += 1;
+            }
+        }
+    }
 }
 
 #[inline]
@@ -544,6 +738,18 @@ pub fn proc_kernel_msgmni() -> String {
     alloc::format!("{}\n", msgmni_limit())
 }
 
+pub fn proc_kernel_shmmax() -> String {
+    alloc::format!("{}\n", SHMMAX)
+}
+
+pub fn proc_kernel_shmmni() -> String {
+    alloc::format!("{}\n", SHMMNI)
+}
+
+pub fn proc_kernel_shmall() -> String {
+    alloc::format!("{}\n", SHMALL)
+}
+
 pub fn set_msgmni_from_proc_write(buf: &[u8]) -> usize {
     let Ok(raw) = core::str::from_utf8(buf) else {
         return buf.len();
@@ -555,6 +761,44 @@ pub fn set_msgmni_from_proc_write(buf: &[u8]) -> usize {
         }
     }
     buf.len()
+}
+
+/// Render `/proc/sysvipc/shm` in a Linux-compatible tabular layout.
+pub fn proc_sysvipc_shm() -> String {
+    let segments: Vec<Arc<Mutex<ShmSegment>>> = {
+        let manager = IPC_MANAGER.lock();
+        manager.shm_segments.values().cloned().collect()
+    };
+
+    let mut out = String::from(
+        "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime        rss       swap\n",
+    );
+    for shm in segments {
+        let s = shm.lock();
+        let _ = core::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{:>10} {:>10} {:>5o} {:>21} {:>5} {:>5} {:>6} {:>5} {:>5} {:>5} {:>5} {:>10} {:>10} {:>10} {:>10} {:>10}\n",
+                s.key,
+                s.id,
+                s.mode_bits(),
+                s.size,
+                s.cpid,
+                s.lpid,
+                s.attach_count,
+                s.uid,
+                s.gid,
+                s.cuid,
+                s.cgid,
+                s.atime,
+                s.dtime,
+                s.ctime,
+                s.mapped_size,
+                0
+            ),
+        );
+    }
+    out
 }
 
 /// Render `/proc/sysvipc/msg` in a Linux-compatible tabular layout.
@@ -1004,12 +1248,13 @@ pub fn sys_shmget(key: IpcKey, size: usize, shmflg: i32) -> isize {
         return errno(EINVAL);
     }
 
+    let (euid, egid, pid, is_super) = current_ipc_identity();
     let mut manager = IPC_MANAGER.lock();
 
     // Check if we're creating a private segment
     if key == IPC_PRIVATE {
         let permissions = (shmflg & 0o777) as u32;
-        return match manager.create_shm(key, size, permissions) {
+        return match manager.create_shm(key, size, permissions, euid, egid, pid) {
             Ok(id) => id as isize,
             Err(e) => e,
         };
@@ -1022,10 +1267,15 @@ pub fn sys_shmget(key: IpcKey, size: usize, shmflg: i32) -> isize {
             // Exclusive creation requested but segment exists
             return errno(EEXIST);
         }
-        // Check size matches
-        let shm_size = shm.lock().size;
-        if size > shm_size {
-            return errno(EINVAL);
+        {
+            let shm_locked = shm.lock();
+            if size > shm_locked.size {
+                return errno(EINVAL);
+            }
+            let req = requested_rw_bits(shmflg);
+            if !is_super && req != 0 && !shm_locked.has_access(euid, egid, req) {
+                return errno(EACCES);
+            }
         }
         return id as isize;
     }
@@ -1038,7 +1288,7 @@ pub fn sys_shmget(key: IpcKey, size: usize, shmflg: i32) -> isize {
 
     // Create new segment
     let permissions = (shmflg & 0o777) as u32;
-    match manager.create_shm(key, size, permissions) {
+    match manager.create_shm(key, size, permissions, euid, egid, pid) {
         Ok(id) => id as isize,
         Err(e) => e,
     }
@@ -1061,6 +1311,7 @@ pub fn sys_shmat(shmid: i32, shmaddr: usize, _shmflg: i32) -> isize {
 
     let process = current_process();
     let pid = process.pid.0;
+    let (euid, egid, _, is_super) = current_ipc_identity();
     let mut manager = IPC_MANAGER.lock();
     let shm = match manager.get_shm(shmid) {
         Some(s) => s,
@@ -1083,7 +1334,11 @@ pub fn sys_shmat(shmid: i32, shmaddr: usize, _shmflg: i32) -> isize {
             error!("[shm] shmat on deleted segment shmid={} pid={}", shmid, pid);
             return errno(EINVAL);
         }
-        (shm_locked.size, shm_locked.frames.clone())
+        let req = if _shmflg & SHM_RDONLY != 0 { 0o4 } else { 0o6 };
+        if !is_super && !shm_locked.has_access(euid, egid, req) {
+            return errno(EACCES);
+        }
+        (shm_locked.mapped_size, shm_locked.frames.clone())
     };
 
     let mut map_perm = MapPermission::U | MapPermission::R;
@@ -1180,6 +1435,8 @@ pub fn sys_shmat(shmid: i32, shmaddr: usize, _shmflg: i32) -> isize {
     }
     let mut shm_locked = shm.lock();
     shm_locked.attach_count += 1;
+    shm_locked.atime = now_epoch_sec();
+    shm_locked.lpid = pid as i32;
     attach_addr as isize
 }
 
@@ -1216,6 +1473,8 @@ pub fn sys_shmdt(shmaddr: usize) -> isize {
         if shm_locked.attach_count > 0 {
             shm_locked.attach_count -= 1;
         }
+        shm_locked.dtime = now_epoch_sec();
+        shm_locked.lpid = pid as i32;
         should_remove = shm_locked.marked_for_delete && shm_locked.attach_count == 0;
     }
     if should_remove {
@@ -1236,43 +1495,178 @@ pub fn sys_shmdt(shmaddr: usize) -> isize {
 /// - Success: 0
 /// - Failure: -errno
 pub fn sys_shmctl(shmid: i32, cmd: i32, _buf: usize) -> isize {
+    fn copy_to_user_struct<T>(ptr: usize, value: &T) -> Result<(), isize> {
+        let bytes = unsafe {
+            core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
+        };
+        user_mem::copy_to_user(
+            current_user_token(),
+            ptr as *mut u8,
+            bytes,
+            UserWritePolicy::DemandCowWithForkFallback,
+        )
+    }
+
+    let (euid, egid, _pid, is_super) = current_ipc_identity();
+    let cmd = cmd & 0xff;
     let mut manager = IPC_MANAGER.lock();
 
     match cmd {
         IPC_RMID => {
-            if let Some(shm) = manager.get_shm(shmid) {
-                let mut shm_locked = shm.lock();
-                shm_locked.marked_for_delete = true;
-                let should_remove = shm_locked.attach_count == 0;
-                drop(shm_locked);
-                if should_remove {
-                    manager.remove_shm(shmid);
-                }
-                0
-            } else {
-                errno(EINVAL)
+            let Some(shm) = manager.get_shm(shmid) else {
+                return errno(EINVAL);
+            };
+            let mut shm_locked = shm.lock();
+            if !is_super && !shm_locked.can_ctl(euid) {
+                return errno(EPERM);
             }
+            shm_locked.marked_for_delete = true;
+            shm_locked.ctime = now_epoch_sec();
+            let should_remove = shm_locked.attach_count == 0;
+            drop(shm_locked);
+            if should_remove {
+                manager.remove_shm(shmid);
+            }
+            0
         }
         IPC_STAT => {
-            // Get/Set segment info
-            // For simplicity, just check if segment exists
-            if manager.get_shm(shmid).is_some() {
-                0
-            } else {
-                errno(EINVAL)
+            if _buf == 0 {
+                return errno(EFAULT);
+            }
+            let Some(shm) = manager.get_shm(shmid) else {
+                return errno(EINVAL);
+            };
+            drop(manager);
+            let ds = {
+                let shm_locked = shm.lock();
+                if !is_super && !shm_locked.has_access(euid, egid, 0o4) {
+                    return errno(EACCES);
+                }
+                shm_to_user_ds(&shm_locked)
+            };
+            match copy_to_user_struct(_buf, &ds) {
+                Ok(()) => 0,
+                Err(_) => errno(EFAULT),
             }
         }
         IPC_SET => {
-            // Get/Set segment info
-            // For simplicity, just check if segment exists
-            if manager.get_shm(shmid).is_some() {
-                0
-            } else {
-                errno(EINVAL)
+            if _buf == 0 {
+                return errno(EFAULT);
             }
+            let Some(shm) = manager.get_shm(shmid) else {
+                return errno(EINVAL);
+            };
+            drop(manager);
+            let token = current_user_token();
+            let user_ds = match user_mem::read_from_user::<ShmidDsUser>(
+                token,
+                _buf as *const ShmidDsUser,
+                UserReadPolicy::DemandPaged,
+            ) {
+                Ok(v) => v,
+                Err(_) => return errno(EFAULT),
+            };
+
+            let mut shm_locked = shm.lock();
+            if !is_super && !shm_locked.can_ctl(euid) {
+                return errno(EPERM);
+            }
+            shm_locked.permissions = (user_ds.shm_perm.mode as u32) & 0o777;
+            shm_locked.uid = user_ds.shm_perm.uid;
+            shm_locked.gid = user_ds.shm_perm.gid;
+            shm_locked.ctime = now_epoch_sec();
+            0
+        }
+        IPC_INFO => {
+            if _buf == 0 {
+                return errno(EFAULT);
+            }
+            let info = ShminfoUser {
+                shmmax: SHMMAX as u64,
+                shmmin: SHMMIN as u64,
+                shmmni: SHMMNI as u64,
+                shmseg: SHMSEG as u64,
+                shmall: SHMALL as u64,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+                reserved4: 0,
+            };
+            let max_id = manager
+                .shm_segments
+                .keys()
+                .next_back()
+                .copied()
+                .unwrap_or(0);
+            drop(manager);
+            match copy_to_user_struct(_buf, &info) {
+                Ok(()) => max_id as isize,
+                Err(_) => errno(EFAULT),
+            }
+        }
+        SHM_INFO => {
+            if _buf == 0 {
+                return errno(EFAULT);
+            }
+            let mut info = ShmInfoUser::default();
+            for shm in manager.shm_segments.values() {
+                let shm_locked = shm.lock();
+                info.used_ids += 1;
+                info.shm_tot += shm_locked.frames.len() as u64;
+                info.shm_rss += shm_locked.frames.len() as u64;
+            }
+            let max_id = manager
+                .shm_segments
+                .keys()
+                .next_back()
+                .copied()
+                .unwrap_or(0);
+            drop(manager);
+            match copy_to_user_struct(_buf, &info) {
+                Ok(()) => max_id as isize,
+                Err(_) => errno(EFAULT),
+            }
+        }
+        SHM_STAT | SHM_STAT_ANY => {
+            if _buf == 0 {
+                return errno(EFAULT);
+            }
+            let Some(shm) = manager.get_shm(shmid) else {
+                return errno(EINVAL);
+            };
+            drop(manager);
+            let ds = {
+                let shm_locked = shm.lock();
+                if cmd == SHM_STAT && !is_super && !shm_locked.has_access(euid, egid, 0o4) {
+                    return errno(EACCES);
+                }
+                shm_to_user_ds(&shm_locked)
+            };
+            match copy_to_user_struct(_buf, &ds) {
+                Ok(()) => shmid as isize,
+                Err(_) => errno(EFAULT),
+            }
+        }
+        SHM_LOCK | SHM_UNLOCK => {
+            let Some(shm) = manager.get_shm(shmid) else {
+                return errno(EINVAL);
+            };
+            let mut shm_locked = shm.lock();
+            if !is_super && !shm_locked.can_ctl(euid) {
+                return errno(EPERM);
+            }
+            shm_locked.locked = cmd == SHM_LOCK;
+            shm_locked.ctime = now_epoch_sec();
+            0
         }
         _ => errno(EINVAL),
     }
+}
+
+pub fn inherit_shm_attachments_for_fork(parent_pid: usize, child_pid: usize) {
+    IPC_MANAGER
+        .lock()
+        .inherit_attachments_for_fork(parent_pid, child_pid);
 }
 
 /// Cleanup all SHM attachments that belong to a process when it exits.
@@ -1295,6 +1689,8 @@ pub fn cleanup_shm_attachments_for_pid(pid: usize) {
             if shm_locked.attach_count > 0 {
                 shm_locked.attach_count -= 1;
             }
+            shm_locked.dtime = now_epoch_sec();
+            shm_locked.lpid = pid as i32;
             should_remove = shm_locked.marked_for_delete && shm_locked.attach_count == 0;
         }
         if should_remove {

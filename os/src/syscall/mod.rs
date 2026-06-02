@@ -433,14 +433,39 @@ pub fn proc_sysvipc_msg() -> alloc::string::String {
     ipc::proc_sysvipc_msg()
 }
 
+/// Procfs helper for `/proc/sysvipc/shm`.
+pub fn proc_sysvipc_shm() -> alloc::string::String {
+    ipc::proc_sysvipc_shm()
+}
+
 /// Procfs helper for `/proc/sys/kernel/msgmni`.
 pub fn proc_kernel_msgmni() -> alloc::string::String {
     ipc::proc_kernel_msgmni()
 }
 
+/// Procfs helper for `/proc/sys/kernel/shmmax`.
+pub fn proc_kernel_shmmax() -> alloc::string::String {
+    ipc::proc_kernel_shmmax()
+}
+
+/// Procfs helper for `/proc/sys/kernel/shmmni`.
+pub fn proc_kernel_shmmni() -> alloc::string::String {
+    ipc::proc_kernel_shmmni()
+}
+
+/// Procfs helper for `/proc/sys/kernel/shmall`.
+pub fn proc_kernel_shmall() -> alloc::string::String {
+    ipc::proc_kernel_shmall()
+}
+
 /// Procfs writer for `/proc/sys/kernel/msgmni`.
 pub fn set_msgmni_from_proc_write(buf: &[u8]) -> usize {
     ipc::set_msgmni_from_proc_write(buf)
+}
+
+/// Register SysV shared-memory attachments inherited by a forked process.
+pub fn inherit_shm_for_process_fork(parent_pid: usize, child_pid: usize) {
+    ipc::inherit_shm_attachments_for_fork(parent_pid, child_pid);
 }
 
 const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
