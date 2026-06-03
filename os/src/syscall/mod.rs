@@ -18,6 +18,14 @@ const SYSCALL_CAPSET: usize = 91;
 const SYSCALL_PERSONALITY: usize = 92;
 /// getcwd syscall
 const SYSCALL_GETCWD: usize = 17;
+/// eventfd2 syscall
+const SYSCALL_EVENTFD2: usize = 19;
+/// epoll_create1 syscall
+const SYSCALL_EPOLL_CREATE1: usize = 20;
+/// epoll_ctl syscall
+const SYSCALL_EPOLL_CTL: usize = 21;
+/// epoll_pwait syscall
+const SYSCALL_EPOLL_PWAIT: usize = 22;
 const SYSCALL_SETXATTR: usize = 5;
 const SYSCALL_LSETXATTR: usize = 6;
 const SYSCALL_FSETXATTR: usize = 7;
@@ -150,6 +158,11 @@ const SYSCALL_MEMFD_CREATE: usize = 279;
 const SYSCALL_NAME_TO_HANDLE_AT: usize = 264;
 /// open_by_handle_at syscall
 const SYSCALL_OPEN_BY_HANDLE_AT: usize = 265;
+const SYSCALL_INOTIFY_INIT1: usize = 26;
+const SYSCALL_INOTIFY_ADD_WATCH: usize = 27;
+const SYSCALL_INOTIFY_RM_WATCH: usize = 28;
+const SYSCALL_SIGNALFD4: usize = 74;
+const SYSCALL_COPY_FILE_RANGE: usize = 285;
 /// exit syscall
 const SYSCALL_EXIT: usize = 93;
 /// exit_group syscall
@@ -172,6 +185,16 @@ const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_GETITIMER: usize = 102;
 /// setitimer syscall
 const SYSCALL_SETITIMER: usize = 103;
+/// timer_create syscall
+const SYSCALL_TIMER_CREATE: usize = 107;
+/// timer_gettime syscall
+const SYSCALL_TIMER_GETTIME: usize = 108;
+/// timer_getoverrun syscall
+const SYSCALL_TIMER_GETOVERRUN: usize = 109;
+/// timer_settime syscall
+const SYSCALL_TIMER_SETTIME: usize = 110;
+/// timer_delete syscall
+const SYSCALL_TIMER_DELETE: usize = 111;
 /// clock_nanosleep syscall
 const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 /// ptrace syscall
@@ -224,8 +247,12 @@ const SYSCALL_RT_SIGSUSPEND: usize = 133;
 const SYSCALL_SIGACTION: usize = 134;
 /// sigprocmask syscall
 const SYSCALL_SIGPROCMASK: usize = 135;
+/// rt_sigpending syscall
+const SYSCALL_RT_SIGPENDING: usize = 136;
 /// rt_sigtimedwait syscall
 const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
+/// rt_sigqueueinfo syscall
+const SYSCALL_RT_SIGQUEUEINFO: usize = 138;
 /// sigreturn syscall
 const SYSCALL_SIGRETURN: usize = 139;
 /// setpriority syscall
@@ -329,6 +356,8 @@ const SYSCALL_SHMDT: usize = 197;
 const SYSCALL_SBRK: usize = 214;
 /// munmap syscall
 const SYSCALL_MUNMAP: usize = 215;
+/// mremap syscall
+const SYSCALL_MREMAP: usize = 216;
 /// fork syscall
 const SYSCALL_FORK: usize = 220;
 /// clone3 syscall
@@ -462,7 +491,7 @@ const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (19, "eventfd2"),
     (20, "epoll_create1"),
     (21, "epoll_ctl"),
-    (22, "dup2"),
+    (22, "epoll_pwait"),
     (23, "dup"),
     (24, "dup3"),
     (25, "fcntl"),
@@ -790,6 +819,28 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_LREMOVEXATTR => sys_removexattr(args[0] as *const u8, args[1] as *const u8, false),
         SYSCALL_FREMOVEXATTR => sys_fremovexattr(args[0], args[1] as *const u8),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
+        SYSCALL_EVENTFD2 => sys_eventfd2(args[0], args[1]),
+        SYSCALL_EPOLL_CREATE1 => sys_epoll_create1(args[0]),
+        SYSCALL_EPOLL_CTL => sys_epoll_ctl(args[0], args[1], args[2], args[3] as *const u8),
+        SYSCALL_EPOLL_PWAIT => {
+            sys_epoll_pwait(args[0], args[1] as *mut u8, args[2], args[3] as isize)
+        }
+        SYSCALL_INOTIFY_INIT1 => sys_inotify_init1(args[0]),
+        SYSCALL_INOTIFY_ADD_WATCH => {
+            sys_inotify_add_watch(args[0], args[1] as *const u8, args[2] as u32)
+        }
+        SYSCALL_INOTIFY_RM_WATCH => sys_inotify_rm_watch(args[0], args[1] as i32),
+        SYSCALL_SIGNALFD4 => {
+            sys_signalfd4(args[0] as isize, args[1] as *const usize, args[2], args[3])
+        }
+        SYSCALL_COPY_FILE_RANGE => sys_copy_file_range(
+            args[0],
+            args[1] as *mut i64,
+            args[2],
+            args[3] as *mut i64,
+            args[4],
+            args[5] as u32,
+        ),
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2] as u32),
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1] as i32, args[2]),
@@ -998,6 +1049,18 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as *const ITimerVal,
             args[2] as *mut ITimerVal,
         ),
+        SYSCALL_TIMER_CREATE => {
+            sys_timer_create(args[0], args[1] as *const u8, args[2] as *mut usize)
+        }
+        SYSCALL_TIMER_GETTIME => sys_timer_gettime(args[0], args[1] as *mut u8),
+        SYSCALL_TIMER_GETOVERRUN => sys_timer_getoverrun(args[0]),
+        SYSCALL_TIMER_SETTIME => sys_timer_settime(
+            args[0],
+            args[1] as i32,
+            args[2] as *const u8,
+            args[3] as *mut u8,
+        ),
+        SYSCALL_TIMER_DELETE => sys_timer_delete(args[0]),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const TimeSpec, args[1] as *mut TimeSpec),
         SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(
             args[0],
@@ -1037,6 +1100,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *mut usize,
             args[3],
         ),
+        SYSCALL_RT_SIGPENDING => sys_rt_sigpending(args[0] as *mut usize, args[1]),
+        SYSCALL_RT_SIGQUEUEINFO => {
+            sys_rt_sigqueueinfo(args[0] as isize, args[1] as i32, args[2] as *const u8)
+        }
         // sigaltstack: stub for glibc compatibility
         132 => 0,
         SYSCALL_SIGRETURN => sys_sigreturn(),
@@ -1167,6 +1234,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PTRACE => sys_ptrace(args[0], args[1] as isize, args[2], args[3]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
+        SYSCALL_MREMAP => sys_mremap(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2]),
         SYSCALL_MLOCK => sys_mlock(args[0], args[1]),

@@ -48,6 +48,10 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
     static ref PERSONALITY_STATE: UPIntrFreeCell<BTreeMap<usize, usize>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref POSIX_TIMERS: UPIntrFreeCell<BTreeMap<(usize, usize), PosixTimer>> =
+        unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
+    static ref POSIX_TIMER_NEXT_ID: UPIntrFreeCell<usize> =
+        unsafe { UPIntrFreeCell::new(0) };
 }
 
 #[allow(dead_code)]
@@ -3788,6 +3792,31 @@ pub fn sys_sigprocmask(
     0
 }
 
+pub fn sys_rt_sigpending(set: *mut usize, sigsetsize: usize) -> isize {
+    if sigsetsize != core::mem::size_of::<usize>() {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
+    let task = current_task().unwrap();
+    // Get pending signals as a user mask
+    let pending = task.with_signals(|signals| flags_to_user_mask(signals.signal_pending));
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&(pending as usize) as *const usize) as *const u8,
+            core::mem::size_of::<usize>(),
+        )
+    };
+    if let Err(err) = copy_to_user(token, set as *mut u8, bytes) {
+        return err;
+    }
+    0
+}
+
+pub fn sys_rt_sigqueueinfo(pid: isize, sig: i32, _info: *const u8) -> isize {
+    // Simplified: just deliver the signal like kill
+    sys_kill(pid, sig)
+}
+
 pub fn sys_sigreturn() -> isize {
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
@@ -5385,4 +5414,300 @@ pub fn sys_get_mempolicy(
         }
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// POSIX timers (timer_create / timer_settime / timer_gettime / timer_delete)
+// ---------------------------------------------------------------------------
+
+struct PosixTimer {
+    #[allow(dead_code)]
+    clockid: usize,
+    #[allow(dead_code)]
+    sigev_signo: i32,
+    /// Expiry time in microseconds (absolute monotonic)
+    value_us: u64,
+    /// Interval for periodic timers (microseconds)
+    interval_us: u64,
+    overrun: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ITimerSpec {
+    it_interval: TimeSpec,
+    it_value: TimeSpec,
+}
+
+/// timer_create(clockid_t clockid, struct sigevent *sevp, timer_t *timerid)
+pub fn sys_timer_create(clockid: usize, sevp: *const u8, timerid: *mut usize) -> isize {
+    let pid = current_process().pid.0;
+    let token = current_user_token();
+
+    // Read sigev_signo from sigevent if provided, otherwise default to SIGALRM (14)
+    let sigev_signo: i32 = if !sevp.is_null() {
+        // struct sigevent layout: sigev_value (8 bytes), sigev_signo (4 bytes at offset 8)
+        let signo_ptr = (sevp as usize + 8) as *const i32;
+        match read_from_user::<i32>(token, signo_ptr) {
+            Ok(v) => v,
+            Err(_) => 14, // default SIGALRM
+        }
+    } else {
+        14 // SIGALRM
+    };
+
+    let timer_id = {
+        let mut next_id = POSIX_TIMER_NEXT_ID.exclusive_access();
+        let id = *next_id;
+        *next_id += 1;
+        id
+    };
+
+    let timer = PosixTimer {
+        clockid,
+        sigev_signo,
+        value_us: 0,
+        interval_us: 0,
+        overrun: 0,
+    };
+
+    POSIX_TIMERS
+        .exclusive_access()
+        .insert((pid, timer_id), timer);
+
+    // Write timer ID back to userspace
+    let id_bytes = timer_id.to_ne_bytes();
+    if let Err(err) = copy_to_user(token, timerid as *mut u8, &id_bytes) {
+        return err;
+    }
+    0
+}
+
+/// timer_settime(timer_t timerid, int flags, const struct itimerspec *new_value,
+///               struct itimerspec *old_value)
+pub fn sys_timer_settime(
+    timerid: usize,
+    flags: i32,
+    new_value: *const u8,
+    old_value: *mut u8,
+) -> isize {
+    let pid = current_process().pid.0;
+    let token = current_user_token();
+
+    let key = (pid, timerid);
+
+    // Read new itimerspec from userspace
+    let new_spec = match read_from_user::<ITimerSpec>(token, new_value as *const ITimerSpec) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+
+    let mut timers = POSIX_TIMERS.exclusive_access();
+    let timer = match timers.get_mut(&key) {
+        Some(t) => t,
+        None => return errno(EINVAL),
+    };
+
+    // Write old value if requested
+    if !old_value.is_null() {
+        let remaining_us = if timer.value_us > 0 {
+            let now = get_time_us() as u64;
+            if timer.value_us > now {
+                timer.value_us - now
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let old_spec = ITimerSpec {
+            it_interval: TimeSpec {
+                tv_sec: (timer.interval_us / 1_000_000) as usize,
+                tv_nsec: ((timer.interval_us % 1_000_000) * 1000) as usize,
+            },
+            it_value: TimeSpec {
+                tv_sec: (remaining_us / 1_000_000) as usize,
+                tv_nsec: ((remaining_us % 1_000_000) * 1000) as usize,
+            },
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&old_spec as *const ITimerSpec) as *const u8,
+                core::mem::size_of::<ITimerSpec>(),
+            )
+        };
+        if let Err(err) = copy_to_user(token, old_value as *mut u8, bytes) {
+            return err;
+        }
+    }
+
+    // Compute new expiry
+    let interval_us =
+        new_spec.it_interval.tv_sec as u64 * 1_000_000 + new_spec.it_interval.tv_nsec as u64 / 1000;
+    let value_us =
+        new_spec.it_value.tv_sec as u64 * 1_000_000 + new_spec.it_value.tv_nsec as u64 / 1000;
+
+    timer.interval_us = interval_us;
+
+    const TIMER_ABSTIME: i32 = 1;
+    if value_us == 0 {
+        // Disarm timer
+        timer.value_us = 0;
+    } else if (flags & TIMER_ABSTIME) != 0 {
+        // Absolute time
+        timer.value_us = value_us;
+    } else {
+        // Relative time
+        timer.value_us = get_time_us() as u64 + value_us;
+    }
+
+    0
+}
+
+/// timer_gettime(timer_t timerid, struct itimerspec *curr_value)
+pub fn sys_timer_gettime(timerid: usize, curr_value: *mut u8) -> isize {
+    let pid = current_process().pid.0;
+    let token = current_user_token();
+
+    let key = (pid, timerid);
+    let timers = POSIX_TIMERS.exclusive_access();
+    let timer = match timers.get(&key) {
+        Some(t) => t,
+        None => return errno(EINVAL),
+    };
+
+    let remaining_us = if timer.value_us > 0 {
+        let now = get_time_us() as u64;
+        if timer.value_us > now {
+            timer.value_us - now
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let spec = ITimerSpec {
+        it_interval: TimeSpec {
+            tv_sec: (timer.interval_us / 1_000_000) as usize,
+            tv_nsec: ((timer.interval_us % 1_000_000) * 1000) as usize,
+        },
+        it_value: TimeSpec {
+            tv_sec: (remaining_us / 1_000_000) as usize,
+            tv_nsec: ((remaining_us % 1_000_000) * 1000) as usize,
+        },
+    };
+
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&spec as *const ITimerSpec) as *const u8,
+            core::mem::size_of::<ITimerSpec>(),
+        )
+    };
+    if let Err(err) = copy_to_user(token, curr_value as *mut u8, bytes) {
+        return err;
+    }
+    0
+}
+
+/// timer_getoverrun(timer_t timerid)
+pub fn sys_timer_getoverrun(timerid: usize) -> isize {
+    let pid = current_process().pid.0;
+    let key = (pid, timerid);
+    let timers = POSIX_TIMERS.exclusive_access();
+    match timers.get(&key) {
+        Some(t) => t.overrun as isize,
+        None => errno(EINVAL),
+    }
+}
+
+/// timer_delete(timer_t timerid)
+pub fn sys_timer_delete(timerid: usize) -> isize {
+    let pid = current_process().pid.0;
+    let key = (pid, timerid);
+    let mut timers = POSIX_TIMERS.exclusive_access();
+    if timers.remove(&key).is_some() {
+        0
+    } else {
+        errno(EINVAL)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mremap
+// ---------------------------------------------------------------------------
+
+/// mremap(old_addr, old_size, new_size, flags, new_addr)
+pub fn sys_mremap(
+    old_addr: usize,
+    old_size: usize,
+    new_size: usize,
+    flags: usize,
+    _new_addr: usize,
+) -> isize {
+    const MREMAP_MAYMOVE: usize = 1;
+
+    let pid = current_process().pid.0;
+    if crate::syscall::should_trace_syscall(pid) {
+        syscall!(
+            "kernel:pid[{}] sys_mremap old_addr={:#x} old_size={:#x} new_size={:#x} flags={:#x}",
+            pid,
+            old_addr,
+            old_size,
+            new_size,
+            flags
+        );
+    }
+
+    if old_addr % PAGE_SIZE != 0 {
+        return errno(EINVAL);
+    }
+
+    let old_size_aligned = (old_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let new_size_aligned = (new_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    // Shrink or same size: just return old address (no-op)
+    if new_size_aligned <= old_size_aligned {
+        return old_addr as isize;
+    }
+
+    // Grow: need to allocate more space
+    if (flags & MREMAP_MAYMOVE) != 0 {
+        // Allocate a new region, copy old data, unmap old region
+        let new_addr = sys_mmap(0, new_size_aligned, 0x3 /* PROT_READ|PROT_WRITE */, 0x22 /* MAP_PRIVATE|MAP_ANON */, usize::MAX, 0);
+        if new_addr < 0 {
+            return new_addr; // propagate error
+        }
+        let new_addr = new_addr as usize;
+
+        // Copy old data page-by-page via the page table
+        let token = current_user_token();
+        let page_table = PageTable::from_token(token);
+        let copy_len = old_size_aligned;
+        let mut offset = 0;
+        while offset < copy_len {
+            let src_va = old_addr + offset;
+            let dst_va = new_addr + offset;
+            let chunk = core::cmp::min(PAGE_SIZE, copy_len - offset);
+
+            if let Some(src_pa) = page_table.translate_va(VirtAddr::from(src_va)) {
+                if let Some(dst_pa) = page_table.translate_va(VirtAddr::from(dst_va)) {
+                    let src_ptr = src_pa.0 as *const u8;
+                    let dst_ptr = dst_pa.0 as *mut u8;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, chunk);
+                    }
+                }
+            }
+            offset += chunk;
+        }
+
+        // Unmap old region
+        sys_munmap(old_addr, old_size_aligned);
+
+        new_addr as isize
+    } else {
+        // Cannot move, try to extend in place — for simplicity return ENOMEM
+        errno(ENOMEM)
+    }
 }

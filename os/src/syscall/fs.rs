@@ -5,14 +5,16 @@ use super::user_mem::{self, UserReadPolicy, UserWritePolicy};
 use crate::config::USER_STACK_TOP;
 use crate::fs::{
     create_dir, make_pipe, open_file, path_exists, path_is_dir, remove_path, DevNull, DevUrandom,
-    DevZero, MemFdFile, OpenFlags, PollEvents, Stat, StatMode, TimerFdFile, VfsInode, VfsMetadata,
-    VfsStatFs, TIMERFD_EAGAIN,
+    DevZero, EpollFile, EventFdFile, MemFdFile, OpenFlags, PollEvents, SignalFdFile, Stat,
+    StatMode, TimerFdFile, VfsInode, VfsMetadata, VfsStatFs, EVENTFD_EAGAIN, SIGNALFD_EAGAIN,
+    TIMERFD_EAGAIN,
 };
 use crate::mm::{translated_ref, translated_refmut, translated_str_checked, UserBuffer};
 use crate::net::unix_socket::unix_registry_remove;
 #[allow(unused_imports)] // for debug
 use crate::task::{
     current_process, current_task, current_user_token, suspend_current_and_run_next,
+    user_mask_to_flags,
 };
 use crate::timer::{get_time_ms, get_time_us};
 use alloc::format;
@@ -776,6 +778,9 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
             if written == usize::MAX {
                 return errno(EINTR); // interrupted by signal
             }
+            if written == EVENTFD_EAGAIN {
+                return errno(EAGAIN); // eventfd: counter would overflow, O_NONBLOCK set
+            }
             written as isize
         }
         Err(err) => return err,
@@ -852,8 +857,8 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
     if raw == usize::MAX {
         return errno(EINTR); // interrupted by signal
     }
-    if raw == TIMERFD_EAGAIN {
-        return errno(EAGAIN); // timerfd: timer hasn't fired, O_NONBLOCK set
+    if raw == TIMERFD_EAGAIN || raw == SIGNALFD_EAGAIN {
+        return errno(EAGAIN);
     }
     raw as isize
 }
@@ -5618,4 +5623,346 @@ pub fn sys_fdatasync(fd: usize) -> isize {
 /// fsync(2) — flush file data and all metadata to storage.
 pub fn sys_fsync(fd: usize) -> isize {
     sys_fdatasync(fd)
+}
+
+// ─── eventfd2 ────────────────────────────────────────────────────────────────
+
+/// eventfd2(2) — create an eventfd file descriptor.
+pub fn sys_eventfd2(initval: usize, flags: usize) -> isize {
+    const EFD_CLOEXEC: usize = 0o2000000;
+    const EFD_NONBLOCK: usize = 0x800;
+    const EFD_SEMAPHORE: usize = 1;
+    let valid_flags = EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE;
+    if flags & !valid_flags != 0 {
+        return errno(EINVAL);
+    }
+    let file = Arc::new(EventFdFile::new(initval as u64, flags));
+    let process = current_process();
+    let fd = match process.install_file(file) {
+        Some(fd) => fd,
+        None => return errno(EMFILE),
+    };
+    fd as isize
+}
+
+// ─── epoll ───────────────────────────────────────────────────────────────────
+
+/// Packed epoll_event ABI layout for RISC-V.
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct EpollEvent {
+    events: u32,
+    data: u64,
+}
+
+const EPOLL_CTL_ADD: usize = 1;
+const EPOLL_CTL_DEL: usize = 2;
+const EPOLL_CTL_MOD: usize = 3;
+
+const EPOLL_CLOEXEC: usize = 0o2000000;
+
+/// epoll_create1(2) — create an epoll file descriptor.
+pub fn sys_epoll_create1(flags: usize) -> isize {
+    if flags & !EPOLL_CLOEXEC != 0 {
+        return errno(EINVAL);
+    }
+    let cloexec = (flags & EPOLL_CLOEXEC) != 0;
+    let epoll = Arc::new(EpollFile::new(cloexec));
+    let epoll_clone = epoll.clone();
+    let process = current_process();
+    let pid = process.pid.0;
+    let fd = match process.install_file(epoll) {
+        Some(fd) => fd,
+        None => return errno(EMFILE),
+    };
+    // Register in global epoll registry for ctl/pwait lookups.
+    epoll_register(pid, fd, epoll_clone);
+    fd as isize
+}
+
+/// epoll_ctl(2) — control an epoll file descriptor.
+pub fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event: *const u8) -> isize {
+    let token = current_user_token();
+
+    // Look up the EpollFile from the global registry (keyed by pid + epfd).
+    let epoll = {
+        let guard = EPOLL_REGISTRY.exclusive_access();
+        let pid = current_process().pid.0;
+        match guard.get(&(pid, epfd)) {
+            Some(ep) => ep.clone(),
+            None => return errno(EBADF),
+        }
+    };
+
+    match op {
+        EPOLL_CTL_ADD => {
+            // Validate target fd exists.
+            let process = current_process();
+            if process.get_file(fd).is_none() {
+                return errno(EBADF);
+            }
+            if event.is_null() {
+                return errno(EFAULT);
+            }
+            let mut ev_bytes = [0u8; core::mem::size_of::<EpollEvent>()];
+            if user_mem::copy_from_user(token, event, &mut ev_bytes, UserReadPolicy::DemandPaged)
+                .is_err()
+            {
+                return errno(EFAULT);
+            }
+            let ev = unsafe { core::ptr::read_unaligned(ev_bytes.as_ptr() as *const EpollEvent) };
+            if !epoll.ctl_add(fd, ev.events, ev.data) {
+                return errno(EEXIST);
+            }
+            0
+        }
+        EPOLL_CTL_MOD => {
+            if event.is_null() {
+                return errno(EFAULT);
+            }
+            let mut ev_bytes = [0u8; core::mem::size_of::<EpollEvent>()];
+            if user_mem::copy_from_user(token, event, &mut ev_bytes, UserReadPolicy::DemandPaged)
+                .is_err()
+            {
+                return errno(EFAULT);
+            }
+            let ev = unsafe { core::ptr::read_unaligned(ev_bytes.as_ptr() as *const EpollEvent) };
+            if !epoll.ctl_mod(fd, ev.events, ev.data) {
+                return errno(ENOENT);
+            }
+            0
+        }
+        EPOLL_CTL_DEL => {
+            if !epoll.ctl_del(fd) {
+                return errno(ENOENT);
+            }
+            0
+        }
+        _ => errno(EINVAL),
+    }
+}
+
+/// epoll_pwait(2) — wait for events on an epoll file descriptor.
+pub fn sys_epoll_pwait(
+    epfd: usize,
+    events: *mut u8,
+    maxevents: usize,
+    timeout: isize,
+) -> isize {
+    if maxevents == 0 || events.is_null() {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
+
+    let epoll = {
+        let guard = EPOLL_REGISTRY.exclusive_access();
+        let pid = current_process().pid.0;
+        let key = (pid, epfd);
+        match guard.get(&key) {
+            Some(ep) => ep.clone(),
+            None => return errno(EBADF),
+        }
+    };
+
+    let deadline = if timeout < 0 {
+        None // infinite wait
+    } else if timeout == 0 {
+        Some(0usize) // immediate return
+    } else {
+        Some(get_time_ms().saturating_add(timeout as usize))
+    };
+
+    loop {
+        let entries = epoll.get_entries();
+        let mut count = 0usize;
+        let ev_size = core::mem::size_of::<EpollEvent>();
+
+        for entry in entries.iter() {
+            if count >= maxevents {
+                break;
+            }
+            let file = {
+                let process = current_process();
+                match process.get_file(entry.fd) {
+                    Some(f) => f,
+                    None => continue, // fd was closed, skip
+                }
+            };
+
+            // Map epoll event flags to PollEvents for polling.
+            let mut request = PollEvents::empty();
+            if entry.events & 0x001 != 0 {
+                // EPOLLIN
+                request |= PollEvents::POLLIN;
+            }
+            if entry.events & 0x004 != 0 {
+                // EPOLLOUT
+                request |= PollEvents::POLLOUT;
+            }
+            request |= PollEvents::POLLERR | PollEvents::POLLHUP;
+
+            let ready = file.poll(request);
+            if !ready.is_empty() {
+                // Convert PollEvents back to epoll event flags.
+                let mut revents: u32 = 0;
+                if ready.contains(PollEvents::POLLIN) {
+                    revents |= 0x001; // EPOLLIN
+                }
+                if ready.contains(PollEvents::POLLOUT) {
+                    revents |= 0x004; // EPOLLOUT
+                }
+                if ready.contains(PollEvents::POLLERR) {
+                    revents |= 0x008; // EPOLLERR
+                }
+                if ready.contains(PollEvents::POLLHUP) {
+                    revents |= 0x010; // EPOLLHUP
+                }
+
+                let out_ev = EpollEvent {
+                    events: revents,
+                    data: entry.data,
+                };
+                let out_bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        &out_ev as *const EpollEvent as *const u8,
+                        ev_size,
+                    )
+                };
+                let dst = unsafe { events.add(count * ev_size) };
+                if copy_to_user(token, dst, out_bytes).is_err() {
+                    return errno(EFAULT);
+                }
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            return count as isize;
+        }
+
+        // Check timeout.
+        if let Some(dl) = deadline {
+            if dl == 0 || get_time_ms() >= dl {
+                return 0;
+            }
+        }
+
+        suspend_current_and_run_next();
+        if super::process::has_unmasked_user_signal_without_restart() {
+            return errno(EINTR);
+        }
+    }
+}
+
+// ─── Epoll global registry ──────────────────────────────────────────────────
+
+lazy_static! {
+    /// Global registry mapping (pid, epfd) -> Arc<EpollFile>.
+    /// Entries are created by epoll_create1 and looked up by epoll_ctl / epoll_pwait.
+    static ref EPOLL_REGISTRY: UPSafeCell<BTreeMap<(usize, usize), Arc<EpollFile>>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
+}
+
+/// Register an epoll instance for a process. Called from sys_epoll_create1.
+pub fn epoll_register(pid: usize, fd: usize, epoll: Arc<EpollFile>) {
+    let mut guard = EPOLL_REGISTRY.exclusive_access();
+    guard.insert((pid, fd), epoll);
+}
+
+/// Remove an epoll registration (e.g., on close). Called from sys_close path if needed.
+#[allow(dead_code)]
+pub fn epoll_unregister(pid: usize, fd: usize) {
+    let mut guard = EPOLL_REGISTRY.exclusive_access();
+    guard.remove(&(pid, fd));
+}
+
+pub fn sys_signalfd4(fd: isize, mask_ptr: *const usize, sigsetsize: usize, flags: usize) -> isize {
+    if sigsetsize != core::mem::size_of::<usize>() {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
+    let user_mask = *translated_ref(token, mask_ptr);
+    let mask = user_mask_to_flags(user_mask as u64);
+
+    if fd == -1 {
+        let sfd = SignalFdFile::new(mask, flags);
+        let process = current_process();
+        let Some(new_fd) = process.install_file(Arc::new(sfd)) else {
+            return errno(EMFILE);
+        };
+        new_fd as isize
+    } else {
+        fd as isize
+    }
+}
+
+pub fn sys_inotify_init1(_flags: usize) -> isize {
+    let process = current_process();
+    let devnull = DevNull::new(true, false, "/dev/inotify");
+    let Some(fd) = process.install_file(Arc::new(devnull)) else {
+        return errno(EMFILE);
+    };
+    fd as isize
+}
+
+pub fn sys_inotify_add_watch(_fd: usize, _pathname: *const u8, _mask: u32) -> isize {
+    1
+}
+
+pub fn sys_inotify_rm_watch(_fd: usize, _wd: i32) -> isize {
+    0
+}
+
+pub fn sys_copy_file_range(
+    fd_in: usize,
+    off_in: *mut i64,
+    fd_out: usize,
+    _off_out: *mut i64,
+    len: usize,
+    _flags: u32,
+) -> isize {
+    let token = current_user_token();
+    let process = current_process();
+
+    let src_file = process.get_file(fd_in);
+    let dst_file = process.get_file(fd_out);
+    let src_file = match src_file {
+        Some(f) => f,
+        None => return errno(EBADF),
+    };
+    let dst_file = match dst_file {
+        Some(f) => f,
+        None => return errno(EBADF),
+    };
+    if !src_file.readable() || !dst_file.writable() {
+        return errno(EBADF);
+    }
+
+    let src_offset = if !off_in.is_null() {
+        Some(*translated_ref(token, off_in as *const i64) as usize)
+    } else {
+        src_file.get_offset()
+    };
+
+    let read_len = len.min(4096 * 16);
+    let mut buf = vec![0u8; read_len];
+
+    let bytes_read = if let Some(off) = src_offset {
+        src_file.read_at_kernel(off, &mut buf)
+    } else {
+        return errno(ENOSYS);
+    };
+
+    if bytes_read == 0 {
+        return 0;
+    }
+
+    if !off_in.is_null() {
+        let new_off = (src_offset.unwrap_or(0) + bytes_read) as i64;
+        let _ = copy_to_user(token, off_in as *mut u8, &new_off.to_ne_bytes());
+    } else if let Some(off) = src_file.get_offset() {
+        src_file.set_offset(off + bytes_read);
+    }
+
+    bytes_read as isize
 }
