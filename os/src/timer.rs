@@ -106,6 +106,8 @@ pub fn check_timer() {
     crate::net::poll_net_if_available();
     // Check ITIMER_REAL for all processes
     check_itimers(current_ms);
+    // Check POSIX timers (timer_create/timer_settime)
+    check_posix_timers(current_ms);
 }
 
 /// Check and fire ITIMER_REAL timers across all processes.
@@ -148,6 +150,38 @@ fn check_itimers(current_ms: usize) {
                 task.set_status(TaskStatus::Ready);
                 wakeup_task(task.clone());
                 log::info!("[itimer] pid={} woke blocked task", _pid);
+            }
+        }
+    }
+}
+
+/// Check and fire POSIX timers (timer_create / timer_settime).
+fn check_posix_timers(current_ms: usize) {
+    use crate::task::{pid2process_snapshot, wakeup_task, SignalFlags, TaskStatus};
+    use crate::syscall::posix_timers_check_expired;
+
+    let current_us = current_ms as u64 * 1000;
+    let expired_list = posix_timers_check_expired(current_us);
+
+    if expired_list.is_empty() {
+        return;
+    }
+
+    let procs = pid2process_snapshot();
+    for (pid, signo) in expired_list {
+        if let Some((_p, process)) = procs.iter().find(|(p, _)| *p == pid) {
+            let sig_flag = if signo > 0 && signo <= 64 {
+                SignalFlags::from_bits_truncate(1u64 << signo as u32)
+            } else {
+                SignalFlags::SIGALRM
+            };
+            process.insert_process_signal(sig_flag, 0i32, 0i32);
+            for task in process.tasks_snapshot() {
+                if task.status() == TaskStatus::Blocked {
+                    task.mark_interrupted();
+                    task.set_status(TaskStatus::Ready);
+                    wakeup_task(task.clone());
+                }
             }
         }
     }

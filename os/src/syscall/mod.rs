@@ -457,6 +457,11 @@ const TRACE_NAME: Option<&str> = option_env!("TRACE_NAME");
 /// Global switch for syscall tracing, useful for toggling via a debugger.
 pub static SYSCALL_TRACE_ALL: AtomicBool = AtomicBool::new(true);
 
+/// Called from timer interrupt to check expired POSIX timers.
+pub fn posix_timers_check_expired(current_us: u64) -> alloc::vec::Vec<(usize, i32)> {
+    process::posix_timers_check_expired(current_us)
+}
+
 /// Procfs helper for `/proc/sysvipc/msg`.
 pub fn proc_sysvipc_msg() -> alloc::string::String {
     ipc::proc_sysvipc_msg()

@@ -5633,6 +5633,28 @@ pub fn sys_timer_delete(timerid: usize) -> isize {
     }
 }
 
+/// Called from timer interrupt to check which POSIX timers have expired.
+/// Returns a list of (pid, sigev_signo) for timers that just fired.
+pub fn posix_timers_check_expired(current_us: u64) -> alloc::vec::Vec<(usize, i32)> {
+    let mut result = alloc::vec::Vec::new();
+    let mut timers = POSIX_TIMERS.exclusive_access();
+    for ((pid, _tid), timer) in timers.iter_mut() {
+        if timer.value_us == 0 {
+            continue;
+        }
+        if timer.value_us <= current_us {
+            result.push((*pid, timer.sigev_signo));
+            timer.overrun += 1;
+            if timer.interval_us > 0 {
+                timer.value_us = current_us + timer.interval_us;
+            } else {
+                timer.value_us = 0;
+            }
+        }
+    }
+    result
+}
+
 // ---------------------------------------------------------------------------
 // mremap
 // ---------------------------------------------------------------------------
