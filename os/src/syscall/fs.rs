@@ -6147,10 +6147,13 @@ pub fn sys_copy_file_range(
     fd_in: usize,
     off_in: *mut i64,
     fd_out: usize,
-    _off_out: *mut i64,
+    off_out: *mut i64,
     len: usize,
-    _flags: u32,
+    flags: u32,
 ) -> isize {
+    if flags != 0 {
+        return errno(EINVAL);
+    }
     let token = current_user_token();
     let process = current_process();
 
@@ -6169,12 +6172,28 @@ pub fn sys_copy_file_range(
     }
 
     let src_offset = if !off_in.is_null() {
-        Some(*translated_ref(token, off_in as *const i64) as usize)
+        let off = *translated_ref(token, off_in as *const i64);
+        if off < 0 {
+            return errno(EINVAL);
+        }
+        Some(off as usize)
     } else {
         src_file.get_offset()
     };
+    let dst_offset = if !off_out.is_null() {
+        let off = *translated_ref(token, off_out as *const i64);
+        if off < 0 {
+            return errno(EINVAL);
+        }
+        Some(off as usize)
+    } else {
+        dst_file.get_offset()
+    };
 
     let read_len = len.min(4096 * 16);
+    if read_len == 0 {
+        return 0;
+    }
     let mut buf = vec![0u8; read_len];
 
     let bytes_read = if let Some(off) = src_offset {
@@ -6187,12 +6206,46 @@ pub fn sys_copy_file_range(
         return 0;
     }
 
-    if !off_in.is_null() {
-        let new_off = (src_offset.unwrap_or(0) + bytes_read) as i64;
-        let _ = copy_to_user(token, off_in as *mut u8, &new_off.to_ne_bytes());
-    } else if let Some(off) = src_file.get_offset() {
-        src_file.set_offset(off + bytes_read);
+    let saved_dst_offset = dst_file.get_offset();
+    if let Some(off) = dst_offset {
+        dst_file.set_offset(off);
+    }
+    let write_buf = unsafe {
+        UserBuffer::new(alloc::vec![core::slice::from_raw_parts_mut(
+            buf.as_mut_ptr(),
+            bytes_read,
+        )])
+    };
+    let bytes_written = match dst_file.write_user_buffer(write_buf) {
+        Ok(n) => n,
+        Err(err) => {
+            if let (Some(saved), Some(_)) = (saved_dst_offset, dst_offset) {
+                dst_file.set_offset(saved);
+            }
+            return err;
+        }
+    };
+    if bytes_written == 0 {
+        if let (Some(saved), Some(_)) = (saved_dst_offset, dst_offset) {
+            dst_file.set_offset(saved);
+        }
+        return 0;
     }
 
-    bytes_read as isize
+    if !off_in.is_null() {
+        let new_off = (src_offset.unwrap_or(0) + bytes_written) as i64;
+        let _ = copy_to_user(token, off_in as *mut u8, &new_off.to_ne_bytes());
+    } else if let Some(off) = src_file.get_offset() {
+        src_file.set_offset(off + bytes_written);
+    }
+
+    if !off_out.is_null() {
+        let new_off = (dst_offset.unwrap_or(0) + bytes_written) as i64;
+        let _ = copy_to_user(token, off_out as *mut u8, &new_off.to_ne_bytes());
+        if let Some(saved) = saved_dst_offset {
+            dst_file.set_offset(saved);
+        }
+    }
+
+    bytes_written as isize
 }
