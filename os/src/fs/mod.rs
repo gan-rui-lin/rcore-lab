@@ -347,6 +347,7 @@ pub fn ensure_basic_paths() {
     create_dir("/usr/bin");
     create_dir("/tmp");
     create_dir("/root");
+    create_dir("/boot");
 
     // Always overwrite passwd/group to ensure all required entries are present
     // across multiple test runs on the same sdcard image.
@@ -407,6 +408,21 @@ users:x:100:\n\
     append_line_if_missing("/etc/group", "nogroup:x:65534:\n");
     write_file_if_missing("/etc/localtime", "");
     write_file_if_missing("/etc/adjtime", "");
+    // LTP tst_kconfig falls back to /boot/config-$(uname -r) when
+    // /proc/config.gz is absent. Keep this aligned with procfs osrelease.
+    write_file_overwrite(
+        "/boot/config-5.10.0",
+        "CONFIG_SYSVIPC=y\n\
+CONFIG_POSIX_TIMERS=y\n\
+CONFIG_EPOLL=y\n\
+CONFIG_EVENTFD=y\n\
+CONFIG_SIGNALFD=y\n\
+CONFIG_TIMERFD=y\n\
+CONFIG_INOTIFY_USER=y\n\
+CONFIG_PROC_FS=y\n\
+CONFIG_TMPFS=y\n\
+CONFIG_EXT4_FS=y\n",
+    );
     // NSS configuration: ensure glibc uses "files" for all relevant databases.
     write_file_if_missing(
         "/etc/nsswitch.conf",
