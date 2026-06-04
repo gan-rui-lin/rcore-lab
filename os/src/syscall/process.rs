@@ -50,8 +50,9 @@ lazy_static! {
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
     static ref POSIX_TIMERS: UPIntrFreeCell<BTreeMap<(usize, usize), PosixTimer>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
-    static ref POSIX_TIMER_NEXT_ID: UPIntrFreeCell<usize> =
-        unsafe { UPIntrFreeCell::new(0) };
+    static ref POSIX_TIMER_NEXT_ID: UPIntrFreeCell<usize> = unsafe { UPIntrFreeCell::new(0) };
+    static ref TIMEX_STATE: UPIntrFreeCell<TimexState> =
+        unsafe { UPIntrFreeCell::new(TimexState::default()) };
 }
 
 #[allow(dead_code)]
@@ -4494,6 +4495,31 @@ struct Timex {
     _pad: [u8; 128],
 }
 
+#[derive(Clone, Copy)]
+struct TimexState {
+    offset: i64,
+    freq: i64,
+    maxerror: i64,
+    esterror: i64,
+    status: i32,
+    constant: i64,
+    tick: i64,
+}
+
+impl Default for TimexState {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            freq: 0,
+            maxerror: 0,
+            esterror: 0,
+            status: 0,
+            constant: 0,
+            tick: 10000,
+        }
+    }
+}
+
 pub fn sys_adjtimex(buf: *mut u8) -> isize {
     if buf.is_null() {
         return errno(EFAULT);
@@ -4505,6 +4531,15 @@ pub fn sys_adjtimex(buf: *mut u8) -> isize {
         Err(_) => return errno(EFAULT),
     };
 
+    const ADJ_OFFSET: u32 = 0x0001;
+    const ADJ_FREQUENCY: u32 = 0x0002;
+    const ADJ_MAXERROR: u32 = 0x0004;
+    const ADJ_ESTERROR: u32 = 0x0008;
+    const ADJ_STATUS: u32 = 0x0010;
+    const ADJ_TIMECONST: u32 = 0x0020;
+    const ADJ_TICK: u32 = 0x4000;
+    const ADJ_ADJTIME: u32 = 0x8000;
+
     // Any "set" operation requires CAP_SYS_TIME (root). modes == 0 is read-only.
     if modes != 0 {
         let process = current_process();
@@ -4514,35 +4549,124 @@ pub fn sys_adjtimex(buf: *mut u8) -> isize {
     }
 
     // ADJ_ADJTIME (0x8000) without ADJ_OFFSET (0x0001) is invalid
-    if (modes & 0x8000) != 0 && (modes & 0x0001) == 0 {
+    if (modes & ADJ_ADJTIME) != 0 && (modes & ADJ_OFFSET) == 0 {
         return errno(EINVAL);
     }
 
-    // ADJ_TICK (0x4000): validate tick range [9000, 11000] µs (at HZ=100)
-    // tick is at byte offset 88 in struct timex (64-bit ABI)
-    // modes(4)+pad(4)+offset(8)+freq(8)+maxerror(8)+esterror(8)+status(4)+pad(4)+
-    // constant(8)+precision(8)+tolerance(8)+time_sec(8)+time_usec(8) = 88
+    // Field offsets in the 64-bit kernel timex ABI used by LTP.
+    const OFFSET_OFFSET: usize = 8;
+    const FREQ_OFFSET: usize = 16;
+    const MAXERROR_OFFSET: usize = 24;
+    const ESTERROR_OFFSET: usize = 32;
+    const STATUS_OFFSET: usize = 40;
+    const CONSTANT_OFFSET: usize = 48;
     const TICK_OFFSET: usize = 88;
-    const ADJ_TICK: u32 = 0x4000;
-    if (modes & ADJ_TICK) != 0 {
-        let tick_ptr = unsafe { (buf as *const u8).add(TICK_OFFSET) } as *const i64;
-        let tick = match read_from_user::<i64>(token, tick_ptr) {
+
+    let read_i64 = |offset: usize| -> Result<i64, isize> {
+        let ptr = unsafe { (buf as *const u8).add(offset) } as *const i64;
+        read_from_user::<i64>(token, ptr)
+    };
+    let read_i32 = |offset: usize| -> Result<i32, isize> {
+        let ptr = unsafe { (buf as *const u8).add(offset) } as *const i32;
+        read_from_user::<i32>(token, ptr)
+    };
+
+    let mut state = *TIMEX_STATE.exclusive_access();
+    if (modes & ADJ_OFFSET) != 0 {
+        state.offset = match read_i64(OFFSET_OFFSET) {
             Ok(v) => v,
-            Err(_) => return errno(EFAULT),
+            Err(err) => return err,
+        };
+    }
+    if (modes & ADJ_FREQUENCY) != 0 {
+        state.freq = match read_i64(FREQ_OFFSET) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+    }
+    if (modes & ADJ_MAXERROR) != 0 {
+        state.maxerror = match read_i64(MAXERROR_OFFSET) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+    }
+    if (modes & ADJ_ESTERROR) != 0 {
+        state.esterror = match read_i64(ESTERROR_OFFSET) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+    }
+    if (modes & ADJ_STATUS) != 0 {
+        state.status = match read_i32(STATUS_OFFSET) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+    }
+    if (modes & ADJ_TIMECONST) != 0 {
+        state.constant = match read_i64(CONSTANT_OFFSET) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+    }
+    if (modes & ADJ_TICK) != 0 {
+        let tick = match read_i64(TICK_OFFSET) {
+            Ok(v) => v,
+            Err(err) => return err,
         };
         // Only validate explicitly non-default tick values
         if tick != 0 && (tick < 9000 || tick > 11000) {
             return errno(EINVAL);
         }
+        if tick != 0 {
+            state.tick = tick;
+        }
     }
 
-    // Write sensible output fields so that modes=0 (read) returns current state.
-    // tick=10000 µs = 100Hz, status bits = 0 (TIME_OK).
-    let tick_ptr = unsafe { (buf as *mut u8).add(TICK_OFFSET) } as *mut i64;
-    let _ = copy_to_user(token, tick_ptr as *mut u8, &10000i64.to_ne_bytes());
+    *TIMEX_STATE.exclusive_access() = state;
+
+    let write_i64 = |offset: usize, value: i64| -> Result<(), isize> {
+        let ptr = unsafe { (buf as *mut u8).add(offset) };
+        copy_to_user(token, ptr, &value.to_ne_bytes())
+    };
+    let write_i32 = |offset: usize, value: i32| -> Result<(), isize> {
+        let ptr = unsafe { (buf as *mut u8).add(offset) };
+        copy_to_user(token, ptr, &value.to_ne_bytes())
+    };
+
+    if let Err(err) = write_i64(OFFSET_OFFSET, state.offset) {
+        return err;
+    }
+    if let Err(err) = write_i64(FREQ_OFFSET, state.freq) {
+        return err;
+    }
+    if let Err(err) = write_i64(MAXERROR_OFFSET, state.maxerror) {
+        return err;
+    }
+    if let Err(err) = write_i64(ESTERROR_OFFSET, state.esterror) {
+        return err;
+    }
+    if let Err(err) = write_i32(STATUS_OFFSET, state.status) {
+        return err;
+    }
+    if let Err(err) = write_i64(CONSTANT_OFFSET, state.constant) {
+        return err;
+    }
+    if let Err(err) = write_i64(TICK_OFFSET, state.tick) {
+        return err;
+    }
 
     // Return TIME_OK (0)
     0
+}
+
+/// clock_adjtime(clockid, buf) - share adjtimex semantics for supported clocks.
+pub fn sys_clock_adjtime(clockid: usize, buf: *mut u8) -> isize {
+    const CLOCK_REALTIME: usize = 0;
+    const CLOCK_MONOTONIC: usize = 1;
+    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
+        return errno(EINVAL);
+    }
+    sys_adjtimex(buf)
 }
 
 /// Capability header and data structs (Linux ABI)
@@ -5483,19 +5607,46 @@ struct ITimerSpec {
 
 /// timer_create(clockid_t clockid, struct sigevent *sevp, timer_t *timerid)
 pub fn sys_timer_create(clockid: usize, sevp: *const u8, timerid: *mut usize) -> isize {
+    if timerid.is_null() {
+        return errno(EFAULT);
+    }
+    const MAX_CLOCKS: usize = 16;
+    if clockid >= MAX_CLOCKS {
+        return errno(EINVAL);
+    }
     let pid = current_process().pid.0;
     let token = current_user_token();
 
-    // Read sigev_signo from sigevent if provided, otherwise default to SIGALRM (14)
-    let sigev_signo: i32 = if !sevp.is_null() {
-        // struct sigevent layout: sigev_value (8 bytes), sigev_signo (4 bytes at offset 8)
+    // struct sigevent layout on the tested 64-bit ABI:
+    // sigev_value (8 bytes), sigev_signo (4 bytes), sigev_notify (4 bytes).
+    const SIGEV_SIGNAL: i32 = 0;
+    const SIGEV_NONE: i32 = 1;
+    const SIGEV_THREAD: i32 = 2;
+    const SIGEV_THREAD_ID: i32 = 4;
+
+    let (sigev_signo, sigev_notify) = if !sevp.is_null() {
         let signo_ptr = (sevp as usize + 8) as *const i32;
-        match read_from_user::<i32>(token, signo_ptr) {
+        let notify_ptr = (sevp as usize + 12) as *const i32;
+        let signo = match read_from_user::<i32>(token, signo_ptr) {
             Ok(v) => v,
-            Err(_) => 14, // default SIGALRM
+            Err(err) => return err,
+        };
+        let notify = match read_from_user::<i32>(token, notify_ptr) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
+        match notify {
+            SIGEV_SIGNAL | SIGEV_THREAD | SIGEV_THREAD_ID
+                if signo <= 0 || signo as usize > crate::task::MAX_SIG =>
+            {
+                return errno(EINVAL);
+            }
+            SIGEV_SIGNAL | SIGEV_NONE | SIGEV_THREAD | SIGEV_THREAD_ID => {}
+            _ => return errno(EINVAL),
         }
+        (signo, notify)
     } else {
-        14 // SIGALRM
+        (14, SIGEV_SIGNAL)
     };
 
     let timer_id = {
@@ -5507,7 +5658,11 @@ pub fn sys_timer_create(clockid: usize, sevp: *const u8, timerid: *mut usize) ->
 
     let timer = PosixTimer {
         clockid,
-        sigev_signo,
+        sigev_signo: if sigev_notify == SIGEV_NONE {
+            0
+        } else {
+            sigev_signo
+        },
         value_us: 0,
         interval_us: 0,
         overrun: 0,
@@ -5517,8 +5672,9 @@ pub fn sys_timer_create(clockid: usize, sevp: *const u8, timerid: *mut usize) ->
         .exclusive_access()
         .insert((pid, timer_id), timer);
 
-    // Write timer ID back to userspace
-    let id_bytes = timer_id.to_ne_bytes();
+    // Linux timer_t is int-sized on the tested ABIs; do not overwrite the
+    // adjacent user stack slot by copying a native usize.
+    let id_bytes = (timer_id as i32).to_ne_bytes();
     if let Err(err) = copy_to_user(token, timerid as *mut u8, &id_bytes) {
         return err;
     }
@@ -5538,11 +5694,20 @@ pub fn sys_timer_settime(
 
     let key = (pid, timerid);
 
+    if new_value.is_null() {
+        return errno(EINVAL);
+    }
+
     // Read new itimerspec from userspace
     let new_spec = match read_from_user::<ITimerSpec>(token, new_value as *const ITimerSpec) {
         Ok(v) => v,
         Err(err) => return err,
     };
+
+    const NSEC_PER_SEC: usize = 1_000_000_000;
+    if new_spec.it_interval.tv_nsec >= NSEC_PER_SEC || new_spec.it_value.tv_nsec >= NSEC_PER_SEC {
+        return errno(EINVAL);
+    }
 
     let mut timers = POSIX_TIMERS.exclusive_access();
     let timer = match timers.get_mut(&key) {
