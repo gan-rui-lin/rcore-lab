@@ -53,8 +53,8 @@ pub use manager::{
     ready_queue_snapshot, remove_from_pid2process, remove_task, wakeup_task,
 };
 pub use process::{
-    ChildWaitEvent, IntervalTimerState, RLimit, RLIMIT_NLIMITS, RLIMIT_NOFILE, RLIMIT_STACK,
-    RLIM_INFINITY,
+    ChildWaitEvent, IntervalTimerState, RLimit, DEFAULT_TIMER_SLACK_NS, RLIMIT_NLIMITS,
+    RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY,
 };
 pub use processor::{
     current_kstack_top, current_process, current_task, current_task_context_for_alloc_trace,

@@ -30,6 +30,7 @@ pub const RLIMIT_NLIMITS: usize = 16;
 pub const RLIMIT_STACK: usize = 3;
 pub const RLIMIT_NOFILE: usize = 7;
 pub const RLIM_INFINITY: u64 = u64::MAX;
+pub const DEFAULT_TIMER_SLACK_NS: usize = 50_000;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -126,6 +127,8 @@ pub struct ProcessTimers {
     pub itimer_real_expire_ms: usize,
     /// ITIMER_REAL: interval for repeating timer in ms, 0 = one-shot.
     pub itimer_real_interval_ms: usize,
+    pub timer_slack_ns: usize,
+    pub default_timer_slack_ns: usize,
 }
 
 pub struct ProcessMemory {
@@ -508,6 +511,8 @@ impl ProcessControlBlock {
                     itimers: [IntervalTimerState::default(); 3],
                     itimer_real_expire_ms: 0,
                     itimer_real_interval_ms: 0,
+                    timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+                    default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
                 })
             },
             threads: unsafe {
@@ -943,6 +948,7 @@ impl ProcessControlBlock {
         info!("[fork-stage] pid={} before fd_table clone", self.pid.0);
         let parent_fs = self.fs.read().clone();
         let parent_identity = self.identity.read().clone();
+        let parent_timer_slack_ns = self.with_timers(|timers| timers.timer_slack_ns);
         let new_fd_table = parent_fs.fd_table.clone();
         info!(
             "[fork-stage] pid={} after fd_table clone new_len={}",
@@ -982,6 +988,8 @@ impl ProcessControlBlock {
                     itimers: [IntervalTimerState::default(); 3],
                     itimer_real_expire_ms: 0,
                     itimer_real_interval_ms: 0,
+                    timer_slack_ns: parent_timer_slack_ns,
+                    default_timer_slack_ns: parent_timer_slack_ns,
                 })
             },
             threads: unsafe {

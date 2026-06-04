@@ -213,6 +213,7 @@ impl VfsInode for ProcPidDirInode {
             "cgroup" => Some(ProcFileInode::new(|| String::from("0::/\n"))),
             // /proc/self/status - needed by various tests
             "status" => Some(ProcPidStatusInode::new(self.pid)),
+            "timerslack_ns" => Some(ProcPidTimerSlackInode::new(self.pid)),
             // /proc/self/fd - file descriptor directory
             "fd" => Some(ProcStaticDirInode::new(BTreeMap::new())),
             // /proc/self/cmdline
@@ -630,6 +631,77 @@ impl VfsInode for ProcPidStatusInode {
     }
 
     fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        buf.len()
+    }
+
+    fn lookup(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsInode>> {
+        None
+    }
+
+    fn truncate(&self) {}
+
+    fn list(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn size(&self) -> usize {
+        self.render().as_bytes().len()
+    }
+}
+
+struct ProcPidTimerSlackInode {
+    pid: usize,
+}
+
+impl ProcPidTimerSlackInode {
+    fn new(pid: usize) -> Arc<Self> {
+        Arc::new(Self { pid })
+    }
+
+    fn render(&self) -> String {
+        let Some(process) = pid2process(self.pid) else {
+            return String::new();
+        };
+        let value = process.with_timers(|timers| timers.timer_slack_ns);
+        format!("{value}\n")
+    }
+}
+
+impl VfsInode for ProcPidTimerSlackInode {
+    fn kind(&self) -> VfsNodeKind {
+        VfsNodeKind::File
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let content = self.render();
+        let bytes = content.as_bytes();
+        if offset >= bytes.len() {
+            return 0;
+        }
+        let n = core::cmp::min(buf.len(), bytes.len() - offset);
+        buf[..n].copy_from_slice(&bytes[offset..offset + n]);
+        n
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        let Some(process) = pid2process(self.pid) else {
+            return buf.len();
+        };
+        if let Ok(raw) = core::str::from_utf8(buf) {
+            if let Ok(value) = raw.trim().parse::<usize>() {
+                process.with_timers_mut(|timers| {
+                    timers.timer_slack_ns = if value == 0 {
+                        timers.default_timer_slack_ns
+                    } else {
+                        value
+                    };
+                });
+            }
+        }
         buf.len()
     }
 

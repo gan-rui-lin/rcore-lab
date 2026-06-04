@@ -4796,6 +4796,8 @@ pub fn sys_prctl(option: usize, arg2: usize, arg3: usize, _arg4: usize, _arg5: u
     const PR_CAPBSET_READ: usize = 23;
     const PR_CAPBSET_DROP: usize = 24;
     const PR_SET_SECUREBITS: usize = 28;
+    const PR_SET_TIMERSLACK: usize = 29;
+    const PR_GET_TIMERSLACK: usize = 30;
     const PR_SET_SECCOMP: usize = 22;
     const PR_GET_SECCOMP: usize = 21;
     const SECCOMP_MODE_FILTER: usize = 2;
@@ -4880,6 +4882,21 @@ pub fn sys_prctl(option: usize, arg2: usize, arg3: usize, _arg4: usize, _arg5: u
                 return errno(EPERM);
             }
             0
+        }
+        PR_SET_TIMERSLACK => {
+            let process = current_process();
+            process.with_timers_mut(|timers| {
+                if arg2 == 0 {
+                    timers.timer_slack_ns = timers.default_timer_slack_ns;
+                } else {
+                    timers.timer_slack_ns = arg2;
+                }
+            });
+            0
+        }
+        PR_GET_TIMERSLACK => {
+            let process = current_process();
+            process.with_timers(|timers| timers.timer_slack_ns as isize)
         }
         PR_SET_TIMING => errno(EINVAL),
         PR_SET_NAME => {
