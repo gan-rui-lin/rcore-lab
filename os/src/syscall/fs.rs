@@ -1456,9 +1456,24 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
     if create_dir(&full_path) {
         let creds = current_process().credentials_snapshot();
         let uid = creds.effective_uid;
-        let gid = creds.effective_gid;
+        let parent_metadata = metadata_for_path(&parent);
+        let inherit_sgid = parent_metadata
+            .map(|metadata| (metadata.mode & 0o2000) != 0)
+            .unwrap_or(false);
+        let gid = if inherit_sgid {
+            parent_metadata
+                .map(|metadata| metadata.gid)
+                .unwrap_or(creds.effective_gid)
+        } else {
+            creds.effective_gid
+        };
+        let mode = if inherit_sgid {
+            apply_umask(_mode) | 0o2000
+        } else {
+            apply_umask(_mode)
+        };
         if let Some(inode) = inode_for_path(&full_path) {
-            let _ = inode.chmod(apply_umask(_mode));
+            let _ = inode.chmod(mode);
             let _ = inode.chown(Some(uid), Some(gid));
         }
         0
