@@ -1,7 +1,10 @@
 //! File trait & inode(dir, file, pipe, stdin, stdout)
 
+mod epoll;
+mod eventfd;
 mod memfd;
 mod pipe;
+mod signalfd;
 mod stdio;
 pub mod timerfd;
 mod vfs;
@@ -313,6 +316,9 @@ bitflags::bitflags! {
     }
 }
 
+pub(crate) use epoll::EpollFile;
+pub(crate) use eventfd::{EventFdFile, EVENTFD_EAGAIN};
+pub(crate) use signalfd::{SignalFdFile, SIGNALFD_EAGAIN};
 pub use memfd::MemFdFile;
 pub use pipe::make_pipe;
 pub use stdio::{DevNull, DevUrandom, DevZero, Stdin, Stdout};

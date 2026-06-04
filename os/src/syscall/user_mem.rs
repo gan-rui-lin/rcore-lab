@@ -503,11 +503,6 @@ fn legacy_fork_write_fallback(
     ptr: *const u8,
     len: usize,
 ) -> Option<Vec<&'static mut [u8]>> {
-    let process = current_process();
-    let proc_name = process.name();
-    if !proc_name.starts_with("fork") {
-        return None;
-    }
     if !is_user_read_mapped(token, ptr, len) {
         return None;
     }

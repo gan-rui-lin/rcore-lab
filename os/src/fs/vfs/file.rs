@@ -54,6 +54,7 @@ impl VfsFile {
         self.inode.read_at(offset, buf)
     }
 
+    #[allow(dead_code)]
     pub fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
         self.inode.write_at(offset, buf)
     }
