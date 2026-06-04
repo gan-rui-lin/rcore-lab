@@ -51,6 +51,7 @@ pub const IPC_STAT: i32 = 2; // Get options
 pub const IPC_INFO: i32 = 3; // Get info
 pub const MSG_STAT: i32 = 11;
 pub const MSG_INFO: i32 = 12;
+pub const MSG_STAT_ANY: i32 = 13;
 pub const SHM_LOCK: i32 = 11;
 pub const SHM_UNLOCK: i32 = 12;
 pub const SHM_STAT: i32 = 13;
@@ -813,6 +814,21 @@ impl IpcManager {
 
     pub fn remove_msgq(&mut self, id: IpcId) -> bool {
         self.message_queues.remove(&id).is_some()
+    }
+
+    pub fn msgq_by_index(&self, index: usize) -> Option<(IpcId, Arc<Mutex<MessageQueue>>)> {
+        self.message_queues
+            .iter()
+            .nth(index)
+            .map(|(id, msgq)| (*id, msgq.clone()))
+    }
+
+    pub fn highest_msgq_index(&self) -> isize {
+        if self.message_queues.is_empty() {
+            0
+        } else {
+            self.message_queues.len() as isize - 1
+        }
     }
 
     pub fn create_shm(
@@ -1921,14 +1937,32 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, _buf: usize) -> isize {
             if _buf == 0 {
                 return errno(EFAULT);
             }
+            let (used_queues, used_messages, used_bytes) = manager
+                .message_queues
+                .values()
+                .map(|msgq| {
+                    let q = msgq.lock();
+                    (1, q.messages.len() as i32, q.total_bytes as i32)
+                })
+                .fold((0, 0, 0), |acc, item| {
+                    (acc.0 + item.0, acc.1 + item.1, acc.2 + item.2)
+                });
             let info = MsgInfoUser {
-                msgpool: MSGMNB as i32,
-                msgmap: msgmni_limit() as i32,
+                msgpool: if cmd == MSG_INFO {
+                    used_queues
+                } else {
+                    MSGMNB as i32
+                },
+                msgmap: if cmd == MSG_INFO {
+                    used_messages
+                } else {
+                    msgmni_limit() as i32
+                },
                 msgmax: MSGMAX as i32,
                 msgmnb: MSGMNB as i32,
                 msgmni: msgmni_limit() as i32,
                 msgssz: 0,
-                msgtql: 0,
+                msgtql: if cmd == MSG_INFO { used_bytes } else { 0 },
                 msgseg: 0,
             };
             let token = current_user_token();
@@ -1948,24 +1982,35 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, _buf: usize) -> isize {
             {
                 return errno(EFAULT);
             }
-            manager
-                .message_queues
-                .keys()
-                .next_back()
-                .copied()
-                .unwrap_or(0) as isize
+            if cmd == MSG_INFO {
+                manager.highest_msgq_index()
+            } else {
+                manager
+                    .message_queues
+                    .keys()
+                    .next_back()
+                    .copied()
+                    .unwrap_or(0) as isize
+            }
         }
-        MSG_STAT => {
+        MSG_STAT | MSG_STAT_ANY => {
             if _buf == 0 {
                 return errno(EFAULT);
             }
-            let Some(msgq) = manager.get_msgq(msqid) else {
+            let msgq_by_index = if msqid >= 0 {
+                manager.msgq_by_index(msqid as usize)
+            } else {
+                None
+            };
+            let Some((real_msqid, msgq)) =
+                msgq_by_index.or_else(|| manager.get_msgq(msqid).map(|msgq| (msqid, msgq)))
+            else {
                 return errno(EINVAL);
             };
             drop(manager);
             let ds = {
                 let q = msgq.lock();
-                if !is_super && !q.has_access(euid, egid, 0o4) {
+                if cmd == MSG_STAT && !is_super && !q.has_access(euid, egid, 0o4) {
                     return errno(EACCES);
                 }
                 msgq_to_user_ds(&q)
@@ -1987,7 +2032,7 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, _buf: usize) -> isize {
             {
                 return errno(EFAULT);
             }
-            msqid as isize
+            real_msqid as isize
         }
         _ => errno(EINVAL),
     }
