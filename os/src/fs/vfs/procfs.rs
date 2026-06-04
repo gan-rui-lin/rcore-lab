@@ -1024,6 +1024,10 @@ pub(in crate::fs::vfs) fn procfs_root() -> Arc<dyn VfsInode> {
     entries.insert(String::from("stat"), ProcFileInode::new(proc_stat));
     entries.insert(String::from("uptime"), ProcFileInode::new(proc_uptime));
     entries.insert(String::from("cpuinfo"), ProcFileInode::new(proc_cpuinfo));
+    entries.insert(
+        String::from("version"),
+        ProcFileInode::new(|| String::from("Linux version 5.10.0 (rcore-lab)\n")),
+    );
     // /proc/cmdline — tst_kconfig.c tries to open this
     entries.insert(
         String::from("cmdline"),

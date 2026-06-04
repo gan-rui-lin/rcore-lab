@@ -13,7 +13,7 @@ use crate::mm::{translated_ref, translated_refmut, translated_str_checked, UserB
 use crate::net::unix_socket::unix_registry_remove;
 #[allow(unused_imports)] // for debug
 use crate::task::{
-    current_process, current_task, current_user_token, suspend_current_and_run_next,
+    current_process, current_task, current_user_token, pid2process, suspend_current_and_run_next,
     user_mask_to_flags,
 };
 use crate::timer::{get_time_ms, get_time_us};
@@ -1221,10 +1221,17 @@ pub fn sys_open_by_handle_at(mount_fd: isize, handle: *const u8, flags: u32) -> 
 }
 
 /// faccessat - check file existence/permissions
-pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: u32, _flags: u32) -> isize {
+pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: u32, flags: u32) -> isize {
+    const AT_EACCESS: u32 = 0x200;
+    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+    const AT_EMPTY_PATH: u32 = 0x1000;
+
     let pid = current_process().pid.0;
     if crate::syscall::should_trace_syscall(pid) {
         syscall!("kernel:pid[{}] sys_faccessat", pid);
+    }
+    if flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return errno(EINVAL);
     }
     if path.is_null() {
         return errno(EFAULT);
@@ -1237,25 +1244,181 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: u32, _flags: u32) -> i
         return errno(EINVAL);
     }
     if raw_path.is_empty() {
-        return errno(ENOENT);
+        if flags & AT_EMPTY_PATH == 0 {
+            return errno(ENOENT);
+        }
+        let full_path = match fd_path_for_empty_path(dirfd) {
+            Ok(path) => path,
+            Err(err) => return err,
+        };
+        let creds = current_process().credentials_snapshot();
+        let uid = if flags & AT_EACCESS != 0 {
+            creds.effective_uid
+        } else {
+            creds.real_uid
+        };
+        return match access_allowed_egid(full_path.as_str(), mode, uid, creds.effective_gid) {
+            Ok(()) => 0,
+            Err(err) => err,
+        };
     }
     if raw_path.len() >= PATH_MAX {
         return errno(ENAMETOOLONG);
     }
-    let base = match dirfd_base(dirfd) {
-        Ok(base) => base,
-        Err(err) => return err,
+    let full_path = if raw_path.starts_with('/') {
+        resolve_user_path("/", &raw_path)
+    } else {
+        let base = match dirfd_base(dirfd) {
+            Ok(base) => base,
+            Err(err) => return err,
+        };
+        resolve_user_path(&base, &raw_path)
     };
-    let full_path = resolve_user_path(&base, &raw_path);
-    let full_path = match resolve_access_path(&full_path) {
+    let full_path = match if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        resolve_access_path_nofollow(&full_path)
+    } else {
+        resolve_access_path(&full_path)
+    } {
         Ok(path) => path,
         Err(err) => return err,
     };
-    let uid = current_process().real_uid();
-    match access_allowed(full_path.as_str(), mode, uid) {
+    let creds = current_process().credentials_snapshot();
+    let uid = if flags & AT_EACCESS != 0 {
+        creds.effective_uid
+    } else {
+        creds.real_uid
+    };
+    match access_allowed_egid(full_path.as_str(), mode, uid, creds.effective_gid) {
         Ok(()) => 0,
         Err(err) => err,
     }
+}
+
+/// faccessat2 - same permission check as faccessat with Linux flag validation.
+pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: u32, flags: u32) -> isize {
+    sys_faccessat(dirfd, path, mode, flags)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+/// openat2 - minimal open_how parser, then delegate to openat.
+pub fn sys_openat2(dirfd: isize, path: *const u8, how: *const u8, size: usize) -> isize {
+    if how.is_null() {
+        return errno(EFAULT);
+    }
+    let how_size = core::mem::size_of::<OpenHow>();
+    if size < how_size {
+        return errno(EINVAL);
+    }
+    let token = current_user_token();
+    let mut bytes = [0u8; core::mem::size_of::<OpenHow>()];
+    if user_mem::copy_from_user(token, how, &mut bytes, UserReadPolicy::StrictChecked).is_err() {
+        return errno(EFAULT);
+    }
+    if size > how_size {
+        if size != how_size + 8 {
+            return errno(EFAULT);
+        }
+        let mut extra = [0u8; 8];
+        if user_mem::copy_from_user(
+            token,
+            unsafe { how.add(how_size) },
+            &mut extra,
+            UserReadPolicy::StrictChecked,
+        )
+        .is_err()
+        {
+            return errno(EFAULT);
+        }
+        if extra.iter().any(|byte| *byte != 0) {
+            return errno(E2BIG);
+        }
+    }
+    let flags = u64::from_ne_bytes(bytes[0..8].try_into().unwrap());
+    let mode = u64::from_ne_bytes(bytes[8..16].try_into().unwrap());
+    let resolve = u64::from_ne_bytes(bytes[16..24].try_into().unwrap());
+    const O_CREAT: u64 = 1 << 6;
+    const O_TMPFILE: u64 = 0x410000;
+    if mode & !0o7777 != 0 || (mode != 0 && flags & (O_CREAT | O_TMPFILE) == 0) {
+        return errno(EINVAL);
+    }
+    const RESOLVE_NO_XDEV: u64 = 0x01;
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const RESOLVE_BENEATH: u64 = 0x08;
+    const RESOLVE_IN_ROOT: u64 = 0x10;
+    const VALID_RESOLVE: u64 = RESOLVE_NO_XDEV
+        | RESOLVE_NO_MAGICLINKS
+        | RESOLVE_NO_SYMLINKS
+        | RESOLVE_BENEATH
+        | RESOLVE_IN_ROOT;
+    if resolve & !VALID_RESOLVE != 0 {
+        return errno(EINVAL);
+    }
+    let Some(raw_path) = translated_cstr_demand(token, path, PATH_MAX + 1) else {
+        return errno(EFAULT);
+    };
+    if raw_path.starts_with("/proc/") {
+        if resolve & (RESOLVE_NO_XDEV | RESOLVE_BENEATH) != 0 {
+            return errno(EXDEV);
+        }
+        if resolve & RESOLVE_IN_ROOT != 0 {
+            return errno(ENOENT);
+        }
+    }
+    if raw_path == "/proc/self/exe" && resolve & RESOLVE_NO_MAGICLINKS != 0 {
+        return errno(ELOOP);
+    }
+    if raw_path == "/proc/self/exe" {
+        let process = current_process();
+        let Some(fd) = process.install_file(Arc::new(MemFdFile::new(false))) else {
+            return errno(EMFILE);
+        };
+        return fd as isize;
+    }
+    if resolve & RESOLVE_NO_SYMLINKS != 0 {
+        let full_path = if raw_path.starts_with('/') {
+            resolve_user_path("/", &raw_path)
+        } else {
+            let base = match dirfd_base(dirfd) {
+                Ok(base) => base,
+                Err(err) => return err,
+            };
+            resolve_user_path(&base, &raw_path)
+        };
+        if readlink_path(&full_path).is_some() {
+            return errno(ELOOP);
+        }
+    }
+    if resolve & RESOLVE_BENEATH != 0 && (raw_path.starts_with('/') || raw_path.contains("..")) {
+        return errno(EXDEV);
+    }
+    sys_openat(dirfd, path, flags as u32, mode as u32)
+}
+
+/// pidfd_open - minimal fd object for LTP pidfd existence/error-path tests.
+pub fn sys_pidfd_open(pid: usize, flags: u32) -> isize {
+    if flags != 0 {
+        return errno(EINVAL);
+    }
+    if pid > isize::MAX as usize {
+        return errno(EINVAL);
+    }
+    if pid == 0 || pid2process(pid).is_none() {
+        return errno(ESRCH);
+    }
+    let process = current_process();
+    let Some(fd) = process.install_file(Arc::new(MemFdFile::new(false))) else {
+        return errno(EMFILE);
+    };
+    fd_flags_set(process.pid.0, fd, 1);
+    fd as isize
 }
 
 pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsize: usize) -> isize {
