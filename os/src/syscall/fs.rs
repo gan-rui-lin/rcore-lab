@@ -3021,8 +3021,10 @@ pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> isize {
         const S_IFMT: u32 = 0o170000;
         const S_IFIFO: u32 = 0o010000;
         const S_IFSOCK: u32 = 0o140000;
-        let node_type = effective_path_mode(path) & S_IFMT;
-        if matches!(node_type, S_IFIFO | S_IFSOCK) {
+        if matches!(
+            metadata_for_path(path).map(|metadata| metadata.mode & S_IFMT),
+            Some(S_IFIFO | S_IFSOCK)
+        ) {
             return errno(ESPIPE);
         }
     }
