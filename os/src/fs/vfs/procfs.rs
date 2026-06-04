@@ -796,6 +796,10 @@ fn proc_sys_kernel() -> Arc<dyn VfsInode> {
         String::from("shmall"),
         ProcFileInode::new(crate::syscall::proc_kernel_shmall),
     );
+    entries.insert(
+        String::from("sem"),
+        ProcFileInode::new(crate::syscall::proc_kernel_sem),
+    );
     // /proc/sys/kernel/ostype and /proc/sys/kernel/osrelease.
     entries.insert(
         String::from("ostype"),

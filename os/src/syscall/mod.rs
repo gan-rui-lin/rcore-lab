@@ -505,6 +505,11 @@ pub fn proc_kernel_shmall() -> alloc::string::String {
     ipc::proc_kernel_shmall()
 }
 
+/// Procfs helper for `/proc/sys/kernel/sem`.
+pub fn proc_kernel_sem() -> alloc::string::String {
+    ipc::proc_kernel_sem()
+}
+
 /// Procfs writer for `/proc/sys/kernel/msgmni`.
 pub fn set_msgmni_from_proc_write(buf: &[u8]) -> usize {
     ipc::set_msgmni_from_proc_write(buf)

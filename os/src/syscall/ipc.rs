@@ -1005,6 +1005,10 @@ pub fn proc_kernel_shmall() -> String {
     alloc::format!("{}\n", SHMALL)
 }
 
+pub fn proc_kernel_sem() -> String {
+    alloc::format!("{} {} {} {}\n", SEMMSL, SEMMNI * SEMMSL, SEMOPM, SEMMNI)
+}
+
 pub fn set_msgmni_from_proc_write(buf: &[u8]) -> usize {
     let Ok(raw) = core::str::from_utf8(buf) else {
         return buf.len();
@@ -1135,7 +1139,7 @@ fn sem_info_user(sets: usize, total_sems: usize) -> SemInfoUser {
         semume: SEMOPM as i32,
         semusz: sets as i32,
         semvmx: SEMVMX,
-        semaem: SEMVMX,
+        semaem: total_sems as i32,
     }
 }
 
@@ -1328,7 +1332,14 @@ pub fn sys_semctl(semid: i32, semnum: usize, cmd: i32, arg: usize) -> isize {
     }
 
     let (real_semid, sem) = if cmd == SEM_STAT || cmd == SEM_STAT_ANY {
-        let Some((id, sem)) = manager.sem_by_index(semid as usize) else {
+        let sem_by_index = if semid >= 0 {
+            manager.sem_by_index(semid as usize)
+        } else {
+            None
+        };
+        let Some((id, sem)) =
+            sem_by_index.or_else(|| manager.get_sem(semid).map(|sem| (semid, sem)))
+        else {
             return errno(EINVAL);
         };
         (id, sem)
