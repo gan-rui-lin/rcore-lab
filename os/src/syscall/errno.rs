@@ -34,6 +34,7 @@ pub const ENOSYS: isize = 38;
 pub const ENOTEMPTY: isize = 39;
 pub const ELOOP: isize = 40;
 pub const ENOMSG: isize = 42;
+pub const EIDRM: isize = 43;
 pub const ENODATA: isize = 61;
 pub const EOVERFLOW: isize = 75;
 pub const ENOTSUP: isize = 95;

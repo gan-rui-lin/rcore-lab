@@ -930,6 +930,10 @@ fn proc_sysvipc() -> Arc<dyn VfsInode> {
         String::from("shm"),
         ProcFileInode::new(crate::syscall::proc_sysvipc_shm),
     );
+    entries.insert(
+        String::from("sem"),
+        ProcFileInode::new(crate::syscall::proc_sysvipc_sem),
+    );
     ProcStaticDirInode::new(entries)
 }
 

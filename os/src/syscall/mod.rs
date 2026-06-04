@@ -158,11 +158,15 @@ const SYSCALL_MEMFD_CREATE: usize = 279;
 const SYSCALL_NAME_TO_HANDLE_AT: usize = 264;
 /// open_by_handle_at syscall
 const SYSCALL_OPEN_BY_HANDLE_AT: usize = 265;
+const SYSCALL_CLOCK_ADJTIME: usize = 266;
 const SYSCALL_INOTIFY_INIT1: usize = 26;
 const SYSCALL_INOTIFY_ADD_WATCH: usize = 27;
 const SYSCALL_INOTIFY_RM_WATCH: usize = 28;
 const SYSCALL_SIGNALFD4: usize = 74;
 const SYSCALL_COPY_FILE_RANGE: usize = 285;
+const SYSCALL_PIDFD_OPEN: usize = 434;
+const SYSCALL_OPENAT2: usize = 437;
+const SYSCALL_FACCESSAT2: usize = 439;
 /// exit syscall
 const SYSCALL_EXIT: usize = 93;
 /// exit_group syscall
@@ -344,6 +348,10 @@ const SYSCALL_MSGCTL: usize = 187;
 const SYSCALL_MSGRCV: usize = 188;
 /// msgsnd syscall
 const SYSCALL_MSGSND: usize = 189;
+const SYSCALL_SEMGET: usize = 190;
+const SYSCALL_SEMCTL: usize = 191;
+const SYSCALL_SEMTIMEDOP: usize = 192;
+const SYSCALL_SEMOP: usize = 193;
 /// shmget syscall
 const SYSCALL_SHMGET: usize = 194;
 /// shmctl syscall
@@ -470,6 +478,11 @@ pub fn proc_sysvipc_msg() -> alloc::string::String {
 /// Procfs helper for `/proc/sysvipc/shm`.
 pub fn proc_sysvipc_shm() -> alloc::string::String {
     ipc::proc_sysvipc_shm()
+}
+
+/// Procfs helper for `/proc/sysvipc/sem`.
+pub fn proc_sysvipc_sem() -> alloc::string::String {
+    ipc::proc_sysvipc_sem()
 }
 
 /// Procfs helper for `/proc/sys/kernel/msgmni`.
@@ -895,12 +908,25 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as u32,
             args[3] as u32,
         ),
+        SYSCALL_FACCESSAT2 => sys_faccessat2(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as u32,
+            args[3] as u32,
+        ),
         SYSCALL_OPENAT => sys_openat(
             args[0] as isize,
             args[1] as *const u8,
             args[2] as u32,
             args[3] as u32,
         ),
+        SYSCALL_OPENAT2 => sys_openat2(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+        ),
+        SYSCALL_PIDFD_OPEN => sys_pidfd_open(args[0], args[1] as u32),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_CLOSE => sys_close(args[0]),
         SYSCALL_CLOSE_RANGE => sys_close_range(args[0], args[1], args[2] as u32),
@@ -1195,6 +1221,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4] as i32,
         ),
         SYSCALL_MSGCTL => sys_msgctl(args[0] as i32, args[1] as i32, args[2]),
+        SYSCALL_SEMGET => sys_semget(args[0] as i32, args[1], args[2] as i32),
+        SYSCALL_SEMCTL => sys_semctl(args[0] as i32, args[1], args[2] as i32, args[3]),
+        SYSCALL_SEMTIMEDOP => sys_semtimedop(args[0] as i32, args[1], args[2], args[3]),
+        SYSCALL_SEMOP => sys_semop(args[0] as i32, args[1], args[2]),
         SYSCALL_SHMGET => sys_shmget(args[0] as i32, args[1], args[2] as i32),
         SYSCALL_SHMAT => sys_shmat(args[0] as i32, args[1], args[2] as i32),
         SYSCALL_SHMDT => sys_shmdt(args[0]),
@@ -1251,6 +1281,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         }
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_ADJTIMEX => process::sys_adjtimex(args[0] as *mut u8),
+        SYSCALL_CLOCK_ADJTIME => process::sys_clock_adjtime(args[0], args[1] as *mut u8),
         SYSCALL_PRCTL => process::sys_prctl(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_SETHOSTNAME => process::sys_sethostname(args[0] as *const u8, args[1]),

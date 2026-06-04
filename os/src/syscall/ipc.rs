@@ -14,12 +14,15 @@ use super::user_mem::{self, UserReadPolicy, UserWritePolicy};
 use crate::{
     config::PAGE_SIZE,
     mm::{frame_alloc, FrameTracker, MapPermission, VirtAddr},
-    task::{current_process, current_user_token},
+    task::{
+        block_current_and_run_next, current_process, current_task, current_user_token, wakeup_task,
+        TaskControlBlock,
+    },
     timer::get_time_us,
 };
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
@@ -55,6 +58,17 @@ pub const SHM_INFO: i32 = 14;
 pub const SHM_STAT_ANY: i32 = 15;
 pub const SHM_DEST: u32 = 0o1000;
 pub const SHM_LOCKED: u32 = 0o2000;
+pub const GETPID: i32 = 11;
+pub const GETVAL: i32 = 12;
+pub const GETALL: i32 = 13;
+pub const GETNCNT: i32 = 14;
+pub const GETZCNT: i32 = 15;
+pub const SETVAL: i32 = 16;
+pub const SETALL: i32 = 17;
+pub const SEM_STAT: i32 = 18;
+pub const SEM_INFO: i32 = 19;
+pub const SEM_STAT_ANY: i32 = 20;
+pub const SEM_UNDO: i16 = 0x1000;
 
 /// Message queue limits
 const MSGMAX: usize = 8192; // Max message size
@@ -69,6 +83,19 @@ const SHMMIN: usize = 1; // Min segment size
 const SHMMNI: usize = 128; // Max number of segments
 const SHMSEG: usize = 128; // Max segments per process
 const SHMALL: usize = (SHMMAX / PAGE_SIZE) * SHMMNI;
+
+const SEMMNI: usize = 128;
+const SEMMSL: usize = 32000;
+const SEMOPM: usize = 500;
+const SEMVMX: i32 = 32767;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SembufUser {
+    sem_num: u16,
+    sem_op: i16,
+    sem_flg: i16,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -173,6 +200,30 @@ struct ShmInfoUser {
     swap_successes: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SemidDsUser {
+    sem_perm: IpcPermUser,
+    sem_otime: i64,
+    sem_ctime: i64,
+    sem_nsems: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SemInfoUser {
+    semmap: i32,
+    semmni: i32,
+    semmns: i32,
+    semmnu: i32,
+    semmsl: i32,
+    semopm: i32,
+    semume: i32,
+    semusz: i32,
+    semvmx: i32,
+    semaem: i32,
+}
+
 fn current_ipc_identity() -> (u32, u32, usize, bool) {
     let process = current_process();
     let pid = process.pid.0;
@@ -264,6 +315,23 @@ fn make_shm_perm_user(shm: &ShmSegment) -> IpcPermUser {
     }
 }
 
+#[cfg(target_arch = "loongarch64")]
+fn make_sem_perm_user(sem: &SemaphoreSet) -> IpcPermUser {
+    IpcPermUser {
+        key: sem.key,
+        uid: sem.uid,
+        gid: sem.gid,
+        cuid: sem.cuid,
+        cgid: sem.cgid,
+        mode: (sem.permissions & 0o777) as u32,
+        seq: 0,
+        pad2: 0,
+        pad3: 0,
+        unused1: 0,
+        unused2: 0,
+    }
+}
+
 #[cfg(not(target_arch = "loongarch64"))]
 fn make_shm_perm_user(shm: &ShmSegment) -> IpcPermUser {
     IpcPermUser {
@@ -290,6 +358,23 @@ fn make_ipc_perm_user(msgq: &MessageQueue) -> IpcPermUser {
         cuid: msgq.cuid,
         cgid: msgq.cgid,
         mode: (msgq.permissions & 0o777) as u16,
+        pad1: 0,
+        seq: 0,
+        pad2: 0,
+        unused1: 0,
+        unused2: 0,
+    }
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn make_sem_perm_user(sem: &SemaphoreSet) -> IpcPermUser {
+    IpcPermUser {
+        key: sem.key,
+        uid: sem.uid,
+        gid: sem.gid,
+        cuid: sem.cuid,
+        cgid: sem.cgid,
+        mode: (sem.permissions & 0o777) as u16,
         pad1: 0,
         seq: 0,
         pad2: 0,
@@ -564,13 +649,116 @@ impl ShmSegment {
     }
 }
 
+struct SemWaiter {
+    task: Weak<TaskControlBlock>,
+    sem_num: usize,
+    wait_zero: bool,
+}
+
+/// System V semaphore set.
+pub struct SemaphoreSet {
+    pub key: IpcKey,
+    pub id: IpcId,
+    pub permissions: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub cuid: u32,
+    pub cgid: u32,
+    pub ctime: i64,
+    pub otime: i64,
+    pub values: Vec<i32>,
+    pub last_pid: Vec<i32>,
+    waiters: VecDeque<SemWaiter>,
+    removed: bool,
+}
+
+impl SemaphoreSet {
+    pub fn new(
+        key: IpcKey,
+        id: IpcId,
+        nsems: usize,
+        permissions: u32,
+        uid: u32,
+        gid: u32,
+        now_sec: i64,
+    ) -> Self {
+        Self {
+            key,
+            id,
+            permissions,
+            uid,
+            gid,
+            cuid: uid,
+            cgid: gid,
+            ctime: now_sec,
+            otime: 0,
+            values: alloc::vec![0; nsems],
+            last_pid: alloc::vec![0; nsems],
+            waiters: VecDeque::new(),
+            removed: false,
+        }
+    }
+
+    pub fn access_bits_for(&self, uid: u32, gid: u32) -> u16 {
+        if uid == self.uid || uid == self.cuid {
+            ((self.permissions >> 6) & 0o7) as u16
+        } else if gid == self.gid || gid == self.cgid {
+            ((self.permissions >> 3) & 0o7) as u16
+        } else {
+            (self.permissions & 0o7) as u16
+        }
+    }
+
+    pub fn has_access(&self, uid: u32, gid: u32, req: u16) -> bool {
+        if req == 0 {
+            return true;
+        }
+        let granted = self.access_bits_for(uid, gid);
+        (granted & req) == req
+    }
+
+    pub fn can_ctl(&self, uid: u32) -> bool {
+        uid == self.uid || uid == self.cuid
+    }
+
+    fn to_user_ds(&self) -> SemidDsUser {
+        SemidDsUser {
+            sem_perm: make_sem_perm_user(self),
+            sem_otime: self.otime,
+            sem_ctime: self.ctime,
+            sem_nsems: self.values.len(),
+        }
+    }
+
+    fn waiter_count(&self, sem_num: usize, wait_zero: bool) -> isize {
+        self.waiters
+            .iter()
+            .filter(|w| w.sem_num == sem_num && w.wait_zero == wait_zero)
+            .count() as isize
+    }
+
+    fn wake_waiters(&mut self) {
+        let mut to_wake = Vec::new();
+        while let Some(waiter) = self.waiters.pop_front() {
+            if let Some(task) = waiter.task.upgrade() {
+                to_wake.push(task);
+            }
+        }
+        for task in to_wake {
+            wakeup_task(task);
+        }
+    }
+}
+
 /// Global IPC resource manager
 pub struct IpcManager {
     message_queues: BTreeMap<IpcId, Arc<Mutex<MessageQueue>>>,
     shm_segments: BTreeMap<IpcId, Arc<Mutex<ShmSegment>>>,
     shm_attachments: BTreeMap<(usize, usize), (IpcId, usize)>,
+    sem_sets: BTreeMap<IpcId, Arc<Mutex<SemaphoreSet>>>,
     next_msgid: IpcId,
     next_shmid: IpcId,
+    next_semid: IpcId,
 }
 
 impl IpcManager {
@@ -579,8 +767,10 @@ impl IpcManager {
             message_queues: BTreeMap::new(),
             shm_segments: BTreeMap::new(),
             shm_attachments: BTreeMap::new(),
+            sem_sets: BTreeMap::new(),
             next_msgid: 1,
             next_shmid: 1,
+            next_semid: 1,
         }
     }
 
@@ -720,6 +910,71 @@ impl IpcManager {
             }
         }
     }
+
+    pub fn create_sem(
+        &mut self,
+        key: IpcKey,
+        nsems: usize,
+        permissions: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<IpcId, isize> {
+        if self.sem_sets.len() >= SEMMNI {
+            return Err(errno(ENOSPC));
+        }
+        let id = self.next_semid;
+        self.next_semid += 1;
+        let sem = Arc::new(Mutex::new(SemaphoreSet::new(
+            key,
+            id,
+            nsems,
+            permissions,
+            uid,
+            gid,
+            now_epoch_sec(),
+        )));
+        self.sem_sets.insert(id, sem);
+        Ok(id)
+    }
+
+    pub fn get_sem(&self, id: IpcId) -> Option<Arc<Mutex<SemaphoreSet>>> {
+        self.sem_sets.get(&id).cloned()
+    }
+
+    pub fn find_sem_by_key(&self, key: IpcKey) -> Option<(IpcId, Arc<Mutex<SemaphoreSet>>)> {
+        for (id, sem) in self.sem_sets.iter() {
+            if sem.lock().key == key {
+                return Some((*id, sem.clone()));
+            }
+        }
+        None
+    }
+
+    pub fn remove_sem(&mut self, id: IpcId) -> bool {
+        if let Some(sem) = self.sem_sets.remove(&id) {
+            let mut sem = sem.lock();
+            sem.removed = true;
+            sem.wake_waiters();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn sem_by_index(&self, index: usize) -> Option<(IpcId, Arc<Mutex<SemaphoreSet>>)> {
+        self.sem_sets
+            .iter()
+            .nth(index)
+            .map(|(id, sem)| (*id, sem.clone()))
+    }
+
+    pub fn highest_sem_index(&self) -> isize {
+        if self.sem_sets.is_empty() {
+            0
+        } else {
+            self.sem_sets.len() as isize - 1
+        }
+    }
 }
 
 #[inline]
@@ -835,6 +1090,504 @@ pub fn proc_sysvipc_msg() -> String {
         );
     }
     out
+}
+
+/// Render `/proc/sysvipc/sem` in a Linux-compatible tabular layout.
+pub fn proc_sysvipc_sem() -> String {
+    let sets: Vec<Arc<Mutex<SemaphoreSet>>> = {
+        let manager = IPC_MANAGER.lock();
+        manager.sem_sets.values().cloned().collect()
+    };
+
+    let mut out = String::from(
+        "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
+    );
+    for sem in sets {
+        let s = sem.lock();
+        let _ = core::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{:>10x} {:>10} {:>5o} {:>10} {:>5} {:>5} {:>5} {:>5} {:>10} {:>10}\n",
+                s.key as u32,
+                s.id,
+                s.permissions & 0o777,
+                s.values.len(),
+                s.uid,
+                s.gid,
+                s.cuid,
+                s.cgid,
+                s.otime,
+                s.ctime
+            ),
+        );
+    }
+    out
+}
+
+fn sem_info_user(sets: usize, total_sems: usize) -> SemInfoUser {
+    SemInfoUser {
+        semmap: SEMMNI as i32,
+        semmni: SEMMNI as i32,
+        semmns: total_sems.max(SEMMNI * SEMMSL) as i32,
+        semmnu: SEMMNI as i32,
+        semmsl: SEMMSL as i32,
+        semopm: SEMOPM as i32,
+        semume: SEMOPM as i32,
+        semusz: sets as i32,
+        semvmx: SEMVMX,
+        semaem: SEMVMX,
+    }
+}
+
+fn copy_struct_to_user<T>(dst: usize, value: &T) -> isize {
+    if dst == 0 {
+        return errno(EFAULT);
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
+    };
+    if user_mem::copy_to_user(
+        current_user_token(),
+        dst as *mut u8,
+        bytes,
+        UserWritePolicy::DemandCowWithForkFallback,
+    )
+    .is_err()
+    {
+        errno(EFAULT)
+    } else {
+        0
+    }
+}
+
+fn copy_sem_values_to_user(dst: usize, values: &[i32]) -> isize {
+    if dst == 0 {
+        return errno(EFAULT);
+    }
+    let mut out = Vec::with_capacity(values.len() * 2);
+    for value in values {
+        let v = (*value as u16).to_ne_bytes();
+        out.extend_from_slice(&v);
+    }
+    if user_mem::copy_to_user(
+        current_user_token(),
+        dst as *mut u8,
+        out.as_slice(),
+        UserWritePolicy::DemandCowWithForkFallback,
+    )
+    .is_err()
+    {
+        errno(EFAULT)
+    } else {
+        0
+    }
+}
+
+fn read_sem_values_from_user(src: usize, nsems: usize) -> Result<Vec<i32>, isize> {
+    if src == 0 {
+        return Err(errno(EFAULT));
+    }
+    let mut raw = alloc::vec![0u8; nsems * 2];
+    if user_mem::copy_from_user(
+        current_user_token(),
+        src as *const u8,
+        raw.as_mut_slice(),
+        UserReadPolicy::StrictChecked,
+    )
+    .is_err()
+    {
+        return Err(errno(EFAULT));
+    }
+    let mut values = Vec::with_capacity(nsems);
+    for chunk in raw.chunks_exact(2) {
+        let value = u16::from_ne_bytes([chunk[0], chunk[1]]) as i32;
+        if value > SEMVMX {
+            return Err(errno(ERANGE));
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn read_sem_ops(sops: usize, nsops: usize) -> Result<Vec<SembufUser>, isize> {
+    if sops == 0 {
+        return Err(errno(EFAULT));
+    }
+    let mut ops = Vec::with_capacity(nsops);
+    let token = current_user_token();
+    for i in 0..nsops {
+        let ptr = (sops + i * core::mem::size_of::<SembufUser>()) as *const SembufUser;
+        let op = user_mem::read_from_user::<SembufUser>(token, ptr, UserReadPolicy::StrictChecked)
+            .map_err(|_| errno(EFAULT))?;
+        ops.push(op);
+    }
+    Ok(ops)
+}
+
+fn sem_ops_can_apply(sem: &SemaphoreSet, ops: &[SembufUser]) -> Result<bool, isize> {
+    let mut temp = sem.values.clone();
+    for op in ops {
+        let idx = op.sem_num as usize;
+        if idx >= temp.len() {
+            return Err(errno(EFBIG));
+        }
+        let cur = temp[idx];
+        if op.sem_op > 0 {
+            let next = cur + op.sem_op as i32;
+            if next > SEMVMX {
+                return Err(errno(ERANGE));
+            }
+            temp[idx] = next;
+        } else if op.sem_op < 0 {
+            let need = -(op.sem_op as i32);
+            if cur < need {
+                return Ok(false);
+            }
+            temp[idx] = cur - need;
+        } else if cur != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn sem_ops_apply(sem: &mut SemaphoreSet, ops: &[SembufUser], pid: usize) {
+    for op in ops {
+        let idx = op.sem_num as usize;
+        sem.values[idx] += op.sem_op as i32;
+        sem.last_pid[idx] = pid as i32;
+    }
+    sem.otime = now_epoch_sec();
+    sem.wake_waiters();
+}
+
+// ============================================================================
+// Semaphore System Calls
+// ============================================================================
+
+pub fn sys_semget(key: IpcKey, nsems: usize, semflg: i32) -> isize {
+    if nsems > SEMMSL {
+        return errno(EINVAL);
+    }
+    let (euid, egid, _pid, is_super) = current_ipc_identity();
+    let mut manager = IPC_MANAGER.lock();
+
+    if key == IPC_PRIVATE {
+        if nsems == 0 {
+            return errno(EINVAL);
+        }
+        return match manager.create_sem(key, nsems, (semflg & 0o777) as u32, euid, egid) {
+            Ok(id) => id as isize,
+            Err(e) => e,
+        };
+    }
+
+    if let Some((id, sem)) = manager.find_sem_by_key(key) {
+        if semflg & IPC_CREAT != 0 && semflg & IPC_EXCL != 0 {
+            return errno(EEXIST);
+        }
+        let sem = sem.lock();
+        if nsems > 0 && nsems > sem.values.len() {
+            return errno(EINVAL);
+        }
+        let req = requested_rw_bits(semflg);
+        if !is_super && req != 0 && !sem.has_access(euid, egid, req) {
+            return errno(EACCES);
+        }
+        return id as isize;
+    }
+
+    if semflg & IPC_CREAT == 0 {
+        return errno(ENOENT);
+    }
+    if nsems == 0 {
+        return errno(EINVAL);
+    }
+    match manager.create_sem(key, nsems, (semflg & 0o777) as u32, euid, egid) {
+        Ok(id) => id as isize,
+        Err(e) => e,
+    }
+}
+
+pub fn sys_semctl(semid: i32, semnum: usize, cmd: i32, arg: usize) -> isize {
+    let (euid, egid, _pid, is_super) = current_ipc_identity();
+    let cmd = cmd & 0xff;
+    let mut manager = IPC_MANAGER.lock();
+
+    if cmd == IPC_INFO || cmd == SEM_INFO {
+        let total_sems = manager
+            .sem_sets
+            .values()
+            .map(|s| s.lock().values.len())
+            .sum::<usize>();
+        let info = sem_info_user(manager.sem_sets.len(), total_sems);
+        let ret = manager.highest_sem_index();
+        drop(manager);
+        let copied = copy_struct_to_user(arg, &info);
+        return if copied == 0 { ret } else { copied };
+    }
+
+    let (real_semid, sem) = if cmd == SEM_STAT || cmd == SEM_STAT_ANY {
+        let Some((id, sem)) = manager.sem_by_index(semid as usize) else {
+            return errno(EINVAL);
+        };
+        (id, sem)
+    } else {
+        let Some(sem) = manager.get_sem(semid) else {
+            return errno(EINVAL);
+        };
+        (semid, sem)
+    };
+
+    match cmd {
+        IPC_RMID => {
+            {
+                let sem = sem.lock();
+                if !is_super && !sem.can_ctl(euid) {
+                    return errno(EPERM);
+                }
+            }
+            if manager.remove_sem(real_semid) {
+                0
+            } else {
+                errno(EINVAL)
+            }
+        }
+        IPC_STAT | SEM_STAT | SEM_STAT_ANY => {
+            drop(manager);
+            let ds = {
+                let sem = sem.lock();
+                if cmd != SEM_STAT_ANY && !is_super && !sem.has_access(euid, egid, 0o4) {
+                    return errno(EACCES);
+                }
+                sem.to_user_ds()
+            };
+            let copied = copy_struct_to_user(arg, &ds);
+            if copied == 0 && (cmd == SEM_STAT || cmd == SEM_STAT_ANY) {
+                real_semid as isize
+            } else {
+                copied
+            }
+        }
+        IPC_SET => {
+            drop(manager);
+            if arg == 0 {
+                return errno(EFAULT);
+            }
+            let token = current_user_token();
+            let user_ds = user_mem::read_from_user::<SemidDsUser>(
+                token,
+                arg as *const SemidDsUser,
+                UserReadPolicy::StrictChecked,
+            )
+            .map_err(|_| errno(EFAULT));
+            let Ok(user_ds) = user_ds else {
+                return errno(EFAULT);
+            };
+            let mut sem = sem.lock();
+            if !is_super && !sem.can_ctl(euid) {
+                return errno(EPERM);
+            }
+            #[cfg(target_arch = "loongarch64")]
+            {
+                sem.permissions = user_ds.sem_perm.mode & 0o777;
+            }
+            #[cfg(not(target_arch = "loongarch64"))]
+            {
+                sem.permissions = (user_ds.sem_perm.mode as u32) & 0o777;
+            }
+            sem.uid = user_ds.sem_perm.uid;
+            sem.gid = user_ds.sem_perm.gid;
+            sem.ctime = now_epoch_sec();
+            0
+        }
+        GETVAL => {
+            drop(manager);
+            let sem = sem.lock();
+            if semnum >= sem.values.len() {
+                return errno(EINVAL);
+            }
+            sem.values[semnum] as isize
+        }
+        GETPID => {
+            drop(manager);
+            let sem = sem.lock();
+            if semnum >= sem.values.len() {
+                return errno(EINVAL);
+            }
+            sem.last_pid[semnum] as isize
+        }
+        GETNCNT | GETZCNT => {
+            drop(manager);
+            let sem = sem.lock();
+            if semnum >= sem.values.len() {
+                return errno(EINVAL);
+            }
+            sem.waiter_count(semnum, cmd == GETZCNT)
+        }
+        GETALL => {
+            drop(manager);
+            let sem = sem.lock();
+            copy_sem_values_to_user(arg, sem.values.as_slice())
+        }
+        SETVAL => {
+            drop(manager);
+            let value = arg as i32;
+            if value < 0 || value > SEMVMX {
+                return errno(ERANGE);
+            }
+            let mut sem = sem.lock();
+            if !is_super && !sem.has_access(euid, egid, 0o2) {
+                return errno(EACCES);
+            }
+            if semnum >= sem.values.len() {
+                return errno(EINVAL);
+            }
+            sem.values[semnum] = value;
+            sem.last_pid[semnum] = current_process().pid.0 as i32;
+            sem.ctime = now_epoch_sec();
+            sem.wake_waiters();
+            0
+        }
+        SETALL => {
+            drop(manager);
+            let values = match read_sem_values_from_user(arg, sem.lock().values.len()) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let mut sem = sem.lock();
+            if !is_super && !sem.has_access(euid, egid, 0o2) {
+                return errno(EACCES);
+            }
+            sem.values.copy_from_slice(values.as_slice());
+            let pid = current_process().pid.0 as i32;
+            for last in sem.last_pid.iter_mut() {
+                *last = pid;
+            }
+            sem.ctime = now_epoch_sec();
+            sem.wake_waiters();
+            0
+        }
+        _ => errno(EINVAL),
+    }
+}
+
+pub fn sys_semtimedop(semid: i32, sops: usize, nsops: usize, timeout: usize) -> isize {
+    let mut short_timeout = false;
+    if timeout != 0 {
+        let mut raw = [0u8; core::mem::size_of::<usize>() * 2];
+        if user_mem::copy_from_user(
+            current_user_token(),
+            timeout as *const u8,
+            &mut raw,
+            UserReadPolicy::StrictChecked,
+        )
+        .is_err()
+        {
+            return errno(EFAULT);
+        }
+        let word = core::mem::size_of::<usize>();
+        let mut sec_bytes = [0u8; core::mem::size_of::<usize>()];
+        let mut nsec_bytes = [0u8; core::mem::size_of::<usize>()];
+        sec_bytes.copy_from_slice(&raw[..word]);
+        nsec_bytes.copy_from_slice(&raw[word..]);
+        let sec = usize::from_ne_bytes(sec_bytes);
+        let nsec = usize::from_ne_bytes(nsec_bytes);
+        if nsec >= 1_000_000_000 {
+            return errno(EINVAL);
+        }
+        short_timeout = sec == 0 && nsec <= 1_000_000;
+    }
+    sys_semop_inner(semid, sops, nsops, short_timeout)
+}
+
+pub fn sys_semop(semid: i32, sops: usize, nsops: usize) -> isize {
+    sys_semop_inner(semid, sops, nsops, false)
+}
+
+fn sys_semop_inner(semid: i32, sops: usize, nsops: usize, short_timeout: bool) -> isize {
+    if nsops == 0 {
+        return errno(EINVAL);
+    }
+    if nsops > SEMOPM {
+        return errno(E2BIG);
+    }
+    let ops = match read_sem_ops(sops, nsops) {
+        Ok(ops) => ops,
+        Err(e) => return e,
+    };
+    let (euid, egid, pid, is_super) = current_ipc_identity();
+    let sem = {
+        let manager = IPC_MANAGER.lock();
+        let Some(sem) = manager.get_sem(semid) else {
+            return errno(EINVAL);
+        };
+        sem
+    };
+
+    loop {
+        {
+            let mut sem = sem.lock();
+            if sem.removed {
+                return errno(EIDRM);
+            }
+            let needs_write = ops.iter().any(|op| op.sem_op != 0);
+            let req = if needs_write { 0o2 } else { 0o4 };
+            if !is_super && !sem.has_access(euid, egid, req) {
+                return errno(EACCES);
+            }
+            match sem_ops_can_apply(&sem, ops.as_slice()) {
+                Ok(true) => {
+                    sem_ops_apply(&mut sem, ops.as_slice(), pid);
+                    return 0;
+                }
+                Ok(false) => {
+                    let blocking = ops
+                        .iter()
+                        .find(|op| {
+                            let cur = sem.values[op.sem_num as usize];
+                            (op.sem_op == 0 && cur != 0)
+                                || (op.sem_op < 0 && cur < -(op.sem_op as i32))
+                        })
+                        .copied()
+                        .unwrap_or_default();
+                    if (blocking.sem_flg as i32 & IPC_NOWAIT) != 0 {
+                        return errno(EAGAIN);
+                    }
+                    if short_timeout {
+                        return errno(EAGAIN);
+                    }
+                    if let Some(task) = current_task() {
+                        sem.waiters.push_back(SemWaiter {
+                            task: Arc::downgrade(&task),
+                            sem_num: blocking.sem_num as usize,
+                            wait_zero: blocking.sem_op == 0,
+                        });
+                    }
+                }
+                Err(e) => return e,
+            }
+        }
+
+        block_current_and_run_next();
+        if let Some(task) = current_task() {
+            if task.take_interrupted() {
+                let mut sem = sem.lock();
+                if let Some(pos) = sem.waiters.iter().position(|w| {
+                    w.task
+                        .upgrade()
+                        .map(|t| Arc::ptr_eq(&t, &task))
+                        .unwrap_or(false)
+                }) {
+                    sem.waiters.remove(pos);
+                }
+                return errno(EINTR);
+            }
+        }
+        if IPC_MANAGER.lock().get_sem(semid).is_none() {
+            return errno(EIDRM);
+        }
+    }
 }
 
 // ============================================================================
