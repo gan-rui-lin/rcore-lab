@@ -907,11 +907,23 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         Ok(base) => base,
         Err(err) => return err,
     };
+    let raw_flags = flags;
+    let flags = OpenFlags::from_bits_truncate(flags);
     let full_path = resolve_user_path(&base, &raw_path);
-    let full_path = match resolve_access_path(&full_path) {
+    let full_path = match if flags.contains(OpenFlags::NOFOLLOW) {
+        resolve_access_path_nofollow(&full_path)
+    } else {
+        resolve_access_path(&full_path)
+    } {
         Ok(path) => path,
         Err(err) => return err,
     };
+    if flags.contains(OpenFlags::NOFOLLOW)
+        && !flags.contains(OpenFlags::PATH)
+        && readlink_path(&full_path).is_some()
+    {
+        return errno(ELOOP);
+    }
     let proc_name = process.name();
     let trace_so_open =
         proc_name == "entry-dynamic.exe" && (raw_path.contains(".so") || full_path.contains(".so"));
@@ -935,14 +947,13 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     // }
     // O_TMPFILE (0x410000 on riscv64/loongarch64): create anonymous temp file in dir
     const O_TMPFILE: u32 = 0x410000;
-    if (flags & O_TMPFILE) == O_TMPFILE {
+    if (raw_flags & O_TMPFILE) == O_TMPFILE {
         let memfd: Arc<dyn crate::fs::File + Send + Sync> = Arc::new(MemFdFile::new(false));
         let Some(fd) = process.install_file(memfd) else {
             return errno(EMFILE);
         };
         return fd as isize;
     }
-    let flags = OpenFlags::from_bits_truncate(flags);
     let existed = path_exists(&full_path);
     if flags.contains(OpenFlags::CREATE) && path_is_dir(&full_path) {
         return errno(EISDIR);
@@ -1263,47 +1274,69 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsize: usiz
     let Some(raw_path) = translated_cstr_demand(token, path, PATH_MAX + 1) else {
         return errno(EFAULT);
     };
-    if raw_path.is_empty() {
-        return errno(ENOENT);
-    }
-    if raw_path_too_long(&raw_path) {
-        return errno(ENAMETOOLONG);
-    }
-    let full_path = if raw_path.starts_with('/') {
-        normalize_path(&raw_path)
-    } else {
-        let base = match dirfd_base(dirfd) {
-            Ok(base) => base,
-            Err(err) => return err,
-        };
-        resolve_path(&base, &raw_path)
-    };
-    let full_path = match resolve_access_path_nofollow(&full_path) {
-        Ok(path) => path,
-        Err(err) => return err,
-    };
 
     // Minimal procfs compatibility for busybox/glibc probes.
     // If /proc/<pid>/exe (or /proc/self/exe) is requested, return a stable executable path.
     let process = current_process();
-    let process_name = process.name();
-    let self_exe =
-        full_path == "/proc/self/exe" || full_path == format!("/proc/{}/exe", process.pid.0);
-
-    let target = if self_exe {
-        if process_name == "busybox" || process_name == "sh" {
-            String::from("/bin/sh")
-        } else {
-            format!("/{}", process_name)
+    let target = if raw_path.is_empty() {
+        if dirfd < 0 {
+            return errno(ENOENT);
         }
-    } else if let Some(target) = readlink_path(&full_path) {
+        let Some(file) = process.get_file(dirfd as usize) else {
+            return errno(EBADF);
+        };
+        let Some(path) = file.path() else {
+            return errno(EINVAL);
+        };
+        let Some(target) = readlink_path(path) else {
+            return errno(EINVAL);
+        };
         target
     } else {
-        return if path_exists_for_access(&full_path) {
-            errno(EINVAL)
+        if raw_path_too_long(&raw_path) {
+            return errno(ENAMETOOLONG);
+        }
+        let full_path = if raw_path.starts_with('/') {
+            normalize_path(&raw_path)
         } else {
-            errno(ENOENT)
+            let base = match dirfd_base(dirfd) {
+                Ok(base) => base,
+                Err(err) => return err,
+            };
+            resolve_path(&base, &raw_path)
         };
+        let full_path = match resolve_access_path_nofollow(&full_path) {
+            Ok(path) => path,
+            Err(err) => return err,
+        };
+        {
+            let creds = process.credentials_snapshot();
+            if let Err(err) =
+                check_search_permissions(&full_path, creds.effective_uid, creds.effective_gid)
+            {
+                return err;
+            }
+        }
+
+        let process_name = process.name();
+        let self_exe =
+            full_path == "/proc/self/exe" || full_path == format!("/proc/{}/exe", process.pid.0);
+
+        if self_exe {
+            if process_name == "busybox" || process_name == "sh" {
+                String::from("/bin/sh")
+            } else {
+                format!("/{}", process_name)
+            }
+        } else if let Some(target) = readlink_path(&full_path) {
+            target
+        } else {
+            return if path_exists_for_access(&full_path) {
+                errno(EINVAL)
+            } else {
+                errno(ENOENT)
+            };
+        }
     };
 
     let bytes = target.as_bytes();

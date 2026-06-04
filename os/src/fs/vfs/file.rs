@@ -250,13 +250,16 @@ pub fn list_apps() {
 pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<dyn File>> {
     let path = normalize_path(path);
     let (mut readable, mut writable) = flags.read_write();
-    let status_flags =
-        flags.bits() & (OpenFlags::PATH | OpenFlags::APPEND | OpenFlags::DIRECT).bits();
+    let status_flags = flags.bits()
+        & (OpenFlags::PATH | OpenFlags::APPEND | OpenFlags::DIRECT | OpenFlags::NOFOLLOW).bits();
     if flags.contains(OpenFlags::PATH) {
         readable = false;
         writable = false;
     }
-    let inode = if flags.contains(OpenFlags::CREATE) {
+    let inode = if flags.contains(OpenFlags::PATH) && flags.contains(OpenFlags::NOFOLLOW) {
+        let (parent, name) = resolve_parent_inode(&path)?;
+        parent.lookup(&name)?
+    } else if flags.contains(OpenFlags::CREATE) {
         if let Some(inode) = resolve_inode_quiet(&path) {
             inode
         } else {

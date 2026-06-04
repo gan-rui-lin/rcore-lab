@@ -279,6 +279,8 @@ bitflags! {
         const DIRECT = 1 << 14;
         /// must be a directory
         const DIRECTORY = 1 << 16;
+        /// do not follow final symbolic link
+        const NOFOLLOW = 1 << 17;
         /// close-on-exec
         const CLOEXEC = 1 << 19;
         /// path-only descriptor (Linux O_PATH on riscv64)
