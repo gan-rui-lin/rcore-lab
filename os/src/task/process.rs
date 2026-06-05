@@ -451,6 +451,7 @@ impl ProcessControlBlock {
         let minimal_tcb = Self::alloc_minimal_tcb_if_needed(&mut memory_set, &tls_area);
 
         let pid_handle = pid_alloc();
+        crate::syscall::sched_reset_process_state(pid_handle.0);
         let process = Arc::new(Self {
             pid: pid_handle,
             memory: unsafe {
@@ -945,6 +946,7 @@ impl ProcessControlBlock {
         // info!("[fork-stage] pid={} after memory_set clone", self.pid.0);
 
         let pid = pid_alloc();
+        crate::syscall::sched_reset_process_state(pid.0);
         info!("[fork-stage] pid={} before fd_table clone", self.pid.0);
         let parent_fs = self.fs.read().clone();
         let parent_identity = self.identity.read().clone();
@@ -1024,6 +1026,7 @@ impl ProcessControlBlock {
         // info!("[fork-stage] pid={} child pcb allocated new_pid={}", self.pid.0, new_pid_value);
         self.push_child(Arc::clone(&child));
         crate::syscall::inherit_shm_for_process_fork(self.pid.0, child.pid.0);
+        crate::syscall::sched_inherit_for_fork(self.pid.0, child.pid.0);
         info!("[fork-stage] pid={} child linked to parent", self.pid.0);
         let parent_task = self.get_task(0);
         let ustack_base = parent_task.ustack_base();

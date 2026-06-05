@@ -203,6 +203,8 @@ const SYSCALL_TIMER_DELETE: usize = 111;
 const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 /// ptrace syscall
 const SYSCALL_PTRACE: usize = 117;
+/// sched_setparam syscall
+const SYSCALL_SCHED_SETPARAM: usize = 118;
 /// sched_setscheduler syscall
 const SYSCALL_SCHED_SETSCHEDULER: usize = 119;
 /// sched_getscheduler syscall
@@ -526,6 +528,16 @@ pub fn inherit_shm_for_process_fork(parent_pid: usize, child_pid: usize) {
     ipc::inherit_shm_attachments_for_fork(parent_pid, child_pid);
 }
 
+/// Reset per-process scheduler compatibility state for a newly allocated PID.
+pub fn sched_reset_process_state(pid: usize) {
+    process::sched_reset_process_state(pid);
+}
+
+/// Inherit scheduler compatibility state across fork.
+pub fn sched_inherit_for_fork(parent_pid: usize, child_pid: usize) {
+    process::sched_inherit_for_fork(parent_pid, child_pid);
+}
+
 const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (1, "fork"),
     (3, "wait"),
@@ -625,6 +637,7 @@ const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (115, "clock_nanosleep"),
     (116, "syslog"),
     (117, "ptrace"),
+    (118, "sched_setparam"),
     (119, "sched_setscheduler"),
     (120, "sched_getscheduler"),
     (121, "sched_getparam"),
@@ -1142,6 +1155,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         }
         SYSCALL_SCHED_GETSCHEDULER => sys_sched_getscheduler(args[0]),
         SYSCALL_SCHED_GETPARAM => sys_sched_getparam(args[0], args[1] as *mut u8),
+        SYSCALL_SCHED_SETPARAM => sys_sched_setparam(args[0], args[1] as *const u8),
         SYSCALL_SCHED_SETAFFINITY => sys_sched_setaffinity(args[0], args[1], args[2] as *const u8),
         SYSCALL_SCHED_GETAFFINITY => {
             sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8)

@@ -44,7 +44,7 @@ lazy_static! {
     static ref REALTIME_OFFSET_US: UPIntrFreeCell<i64> = unsafe { UPIntrFreeCell::new(0) };
     static ref UTS_STATE: UPIntrFreeCell<(String, String)> =
         unsafe { UPIntrFreeCell::new((String::from("rcore"), String::from("ruos"))) };
-    static ref SCHED_POLICIES: UPIntrFreeCell<BTreeMap<usize, i32>> =
+    static ref SCHED_STATE: UPIntrFreeCell<BTreeMap<usize, SchedState>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
     static ref PERSONALITY_STATE: UPIntrFreeCell<BTreeMap<usize, usize>> =
         unsafe { UPIntrFreeCell::new(BTreeMap::new()) };
@@ -53,6 +53,60 @@ lazy_static! {
     static ref POSIX_TIMER_NEXT_ID: UPIntrFreeCell<usize> = unsafe { UPIntrFreeCell::new(0) };
     static ref TIMEX_STATE: UPIntrFreeCell<TimexState> =
         unsafe { UPIntrFreeCell::new(TimexState::default()) };
+}
+
+const SCHED_OTHER: i32 = 0;
+const SCHED_FIFO: i32 = 1;
+const SCHED_RR: i32 = 2;
+const SCHED_BATCH: i32 = 3;
+const SCHED_IDLE: i32 = 5;
+const SCHED_DEADLINE: i32 = 6;
+const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
+
+#[derive(Clone, Copy)]
+struct SchedState {
+    policy: i32,
+    priority: i32,
+    nice: i32,
+    flags: u64,
+    runtime: u64,
+    deadline: u64,
+    period: u64,
+    reset_on_fork: bool,
+}
+
+impl Default for SchedState {
+    fn default() -> Self {
+        Self {
+            policy: SCHED_OTHER,
+            priority: 0,
+            nice: 0,
+            flags: 0,
+            runtime: 0,
+            deadline: 0,
+            period: 0,
+            reset_on_fork: false,
+        }
+    }
+}
+
+pub fn sched_reset_process_state(pid: usize) {
+    SCHED_STATE.exclusive_access().remove(&pid);
+}
+
+pub fn sched_inherit_for_fork(parent_pid: usize, child_pid: usize) {
+    let parent = sched_state_for(parent_pid);
+    let child = if parent.reset_on_fork {
+        SchedState::default()
+    } else {
+        parent
+    };
+    let mut states = SCHED_STATE.exclusive_access();
+    if matches!(child.policy, SCHED_OTHER) && child.priority == 0 && !child.reset_on_fork {
+        states.remove(&child_pid);
+    } else {
+        states.insert(child_pid, child);
+    }
 }
 
 #[allow(dead_code)]
@@ -5488,36 +5542,94 @@ fn normalize_sched_pid(pid: usize) -> Result<usize, isize> {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct UserSchedAttr {
+    size: u32,
+    policy: u32,
+    flags: u64,
+    nice: i32,
+    priority: u32,
+    runtime: u64,
+    deadline: u64,
+    period: u64,
+}
+
+fn sched_state_for(pid: usize) -> SchedState {
+    SCHED_STATE
+        .exclusive_access()
+        .get(&pid)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn read_sched_priority(param: *const u8) -> Result<i32, isize> {
+    if param.is_null() {
+        return Err(errno(EINVAL));
+    }
+    read_from_user::<i32>(current_user_token(), param as *const i32).map_err(|_| errno(EINVAL))
+}
+
+fn read_sched_priority_fault(param: *const u8) -> Result<i32, isize> {
+    if param.is_null() {
+        return Err(errno(EFAULT));
+    }
+    read_from_user::<i32>(current_user_token(), param as *const i32).map_err(|_| errno(EFAULT))
+}
+
+fn priority_valid_for_policy(policy: i32, priority: i32) -> bool {
+    match policy {
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => priority == 0,
+        SCHED_FIFO | SCHED_RR => (1..=99).contains(&priority),
+        _ => false,
+    }
+}
+
+fn policy_is_valid(policy: i32) -> bool {
+    matches!(
+        policy,
+        SCHED_OTHER | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE
+    )
+}
+
+fn policy_needs_root(policy: i32) -> bool {
+    matches!(policy, SCHED_FIFO | SCHED_RR | SCHED_DEADLINE)
+}
+
+fn can_change_sched_target(target_pid: usize) -> bool {
+    if current_process().effective_uid() == 0 {
+        return true;
+    }
+    target_pid == current_process().pid.0
+}
+
 /// sched_setscheduler(pid, policy, param)
 pub fn sys_sched_setscheduler(pid: usize, policy: i32, param: *const u8) -> isize {
-    const SCHED_OTHER: i32 = 0;
-    const SCHED_FIFO: i32 = 1;
-    const SCHED_RR: i32 = 2;
-
     let target_pid = match normalize_sched_pid(pid) {
         Ok(pid) => pid,
         Err(err) => return err,
     };
-    if !matches!(policy, SCHED_OTHER | SCHED_FIFO | SCHED_RR) {
+    let reset_on_fork = (policy & SCHED_RESET_ON_FORK) != 0;
+    let policy = policy & !SCHED_RESET_ON_FORK;
+    if !policy_is_valid(policy) {
         return errno(EINVAL);
     }
-    if param.is_null() {
-        return errno(EFAULT);
-    }
-    let token = current_user_token();
-    let sched_priority = match read_from_user::<i32>(token, param as *const i32) {
+    let sched_priority = match read_sched_priority_fault(param) {
         Ok(priority) => priority,
-        Err(_) => return errno(EFAULT),
+        Err(err) => return err,
     };
-    let valid_priority = match policy {
-        SCHED_OTHER => sched_priority == 0,
-        SCHED_FIFO | SCHED_RR => (1..=99).contains(&sched_priority),
-        _ => false,
-    };
-    if !valid_priority {
+    if !priority_valid_for_policy(policy, sched_priority) {
         return errno(EINVAL);
     }
-    SCHED_POLICIES.exclusive_access().insert(target_pid, policy);
+    if policy_needs_root(policy) && current_process().effective_uid() != 0 {
+        return errno(EPERM);
+    }
+
+    let mut state = sched_state_for(target_pid);
+    state.policy = policy;
+    state.priority = sched_priority;
+    state.reset_on_fork = reset_on_fork;
+    SCHED_STATE.exclusive_access().insert(target_pid, state);
     0
 }
 
@@ -5527,35 +5639,51 @@ pub fn sys_sched_getscheduler(pid: usize) -> isize {
         Ok(pid) => pid,
         Err(err) => return err,
     };
-    SCHED_POLICIES
-        .exclusive_access()
-        .get(&target_pid)
-        .copied()
-        .unwrap_or(0) as isize
+    sched_state_for(target_pid).policy as isize
 }
 
 /// sched_getparam(pid, param)
-/// Write sched_priority = 0 (for SCHED_OTHER).
 pub fn sys_sched_getparam(pid: usize, param: *mut u8) -> isize {
-    if let Err(err) = normalize_sched_pid(pid) {
-        return err;
-    }
     if param.is_null() {
         return errno(EINVAL);
     }
+    let target_pid = match normalize_sched_pid(pid) {
+        Ok(pid) => pid,
+        Err(err) => return err,
+    };
     let token = current_user_token();
     // struct sched_param { int sched_priority; }
-    let priority: i32 = 0;
+    let priority: i32 = sched_state_for(target_pid).priority;
     match copy_to_user(token, param, &priority.to_le_bytes()) {
         Ok(_) => 0,
         Err(e) => e,
     }
 }
 
+/// sched_setparam(pid, param)
+pub fn sys_sched_setparam(pid: usize, param: *const u8) -> isize {
+    let target_pid = match normalize_sched_pid(pid) {
+        Ok(pid) => pid,
+        Err(err) => return err,
+    };
+    let priority = match read_sched_priority(param) {
+        Ok(priority) => priority,
+        Err(err) => return err,
+    };
+    let mut state = sched_state_for(target_pid);
+    if !priority_valid_for_policy(state.policy, priority) {
+        return errno(EINVAL);
+    }
+    if !can_change_sched_target(target_pid) {
+        return errno(EPERM);
+    }
+    state.priority = priority;
+    SCHED_STATE.exclusive_access().insert(target_pid, state);
+    0
+}
+
 /// sched_rr_get_interval(pid, tp)
 pub fn sys_sched_rr_get_interval(pid: usize, interval: *mut TimeSpec) -> isize {
-    const SCHED_FIFO: i32 = 1;
-    const SCHED_RR: i32 = 2;
     const RR_TIMESLICE_NS: usize = 100_000_000;
 
     let target_pid = match normalize_sched_pid(pid) {
@@ -5566,12 +5694,7 @@ pub fn sys_sched_rr_get_interval(pid: usize, interval: *mut TimeSpec) -> isize {
         return errno(EFAULT);
     }
 
-    let policy = SCHED_POLICIES
-        .exclusive_access()
-        .get(&target_pid)
-        .copied()
-        .unwrap_or(0);
-    let spec = match policy {
+    let spec = match sched_state_for(target_pid).policy {
         SCHED_RR => TimeSpec {
             tv_sec: 0,
             tv_nsec: RR_TIMESLICE_NS,
@@ -5611,11 +5734,36 @@ pub fn sys_sched_setattr(pid: usize, attr: usize, flags: usize) -> isize {
     if target_pid != current_process().pid.0 && pid2process(target_pid).is_none() {
         return errno(ESRCH);
     }
+    let user_attr = match read_from_user::<UserSchedAttr>(
+        current_user_token(),
+        attr as *const UserSchedAttr,
+    ) {
+        Ok(attr) => attr,
+        Err(_) => return errno(EINVAL),
+    };
+    let policy = user_attr.policy as i32;
+    if !policy_is_valid(policy) || !priority_valid_for_policy(policy, user_attr.priority as i32) {
+        return errno(EINVAL);
+    }
+    if policy_needs_root(policy) && current_process().effective_uid() != 0 {
+        return errno(EPERM);
+    }
+
+    let state = SchedState {
+        policy,
+        priority: user_attr.priority as i32,
+        nice: user_attr.nice,
+        flags: user_attr.flags,
+        runtime: user_attr.runtime,
+        deadline: user_attr.deadline,
+        period: user_attr.period,
+        reset_on_fork: false,
+    };
+    SCHED_STATE.exclusive_access().insert(target_pid, state);
     0
 }
 
 /// sched_getattr(pid, attr, size, flags)
-/// Return a sched_attr struct with SCHED_OTHER policy and priority 0.
 pub fn sys_sched_getattr(pid: usize, attr: *mut u8, size: usize, flags: usize) -> isize {
     if flags != 0 || attr.is_null() || size < 48 {
         return errno(EINVAL);
@@ -5628,18 +5776,16 @@ pub fn sys_sched_getattr(pid: usize, attr: *mut u8, size: usize, flags: usize) -
         return errno(ESRCH);
     }
     let token = current_user_token();
-    // struct sched_attr (48 bytes minimum):
-    //   u32 size = 48
-    //   u32 sched_policy = 0 (SCHED_OTHER)
-    //   u64 sched_flags = 0
-    //   s32 sched_nice = 0
-    //   u32 sched_priority = 0
-    //   u64 sched_runtime = 0
-    //   u64 sched_deadline = 0
-    //   u64 sched_period = 0
+    let state = sched_state_for(target_pid);
     let mut buf = [0u8; 48];
     buf[0..4].copy_from_slice(&48u32.to_le_bytes()); // size = 48
-                                                     // All other fields are 0 (SCHED_OTHER, no priority, etc.)
+    buf[4..8].copy_from_slice(&(state.policy as u32).to_le_bytes());
+    buf[8..16].copy_from_slice(&state.flags.to_le_bytes());
+    buf[16..20].copy_from_slice(&state.nice.to_le_bytes());
+    buf[20..24].copy_from_slice(&(state.priority as u32).to_le_bytes());
+    buf[24..32].copy_from_slice(&state.runtime.to_le_bytes());
+    buf[32..40].copy_from_slice(&state.deadline.to_le_bytes());
+    buf[40..48].copy_from_slice(&state.period.to_le_bytes());
     match copy_to_user(token, attr, &buf) {
         Ok(_) => 0,
         Err(e) => e,
