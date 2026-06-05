@@ -41,3 +41,35 @@ SINGLE_TEST=/glibc/ltp/testcases/bin/sched_rr_get_interval03 LOG=ERROR timeout 9
 - 未运行从 `sched_rr_get_interval01` 开始的连续小窗口，因为当前日志中紧随其后的
   `sched_setaffinity01` 是已知 timeout 风险点，本轮按单用例验证避免拖住内核。
 - 构建仅出现 vendor 目录既有 `unexpected_cfgs` 警告。
+
+## reboot
+
+修改位置：
+
+- `os/src/syscall/mod.rs`
+- `os/src/syscall/process.rs`
+
+补齐 `reboot(2)` 在 LTP 中覆盖的无害分支：
+
+- 接入 142 号 syscall。
+- 支持 libc 四参形式和直接 cmd 形式。
+- magic 参数与 cmd 按低 32 位比较，兼容 rv64 上 32 位有符号常量被 sign-extend 的情况。
+- `LINUX_REBOOT_CMD_CAD_ON` / `LINUX_REBOOT_CMD_CAD_OFF` 在 root 下返回成功。
+- 非法命令返回 `EINVAL`。
+- 非 root 执行 CAD_ON/CAD_OFF 返回 `EPERM`。
+- 其它真实重启类命令不执行，避免误触发关机/重启路径。
+
+验证命令：
+
+```bash
+make -C os kernel LOG=ERROR OFFLINE=1
+SINGLE_TEST=/glibc/ltp/testcases/bin/reboot01 LOG=ERROR timeout 90 bash run.sh -f sdcard-rv.img -t rv
+SINGLE_TEST=/glibc/ltp/testcases/bin/reboot02 LOG=ERROR timeout 90 bash run.sh -f sdcard-rv.img -t rv
+```
+
+验证结果：
+
+| 用例 | 结果 |
+|------|------|
+| `reboot01` | PASS，CAD_ON/CAD_OFF 均返回成功 |
+| `reboot02` | PASS，覆盖 `EINVAL` 与 `EPERM` |
