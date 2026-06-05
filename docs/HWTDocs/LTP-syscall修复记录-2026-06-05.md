@@ -189,3 +189,49 @@ SINGLE_TEST=/glibc/ltp/testcases/bin/sched_setaffinity01 LOG=ERROR timeout 90 ba
 |------|------|
 | `getcpu01` | PASS，返回 `cpuid:0, node id:0` |
 | `sched_setaffinity01` | 依赖回归检查 PASS |
+
+## sched 参数、策略与 sched_attr 状态
+
+修改位置：
+
+- `os/src/syscall/mod.rs`
+- `os/src/syscall/process.rs`
+- `os/src/task/process.rs`
+
+修复内容：
+
+- 接入 118 号 `sched_setparam` syscall。
+- 用 per-pid `SchedState` 统一保存 `sched_setscheduler` / `sched_setparam`
+  / `sched_setattr` 需要读回的策略、优先级和 deadline 属性。
+- 补齐 `SCHED_BATCH`、`SCHED_IDLE`、`SCHED_DEADLINE`、`SCHED_RESET_ON_FORK`
+  的基础语义。
+- 补齐非 root 设置实时策略或跨进程改调度参数的 `EPERM`。
+- 区分 `sched_setscheduler` 坏用户地址 `EFAULT` 与 `sched_setparam`
+  用例期望的空参数 `EINVAL`。
+- 新进程分配 PID 时清理旧调度状态，fork 时按 `SCHED_RESET_ON_FORK`
+  决定继承或归零，避免 PID 复用污染连续 LTP。
+
+验证命令：
+
+```bash
+make -C os kernel LOG=ERROR OFFLINE=1
+for t in sched_getattr01 sched_getattr02 sched_setattr01 \
+         sched_getparam01 sched_getparam03 \
+         sched_setparam01 sched_setparam02 sched_setparam03 sched_setparam04 sched_setparam05 \
+         sched_setscheduler01 sched_setscheduler02 sched_setscheduler03 sched_setscheduler04; do
+  SINGLE_TEST=/glibc/ltp/testcases/bin/$t LOG=INFO timeout 80 bash run.sh
+done
+SINGLE_TEST=glibc-ltp LTP_START_FROM=sched_getattr01 LTP_CASE_LIMIT=25 \
+  LTP_CASE_TIMEOUT=30 LOG=INFO timeout 90 bash run.sh
+```
+
+验证结果：
+
+| 用例 | 结果 |
+|------|------|
+| `sched_getattr01` / `sched_getattr02` | PASS，deadline 属性可读回且错误路径保持 |
+| `sched_setattr01` | PASS |
+| `sched_getparam01` / `sched_getparam03` | PASS |
+| `sched_setparam01` - `sched_setparam05` | PASS |
+| `sched_setscheduler01` - `sched_setscheduler04` | PASS |
+| `sched_getattr01` 起始连续窗口 | `sched_getattr01` 到 `sched_setscheduler04` 全部 `FAIL ... : 0`，无 `sched_*` TFAIL；后续旧 `sched_tc*` 仍为 129 |
