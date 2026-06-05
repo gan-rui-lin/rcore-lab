@@ -316,6 +316,8 @@ const SYSCALL_GETRLIMIT: usize = 163;
 const SYSCALL_GETRUSAGE: usize = 165;
 /// umask syscall
 const SYSCALL_UMASK: usize = 166;
+/// getcpu syscall
+const SYSCALL_GETCPU: usize = 168;
 /// statfs syscall
 const SYSCALL_STATFS: usize = 43;
 /// fstatfs syscall
@@ -668,6 +670,7 @@ const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (165, "getrusage"),
     (166, "umask"),
     (167, "prctl"),
+    (168, "getcpu"),
     (169, "gettimeofday"),
     (171, "adjtimex"),
     (172, "getpid"),
@@ -1223,6 +1226,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SETGROUPS => process::sys_setgroups(args[0], args[1] as *const u32),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut RLimit),
         SYSCALL_GETRUSAGE => sys_getrusage(args[0] as isize, args[1] as *mut RUsage),
+        SYSCALL_GETCPU => sys_getcpu(args[0] as *mut u32, args[1] as *mut u32, args[2]),
         SYSCALL_UMASK => sys_umask(args[0]),
         SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut process::SysInfo),
         SYSCALL_MSGGET => sys_msgget(args[0] as i32, args[1] as i32),

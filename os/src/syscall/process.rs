@@ -5632,6 +5632,22 @@ pub fn sys_sched_getattr(_pid: usize, attr: *mut u8, size: usize, _flags: usize)
     }
 }
 
+/// getcpu(cpu, node, tcache)
+pub fn sys_getcpu(cpu: *mut u32, node: *mut u32, _tcache: usize) -> isize {
+    let token = current_user_token();
+    if !cpu.is_null() {
+        if let Err(err) = copy_to_user(token, cpu as *mut u8, &0u32.to_le_bytes()) {
+            return err;
+        }
+    }
+    if !node.is_null() {
+        if let Err(err) = copy_to_user(token, node as *mut u8, &0u32.to_le_bytes()) {
+            return err;
+        }
+    }
+    0
+}
+
 /// sched_setaffinity(pid, cpusetsize, mask)
 pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask: *const u8) -> isize {
     if cpusetsize == 0 {
