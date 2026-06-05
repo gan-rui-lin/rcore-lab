@@ -271,6 +271,8 @@ bitflags! {
         const RDWR = 1 << 1;
         /// create new file
         const CREATE = 1 << 6;
+        /// error if O_CREAT target exists
+        const EXCL = 1 << 7;
         /// truncate file size to 0
         const TRUNC = 1 << 9;
         /// append

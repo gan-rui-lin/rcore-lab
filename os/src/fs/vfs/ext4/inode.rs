@@ -634,6 +634,7 @@ impl VfsInode for Ext4Inode {
         if rc != EOK as i32 {
             return Err(ext4_errno(rc));
         }
+        ext4_cache_remove_path(self.path.as_str());
         ext4_cache_remove_path(new_path);
         Ok(())
     }

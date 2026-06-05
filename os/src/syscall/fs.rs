@@ -954,8 +954,15 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         };
         return fd as isize;
     }
+    let (readable, writable) = flags.read_write();
     let existed = path_exists(&full_path);
+    if flags.contains(OpenFlags::CREATE) && flags.contains(OpenFlags::EXCL) && existed {
+        return errno(EEXIST);
+    }
     if flags.contains(OpenFlags::CREATE) && path_is_dir(&full_path) {
+        return errno(EISDIR);
+    }
+    if path_is_dir(&full_path) && writable {
         return errno(EISDIR);
     }
     if flags.contains(OpenFlags::DIRECTORY) && !path_is_dir(&full_path) {
@@ -967,7 +974,6 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         return errno(EROFS);
     }
     // Special device files
-    let (readable, writable) = flags.read_write();
     let euid = process.effective_uid();
     if flags.contains(OpenFlags::CREATE) && !existed {
         if let Some((parent, _)) = full_path.rsplit_once('/') {
@@ -4827,6 +4833,9 @@ pub fn sys_pread64(fd: usize, buf: *const u8, count: usize, offset: isize) -> is
     let Some(inode) = file.inode() else {
         return errno(ESPIPE);
     };
+    if inode.is_dir() {
+        return errno(EISDIR);
+    }
     if offset < 0 {
         return errno(EINVAL);
     }
