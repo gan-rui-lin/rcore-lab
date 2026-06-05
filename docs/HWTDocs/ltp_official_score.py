@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Score rcore-lab LTP logs with the official judge scripts.
+Score rcore-lab OS competition logs with the official judge scripts.
 
-This script does not reimplement LTP scoring. It extracts ltp-musl/ltp-glibc
-test-group segments from QEMU logs, feeds each segment to the corresponding
-official judge script, and only aggregates the official JSON output.
+This script does not reimplement scoring. It extracts test-group segments from
+QEMU logs, feeds each segment to the corresponding official judge script, and
+only aggregates the official JSON output.
 """
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any
 
 
-START_RE = re.compile(r"#### OS COMP TEST GROUP START (ltp-(musl|glibc)) ####")
-END_RE = re.compile(r"#### OS COMP TEST GROUP END (ltp-(musl|glibc)) ####")
+START_RE = re.compile(r"#### OS COMP TEST GROUP START ([A-Za-z0-9_-]+-(musl|glibc)) ####")
+END_RE = re.compile(r"#### OS COMP TEST GROUP END ([A-Za-z0-9_-]+-(musl|glibc)) ####")
 
 
 @dataclass
@@ -55,23 +55,20 @@ def find_judge_dir(explicit: str | None) -> Path:
         ]
         judge_dir = next((p for p in candidates if p.exists()), candidates[0])
 
-    needed = ["judge_ltp-musl.py", "judge_ltp-glibc.py"]
-    missing = [name for name in needed if not (judge_dir / name).is_file()]
-    if missing:
-        raise FileNotFoundError(
-            f"official judge scripts not found in {judge_dir}: {', '.join(missing)}"
-        )
+    if not judge_dir.is_dir():
+        raise FileNotFoundError(f"official judge directory not found: {judge_dir}")
     return judge_dir
 
 
 def normalize_suite(value: str) -> str:
-    if value in {"musl", "ltp-musl"}:
-        return "ltp-musl"
-    if value in {"glibc", "ltp-glibc"}:
-        return "ltp-glibc"
+    value = value.strip()
+    if not value:
+        return "auto"
     if value in {"all", "auto"}:
         return value
-    raise ValueError(f"unknown suite: {value}")
+    if re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        return value
+    raise ValueError(f"invalid suite selector: {value}")
 
 
 def split_segments(log_path: Path) -> list[Segment]:
@@ -140,10 +137,12 @@ def whole_file_segment(log_path: Path, suite: str) -> Segment:
 
 def select_segments(log_path: Path, suite: str) -> list[Segment]:
     marked = split_segments(log_path)
-    if suite == "auto":
+    if suite in {"auto", "all"}:
         return marked
-    if suite == "all":
-        return [seg for seg in marked if seg.suite in {"ltp-musl", "ltp-glibc"}]
+    if suite in {"musl", "glibc"}:
+        return [seg for seg in marked if seg.suite.endswith(f"-{suite}")]
+    if "-" not in suite:
+        return [seg for seg in marked if seg.suite.rsplit("-", 1)[0] == suite]
 
     selected = [seg for seg in marked if seg.suite == suite]
     if selected:
@@ -154,8 +153,9 @@ def select_segments(log_path: Path, suite: str) -> list[Segment]:
 
 
 def run_official_judge(judge_dir: Path, suite: str, data: bytes) -> list[dict[str, Any]]:
-    libc = suite.removeprefix("ltp-")
-    judge = judge_dir / f"judge_ltp-{libc}.py"
+    judge = judge_dir / f"judge_{suite}.py"
+    if not judge.is_file():
+        raise FileNotFoundError(f"official judge script not found: {judge}")
     clean_data = data.replace(b"\r", b"")
     proc = subprocess.run(
         [sys.executable, str(judge)],
@@ -184,13 +184,25 @@ def to_int(value: Any) -> int:
         return 0
 
 
+def to_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def has_count_fields(row: dict[str, Any]) -> bool:
+    return "pass" in row or "all" in row or "total" in row
+
+
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     normalized = [
         {
             "name": str(row.get("name", "")),
             "pass": to_int(row.get("pass", 0)),
-            "all": to_int(row.get("all", 0)),
-            "score": to_int(row.get("score", row.get("pass", 0))),
+            "all": to_int(row.get("all", row.get("total", 0))),
+            "score": to_float(row.get("score", row.get("pass", 0))),
+            "counted": has_count_fields(row),
         }
         for row in rows
     ]
@@ -198,16 +210,17 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     total_pass = sum(row["pass"] for row in normalized)
     total_all = sum(row["all"] for row in normalized)
     total_score = sum(row["score"] for row in normalized)
+    counted_rows = [row for row in normalized if row["counted"]]
     return {
         "cases": total_cases,
         "pass": total_pass,
         "all": total_all,
         "score": total_score,
         "score_rate": (total_score / total_all) if total_all else 0.0,
-        "full": sum(1 for row in normalized if row["all"] > 0 and row["pass"] == row["all"]),
-        "partial": sum(1 for row in normalized if 0 < row["pass"] < row["all"]),
-        "zero": sum(1 for row in normalized if row["all"] > 0 and row["pass"] == 0),
-        "no_stat": sum(1 for row in normalized if row["all"] == 0),
+        "full": sum(1 for row in counted_rows if row["all"] > 0 and row["pass"] == row["all"]),
+        "partial": sum(1 for row in counted_rows if 0 < row["pass"] < row["all"]),
+        "zero": sum(1 for row in counted_rows if row["all"] > 0 and row["pass"] == 0),
+        "no_stat": sum(1 for row in counted_rows if row["all"] == 0),
     }
 
 
@@ -226,7 +239,7 @@ def score_log(log_path: Path, suite: str, judge_dir: Path, complete_only: bool) 
                 "suite": seg.suite,
                 "complete": seg.complete,
                 "line_range": seg.line_range,
-                "judge": f"judge_ltp-{seg.suite.removeprefix('ltp-')}.py",
+                "judge": f"judge_{seg.suite}.py",
                 **summary,
             }
         )
@@ -235,7 +248,8 @@ def score_log(log_path: Path, suite: str, judge_dir: Path, complete_only: bool) 
 
 def total_row(rows: list[dict[str, Any]]) -> dict[str, Any]:
     total_all = sum(to_int(row["all"]) for row in rows)
-    total_score = sum(to_int(row["score"]) for row in rows)
+    total_score = sum(to_float(row["score"]) for row in rows)
+    total_pass = sum(to_int(row["pass"]) for row in rows)
     return {
         "log": "TOTAL",
         "suite": "-",
@@ -243,10 +257,10 @@ def total_row(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "line_range": "-",
         "judge": "-",
         "cases": sum(to_int(row["cases"]) for row in rows),
-        "pass": sum(to_int(row["pass"]) for row in rows),
+        "pass": total_pass,
         "all": total_all,
         "score": total_score,
-        "score_rate": (total_score / total_all) if total_all else 0.0,
+        "score_rate": (total_pass / total_all) if total_all else 0.0,
         "full": sum(to_int(row["full"]) for row in rows),
         "partial": sum(to_int(row["partial"]) for row in rows),
         "zero": sum(to_int(row["zero"]) for row in rows),
@@ -256,6 +270,13 @@ def total_row(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 def format_bool(value: bool) -> str:
     return "yes" if value else "no"
+
+
+def format_number(value: Any) -> str:
+    num = to_float(value)
+    if abs(num - round(num)) < 1e-9:
+        return str(int(round(num)))
+    return f"{num:.4f}"
 
 
 def print_markdown(rows: list[dict[str, Any]], include_total: bool) -> None:
@@ -274,7 +295,7 @@ def print_markdown(rows: list[dict[str, Any]], include_total: bool) -> None:
             f"| {row['cases']} "
             f"| {row['pass']} "
             f"| {row['all']} "
-            f"| {row['score']} "
+            f"| {format_number(row['score'])} "
             f"| {row['score_rate']:.2%} "
             f"| {row['full']} "
             f"| {row['partial']} "
@@ -312,14 +333,16 @@ def print_csv(rows: list[dict[str, Any]], include_total: bool) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Score LTP logs by calling the official judge_ltp-* scripts."
+        description="Score OS competition logs by calling the official judge_*.py scripts."
     )
     parser.add_argument("logs", nargs="+", help="QEMU log file(s)")
     parser.add_argument(
         "--suite",
         default="auto",
-        choices=["auto", "all", "ltp-musl", "ltp-glibc", "musl", "glibc"],
-        help="suite to score; auto scores marked LTP groups (default: auto)",
+        help=(
+            "suite selector: auto/all for all marked groups, musl/glibc for one libc, "
+            "ltp/basic/lmbench for both libcs of a suite, or exact group like ltp-musl"
+        ),
     )
     parser.add_argument(
         "--judge-dir",
@@ -374,4 +397,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
