@@ -5633,9 +5633,50 @@ pub fn sys_sched_getattr(_pid: usize, attr: *mut u8, size: usize, _flags: usize)
 }
 
 /// sched_setaffinity(pid, cpusetsize, mask)
-/// Stub: accept and ignore — we are single-core, so any mask is fine.
-pub fn sys_sched_setaffinity(_pid: usize, _cpusetsize: usize, _mask: *const u8) -> isize {
-    info!("[sched] sched_setaffinity: stub, always success");
+pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask: *const u8) -> isize {
+    if cpusetsize == 0 {
+        return errno(EINVAL);
+    }
+    if mask.is_null() {
+        return errno(EFAULT);
+    }
+
+    let target_pid = match normalize_sched_pid(pid) {
+        Ok(pid) => pid,
+        Err(err) => return err,
+    };
+
+    let token = current_user_token();
+    let mut cpumask = vec![0u8; cpusetsize];
+    if user_mem::copy_from_user(
+        token,
+        mask,
+        &mut cpumask,
+        UserReadPolicy::DemandPaged,
+    )
+    .is_err()
+    {
+        return errno(EFAULT);
+    }
+
+    // rCore currently exposes a single online CPU. Linux rejects masks that do
+    // not include any permitted CPU.
+    if cpumask.first().copied().unwrap_or(0) & 1 == 0 {
+        return errno(EINVAL);
+    }
+
+    let caller = current_process();
+    if target_pid != caller.pid.0 {
+        let Some(target) = pid2process(target_pid) else {
+            return errno(ESRCH);
+        };
+        let caller_euid = caller.effective_uid();
+        let target_uid = target.effective_uid();
+        if caller_euid != 0 && caller_euid != target_uid {
+            return errno(EPERM);
+        }
+    }
+
     0
 }
 
