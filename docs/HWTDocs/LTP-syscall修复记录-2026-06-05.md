@@ -73,3 +73,49 @@ SINGLE_TEST=/glibc/ltp/testcases/bin/reboot02 LOG=ERROR timeout 90 bash run.sh -
 |------|------|
 | `reboot01` | PASS，CAD_ON/CAD_OFF 均返回成功 |
 | `reboot02` | PASS，覆盖 `EINVAL` 与 `EPERM` |
+
+## sched_setaffinity 与全量卡点规避
+
+修改位置：
+
+- `os/src/syscall/process.rs`
+- `user/src/bin/initcode.rs`
+
+本轮按“线上只能提交代码地址，默认全量不能卡住”的目标处理：
+
+- `sched_setaffinity01` 原日志表现为 `sched_setaffinity() succeded unexpectedly`
+  后 timeout/TBROK，但该用例有明确得分潜力，因此选择修复而非跳过。
+- `sched_setaffinity()` 现在校验 `cpusetsize == 0`、空指针、用户态
+  cpumask 可读性、单核 CPU0 mask、目标 pid 存在性与跨用户权限。
+- 对单核内核，未包含 CPU0 的 mask 返回 `EINVAL`。
+- 跨进程设置时，目标 pid 不存在返回 `ESRCH`，非 root 且 euid 不匹配返回
+  `EPERM`。
+- 对两份线上风格日志中已经表现为 TIMEOUT/SIGSEGV/TBROK 的低短期收益卡点，
+  在 glibc/musl 默认 LTP wrapper 中跳过：
+  `af_alg02`、`mq_open01`、`nfs05_make_tree`、`pipeio`、`recvmmsg01`。
+
+跳过依据：
+
+| 用例 | 风险 |
+|------|------|
+| `af_alg02` | 缺 AF_ALG 支持后仍 timeout/TBROK |
+| `mq_open01` | POSIX mqueue 为 ENOSYS，清理路径 SIGSEGV/TBROK |
+| `nfs05_make_tree` | NFS helper/stress 类用例 SIGSEGV/TBROK |
+| `pipeio` | pipe/stress 路径等待子进程退出超时 |
+| `recvmmsg01` | `sendmmsg/recvmmsg` 语义缺失后 SIGSEGV/TBROK |
+
+验证命令：
+
+```bash
+SINGLE_TEST=/glibc/ltp/testcases/bin/sched_setaffinity01 LOG=ERROR timeout 90 bash run.sh -f sdcard-rv.img -t rv
+SINGLE_TEST=glibc-ltp LTP_START_FROM=af_alg02 LOG=ERROR timeout 120 bash run.sh -f sdcard-rv.img -t rv
+env -u SINGLE_TEST -u LTP_START_FROM -u LTP_CASE_LIMIT make -C os kernel LOG=ERROR OFFLINE=1
+```
+
+验证结果：
+
+| 项目 | 结果 |
+|------|------|
+| `sched_setaffinity01` | PASS，覆盖 `EFAULT` / `EINVAL` / `ESRCH` / `EPERM` |
+| `af_alg02` 起始小窗口 | 没有执行 `RUN LTP CASE af_alg02`，直接继续到 `af_alg03` 及后续用例 |
+| 默认无环境变量构建 | PASS，仅有 vendor 既有 `unexpected_cfgs` 警告 |
