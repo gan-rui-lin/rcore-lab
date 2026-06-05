@@ -119,3 +119,73 @@ env -u SINGLE_TEST -u LTP_START_FROM -u LTP_CASE_LIMIT make -C os kernel LOG=ERR
 | `sched_setaffinity01` | PASS，覆盖 `EFAULT` / `EINVAL` / `ESRCH` / `EPERM` |
 | `af_alg02` 起始小窗口 | 没有执行 `RUN LTP CASE af_alg02`，直接继续到 `af_alg03` 及后续用例 |
 | 默认无环境变量构建 | PASS，仅有 vendor 既有 `unexpected_cfgs` 警告 |
+
+## 文件打开、硬链接与 pread 错误语义
+
+修改位置：
+
+- `os/src/fs/mod.rs`
+- `os/src/fs/vfs/ext4/inode.rs`
+- `os/src/syscall/fs.rs`
+
+修复内容：
+
+- 增加 `OpenFlags::EXCL`，`O_CREAT | O_EXCL` 目标已存在时返回 `EEXIST`。
+- 目录以写方式打开时返回 `EISDIR`。
+- `pread64()` 读目录 fd 时返回 `EISDIR`。
+- ext4 `link_to()` 成功后同时失效旧路径和新路径 metadata cache，避免
+  `st_nlink` 继续读到旧值。
+
+验证命令：
+
+```bash
+make -C os kernel LOG=ERROR OFFLINE=1
+for t in fstat02 fstat02_64 link02 pread02 pread02_64 open08; do
+  SINGLE_TEST=/glibc/ltp/testcases/bin/$t LOG=ERROR timeout 90 bash run.sh -f sdcard-rv.img -t rv
+done
+SINGLE_TEST=glibc-ltp LTP_START_FROM=fstat02 LOG=ERROR timeout 90 bash run.sh -f sdcard-rv.img -t rv
+```
+
+验证结果：
+
+| 用例 | 结果 |
+|------|------|
+| `fstat02` / `fstat02_64` | PASS，`st_nlink == 2` |
+| `link02` | PASS，硬链接前后 stat link count 匹配 |
+| `pread02` / `pread02_64` | PASS，覆盖 `ESPIPE` / `EINVAL` / `EISDIR` |
+| `open08` | PASS，覆盖 `EEXIST` / `EISDIR` / `ENOTDIR` / `ENAMETOOLONG` / `EACCES` / `EFAULT` |
+| `fstat02` 起始小窗口 | 能持续推进到 `keyctl09`，未在本轮修复点附近卡住 |
+
+说明：
+
+- `open11` 的主体期望也包含目录写打开 `EISDIR`，但本地单例在 LTP 通用
+  mount flag setup 阶段因 `access(tmpdir, F_OK)` 返回 `EINVAL` 提前 TBROK，
+  未作为本轮已修复用例计入。
+
+## getcpu
+
+修改位置：
+
+- `os/src/syscall/mod.rs`
+- `os/src/syscall/process.rs`
+
+修复内容：
+
+- 接入 168 号 `getcpu` syscall。
+- 单核系统下向非空 `cpu` / `node` 指针分别写入 0。
+- 允许任一输出指针为空，用户指针不可写时返回 `EFAULT`。
+
+验证命令：
+
+```bash
+make -C os kernel LOG=ERROR OFFLINE=1
+SINGLE_TEST=/glibc/ltp/testcases/bin/getcpu01 LOG=ERROR timeout 90 bash run.sh -f sdcard-rv.img -t rv
+SINGLE_TEST=/glibc/ltp/testcases/bin/sched_setaffinity01 LOG=ERROR timeout 90 bash run.sh -f sdcard-rv.img -t rv
+```
+
+验证结果：
+
+| 用例 | 结果 |
+|------|------|
+| `getcpu01` | PASS，返回 `cpuid:0, node id:0` |
+| `sched_setaffinity01` | 依赖回归检查 PASS |
