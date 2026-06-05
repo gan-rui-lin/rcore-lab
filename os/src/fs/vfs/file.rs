@@ -235,6 +235,10 @@ impl File for VfsFile {
     fn read_at_kernel(&self, offset: usize, buf: &mut [u8]) -> usize {
         self.inode.read_at(offset, buf)
     }
+
+    fn write_at_kernel(&self, offset: usize, buf: &[u8]) -> usize {
+        self.inode.write_at(offset, buf)
+    }
 }
 
 pub fn list_apps() {

@@ -45,7 +45,6 @@ impl SignalFdFile {
         }
     }
 
-    #[allow(dead_code)]
     pub fn update_mask(&self, mask: SignalFlags) {
         let mut m = self.mask.exclusive_access();
         *m = mask;
@@ -147,5 +146,9 @@ impl File for SignalFdFile {
         } else {
             0
         }
+    }
+    fn update_signalfd_mask(&self, mask: SignalFlags) -> bool {
+        self.update_mask(mask);
+        true
     }
 }

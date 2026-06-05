@@ -806,9 +806,14 @@ pub fn should_trace_syscall(pid: usize) -> bool {
     true
 }
 
-/// Called by task-exit path to release per-process SHM attachment records.
+/// Called by the task-exit path to release per-process kernel resources that are
+/// tracked in global tables keyed by pid: SHM attachments, POSIX timers, and
+/// epoll registrations. Without this the tables leak and a recycled pid could
+/// inherit stale state (e.g. a dead pid's timer firing signals).
 pub fn cleanup_shm_for_process_exit(pid: usize) {
     ipc::cleanup_shm_attachments_for_pid(pid);
+    process::posix_timers_cleanup_for_pid(pid);
+    fs::epoll_cleanup_for_pid(pid);
 }
 
 /// handle syscall exception with `syscall_id` and other arguments

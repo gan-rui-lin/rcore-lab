@@ -1745,6 +1745,11 @@ pub fn sys_close(fd: usize) -> isize {
     }
     fd_flags_remove(pid, fd);
     flock_unlock_owner(pid, fd);
+    // Drop the global epoll registration if this fd was an epoll instance, so the
+    // Arc<EpollFile> can be released and the (pid, fd) slot is not reused stale.
+    if epoll_is_registered(pid, fd) {
+        epoll_unregister(pid, fd);
+    }
     0
 }
 
@@ -6108,11 +6113,24 @@ pub fn epoll_register(pid: usize, fd: usize, epoll: Arc<EpollFile>) {
     guard.insert((pid, fd), epoll);
 }
 
-/// Remove an epoll registration (e.g., on close). Called from sys_close path if needed.
-#[allow(dead_code)]
+/// Remove an epoll registration (e.g., on close). Called from the sys_close path.
 pub fn epoll_unregister(pid: usize, fd: usize) {
     let mut guard = EPOLL_REGISTRY.exclusive_access();
     guard.remove(&(pid, fd));
+}
+
+/// Drop every epoll registration owned by `pid`. Called on process exit so the
+/// global EPOLL_REGISTRY does not leak Arc<EpollFile> or let a recycled pid
+/// inherit a stale epoll instance.
+pub fn epoll_cleanup_for_pid(pid: usize) {
+    let mut guard = EPOLL_REGISTRY.exclusive_access();
+    guard.retain(|(p, _fd), _| *p != pid);
+}
+
+/// True if `(pid, fd)` is a registered epoll instance. Lets sys_close skip the
+/// registry lookup/removal work for ordinary fds.
+fn epoll_is_registered(pid: usize, fd: usize) -> bool {
+    EPOLL_REGISTRY.exclusive_access().contains_key(&(pid, fd))
 }
 
 pub fn sys_signalfd4(fd: isize, mask_ptr: *const usize, sigsetsize: usize, flags: usize) -> isize {
@@ -6120,18 +6138,31 @@ pub fn sys_signalfd4(fd: isize, mask_ptr: *const usize, sigsetsize: usize, flags
         return errno(EINVAL);
     }
     let token = current_user_token();
-    let user_mask = *translated_ref(token, mask_ptr);
+    let user_mask =
+        match user_mem::read_from_user::<usize>(token, mask_ptr, UserReadPolicy::StrictChecked) {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
     let mask = user_mask_to_flags(user_mask as u64);
+    let process = current_process();
 
     if fd == -1 {
         let sfd = SignalFdFile::new(mask, flags);
-        let process = current_process();
         let Some(new_fd) = process.install_file(Arc::new(sfd)) else {
             return errno(EMFILE);
         };
         new_fd as isize
     } else {
-        fd as isize
+        // Update the mask of an existing signalfd. The fd must refer to a
+        // signalfd; any other file type is rejected with EINVAL.
+        let Some(file) = process.get_file(fd as usize) else {
+            return errno(EBADF);
+        };
+        if file.update_signalfd_mask(mask) {
+            fd as isize
+        } else {
+            errno(EINVAL)
+        }
     }
 }
 
@@ -6180,6 +6211,9 @@ pub fn sys_copy_file_range(
         return errno(EBADF);
     }
 
+    // Resolve the source offset: either from the user-supplied *off_in (which is
+    // safely read with validation) or, when off_in is NULL, from the file's own
+    // current offset.
     let src_offset = if !off_in.is_null() {
         let off = *translated_ref(token, off_in as *const i64);
         if off < 0 {
@@ -6205,10 +6239,9 @@ pub fn sys_copy_file_range(
     }
     let mut buf = vec![0u8; read_len];
 
-    let bytes_read = if let Some(off) = src_offset {
-        src_file.read_at_kernel(off, &mut buf)
-    } else {
-        return errno(ENOSYS);
+    let bytes_read = match src_offset {
+        Some(off) => src_file.read_at_kernel(off, &mut buf),
+        None => return errno(ENOSYS),
     };
 
     if bytes_read == 0 {

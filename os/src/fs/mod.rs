@@ -53,6 +53,11 @@ pub trait File: Send + Sync {
     fn read_at_kernel(&self, _offset: usize, _buf: &mut [u8]) -> usize {
         0
     }
+    /// Write a kernel buffer to the file at a given byte offset.
+    /// Used by in-kernel copies (e.g. copy_file_range). Default returns 0 (unsupported).
+    fn write_at_kernel(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
     /// poll the file for events, return the events bitflags
     /// default implementation returns POLLIN | POLLOUT, which means always readable and writable.
     /// ! for files that are not always ready, e.g. pipes, this should be overridden to return the actual events.
@@ -91,6 +96,12 @@ pub trait File: Send + Sync {
     }
     /// Optional: set file status flags (O_NONBLOCK, O_APPEND, etc.).
     fn set_status_flags(&self, _flags: u32) {}
+    /// Optional: update the accepted signal mask of a signalfd. Returns true if
+    /// this file is a signalfd and the mask was updated. Non-signalfd files
+    /// return false so signalfd4(fd>=0, ...) can reject a non-signalfd fd.
+    fn update_signalfd_mask(&self, _mask: crate::task::SignalFlags) -> bool {
+        false
+    }
     /// Optional: get/add memfd seals. Regular files do not support them.
     fn get_seals(&self) -> Option<u32> {
         None

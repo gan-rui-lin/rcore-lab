@@ -5892,12 +5892,19 @@ struct PosixTimer {
     clockid: usize,
     #[allow(dead_code)]
     sigev_signo: i32,
+    /// sigev_notify from struct sigevent: SIGEV_SIGNAL(0) / SIGEV_NONE(1) / SIGEV_THREAD(2).
+    /// SIGEV_NONE timers expire silently (no signal delivered).
+    sigev_notify: i32,
     /// Expiry time in microseconds (absolute monotonic)
     value_us: u64,
     /// Interval for periodic timers (microseconds)
     interval_us: u64,
     overrun: i32,
 }
+
+/// POSIX sigev_notify values (see <signal.h>).
+const SIGEV_SIGNAL: i32 = 0;
+const SIGEV_NONE: i32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -5918,36 +5925,17 @@ pub fn sys_timer_create(clockid: usize, sevp: *const u8, timerid: *mut usize) ->
     let pid = current_process().pid.0;
     let token = current_user_token();
 
-    // struct sigevent layout on the tested 64-bit ABI:
-    // sigev_value (8 bytes), sigev_signo (4 bytes), sigev_notify (4 bytes).
-    const SIGEV_SIGNAL: i32 = 0;
-    const SIGEV_NONE: i32 = 1;
-    const SIGEV_THREAD: i32 = 2;
-    const SIGEV_THREAD_ID: i32 = 4;
-
-    let (sigev_signo, sigev_notify) = if !sevp.is_null() {
+    // Read sigev_signo / sigev_notify from sigevent if provided.
+    // struct sigevent layout: sigev_value (8 bytes), sigev_signo (i32 @ offset 8),
+    // sigev_notify (i32 @ offset 12).
+    let (sigev_signo, sigev_notify): (i32, i32) = if !sevp.is_null() {
         let signo_ptr = (sevp as usize + 8) as *const i32;
         let notify_ptr = (sevp as usize + 12) as *const i32;
-        let signo = match read_from_user::<i32>(token, signo_ptr) {
-            Ok(v) => v,
-            Err(err) => return err,
-        };
-        let notify = match read_from_user::<i32>(token, notify_ptr) {
-            Ok(v) => v,
-            Err(err) => return err,
-        };
-        match notify {
-            SIGEV_SIGNAL | SIGEV_THREAD | SIGEV_THREAD_ID
-                if signo <= 0 || signo as usize > crate::task::MAX_SIG =>
-            {
-                return errno(EINVAL);
-            }
-            SIGEV_SIGNAL | SIGEV_NONE | SIGEV_THREAD | SIGEV_THREAD_ID => {}
-            _ => return errno(EINVAL),
-        }
+        let signo = read_from_user::<i32>(token, signo_ptr).unwrap_or(14);
+        let notify = read_from_user::<i32>(token, notify_ptr).unwrap_or(SIGEV_SIGNAL);
         (signo, notify)
     } else {
-        (14, SIGEV_SIGNAL)
+        (14, SIGEV_SIGNAL) // default: deliver SIGALRM
     };
 
     let timer_id = {
@@ -5959,11 +5947,8 @@ pub fn sys_timer_create(clockid: usize, sevp: *const u8, timerid: *mut usize) ->
 
     let timer = PosixTimer {
         clockid,
-        sigev_signo: if sigev_notify == SIGEV_NONE {
-            0
-        } else {
-            sigev_signo
-        },
+        sigev_signo,
+        sigev_notify,
         value_us: 0,
         interval_us: 0,
         overrun: 0,
@@ -5973,8 +5958,8 @@ pub fn sys_timer_create(clockid: usize, sevp: *const u8, timerid: *mut usize) ->
         .exclusive_access()
         .insert((pid, timer_id), timer);
 
-    // Linux timer_t is int-sized on the tested ABIs; do not overwrite the
-    // adjacent user stack slot by copying a native usize.
+    // Write timer ID back to userspace. Linux's timer_t is `int` (4 bytes); writing
+    // 8 bytes here would clobber the 4 bytes adjacent to *timerid on the user stack.
     let id_bytes = (timer_id as i32).to_ne_bytes();
     if let Err(err) = copy_to_user(token, timerid as *mut u8, &id_bytes) {
         return err;
@@ -6151,7 +6136,11 @@ pub fn posix_timers_check_expired(current_us: u64) -> alloc::vec::Vec<(usize, i3
             continue;
         }
         if timer.value_us <= current_us {
-            result.push((*pid, timer.sigev_signo));
+            // SIGEV_NONE timers expire silently: keep the overrun counter and the
+            // rearm bookkeeping, but never deliver a signal.
+            if timer.sigev_notify != SIGEV_NONE {
+                result.push((*pid, timer.sigev_signo));
+            }
             timer.overrun += 1;
             if timer.interval_us > 0 {
                 timer.value_us = current_us + timer.interval_us;
@@ -6161,6 +6150,14 @@ pub fn posix_timers_check_expired(current_us: u64) -> alloc::vec::Vec<(usize, i3
         }
     }
     result
+}
+
+/// Remove every POSIX timer belonging to `pid`. Called on process exit so the
+/// global POSIX_TIMERS table does not leak entries or keep firing on dead pids
+/// (which could deliver signals to a recycled pid).
+pub fn posix_timers_cleanup_for_pid(pid: usize) {
+    let mut timers = POSIX_TIMERS.exclusive_access();
+    timers.retain(|(p, _tid), _| *p != pid);
 }
 
 // ---------------------------------------------------------------------------
