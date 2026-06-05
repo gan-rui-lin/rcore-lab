@@ -215,6 +215,8 @@ const SYSCALL_SCHED_SETAFFINITY: usize = 122;
 const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 /// yield syscall
 const SYSCALL_YIELD: usize = 124;
+/// sched_rr_get_interval syscall
+const SYSCALL_SCHED_RR_GET_INTERVAL: usize = 127;
 /// thread_create syscall
 const SYSCALL_THREAD_CREATE: usize = 460;
 /// gettid syscall
@@ -625,6 +627,7 @@ const SYSCALL_NAME_MAP: &[(usize, &str)] = &[
     (122, "sched_setaffinity"),
     (123, "sched_getaffinity"),
     (124, "sched_yield"),
+    (127, "sched_rr_get_interval"),
     (129, "kill_signal"),
     (130, "tkill"),
     (131, "tgkill"),
@@ -1137,6 +1140,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SCHED_SETAFFINITY => sys_sched_setaffinity(args[0], args[1], args[2] as *const u8),
         SYSCALL_SCHED_GETAFFINITY => {
             sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8)
+        }
+        SYSCALL_SCHED_RR_GET_INTERVAL => {
+            sys_sched_rr_get_interval(args[0], args[1] as *mut TimeSpec)
         }
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_KILL => sys_kill(args[0] as isize, args[1] as i32),

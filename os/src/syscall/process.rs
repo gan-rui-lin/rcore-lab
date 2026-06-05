@@ -5515,6 +5515,53 @@ pub fn sys_sched_getparam(pid: usize, param: *mut u8) -> isize {
     }
 }
 
+/// sched_rr_get_interval(pid, tp)
+pub fn sys_sched_rr_get_interval(pid: usize, interval: *mut TimeSpec) -> isize {
+    const SCHED_FIFO: i32 = 1;
+    const SCHED_RR: i32 = 2;
+    const RR_TIMESLICE_NS: usize = 100_000_000;
+
+    let target_pid = match normalize_sched_pid(pid) {
+        Ok(pid) => pid,
+        Err(err) => return err,
+    };
+    if interval.is_null() {
+        return errno(EFAULT);
+    }
+
+    let policy = SCHED_POLICIES
+        .exclusive_access()
+        .get(&target_pid)
+        .copied()
+        .unwrap_or(0);
+    let spec = match policy {
+        SCHED_RR => TimeSpec {
+            tv_sec: 0,
+            tv_nsec: RR_TIMESLICE_NS,
+        },
+        SCHED_FIFO => TimeSpec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        _ => TimeSpec {
+            tv_sec: 0,
+            tv_nsec: RR_TIMESLICE_NS,
+        },
+    };
+
+    let token = current_user_token();
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&spec as *const TimeSpec) as *const u8,
+            core::mem::size_of::<TimeSpec>(),
+        )
+    };
+    match copy_to_user(token, interval as *mut u8, bytes) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
+}
+
 /// sched_setattr(pid, attr, flags)
 /// Stub: pretend success.
 pub fn sys_sched_setattr(_pid: usize, _attr: usize, _flags: usize) -> isize {
