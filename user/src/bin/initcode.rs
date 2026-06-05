@@ -836,7 +836,7 @@ is_skip_case() {
     case \"$1\" in
         # never_run: not a standalone testcase / never-score
         # Source: analysis/rv_ltp/rv_ltp_analysis_report.md -> \"不应该加入测试的条目\".
-        check_icmpv4_connectivity|check_icmpv6_connectivity|cpuacct_task|create_datafile|create_file|data|dirty|growfiles|kernbench|libcgroup_freezer|locktests|ltpServer|mc_member_test|mc_recv|mc_send|mc_verify_opts|mc_verify_opts_error|mmap-corruption01|mmap2|mmstress_dummy|nfs01_open_files|nfs04_create_file|nfs_flock|nfs_flock_dgen|ns-echoclient|ns-tcpclient|openfile|pm_cpu_consolidation.py|pm_ilb_test.py|pm_sched_domain.py|pm_sched_mc.py|print_caps|rwtest|sched_tc2|sched_tc3|sched_tc4|sched_tc5|stress|test_ioctl|testsf_c)
+        check_icmpv4_connectivity|check_icmpv6_connectivity|cpuacct_task|create_datafile|create_file|data|dirty|growfiles|kernbench|libcgroup_freezer|locktests|ltpServer|mc_member_test|mc_recv|mc_send|mc_verify_opts|mc_verify_opts_error|mmap-corruption01|mmap2|mmstress_dummy|nfs01_open_files|nfs04_create_file|nfs_flock|nfs_flock_dgen|ns-echoclient|ns-tcpclient|openfile|pm_cpu_consolidation.py|pm_ilb_test.py|pm_sched_domain.py|pm_sched_mc.py|print_caps|rwtest|sched_driver|sched_tc2|sched_tc3|sched_tc4|sched_tc5|stress|test_ioctl|testsf_c)
             return 0
             ;;
         # skip_hang_case: existing hang/problematic cases
@@ -890,7 +890,7 @@ is_skip_case() {
     case \"$1\" in
         # never_run: not a standalone testcase / never-score
         # Source: analysis/rv_ltp/rv_ltp_analysis_report.md -> \"不应该加入测试的条目\".
-        check_icmpv4_connectivity|check_icmpv6_connectivity|cpuacct_task|create_datafile|create_file|data|dirty|growfiles|kernbench|libcgroup_freezer|locktests|ltpServer|mc_member_test|mc_recv|mc_send|mc_verify_opts|mc_verify_opts_error|mmap-corruption01|mmap2|mmstress_dummy|nfs01_open_files|nfs04_create_file|nfs_flock|nfs_flock_dgen|ns-echoclient|ns-tcpclient|openfile|pm_cpu_consolidation.py|pm_ilb_test.py|pm_sched_domain.py|pm_sched_mc.py|print_caps|rwtest|sched_tc2|sched_tc3|sched_tc4|sched_tc5|stress|test_ioctl|testsf_c)
+        check_icmpv4_connectivity|check_icmpv6_connectivity|cpuacct_task|create_datafile|create_file|data|dirty|growfiles|kernbench|libcgroup_freezer|locktests|ltpServer|mc_member_test|mc_recv|mc_send|mc_verify_opts|mc_verify_opts_error|mmap-corruption01|mmap2|mmstress_dummy|nfs01_open_files|nfs04_create_file|nfs_flock|nfs_flock_dgen|ns-echoclient|ns-tcpclient|openfile|pm_cpu_consolidation.py|pm_ilb_test.py|pm_sched_domain.py|pm_sched_mc.py|print_caps|rwtest|sched_driver|sched_tc2|sched_tc3|sched_tc4|sched_tc5|stress|test_ioctl|testsf_c)
             return 0
             ;;
         # skip_hang_case: existing hang/problematic cases

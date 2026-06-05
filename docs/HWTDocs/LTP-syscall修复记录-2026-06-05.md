@@ -235,3 +235,23 @@ SINGLE_TEST=glibc-ltp LTP_START_FROM=sched_getattr01 LTP_CASE_LIMIT=25 \
 | `sched_setparam01` - `sched_setparam05` | PASS |
 | `sched_setscheduler01` - `sched_setscheduler04` | PASS |
 | `sched_getattr01` 起始连续窗口 | `sched_getattr01` 到 `sched_setscheduler04` 全部 `FAIL ... : 0`，无 `sched_*` TFAIL；后续旧 `sched_tc*` 仍为 129 |
+
+## 跳过 sched_driver
+
+修改位置：
+
+- `user/src/bin/initcode.rs`
+
+处理内容：
+
+- 将 `sched_driver` 加入 glibc/musl LTP wrapper 的 `never_run` 过滤列表。
+- 依据当前 RV 完整日志的官方 judge 结果，`sched_driver` 为
+  `pass=0, all=0, score=0`，没有直接得分潜力。
+- LA 长跑在该用例停于交互式提示 `rm: remove 'ps.out'?`，会阻塞后续高价值
+  LTP 用例继续执行。
+
+结论：
+
+| 用例 | 处理 | 原因 |
+|------|------|------|
+| `sched_driver` | 跳过 | 官方计分为 0，且 LA 会卡住长跑 |
