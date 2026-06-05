@@ -284,24 +284,16 @@ def print_markdown(rows: list[dict[str, Any]], include_total: bool) -> None:
     if include_total and len(rows) > 1:
         output_rows.append(total_row(rows))
 
-    print("| log | suite | complete | lines | cases | pass | all | score | score_rate | full | partial | zero | no_stat | judge |")
-    print("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+    print("| suite | cases | pass | all | score |")
+    print("|---|---:|---:|---:|---:|")
     for row in output_rows:
+        suite = "TOTAL" if row["log"] == "TOTAL" else row["suite"]
         print(
-            f"| {Path(row['log']).name if row['log'] != 'TOTAL' else 'TOTAL'} "
-            f"| {row['suite']} "
-            f"| {format_bool(bool(row['complete']))} "
-            f"| {row['line_range']} "
+            f"| {suite} "
             f"| {row['cases']} "
             f"| {row['pass']} "
             f"| {row['all']} "
-            f"| {format_number(row['score'])} "
-            f"| {row['score_rate']:.2%} "
-            f"| {row['full']} "
-            f"| {row['partial']} "
-            f"| {row['zero']} "
-            f"| {row['no_stat']} "
-            f"| {row['judge']} |"
+            f"| {format_number(row['score'])} |"
         )
 
 
