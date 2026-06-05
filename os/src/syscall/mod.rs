@@ -265,6 +265,8 @@ const SYSCALL_SIGRETURN: usize = 139;
 const SYSCALL_SET_PRIORITY: usize = 140;
 /// getpriority syscall
 const SYSCALL_GET_PRIORITY: usize = 141;
+/// reboot syscall
+const SYSCALL_REBOOT: usize = 142;
 /// setregid syscall
 const SYSCALL_SETREGID: usize = 143;
 /// setgid syscall
@@ -1194,6 +1196,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
+        SYSCALL_REBOOT => process::sys_reboot(args[0], args[1], args[2]),
         SYSCALL_SETREGID => process::sys_setregid(args[0] as u32, args[1] as u32),
         SYSCALL_SETGID => sys_setgid(args[0] as u32),
         SYSCALL_SETREUID => process::sys_setreuid(args[0] as u32, args[1] as u32),

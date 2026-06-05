@@ -4079,6 +4079,43 @@ pub fn sys_setfsgid(gid: u32) -> isize {
     })
 }
 
+/// reboot(magic, magic2, cmd) - only the non-rebooting CAD toggles are accepted.
+pub fn sys_reboot(magic: usize, magic2: usize, cmd: usize) -> isize {
+    const LINUX_REBOOT_MAGIC1: u32 = 0xfee1_dead;
+    const LINUX_REBOOT_MAGIC2: u32 = 672_274_793;
+    const LINUX_REBOOT_MAGIC2A: u32 = 850_722_78;
+    const LINUX_REBOOT_MAGIC2B: u32 = 369_367_448;
+    const LINUX_REBOOT_MAGIC2C: u32 = 537_993_216;
+    const LINUX_REBOOT_CMD_CAD_ON: u32 = 0x89ab_cdef;
+    const LINUX_REBOOT_CMD_CAD_OFF: u32 = 0x0000_0000;
+
+    let magic = magic as u32;
+    let magic2 = magic2 as u32;
+    let cmd = cmd as u32;
+    let cmd = if magic == LINUX_REBOOT_MAGIC1 {
+        if !matches!(
+            magic2,
+            LINUX_REBOOT_MAGIC2
+                | LINUX_REBOOT_MAGIC2A
+                | LINUX_REBOOT_MAGIC2B
+                | LINUX_REBOOT_MAGIC2C
+        ) {
+            return errno(EINVAL);
+        }
+        cmd
+    } else {
+        magic
+    };
+
+    if !matches!(cmd, LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF) {
+        return errno(EINVAL);
+    }
+    if current_process().effective_uid() != 0 {
+        return errno(EPERM);
+    }
+    0
+}
+
 /// Set user ID with minimal Linux-like semantics needed by LTP.
 pub fn sys_setuid(uid: u32) -> isize {
     let process = current_process();
