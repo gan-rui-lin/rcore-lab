@@ -5600,18 +5600,32 @@ pub fn sys_sched_rr_get_interval(pid: usize, interval: *mut TimeSpec) -> isize {
 }
 
 /// sched_setattr(pid, attr, flags)
-/// Stub: pretend success.
-pub fn sys_sched_setattr(_pid: usize, _attr: usize, _flags: usize) -> isize {
-    warn!("[sched] sched_setattr: stub, returning 0");
+pub fn sys_sched_setattr(pid: usize, attr: usize, flags: usize) -> isize {
+    if flags != 0 || attr == 0 {
+        return errno(EINVAL);
+    }
+    let target_pid = match normalize_sched_pid(pid) {
+        Ok(pid) => pid,
+        Err(err) => return err,
+    };
+    if target_pid != current_process().pid.0 && pid2process(target_pid).is_none() {
+        return errno(ESRCH);
+    }
     0
 }
 
 /// sched_getattr(pid, attr, size, flags)
 /// Return a sched_attr struct with SCHED_OTHER policy and priority 0.
-pub fn sys_sched_getattr(_pid: usize, attr: *mut u8, size: usize, _flags: usize) -> isize {
-    warn!("[sched] sched_getattr: called, size={}", size);
-    if attr.is_null() || size < 48 {
+pub fn sys_sched_getattr(pid: usize, attr: *mut u8, size: usize, flags: usize) -> isize {
+    if flags != 0 || attr.is_null() || size < 48 {
         return errno(EINVAL);
+    }
+    let target_pid = match normalize_sched_pid(pid) {
+        Ok(pid) => pid,
+        Err(err) => return err,
+    };
+    if target_pid != current_process().pid.0 && pid2process(target_pid).is_none() {
+        return errno(ESRCH);
     }
     let token = current_user_token();
     // struct sched_attr (48 bytes minimum):
