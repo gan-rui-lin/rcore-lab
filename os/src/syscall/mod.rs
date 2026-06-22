@@ -933,11 +933,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         }
         SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut StatFs),
         SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut StatFs),
+        // NOTE: the faccessat syscall (NR 48) is 3-arg (dirfd, path, mode) — it has
+        // NO flags argument; only faccessat2 (NR 439) does. Reading args[3] here would
+        // pick up a garbage a3 register, which glibc's access() leaves non-zero and
+        // would then trip the flags validation in sys_faccessat (EINVAL). Pass 0.
         SYSCALL_FACCESSAT => sys_faccessat(
             args[0] as isize,
             args[1] as *const u8,
             args[2] as u32,
-            args[3] as u32,
+            0,
         ),
         SYSCALL_FACCESSAT2 => sys_faccessat2(
             args[0] as isize,
